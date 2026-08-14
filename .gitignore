@@ -1,0 +1,37 @@
+# Build
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local tool / agent state (never ship)
+.ledgerful/
+.env
+.env.*
+!.env.example
+.project-ledger/
+graphify-out/
+/output/
+/scratch/
+/out/
+/dist/
+
+# Agent harness local state (skills under .agents/skills/ are tracked)
+.claude/
+.codex/
+.opencode/
+.agents/worktrees/
+.codex/worktrees/
+.agents/review_*.md
+.codex/review_*.md
+.agents/*.lock
+.codex/*.lock
+.grok/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+!.vscode/extensions.json

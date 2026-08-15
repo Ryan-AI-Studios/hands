@@ -2,6 +2,10 @@
 /target/
 **/*.rs.bk
 Cargo.lock.bak
+debug
+*.pdb
+**/mutants.out*/
+rustc-ice-*.txt
 
 # Local tool / agent state (never ship)
 .ledgerful/

@@ -14,11 +14,12 @@ https://github.com/Ryan-AI-Studios/hands
 
 ```powershell
 cd C:\dev\Helping-Hands\hands
-ai-brains context          # once
-ledgerful init             # once
 ai-brains preflight --summary
 ledgerful doctor --json
+# workRoot/stateDir must be this directory, not C:\dev\Helping-Hands
 ```
+
+`ai-brains context` / `ledgerful init` already ran here. Re-run them only if `.env` / `.ledgerful` are missing. Never init in the planning root.
 
 ## Build / test
 

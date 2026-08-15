@@ -20,22 +20,19 @@ Remote: https://github.com/Ryan-AI-Studios/hands
 
 ## Tools (always product cwd)
 
-Init once when the repo is ready:
-
-```powershell
-cd C:\dev\Helping-Hands\hands
-ai-brains context
-ledgerful init
-```
-
-Every coding session (when inited):
+Tools are already inited in this directory. Every coding session:
 
 ```powershell
 cd C:\dev\Helping-Hands\hands
 ai-brains preflight --summary
 ledgerful doctor --json
+# require environment.workRoot and stateDir under C:\dev\Helping-Hands\hands
 ledgerful change-context --json
 ```
+
+If doctor reports `workRoot: C:\dev\Helping-Hands`, you ran from the planning root — discard and
+re-run from here. Re-run `ai-brains context` / `ledgerful init` only if `.env` / `.ledgerful` are
+missing.
 
 Prefer `ledgerful … --json` when parsing. See `.agents/skills/ledgerful` and `ai-brains`.
 

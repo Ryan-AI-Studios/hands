@@ -12,10 +12,10 @@ description: >
 
 | | |
 |---|---|
-| **Init** | `ai-brains context` (and related setup) only in **`C:\dev\Helping-Hands\hands`** |
+| **Init** | Already done in **`C:\dev\Helping-Hands\hands`**. Re-run `ai-brains context` only if `hands\.env` is missing. |
 | **Run every CLI** | Shell cwd = **`C:\dev\Helping-Hands\hands`** — not `C:\dev\Helping-Hands` planning root |
 | **Pair with** | `ledgerful` also only from that same product path |
-| **Not inited yet** | Skip CLI; continue with ADRs/research; note unavailability |
+| **Wrong cwd** | If `ledgerful doctor --json` shows `workRoot`/`stateDir` as the planning root, discard and `cd hands`. |
 
 ```powershell
 cd C:\dev\Helping-Hands\hands
@@ -23,7 +23,7 @@ ai-brains preflight --summary
 ai-brains sync query "<topic>"
 ```
 
-This skill file may live under `hands\.agents\skills\`; **CLI cwd is always the product tree**.
+This skill file may live under `C:\dev\Helping-Hands\.agents\skills\` or `hands\.agents\skills\`; **CLI cwd is always the product tree**.
 
 ## What Each Tool Does
 

@@ -12,10 +12,10 @@ description: >
 
 | | |
 |---|---|
-| **Init** | `ledgerful init` only in **`C:\dev\Helping-Hands\hands`** |
+| **Init** | Already done in **`C:\dev\Helping-Hands\hands`**. Re-run `ledgerful init` only if `hands\.ledgerful` is missing. |
 | **Run every CLI** | Shell cwd = **`C:\dev\Helping-Hands\hands`** — not `C:\dev\Helping-Hands` planning root |
 | **Pair with** | `ai-brains` also only from that same product path |
-| **Not inited yet** | Skip CLI; continue with ADRs/research; note unavailability |
+| **Wrong cwd** | After `doctor --json`, `workRoot` and `stateDir` must be under `\hands`. Planning-root doctor is the wrong tree. |
 
 ```powershell
 cd C:\dev\Helping-Hands\hands

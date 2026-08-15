@@ -63,28 +63,26 @@ session_start:
   3. Read C:\dev\Helping-Hands\conductor\conductor.md
   4. Read C:\dev\Helping-Hands\conductor\deferred.md
   5. Open assigned track: conductor\<####-Name>\{spec.md,plan.md}
-  6. Tools (when inited): ai-brains + ledgerful — ALWAYS cwd = this product root
+  6. Tools: ai-brains + ledgerful from this product root (already inited).
+       After doctor --json, require workRoot/stateDir under \hands — not the planning root.
   7. If execute/implement: load .agents/skills/implement/SKILL.md next
 ```
 
 ## Tools (product cwd only — always)
 
-**Init here once (owner/agent when repo is ready):**
-
-```powershell
-cd C:\dev\Helping-Hands\hands
-ai-brains context
-ledgerful init
-```
-
-**Every session:**
+**Every session** (tools are already inited here):
 
 ```powershell
 cd C:\dev\Helping-Hands\hands
 ai-brains preflight --summary
 ledgerful doctor --json
+# require environment.workRoot and stateDir under C:\dev\Helping-Hands\hands
 ledgerful change-context --json   # before meaningful edits
 ```
+
+The Grok workspace is the **planning root**. That root may contain a stray `.ledgerful`. If
+doctor reports `workRoot: C:\dev\Helping-Hands`, you used the wrong cwd — discard and re-run
+from this directory.
 
 | Tool | Project skill |
 |------|---------------|
@@ -97,9 +95,10 @@ Skills may also exist under `C:\dev\Helping-Hands\.agents\skills\`; **CLI cwd is
 
 | State | Action |
 |-------|--------|
-| Not inited | Skip tool CLIs; note in `review.md` |
+| Inited (`hands\.ledgerful` + `hands\.env`) | **Default.** Every command from **this** cwd. Confirm doctor `workRoot` ends in `\hands`. |
+| Doctor `workRoot` is the planning root | Wrong cwd. Stop. Re-run from this directory. |
+| Missing `hands\.ledgerful` or `hands\.env` | Recover: `ai-brains context` / `ledgerful init` from **this** cwd only. Do **not** re-init if they exist. |
 | CLI missing | Continue without; say so |
-| Inited | Every command from **this** cwd |
 
 ## Conductor (where work is defined)
 

@@ -94,7 +94,11 @@ ledgerful ledger status --compact
 ledgerful change-context --json
 ```
 
-If tools not inited: continue; note in `review.md`. **Do not init in planning root.**
+After `doctor --json`, require `environment.workRoot` and `stateDir` under
+`C:\dev\Helping-Hands\hands`. A planning-root doctor is the wrong tree.
+
+If `hands\.ledgerful` / `hands\.env` are missing: recover init from **this** cwd only; note in
+`review.md`. **Do not init in planning root. Do not re-init if they exist.**
 
 ## Phase 1 — Branch
 

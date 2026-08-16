@@ -21,6 +21,13 @@ impl Detail {
         }
     }
 
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Dom => "dom",
+        }
+    }
+
     pub fn parse_arg(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim).filter(|s| !s.is_empty()) {
             None => Ok(Self::Default),

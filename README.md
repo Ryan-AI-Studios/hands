@@ -43,13 +43,14 @@ cargo run -- scroll --help
 cargo run -- wait-settle --help
 cargo run -- stop --help
 cargo run -- confirm --help
+cargo run -- logs --help
 ```
 
-`hands mcp` serves stdio MCP (`observe`, `click`, `hover`, `type`, `key`, `scroll`, `wait_settle`, `stop`, `confirm`). `hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope (screenshot **path**, 100px grid descriptor, UIA map, capped extract). Image bytes are never inlined.
+`hands mcp` serves stdio MCP (`observe`, `click`, `hover`, `type`, `key`, `scroll`, `wait_settle`, `stop`, `confirm`, `logs`). `hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope (screenshot **path**, 100px grid descriptor, UIA map, capped extract). Image bytes are never inlined.
 
 This binary owns the confirm fence. `click` and `key enter`/`return` refuse irreversible/gray-zone controls unless a matching domain+category allow exists (`ok: false` plus a compact `fence` object; no cursor move). `type` containing a newline is a tool error — use `key enter` to submit. After a refuse, the harness must call `confirm` (`once` / `session` / `persist`) and retry. Grok is always-approve, so a TUI prompt is not the fence.
 
-Input commands (`click` / `hover` / `type` / `key` / `scroll` / `wait-settle`) install a desk lease for the duration of the process: physical mouse/keyboard freezes injection; Pause/Break always aborts. Pause/Break and `stop` wipe session/once allows (desk-wide) and leave persist. `hands confirm` does **not** install the desk lease. `hands stop` as a one-shot CLI still clears session allows; injection itself is a documented no-op without a live MCP lease (use MCP `stop`, or Pause/Break during a live command).
+Input commands (`click` / `hover` / `type` / `key` / `scroll` / `wait-settle`) install a desk lease for the duration of the process: physical mouse/keyboard freezes injection; Pause/Break always aborts. Pause/Break and `stop` wipe session/once allows (desk-wide) and leave persist. **Logs stay.** Each tool call, fence refuse, and confirm grant appends one JSONL line under `%LOCALAPPDATA%\hands\logs\<session>.jsonl` (override `HANDS_LOGS_DIR`). `type` persists only `type_meta.len` — never the typed string or clipboard body. Observe logs the screenshot path and `elements_total`, not `main_text` or element texts. `hands logs --session-id <id>` tails events (default 50); `hands logs --list` lists files. Missing `--session-id` without `--list` is a tool error (no mint). `session_id=desk` is reserved for Pause/`stop` desk-wide events (`desk.jsonl` is unbounded; this track does not rotate). `hands confirm` and `hands logs` do **not** install the desk lease. `hands stop` as a one-shot CLI still clears session allows; injection itself is a documented no-op without a live MCP lease (use MCP `stop`, or Pause/Break during a live command).
 
 ## What this is
 

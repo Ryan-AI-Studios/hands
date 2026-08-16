@@ -60,9 +60,10 @@ cargo run -- scroll --help
 cargo run -- wait-settle --help
 cargo run -- stop --help
 cargo run -- confirm --help
+cargo run -- logs --help
 ```
 
-`hands mcp` is the stdio MCP server (`observe` plus `click` / `hover` / `type` / `key` / `scroll` / `wait_settle` / `stop` / `confirm`). `hands observe [--detail dom] [--session-id <id>]` prints the compact observe envelope on stdout. Input subcommands print a compact actuate envelope (`ok`, `frozen`, `retried`, `settled`, `foregrounded`, optional `fence`). Pause/Break and MCP `stop` halt injection and wipe session/once allows; persist stays. CLI `stop` still clears session allows; injection is a no-op without a live MCP lease. The confirm fence lives in this binary: refuse gated `click` / `key enter` without an allow; after a refuse the harness must call `confirm` then retry (Grok is always-approve). `hands confirm` does not install the desk lease.
+`hands mcp` is the stdio MCP server (`observe` plus `click` / `hover` / `type` / `key` / `scroll` / `wait_settle` / `stop` / `confirm` / `logs`). `hands observe [--detail dom] [--session-id <id>]` prints the compact observe envelope on stdout. Input subcommands print a compact actuate envelope (`ok`, `frozen`, `retried`, `settled`, `foregrounded`, optional `fence`). Pause/Break and MCP `stop` halt injection and wipe session/once allows; persist stays; **logs stay** (`%LOCALAPPDATA%\hands\logs\`, override `HANDS_LOGS_DIR`). `type` logs `len` only; observe logs path + counts, not `main_text`. `hands logs --session-id <id>` tails (does not mint); `--list` lists files. `desk` is reserved; `desk.jsonl` is unbounded (no rotation). CLI `stop` still clears session allows; injection is a no-op without a live MCP lease. The confirm fence lives in this binary: refuse gated `click` / `key enter` without an allow; after a refuse the harness must call `confirm` then retry (Grok is always-approve). `hands confirm` and `hands logs` do not install the desk lease.
 
 Ledgerful verify steps (when configured) must match these real cargo commands.
 

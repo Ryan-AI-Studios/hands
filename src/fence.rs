@@ -59,7 +59,7 @@ fn install_fence() {
 }
 
 #[cfg(test)]
-fn reinstall_for_test() {
+pub(crate) fn reinstall_for_test() {
     install_fence();
 }
 

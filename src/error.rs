@@ -22,6 +22,8 @@ pub enum HandsError {
     Fence(String),
     #[error("{0}")]
     Settle(String),
+    #[error("{0}")]
+    Logs(String),
 }
 
 impl HandsError {

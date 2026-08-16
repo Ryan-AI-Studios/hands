@@ -14,6 +14,7 @@ pub mod fence;
 pub mod foreground;
 pub mod input;
 pub mod lease;
+pub mod logs;
 pub mod mcp;
 pub mod observe;
 pub mod session;

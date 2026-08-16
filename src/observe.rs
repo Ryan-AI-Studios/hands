@@ -3,6 +3,7 @@ use serde::Serialize;
 use crate::capture::{capture_virtual_screen, display_path};
 use crate::error::HandsError;
 use crate::extract::{Detail, Element, Extract, extract_from_nodes, filter_nodes};
+use crate::logs;
 use crate::session::resolve_session_id_from_os;
 use crate::space::{Space, ensure_dpi, virtual_screen};
 use crate::uia;
@@ -44,6 +45,7 @@ pub struct ObserveSidecar {
 pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     ensure_dpi()?;
     let session_id = resolve_session_id_from_os(req.session_id.as_deref());
+    logs::check_write_id(&session_id)?;
     let space = virtual_screen()?;
     let paths = capture_virtual_screen(space)?;
     let screenshot_path = display_path(&paths.screenshot_path);
@@ -65,7 +67,16 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         elements_truncated: false,
     };
     write_sidecar(&paths.observe_path, &full)?;
-    finalize_envelope(full)
+    let envelope = finalize_envelope(full)?;
+    logs::ensure_installed();
+    logs::remember_session(&envelope.session_id);
+    let _ = logs::record_observe(
+        &envelope.session_id,
+        req.detail.as_str(),
+        &envelope.screenshot_path,
+        envelope.elements_total,
+    );
+    Ok(envelope)
 }
 
 fn write_sidecar(path: &std::path::Path, envelope: &ObserveEnvelope) -> Result<(), HandsError> {

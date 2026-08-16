@@ -3,7 +3,7 @@
 //! COM is initialized STA (`COINIT_APARTMENTTHREADED`) on a dedicated OS thread
 //! because tokio's multi-thread runtime is the wrong apartment for IUIAutomation.
 
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoUninitialize, SAFEARRAY,
@@ -29,8 +29,17 @@ pub struct UiaSnapshot {
 #[derive(Debug, Clone)]
 pub struct ResolvedElement {
     pub rect: Rect,
+    pub name: String,
     pub role: String,
     pub hwnd: Option<isize>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HitElement {
+    pub name: String,
+    pub role: String,
+    pub hwnd: Option<isize>,
+    pub value: Option<String>,
 }
 
 pub fn collect(detail: Detail) -> Result<UiaSnapshot, HandsError> {
@@ -80,16 +89,131 @@ fn sta_resolve(want: &[i32]) -> Result<ResolvedElement, HandsError> {
             .map(rect_from_uia)
             .map_err(|err| HandsError::Uia(format!("CurrentBoundingRectangle: {err}")))?
     };
-    let role = unsafe {
+    let (name, role) = name_and_role(&walker, &element);
+    let hwnd = native_hwnd(&walker, &element);
+    Ok(ResolvedElement {
+        rect,
+        name,
+        role,
+        hwnd,
+    })
+}
+
+pub fn hit_test(x: i32, y: i32) -> Result<HitElement, HandsError> {
+    std::thread::Builder::new()
+        .name("hands-uia-sta".into())
+        .spawn(move || sta_hit_test(x, y))
+        .map_err(|err| HandsError::Uia(format!("spawn STA thread: {err}")))?
+        .join()
+        .map_err(|_| HandsError::Uia("UIA STA thread panicked".to_string()))?
+}
+
+pub fn focused() -> Result<HitElement, HandsError> {
+    std::thread::Builder::new()
+        .name("hands-uia-sta".into())
+        .spawn(sta_focused)
+        .map_err(|err| HandsError::Uia(format!("spawn STA thread: {err}")))?
+        .join()
+        .map_err(|_| HandsError::Uia("UIA STA thread panicked".to_string()))?
+}
+
+fn sta_hit_test(x: i32, y: i32) -> Result<HitElement, HandsError> {
+    let _sta = StaGuard::enter()?;
+    let automation = create_automation()?;
+    let element = unsafe { automation.ElementFromPoint(POINT { x, y }) }
+        .map_err(|err| HandsError::Uia(format!("ElementFromPoint: {err}")))?;
+    describe_element(&automation, &element)
+}
+
+fn sta_focused() -> Result<HitElement, HandsError> {
+    let _sta = StaGuard::enter()?;
+    let automation = create_automation()?;
+    let element = unsafe { automation.GetFocusedElement() }
+        .map_err(|err| HandsError::Uia(format!("GetFocusedElement: {err}")))?;
+    describe_element(&automation, &element)
+}
+
+fn describe_element(
+    automation: &IUIAutomation,
+    element: &IUIAutomationElement,
+) -> Result<HitElement, HandsError> {
+    let walker = unsafe { automation.ControlViewWalker() }
+        .map_err(|err| HandsError::Uia(format!("ControlViewWalker: {err}")))?;
+    let (name, role) = name_and_role(&walker, element);
+    Ok(HitElement {
+        name,
+        role,
+        hwnd: native_hwnd(&walker, element),
+        value: value_walk(&walker, element),
+    })
+}
+
+fn role_of(element: &IUIAutomationElement) -> String {
+    unsafe {
         element
             .CurrentLocalizedControlType()
             .ok()
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "element".into())
-    };
-    let hwnd = native_hwnd(&walker, &element);
-    Ok(ResolvedElement { rect, role, hwnd })
+    }
+}
+
+/// First non-empty name wins, paired with **that** node's role (not the leaf).
+/// A Submit button's inner `text` child must stay gated as a button.
+fn pick_named(chain: &[(&str, &str)]) -> (String, String) {
+    for (name, role) in chain {
+        if !name.is_empty() {
+            return ((*name).to_string(), (*role).to_string());
+        }
+    }
+    (
+        String::new(),
+        chain
+            .first()
+            .map(|(_, role)| (*role).to_string())
+            .unwrap_or_default(),
+    )
+}
+
+fn name_and_role(
+    walker: &IUIAutomationTreeWalker,
+    element: &IUIAutomationElement,
+) -> (String, String) {
+    let mut chain = Vec::new();
+    let mut current = element.clone();
+    for _ in 0..8 {
+        let name = unsafe { current.CurrentName() }
+            .ok()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        chain.push((name, role_of(&current)));
+        match unsafe { walker.GetParentElement(&current) } {
+            Ok(parent) => current = parent,
+            Err(_) => break,
+        }
+    }
+    let refs: Vec<(&str, &str)> = chain
+        .iter()
+        .map(|(n, r)| (n.as_str(), r.as_str()))
+        .collect();
+    pick_named(&refs)
+}
+
+fn value_walk(walker: &IUIAutomationTreeWalker, element: &IUIAutomationElement) -> Option<String> {
+    let mut current = element.clone();
+    for _ in 0..8 {
+        if let Some(value) = value_pattern(&current)
+            && !value.is_empty()
+        {
+            return Some(value);
+        }
+        match unsafe { walker.GetParentElement(&current) } {
+            Ok(parent) => current = parent,
+            Err(_) => break,
+        }
+    }
+    None
 }
 
 fn find_runtime_id(
@@ -359,6 +483,22 @@ mod tests {
         };
         let found = resolve_runtime_id(&node.runtime_id).expect("resolve");
         assert!(found.rect.area() > 0);
+    }
+
+    #[test]
+    fn first_named_ancestor_role_wins() {
+        assert_eq!(
+            pick_named(&[("", "text"), ("Submit", "button")]),
+            ("Submit".into(), "button".into())
+        );
+        assert_eq!(
+            pick_named(&[("Send", "text")]),
+            ("Send".into(), "text".into())
+        );
+        assert_eq!(
+            pick_named(&[("", "text"), ("Reply on LinkedIn", "document")]),
+            ("Reply on LinkedIn".into(), "document".into())
+        );
     }
 
     #[test]

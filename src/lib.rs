@@ -4,10 +4,13 @@
 compile_error!("hands is Windows-first");
 
 pub mod actuate;
+pub mod allows;
 pub mod bezier;
 pub mod capture;
+pub mod classify;
 pub mod error;
 pub mod extract;
+pub mod fence;
 pub mod foreground;
 pub mod input;
 pub mod lease;

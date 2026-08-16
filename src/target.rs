@@ -20,6 +20,8 @@ pub struct ResolvedTarget {
     pub y: i32,
     pub rect: Rect,
     pub hwnd: Option<isize>,
+    pub name: String,
+    pub role: String,
 }
 
 impl Target {
@@ -85,6 +87,8 @@ impl Target {
                     y,
                     rect,
                     hwnd: None,
+                    name: String::new(),
+                    role: String::new(),
                 })
             }
             Self::Pixel { x, y } => {
@@ -110,6 +114,8 @@ impl Target {
                     y: *y,
                     rect,
                     hwnd: None,
+                    name: String::new(),
+                    role: String::new(),
                 })
             }
         }
@@ -140,6 +146,8 @@ fn finish_element(
         y,
         rect: found.rect,
         hwnd: found.hwnd,
+        name: found.name,
+        role: found.role,
     })
 }
 

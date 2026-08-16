@@ -42,11 +42,14 @@ cargo run -- key --help
 cargo run -- scroll --help
 cargo run -- wait-settle --help
 cargo run -- stop --help
+cargo run -- confirm --help
 ```
 
-`hands mcp` serves stdio MCP (`observe`, `click`, `hover`, `type`, `key`, `scroll`, `wait_settle`, `stop`). `hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope (screenshot **path**, 100px grid descriptor, UIA map, capped extract). Image bytes are never inlined.
+`hands mcp` serves stdio MCP (`observe`, `click`, `hover`, `type`, `key`, `scroll`, `wait_settle`, `stop`, `confirm`). `hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope (screenshot **path**, 100px grid descriptor, UIA map, capped extract). Image bytes are never inlined.
 
-Input commands (`click` / `hover` / `type` / `key` / `scroll` / `wait-settle`) install a desk lease for the duration of the process: physical mouse/keyboard freezes injection; Pause/Break always aborts. `hands stop` as a one-shot CLI is a documented no-op (use MCP `stop`, or Pause/Break during a live command). There is no confirm fence in this binary yet.
+This binary owns the confirm fence. `click` and `key enter`/`return` refuse irreversible/gray-zone controls unless a matching domain+category allow exists (`ok: false` plus a compact `fence` object; no cursor move). `type` containing a newline is a tool error — use `key enter` to submit. After a refuse, the harness must call `confirm` (`once` / `session` / `persist`) and retry. Grok is always-approve, so a TUI prompt is not the fence.
+
+Input commands (`click` / `hover` / `type` / `key` / `scroll` / `wait-settle`) install a desk lease for the duration of the process: physical mouse/keyboard freezes injection; Pause/Break always aborts. Pause/Break and `stop` wipe session/once allows (desk-wide) and leave persist. `hands confirm` does **not** install the desk lease. `hands stop` as a one-shot CLI still clears session allows; injection itself is a documented no-op without a live MCP lease (use MCP `stop`, or Pause/Break during a live command).
 
 ## What this is
 

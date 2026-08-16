@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::bezier::Rng;
 use crate::error::HandsError;
+use crate::fence::{self, FenceInfo};
 use crate::foreground;
 use crate::input;
 use crate::lease;
@@ -35,6 +36,8 @@ pub struct ActuateEnvelope {
     pub foregrounded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fence: Option<FenceInfo>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,6 +103,25 @@ fn base(
         settled,
         foregrounded,
         error,
+        fence: None,
+    })
+}
+
+fn refuse_fence(
+    session_id: String,
+    target: ActuateTarget,
+    fence: FenceInfo,
+) -> Result<ActuateEnvelope, HandsError> {
+    finalize_envelope(ActuateEnvelope {
+        session_id,
+        ok: false,
+        frozen: false,
+        target,
+        retried: false,
+        settled: false,
+        foregrounded: false,
+        error: None,
+        fence: Some(fence),
     })
 }
 
@@ -165,8 +187,14 @@ pub fn click(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         Ok(r) => r,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
-    remember_target(resolved.rect);
     let info = resolved_info(resolved.kind, resolved.id.clone(), resolved.x, resolved.y);
+    fence::ensure_installed();
+    match fence::gate_click(&session_id, &resolved) {
+        Ok(None) => {}
+        Ok(Some(info_fence)) => return refuse_fence(session_id, info, info_fence),
+        Err(err) => return fail(session_id, info, err, false, false, false),
+    }
+    remember_target(resolved.rect);
     let mut rng = Rng::from_time();
     let roi = settle::default_roi(space, Some(resolved.rect), (resolved.x, resolved.y));
     let snapshot = match crate::capture::capture_roi(space, roi) {
@@ -276,6 +304,16 @@ pub fn type_text(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             false,
         );
     };
+    if text.contains('\n') || text.contains('\r') {
+        return fail(
+            session_id,
+            info,
+            HandsError::Fence("type cannot contain newline; use key enter to submit".into()),
+            false,
+            false,
+            false,
+        );
+    }
     if let Err(err) = ensure_dpi() {
         return fail(session_id, info, err, false, false, false);
     }
@@ -298,6 +336,14 @@ pub fn key(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             false,
         );
     };
+    if input::is_enter_key(name) {
+        fence::ensure_installed();
+        match fence::gate_enter(&session_id) {
+            Ok(None) => {}
+            Ok(Some(info_fence)) => return refuse_fence(session_id, info, info_fence),
+            Err(err) => return fail(session_id, info, err, false, false, false),
+        }
+    }
     if let Err(err) = ensure_dpi() {
         return fail(session_id, info, err, false, false, false);
     }
@@ -396,7 +442,8 @@ fn explicit_roi(req: &ActuateRequest) -> Result<Option<Rect>, HandsError> {
 /// CLI `stop` with no live MCP lease is a documented no-op.
 pub fn stop(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let session_id = session(&req);
-    lease::freeze_now();
+    fence::ensure_installed();
+    lease::freeze_now_with(lease::FreezeCause::Stop);
     let frozen = lease::is_frozen();
     base(
         session_id,
@@ -417,6 +464,8 @@ pub fn stop(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
 /// CLI `stop` without installing hooks — documented no-op.
 pub fn stop_cli_noop(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let session_id = session(&req);
+    fence::ensure_installed();
+    lease::freeze_now_with(lease::FreezeCause::Stop);
     base(
         session_id,
         none_target(),
@@ -449,8 +498,36 @@ mod tests {
             settled: false,
             foregrounded: false,
             error: None,
+            fence: None,
         };
         let err = finalize_envelope(env).expect_err("must not emit oversize");
         assert!(err.to_string().contains("16384"), "{err}");
+    }
+
+    #[test]
+    fn type_trailing_newline_is_tool_error() {
+        let env = type_text(ActuateRequest {
+            session_id: Some("t-newline".into()),
+            text: Some("hello\n".into()),
+            ..ActuateRequest::default()
+        })
+        .unwrap();
+        assert!(!env.ok);
+        assert!(env.fence.is_none());
+        let err = env.error.unwrap_or_default();
+        assert!(err.contains("newline"), "{err}");
+        assert!(err.contains("key enter"), "{err}");
+    }
+
+    #[test]
+    fn type_cr_is_tool_error() {
+        let env = type_text(ActuateRequest {
+            session_id: Some("t-cr".into()),
+            text: Some("hello\r".into()),
+            ..ActuateRequest::default()
+        })
+        .unwrap();
+        assert!(!env.ok);
+        assert!(env.error.unwrap_or_default().contains("newline"));
     }
 }

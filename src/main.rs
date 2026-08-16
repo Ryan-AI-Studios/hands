@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use hands::{
-    ActuateRequest, Detail, HandsError, ObserveRequest, actuate, ensure_dpi, observe,
+    ActuateRequest, Detail, HandsError, ObserveRequest, actuate, allows, ensure_dpi, observe,
     serialize_envelope,
 };
 
@@ -103,11 +103,43 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
+    /// Grant, revoke, or list confirm-fence allows (does not install the desk lease)
+    Confirm {
+        #[arg(long, required_unless_present = "list")]
+        domain: Option<String>,
+        #[arg(long, required_unless_present = "list")]
+        category: Option<String>,
+        #[arg(long, value_enum, required_unless_present = "list")]
+        mode: Option<ConfirmModeArg>,
+        #[arg(long)]
+        revoke: bool,
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum DetailArg {
     Dom,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ConfirmModeArg {
+    Once,
+    Session,
+    Persist,
+}
+
+impl ConfirmModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Session => "session",
+            Self::Persist => "persist",
+        }
+    }
 }
 
 impl From<DetailArg> for Detail {
@@ -132,6 +164,19 @@ async fn main() {
                 fail(err);
             }
             observe_main(detail, session_id)
+        }
+        Command::Confirm {
+            domain,
+            category,
+            mode,
+            revoke,
+            list,
+            session_id,
+        } => {
+            if let Err(err) = dpi {
+                fail(err);
+            }
+            confirm_main(domain, category, mode, revoke, list, session_id)
         }
         other => {
             if let Err(err) = dpi {
@@ -159,7 +204,33 @@ fn observe_main(detail: Option<DetailArg>, session_id: Option<String>) -> Result
     Ok(())
 }
 
+fn confirm_main(
+    domain: Option<String>,
+    category: Option<String>,
+    mode: Option<ConfirmModeArg>,
+    revoke: bool,
+    list: bool,
+    session_id: Option<String>,
+) -> Result<(), HandsError> {
+    let envelope = allows::run_confirm(
+        session_id.as_deref(),
+        domain.as_deref(),
+        category.as_deref(),
+        mode.map(ConfirmModeArg::as_str),
+        revoke,
+        list,
+    )?;
+    let json = allows::serialize_confirm(&envelope)?;
+    println!("{json}");
+    if !envelope.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn input_main(command: Command) -> Result<(), HandsError> {
+    // Subscribe before hooks so Pause during hover/type/scroll still wipes session allows.
+    hands::fence::ensure_installed();
     let install_lease = !matches!(command, Command::Stop { .. });
     let _lease = if install_lease {
         Some(hands::lease::install()?)
@@ -241,7 +312,7 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             session_id,
             ..ActuateRequest::default()
         }))?,
-        Command::Mcp | Command::Observe { .. } => unreachable!(),
+        Command::Mcp | Command::Observe { .. } | Command::Confirm { .. } => unreachable!(),
     };
     println!("{envelope}");
     if !ok {

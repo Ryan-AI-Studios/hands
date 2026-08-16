@@ -52,6 +52,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let snap = uia::collect(req.detail)?;
     let (elements, elements_total) = filter_nodes(&snap.nodes, req.detail);
     let extract = extract_from_nodes(&snap.title, &snap.nodes);
+    crate::fence::note_last_url(extract.url.as_deref());
 
     let full = ObserveEnvelope {
         session_id,

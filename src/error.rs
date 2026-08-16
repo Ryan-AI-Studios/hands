@@ -19,6 +19,8 @@ pub enum HandsError {
     #[error("{0}")]
     Lease(String),
     #[error("{0}")]
+    Fence(String),
+    #[error("{0}")]
     Settle(String),
 }
 

@@ -335,11 +335,18 @@ fn chord(keys: &[VIRTUAL_KEY]) -> Result<(), HandsError> {
     }
 }
 
+pub fn is_enter_key(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "enter" | "return"
+    )
+}
+
 pub fn named_key(name: &str) -> Result<(), HandsError> {
     lease::poll()?;
     let key = name.trim().to_ascii_lowercase();
     match key.as_str() {
-        "enter" => tap_vk(VK_RETURN),
+        "enter" | "return" => tap_vk(VK_RETURN),
         "tab" => tap_vk(VK_TAB),
         "escape" | "esc" => tap_vk(VK_ESCAPE),
         "backspace" => tap_vk(VK_BACK),
@@ -441,6 +448,16 @@ mod tests {
         assert_eq!(type_path_for(&"x".repeat(33)), TypePath::Clipboard);
         assert_eq!(type_path_for(&"é".repeat(32)), TypePath::Unicode);
         assert_eq!(type_path_for(&"é".repeat(33)), TypePath::Clipboard);
+    }
+
+    #[test]
+    fn return_is_enter_alias() {
+        assert!(is_enter_key("return"));
+        assert!(is_enter_key("ENTER"));
+        assert!(is_enter_key(" Return "));
+        assert!(is_enter_key("enter"));
+        assert!(!is_enter_key("tab"));
+        assert!(!is_enter_key("space"));
     }
 
     #[test]

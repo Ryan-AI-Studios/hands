@@ -1,9 +1,9 @@
 //! Desk lease: physical input freezes injection; Pause/Break always halts.
 //!
 //! Low-level hooks run on a dedicated `hands-lease` thread that pumps messages.
-//! Hook procs only store flags — no UIA, capture, or sleep.
+//! Hook procs only store flags — no UIA, capture, file I/O, or allow-store locks.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -29,11 +29,40 @@ pub enum LeaseState {
     Frozen,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezeCause {
+    Physical,
+    Pause,
+    Stop,
+}
+
+const CAUSE_NONE: u8 = 0;
+const CAUSE_PHYSICAL: u8 = 1;
+const CAUSE_PAUSE: u8 = 2;
+const CAUSE_STOP: u8 = 3;
+
+fn cause_code(cause: FreezeCause) -> u8 {
+    match cause {
+        FreezeCause::Physical => CAUSE_PHYSICAL,
+        FreezeCause::Pause => CAUSE_PAUSE,
+        FreezeCause::Stop => CAUSE_STOP,
+    }
+}
+
+fn cause_from_code(code: u8) -> FreezeCause {
+    match code {
+        CAUSE_PAUSE => FreezeCause::Pause,
+        CAUSE_STOP => FreezeCause::Stop,
+        _ => FreezeCause::Physical,
+    }
+}
+
 /// Pure state machine — unit-tested without installing hooks.
 #[derive(Debug, Clone)]
 pub struct LeaseMachine {
     frozen: bool,
     since: Option<Instant>,
+    last_cause: Option<FreezeCause>,
 }
 
 impl LeaseMachine {
@@ -41,7 +70,12 @@ impl LeaseMachine {
         Self {
             frozen: false,
             since: None,
+            last_cause: None,
         }
+    }
+
+    pub fn last_cause(&self) -> Option<FreezeCause> {
+        self.last_cause
     }
 
     pub fn rearm_if_idle(&mut self, now: Instant) {
@@ -60,8 +94,13 @@ impl LeaseMachine {
     }
 
     pub fn freeze_now(&mut self, now: Instant) {
+        self.freeze_now_with(now, FreezeCause::Stop);
+    }
+
+    pub fn freeze_now_with(&mut self, now: Instant, cause: FreezeCause) {
         self.frozen = true;
         self.since = Some(now);
+        self.last_cause = Some(cause);
     }
 
     /// Mouse: freeze only when not injected.
@@ -69,14 +108,16 @@ impl LeaseMachine {
         if injected {
             return;
         }
-        self.freeze_now(now);
+        self.freeze_now_with(now, FreezeCause::Physical);
     }
 
     /// Key: freeze when not injected, or always for Pause/Break.
     pub fn on_key(&mut self, vk: u32, injected: bool, now: Instant) {
         let pause = vk == u32::from(VK_PAUSE.0) || vk == u32::from(VK_CANCEL.0);
-        if pause || !injected {
-            self.freeze_now(now);
+        if pause {
+            self.freeze_now_with(now, FreezeCause::Pause);
+        } else if !injected {
+            self.freeze_now_with(now, FreezeCause::Physical);
         }
     }
 }
@@ -87,11 +128,13 @@ impl Default for LeaseMachine {
     }
 }
 
-type FreezeListener = Arc<dyn Fn() + Send + Sync>;
+type FreezeListener = Arc<dyn Fn(FreezeCause) + Send + Sync>;
 
 static FROZEN: AtomicBool = AtomicBool::new(false);
 static LAST_FREEZE_MS: AtomicU64 = AtomicU64::new(0);
-static PENDING_NOTIFY: AtomicBool = AtomicBool::new(false);
+/// Non-zero means a notify is pending. Pause/Stop values are never overwritten
+/// by Physical. `take_pending_cause` swaps this back to `CAUSE_NONE`.
+static LAST_CAUSE: AtomicU8 = AtomicU8::new(CAUSE_NONE);
 static CLOCK0: OnceLock<Instant> = OnceLock::new();
 static LISTENERS: Mutex<Vec<FreezeListener>> = Mutex::new(Vec::new());
 
@@ -108,23 +151,41 @@ fn rearm_if_idle() {
         return;
     }
     let last = LAST_FREEZE_MS.load(Ordering::SeqCst);
-    if now_ms().saturating_sub(last) >= IDLE_REARM.as_millis() as u64 {
+    if now_ms().saturating_sub(last) < IDLE_REARM.as_millis() as u64 {
+        return;
+    }
+    // A Pause/Stop that lands after we sampled `last` must win: only clear
+    // if the freeze clock has not moved.
+    if LAST_FREEZE_MS.load(Ordering::SeqCst) == last {
         FROZEN.store(false, Ordering::SeqCst);
     }
 }
 
-/// Hook-safe: atomics only, never blocks, never drops Pause/physical.
-fn record_freeze() {
+/// Hook-safe: atomics only. Pause/Stop always notify; Physical is transition-only.
+/// Pending cause lives in `LAST_CAUSE` alone (non-zero = pending).
+fn record_freeze(cause: FreezeCause) {
     let was = FROZEN.swap(true, Ordering::SeqCst);
     LAST_FREEZE_MS.store(now_ms(), Ordering::SeqCst);
-    if !was {
-        PENDING_NOTIFY.store(true, Ordering::SeqCst);
+    match cause {
+        FreezeCause::Pause | FreezeCause::Stop => {
+            LAST_CAUSE.store(cause_code(cause), Ordering::SeqCst);
+        }
+        FreezeCause::Physical if !was => {
+            let _ = LAST_CAUSE.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                if cur == CAUSE_PAUSE || cur == CAUSE_STOP {
+                    None
+                } else {
+                    Some(CAUSE_PHYSICAL)
+                }
+            });
+        }
+        FreezeCause::Physical => {}
     }
 }
 
-/// 0004 can subscribe to freeze events (Pause/Break / physical input).
-/// This track does not clear session allows.
-pub fn subscribe(cb: impl Fn() + Send + Sync + 'static) {
+/// Subscribe to freeze events. Callbacks run on `flush_notify` (pump / poll / freeze_now).
+/// This module does not clear session allows.
+pub fn subscribe(cb: impl Fn(FreezeCause) + Send + Sync + 'static) {
     LISTENERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -137,7 +198,11 @@ pub fn is_frozen() -> bool {
 }
 
 pub fn freeze_now() {
-    record_freeze();
+    freeze_now_with(FreezeCause::Stop);
+}
+
+pub fn freeze_now_with(cause: FreezeCause) {
+    record_freeze(cause);
     flush_notify();
 }
 
@@ -153,26 +218,37 @@ pub fn poll() -> Result<(), HandsError> {
     }
 }
 
-fn flush_notify() {
-    if !PENDING_NOTIFY.swap(false, Ordering::SeqCst) {
-        return;
+fn take_pending_cause() -> Option<FreezeCause> {
+    let code = LAST_CAUSE.swap(CAUSE_NONE, Ordering::SeqCst);
+    if code == CAUSE_NONE {
+        None
+    } else {
+        Some(cause_from_code(code))
     }
+}
+
+pub(crate) fn flush_notify() {
+    let Some(cause) = take_pending_cause() else {
+        return;
+    };
     let listeners = LISTENERS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for cb in listeners {
-        cb();
+        cb(cause);
     }
 }
 
 fn note_mouse(injected: bool) {
     if !injected {
-        record_freeze();
+        record_freeze(FreezeCause::Physical);
     }
 }
 
 fn note_key(vk: u32, injected: bool) {
     let pause = vk == u32::from(VK_PAUSE.0) || vk == u32::from(VK_CANCEL.0);
-    if pause || !injected {
-        record_freeze();
+    if pause {
+        record_freeze(FreezeCause::Pause);
+    } else if !injected {
+        record_freeze(FreezeCause::Physical);
     }
 }
 
@@ -234,10 +310,12 @@ fn lease_thread(ready: mpsc::Sender<Result<u32, HandsError>>) {
                 if status.0 == 0 || status.0 == -1 {
                     break;
                 }
+                flush_notify();
                 unsafe {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+                flush_notify();
             }
             let _ = unsafe { UnhookWindowsHookEx(mh) };
             let _ = unsafe { UnhookWindowsHookEx(kh) };
@@ -295,6 +373,17 @@ unsafe extern "system" fn key_hook(code: i32, wparam: WPARAM, lparam: LPARAM) ->
 }
 
 #[cfg(test)]
+pub(crate) fn reset_for_test() {
+    FROZEN.store(false, Ordering::SeqCst);
+    LAST_FREEZE_MS.store(0, Ordering::SeqCst);
+    LAST_CAUSE.store(CAUSE_NONE, Ordering::SeqCst);
+    LISTENERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -342,8 +431,120 @@ mod tests {
         let mut m = LeaseMachine::new();
         let t0 = Instant::now();
         m.freeze_now(t0);
+        assert_eq!(m.last_cause(), Some(FreezeCause::Stop));
         m.on_mouse(false, t0 + Duration::from_millis(1500));
+        assert_eq!(m.last_cause(), Some(FreezeCause::Physical));
         assert!(m.is_frozen(t0 + Duration::from_millis(3000)));
         assert!(!m.is_frozen(t0 + Duration::from_millis(3500)));
+    }
+
+    #[test]
+    fn machine_pause_while_physically_frozen_is_pause() {
+        let mut m = LeaseMachine::new();
+        let t0 = Instant::now();
+        m.on_mouse(false, t0);
+        assert_eq!(m.last_cause(), Some(FreezeCause::Physical));
+        m.on_key(u32::from(VK_PAUSE.0), true, t0);
+        assert_eq!(m.last_cause(), Some(FreezeCause::Pause));
+        assert!(m.is_frozen(t0));
+    }
+
+    fn collect_causes() -> (Arc<Mutex<Vec<FreezeCause>>>, impl Fn(FreezeCause)) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let slot = seen.clone();
+        (seen, move |cause| {
+            slot.lock().unwrap_or_else(|e| e.into_inner()).push(cause);
+        })
+    }
+
+    #[test]
+    fn injected_letter_does_not_freeze_atomics() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        note_key(u32::from(b'V'), true);
+        flush_notify();
+        assert!(!is_frozen());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pause_injected_is_pause() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        note_key(u32::from(VK_PAUSE.0), true);
+        flush_notify();
+        assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Pause]);
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        note_key(u32::from(VK_CANCEL.0), true);
+        flush_notify();
+        assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Pause]);
+    }
+
+    #[test]
+    fn physical_mouse_is_physical() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        note_mouse(false);
+        flush_notify();
+        assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Physical]);
+        note_mouse(false);
+        flush_notify();
+        assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Physical]);
+    }
+
+    #[test]
+    fn freeze_now_with_stop_is_stop() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        freeze_now_with(FreezeCause::Stop);
+        assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Stop]);
+    }
+
+    #[test]
+    fn pause_while_already_physically_frozen_delivers_pause() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        note_mouse(false);
+        flush_notify();
+        assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Physical]);
+        note_key(u32::from(VK_PAUSE.0), true);
+        flush_notify();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![FreezeCause::Physical, FreezeCause::Pause]
+        );
+    }
+
+    #[test]
+    fn physical_does_not_clobber_pending_pause() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        note_key(u32::from(VK_PAUSE.0), true);
+        note_mouse(false);
+        flush_notify();
+        assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Pause]);
+    }
+
+    #[test]
+    fn take_pending_cause_snapshots_before_clearing_pending() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        note_key(u32::from(VK_PAUSE.0), true);
+        assert_eq!(take_pending_cause(), Some(FreezeCause::Pause));
+        assert_eq!(take_pending_cause(), None);
     }
 }

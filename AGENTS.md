@@ -59,9 +59,10 @@ cargo run -- key --help
 cargo run -- scroll --help
 cargo run -- wait-settle --help
 cargo run -- stop --help
+cargo run -- confirm --help
 ```
 
-`hands mcp` is the stdio MCP server (`observe` plus `click` / `hover` / `type` / `key` / `scroll` / `wait_settle` / `stop`). `hands observe [--detail dom] [--session-id <id>]` prints the compact observe envelope on stdout. Input subcommands print a compact actuate envelope (`ok`, `frozen`, `retried`, `settled`, `foregrounded`). Pause/Break and MCP `stop` halt injection; CLI `stop` is a no-op without a live MCP lease. Confirm fence is not this crate's job yet.
+`hands mcp` is the stdio MCP server (`observe` plus `click` / `hover` / `type` / `key` / `scroll` / `wait_settle` / `stop` / `confirm`). `hands observe [--detail dom] [--session-id <id>]` prints the compact observe envelope on stdout. Input subcommands print a compact actuate envelope (`ok`, `frozen`, `retried`, `settled`, `foregrounded`, optional `fence`). Pause/Break and MCP `stop` halt injection and wipe session/once allows; persist stays. CLI `stop` still clears session allows; injection is a no-op without a live MCP lease. The confirm fence lives in this binary: refuse gated `click` / `key enter` without an allow; after a refuse the harness must call `confirm` then retry (Grok is always-approve). `hands confirm` does not install the desk lease.
 
 Ledgerful verify steps (when configured) must match these real cargo commands.
 

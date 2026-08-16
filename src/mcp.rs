@@ -4,8 +4,10 @@ use rmcp::transport::stdio;
 use rmcp::{ServiceExt, schemars, tool, tool_router};
 
 use crate::actuate::{self, ActuateRequest};
+use crate::allows;
 use crate::error::HandsError;
 use crate::extract::Detail;
+use crate::fence;
 use crate::lease;
 use crate::observe::{ObserveRequest, observe, serialize_envelope};
 
@@ -80,6 +82,22 @@ pub struct WaitSettleParams {
 pub struct StopParams {
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ConfirmParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub revoke: Option<bool>,
+    #[serde(default)]
+    pub list: Option<bool>,
 }
 
 #[derive(Clone, Default)]
@@ -182,6 +200,16 @@ impl HandsServer {
             ..ActuateRequest::default()
         })))
     }
+
+    #[tool(
+        description = "Grant, revoke, or list confirm-fence allows (once / session / persist). After a refuse, call confirm then retry."
+    )]
+    fn confirm(
+        &self,
+        Parameters(params): Parameters<ConfirmParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_confirm(params))
+    }
 }
 
 fn click_req(params: ClickParams) -> ActuateRequest {
@@ -209,6 +237,22 @@ fn run_actuate(result: Result<crate::actuate::ActuateEnvelope, HandsError>) -> C
     }
 }
 
+fn run_confirm(params: ConfirmParams) -> CallToolResult {
+    match allows::run_confirm(
+        params.session_id.as_deref(),
+        params.domain.as_deref(),
+        params.category.as_deref(),
+        params.mode.as_deref(),
+        params.revoke.unwrap_or(false),
+        params.list.unwrap_or(false),
+    )
+    .and_then(|env| allows::serialize_confirm(&env))
+    {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
 fn observe_envelope(params: ObserveParams) -> Result<String, HandsError> {
     let detail = Detail::parse_arg(params.detail.as_deref()).map_err(HandsError::Observe)?;
     let envelope = observe(ObserveRequest {
@@ -219,6 +263,7 @@ fn observe_envelope(params: ObserveParams) -> Result<String, HandsError> {
 }
 
 pub async fn serve() -> Result<(), HandsError> {
+    fence::ensure_installed();
     let _lease = lease::install()?;
     let running = HandsServer
         .serve(stdio())

@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use hands::{
-    ActuateRequest, Detail, HandsError, ObserveRequest, actuate, allows, ensure_dpi, observe,
+    ActuateRequest, Detail, HandsError, ObserveRequest, actuate, allows, ensure_dpi, logs, observe,
     serialize_envelope,
 };
 
@@ -118,6 +118,15 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
+    /// Tail or list session JSONL audit logs (does not install the desk lease; does not mint)
+    Logs {
+        #[arg(long, required_unless_present = "list")]
+        session_id: Option<String>,
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        tail: Option<usize>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -178,6 +187,16 @@ async fn main() {
             }
             confirm_main(domain, category, mode, revoke, list, session_id)
         }
+        Command::Logs {
+            session_id,
+            list,
+            tail,
+        } => {
+            if let Err(err) = dpi {
+                fail(err);
+            }
+            logs_main(session_id, list, tail)
+        }
         other => {
             if let Err(err) = dpi {
                 fail(err);
@@ -228,9 +247,25 @@ fn confirm_main(
     Ok(())
 }
 
+fn logs_main(
+    session_id: Option<String>,
+    list: bool,
+    tail: Option<usize>,
+) -> Result<(), HandsError> {
+    let envelope = logs::run_logs(session_id.as_deref(), list, tail)?;
+    let json = logs::serialize_logs(&envelope)?;
+    println!("{json}");
+    if !envelope.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn input_main(command: Command) -> Result<(), HandsError> {
-    // Subscribe before hooks so Pause during hover/type/scroll still wipes session allows.
+    // Subscribe before hooks so Pause during hover/type/scroll still wipes session allows
+    // and appends pause/stop log events.
     hands::fence::ensure_installed();
+    hands::logs::ensure_installed();
     let install_lease = !matches!(command, Command::Stop { .. });
     let _lease = if install_lease {
         Some(hands::lease::install()?)
@@ -312,7 +347,9 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             session_id,
             ..ActuateRequest::default()
         }))?,
-        Command::Mcp | Command::Observe { .. } | Command::Confirm { .. } => unreachable!(),
+        Command::Mcp | Command::Observe { .. } | Command::Confirm { .. } | Command::Logs { .. } => {
+            unreachable!()
+        }
     };
     println!("{envelope}");
     if !ok {

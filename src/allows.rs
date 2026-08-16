@@ -11,6 +11,7 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::classify::{self, Category};
 use crate::error::HandsError;
+use crate::logs;
 use crate::observe::ENVELOPE_MAX_BYTES;
 use crate::session::resolve_session_id_from_os;
 
@@ -456,8 +457,9 @@ pub fn run_confirm(
     list_flag: bool,
 ) -> Result<ConfirmEnvelope, HandsError> {
     let session_id = resolve_session_id_from_os(session_id);
+    logs::check_write_id(&session_id)?;
     if list_flag {
-        return finalize_confirm(ConfirmEnvelope {
+        let env = finalize_confirm(ConfirmEnvelope {
             session_id: session_id.clone(),
             ok: true,
             domain: None,
@@ -465,7 +467,9 @@ pub fn run_confirm(
             mode: None,
             allows: Some(list(Some(&session_id))?),
             error: None,
-        });
+        })?;
+        log_confirm(&env, false, true);
+        return Ok(env);
     }
     let domain_raw = domain
         .map(str::trim)
@@ -490,7 +494,7 @@ pub fn run_confirm(
     } else {
         grant(&session_id, &domain, category, mode)?;
     }
-    finalize_confirm(ConfirmEnvelope {
+    let env = finalize_confirm(ConfirmEnvelope {
         session_id,
         ok: true,
         domain: Some(domain),
@@ -498,7 +502,24 @@ pub fn run_confirm(
         mode: Some(mode.as_str().to_string()),
         allows: None,
         error: None,
-    })
+    })?;
+    log_confirm(&env, revoke_flag, false);
+    Ok(env)
+}
+
+fn log_confirm(env: &ConfirmEnvelope, revoke: bool, list: bool) {
+    logs::ensure_installed();
+    logs::remember_session(&env.session_id);
+    let _ = logs::record_confirm(
+        &env.session_id,
+        env.domain.as_deref(),
+        env.category.as_deref(),
+        env.mode.as_deref(),
+        revoke,
+        list,
+        env.ok,
+        env.error.as_deref(),
+    );
 }
 
 pub fn serialize_confirm(envelope: &ConfirmEnvelope) -> Result<String, HandsError> {

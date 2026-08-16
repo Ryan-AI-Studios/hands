@@ -10,6 +10,7 @@ use crate::fence::{self, FenceInfo};
 use crate::foreground;
 use crate::input;
 use crate::lease;
+use crate::logs::{self, LogFence, LogTarget};
 use crate::observe::ENVELOPE_MAX_BYTES;
 use crate::session::resolve_session_id_from_os;
 use crate::settle;
@@ -165,8 +166,57 @@ fn resolved_info(kind: &str, id: Option<String>, x: i32, y: i32) -> ActuateTarge
     }
 }
 
-fn session(req: &ActuateRequest) -> String {
+fn raw_session(req: &ActuateRequest) -> String {
     resolve_session_id_from_os(req.session_id.as_deref())
+}
+
+fn session(req: &ActuateRequest) -> Result<String, HandsError> {
+    logs::ensure_installed();
+    let id = raw_session(req);
+    logs::check_write_id(&id)?;
+    logs::remember_session(&id);
+    Ok(id)
+}
+
+fn log_target(target: &ActuateTarget) -> LogTarget {
+    LogTarget {
+        kind: target.kind.clone(),
+        id: target.id.clone(),
+        x: target.x,
+        y: target.y,
+    }
+}
+
+fn log_fence(fence: &FenceInfo) -> LogFence {
+    LogFence {
+        domain: fence.domain.clone(),
+        category: fence.category.clone(),
+        name: fence.name.clone(),
+        role: fence.role.clone(),
+    }
+}
+
+fn after_actuate(
+    tool: &str,
+    result: Result<ActuateEnvelope, HandsError>,
+    type_len: Option<usize>,
+    key: Option<&str>,
+) -> Result<ActuateEnvelope, HandsError> {
+    logs::ensure_installed();
+    if let Ok(env) = &result {
+        logs::remember_session(&env.session_id);
+        let _ = logs::record_actuate(
+            &env.session_id,
+            tool,
+            env.ok,
+            env.error.as_deref(),
+            Some(log_target(&env.target)),
+            env.fence.as_ref().map(log_fence),
+            type_len,
+            key,
+        );
+    }
+    result
 }
 
 fn resolve_req(
@@ -178,7 +228,14 @@ fn resolve_req(
 }
 
 pub fn click(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    let session_id = session(&req);
+    after_actuate("click", click_inner(req), None, None)
+}
+
+fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
+    let session_id = match session(&req) {
+        Ok(id) => id,
+        Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
+    };
     let space = match ensure_dpi().and_then(|_| virtual_screen()) {
         Ok(s) => s,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
@@ -259,7 +316,14 @@ pub fn click(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
 }
 
 pub fn hover(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    let session_id = session(&req);
+    after_actuate("hover", hover_inner(req), None, None)
+}
+
+fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
+    let session_id = match session(&req) {
+        Ok(id) => id,
+        Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
+    };
     let space = match ensure_dpi().and_then(|_| virtual_screen()) {
         Ok(s) => s,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
@@ -292,7 +356,15 @@ pub fn hover(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
 }
 
 pub fn type_text(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    let session_id = session(&req);
+    let type_len = req.text.as_ref().map(|t| t.chars().count());
+    after_actuate("type", type_text_inner(req), type_len, None)
+}
+
+fn type_text_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
+    let session_id = match session(&req) {
+        Ok(id) => id,
+        Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
+    };
     let info = none_target();
     let Some(text) = req.text.as_deref() else {
         return fail(
@@ -324,7 +396,15 @@ pub fn type_text(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
 }
 
 pub fn key(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    let session_id = session(&req);
+    let name = req.name.clone();
+    after_actuate("key", key_inner(req), None, name.as_deref())
+}
+
+fn key_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
+    let session_id = match session(&req) {
+        Ok(id) => id,
+        Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
+    };
     let info = none_target();
     let Some(name) = req.name.as_deref() else {
         return fail(
@@ -354,7 +434,14 @@ pub fn key(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
 }
 
 pub fn scroll(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    let session_id = session(&req);
+    after_actuate("scroll", scroll_inner(req), None, None)
+}
+
+fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
+    let session_id = match session(&req) {
+        Ok(id) => id,
+        Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
+    };
     let Some(dy) = req.dy else {
         return fail(
             session_id,
@@ -370,7 +457,7 @@ pub fn scroll(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let mut foregrounded = false;
     let mut info = none_target();
     if has_target {
-        match hover(ActuateRequest {
+        match hover_inner(ActuateRequest {
             session_id: Some(session_id.clone()),
             element_id: req.element_id.clone(),
             grid: req.grid.clone(),
@@ -404,7 +491,14 @@ pub fn scroll(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
 }
 
 pub fn wait_settle(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    let session_id = session(&req);
+    after_actuate("wait_settle", wait_settle_inner(req), None, None)
+}
+
+fn wait_settle_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
+    let session_id = match session(&req) {
+        Ok(id) => id,
+        Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
+    };
     let space = match ensure_dpi().and_then(|_| virtual_screen()) {
         Ok(s) => s,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
@@ -441,7 +535,15 @@ fn explicit_roi(req: &ActuateRequest) -> Result<Option<Rect>, HandsError> {
 
 /// CLI `stop` with no live MCP lease is a documented no-op.
 pub fn stop(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    let session_id = session(&req);
+    after_actuate("stop", stop_inner(req), None, None)
+}
+
+fn stop_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
+    let session_id = match session(&req) {
+        Ok(id) => id,
+        Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
+    };
+    logs::ensure_installed();
     fence::ensure_installed();
     lease::freeze_now_with(lease::FreezeCause::Stop);
     let frozen = lease::is_frozen();
@@ -463,7 +565,15 @@ pub fn stop(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
 
 /// CLI `stop` without installing hooks — documented no-op.
 pub fn stop_cli_noop(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    let session_id = session(&req);
+    after_actuate("stop", stop_cli_noop_inner(req), None, None)
+}
+
+fn stop_cli_noop_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
+    let session_id = match session(&req) {
+        Ok(id) => id,
+        Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
+    };
+    logs::ensure_installed();
     fence::ensure_installed();
     lease::freeze_now_with(lease::FreezeCause::Stop);
     base(

@@ -9,6 +9,7 @@ use crate::error::HandsError;
 use crate::extract::Detail;
 use crate::fence;
 use crate::lease;
+use crate::logs;
 use crate::observe::{ObserveRequest, observe, serialize_envelope};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -98,6 +99,16 @@ pub struct ConfirmParams {
     pub revoke: Option<bool>,
     #[serde(default)]
     pub list: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LogsParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub list: Option<bool>,
+    #[serde(default)]
+    pub tail: Option<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -210,6 +221,16 @@ impl HandsServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(run_confirm(params))
     }
+
+    #[tool(
+        description = "Read session JSONL audit events (tail) or list session files. Does not mint a session id."
+    )]
+    fn logs(
+        &self,
+        Parameters(params): Parameters<LogsParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_logs(params))
+    }
 }
 
 fn click_req(params: ClickParams) -> ActuateRequest {
@@ -253,6 +274,19 @@ fn run_confirm(params: ConfirmParams) -> CallToolResult {
     }
 }
 
+fn run_logs(params: LogsParams) -> CallToolResult {
+    match logs::run_logs(
+        params.session_id.as_deref(),
+        params.list.unwrap_or(false),
+        params.tail.map(|n| n as usize),
+    )
+    .and_then(|env| logs::serialize_logs(&env))
+    {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
 fn observe_envelope(params: ObserveParams) -> Result<String, HandsError> {
     let detail = Detail::parse_arg(params.detail.as_deref()).map_err(HandsError::Observe)?;
     let envelope = observe(ObserveRequest {
@@ -264,6 +298,7 @@ fn observe_envelope(params: ObserveParams) -> Result<String, HandsError> {
 
 pub async fn serve() -> Result<(), HandsError> {
     fence::ensure_installed();
+    logs::ensure_installed();
     let _lease = lease::install()?;
     let running = HandsServer
         .serve(stdio())

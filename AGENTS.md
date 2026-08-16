@@ -52,9 +52,16 @@ CLI (same observe contract as MCP):
 ```powershell
 cargo run -- mcp --help
 cargo run -- observe --help
+cargo run -- click --help
+cargo run -- hover --help
+cargo run -- type --help
+cargo run -- key --help
+cargo run -- scroll --help
+cargo run -- wait-settle --help
+cargo run -- stop --help
 ```
 
-`hands mcp` is the stdio MCP server (one tool: `observe`). `hands observe [--detail dom] [--session-id <id>]` prints the compact envelope on stdout.
+`hands mcp` is the stdio MCP server (`observe` plus `click` / `hover` / `type` / `key` / `scroll` / `wait_settle` / `stop`). `hands observe [--detail dom] [--session-id <id>]` prints the compact observe envelope on stdout. Input subcommands print a compact actuate envelope (`ok`, `frozen`, `retried`, `settled`, `foregrounded`). Pause/Break and MCP `stop` halt injection; CLI `stop` is a no-op without a live MCP lease. Confirm fence is not this crate's job yet.
 
 Ledgerful verify steps (when configured) must match these real cargo commands.
 

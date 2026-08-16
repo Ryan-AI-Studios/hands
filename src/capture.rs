@@ -10,7 +10,13 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 use crate::error::HandsError;
-use crate::space::{Space, ensure_dpi};
+use crate::space::{Rect, Space, ensure_dpi};
+
+pub struct RoiFrame {
+    pub width: i32,
+    pub height: i32,
+    pub pixels: Vec<u8>,
+}
 
 pub struct CapturePaths {
     pub screenshot_path: PathBuf,
@@ -21,10 +27,25 @@ pub struct CapturePaths {
 pub fn capture_virtual_screen(space: Space) -> Result<CapturePaths, HandsError> {
     ensure_dpi()?;
     let (width, height) = dims(space)?;
-    let pixels = blit_union(space, width, height)?;
+    let pixels = blit_rect(space.origin_x, space.origin_y, width, height)?;
     let paths = observe_paths()?;
     write_png(&paths.screenshot_path, width, height, pixels)?;
     Ok(paths)
+}
+
+/// In-memory RGBA ROI. No file. Clip to `virtual_screen`. Reject zero area.
+pub fn capture_roi(space: Space, rect: Rect) -> Result<RoiFrame, HandsError> {
+    ensure_dpi()?;
+    let clipped = space.clip_rect(rect);
+    if clipped.area() == 0 {
+        return Err(HandsError::Capture("ROI has zero area after clip".into()));
+    }
+    let pixels = blit_rect(clipped.x, clipped.y, clipped.w, clipped.h)?;
+    Ok(RoiFrame {
+        width: clipped.w,
+        height: clipped.h,
+        pixels,
+    })
 }
 
 fn dims(space: Space) -> Result<(i32, i32), HandsError> {
@@ -37,7 +58,7 @@ fn dims(space: Space) -> Result<(i32, i32), HandsError> {
     Ok((space.width, space.height))
 }
 
-fn blit_union(space: Space, width: i32, height: i32) -> Result<Vec<u8>, HandsError> {
+fn blit_rect(origin_x: i32, origin_y: i32, width: i32, height: i32) -> Result<Vec<u8>, HandsError> {
     unsafe {
         let screen = GetDC(None);
         if screen.is_invalid() {
@@ -73,8 +94,8 @@ fn blit_union(space: Space, width: i32, height: i32) -> Result<Vec<u8>, HandsErr
             width,
             height,
             Some(screen),
-            space.origin_x,
-            space.origin_y,
+            origin_x,
+            origin_y,
             rop,
         )
         .map_err(|err| HandsError::Capture(format!("BitBlt failed: {err}")))?;

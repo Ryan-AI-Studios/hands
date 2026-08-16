@@ -35,9 +35,18 @@ cargo test
 ```powershell
 cargo run -- mcp --help
 cargo run -- observe --help
+cargo run -- click --help
+cargo run -- hover --help
+cargo run -- type --help
+cargo run -- key --help
+cargo run -- scroll --help
+cargo run -- wait-settle --help
+cargo run -- stop --help
 ```
 
-`hands mcp` serves stdio MCP. `hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope (screenshot **path**, 100px grid descriptor, UIA map, capped extract). Image bytes are never inlined.
+`hands mcp` serves stdio MCP (`observe`, `click`, `hover`, `type`, `key`, `scroll`, `wait_settle`, `stop`). `hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope (screenshot **path**, 100px grid descriptor, UIA map, capped extract). Image bytes are never inlined.
+
+Input commands (`click` / `hover` / `type` / `key` / `scroll` / `wait-settle`) install a desk lease for the duration of the process: physical mouse/keyboard freezes injection; Pause/Break always aborts. `hands stop` as a one-shot CLI is a documented no-op (use MCP `stop`, or Pause/Break during a live command). There is no confirm fence in this binary yet.
 
 ## What this is
 

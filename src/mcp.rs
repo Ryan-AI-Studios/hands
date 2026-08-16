@@ -3,8 +3,10 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::transport::stdio;
 use rmcp::{ServiceExt, schemars, tool, tool_router};
 
+use crate::actuate::{self, ActuateRequest};
 use crate::error::HandsError;
 use crate::extract::Detail;
+use crate::lease;
 use crate::observe::{ObserveRequest, observe, serialize_envelope};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -13,6 +15,71 @@ pub struct ObserveParams {
     pub session_id: Option<String>,
     #[serde(default)]
     pub detail: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ClickParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub element_id: Option<String>,
+    #[serde(default)]
+    pub grid: Option<String>,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TypeParams {
+    pub text: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct KeyParams {
+    pub name: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ScrollParams {
+    pub dy: i32,
+    #[serde(default)]
+    pub dx: Option<i32>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub element_id: Option<String>,
+    #[serde(default)]
+    pub grid: Option<String>,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct WaitSettleParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+    #[serde(default)]
+    pub w: Option<i32>,
+    #[serde(default)]
+    pub h: Option<i32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct StopParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -29,11 +96,115 @@ impl HandsServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(run_observe(params))
     }
+
+    #[tool(description = "Bézier-move and left-click a UIA id, grid cell, or pixel")]
+    fn click(
+        &self,
+        Parameters(params): Parameters<ClickParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_actuate(actuate::click(click_req(params))))
+    }
+
+    #[tool(description = "Bézier-move to a target and pause 100 ms (no click)")]
+    fn hover(
+        &self,
+        Parameters(params): Parameters<ClickParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_actuate(actuate::hover(click_req(params))))
+    }
+
+    #[tool(
+        name = "type",
+        description = "Type text: short Unicode keystrokes or long clipboard paste+restore"
+    )]
+    fn r#type(
+        &self,
+        Parameters(params): Parameters<TypeParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_actuate(actuate::type_text(ActuateRequest {
+            session_id: params.session_id,
+            text: Some(params.text),
+            ..ActuateRequest::default()
+        })))
+    }
+
+    #[tool(description = "Press a named key (enter, tab, ctrl+a, …)")]
+    fn key(
+        &self,
+        Parameters(params): Parameters<KeyParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_actuate(actuate::key(ActuateRequest {
+            session_id: params.session_id,
+            name: Some(params.name),
+            ..ActuateRequest::default()
+        })))
+    }
+
+    #[tool(description = "Scroll the mouse wheel (dy notches, optional dx and target)")]
+    fn scroll(
+        &self,
+        Parameters(params): Parameters<ScrollParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_actuate(actuate::scroll(ActuateRequest {
+            session_id: params.session_id,
+            element_id: params.element_id,
+            grid: params.grid,
+            x: params.x,
+            y: params.y,
+            dy: Some(params.dy),
+            dx: params.dx,
+            ..ActuateRequest::default()
+        })))
+    }
+
+    #[tool(description = "Wait until an ROI stops changing (pixel delta)")]
+    fn wait_settle(
+        &self,
+        Parameters(params): Parameters<WaitSettleParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_actuate(actuate::wait_settle(ActuateRequest {
+            session_id: params.session_id,
+            x: params.x,
+            y: params.y,
+            w: params.w,
+            h: params.h,
+            ..ActuateRequest::default()
+        })))
+    }
+
+    #[tool(description = "Abort injected input and freeze the desk lease (same as Pause/Break)")]
+    fn stop(
+        &self,
+        Parameters(params): Parameters<StopParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_actuate(actuate::stop(ActuateRequest {
+            session_id: params.session_id,
+            ..ActuateRequest::default()
+        })))
+    }
+}
+
+fn click_req(params: ClickParams) -> ActuateRequest {
+    ActuateRequest {
+        session_id: params.session_id,
+        element_id: params.element_id,
+        grid: params.grid,
+        x: params.x,
+        y: params.y,
+        ..ActuateRequest::default()
+    }
 }
 
 fn run_observe(params: ObserveParams) -> CallToolResult {
     match observe_envelope(params) {
         Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
+fn run_actuate(result: Result<crate::actuate::ActuateEnvelope, HandsError>) -> CallToolResult {
+    match result.and_then(|env| actuate::serialize_envelope(&env).map(|j| (env.ok, j))) {
+        Ok((_ok, json)) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
     }
 }
@@ -48,6 +219,7 @@ fn observe_envelope(params: ObserveParams) -> Result<String, HandsError> {
 }
 
 pub async fn serve() -> Result<(), HandsError> {
+    let _lease = lease::install()?;
     let running = HandsServer
         .serve(stdio())
         .await

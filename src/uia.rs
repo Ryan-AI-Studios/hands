@@ -26,6 +26,13 @@ pub struct UiaSnapshot {
     pub nodes: Vec<RawNode>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedElement {
+    pub rect: Rect,
+    pub role: String,
+    pub hwnd: Option<isize>,
+}
+
 pub fn collect(detail: Detail) -> Result<UiaSnapshot, HandsError> {
     let cap = detail.element_cap();
     std::thread::Builder::new()
@@ -34,6 +41,88 @@ pub fn collect(detail: Detail) -> Result<UiaSnapshot, HandsError> {
         .map_err(|err| HandsError::Uia(format!("spawn STA thread: {err}")))?
         .join()
         .map_err(|_| HandsError::Uia("UIA STA thread panicked".to_string()))?
+}
+
+/// Fresh control-view walk + RuntimeId compare. `ElementFromRuntimeId` is not
+/// on windows 0.62.2.
+pub fn resolve_runtime_id(want: &[i32]) -> Result<ResolvedElement, HandsError> {
+    let want = want.to_vec();
+    std::thread::Builder::new()
+        .name("hands-uia-sta".into())
+        .spawn(move || sta_resolve(&want))
+        .map_err(|err| HandsError::Uia(format!("spawn STA thread: {err}")))?
+        .join()
+        .map_err(|_| HandsError::Uia("UIA STA thread panicked".to_string()))?
+}
+
+fn sta_resolve(want: &[i32]) -> Result<ResolvedElement, HandsError> {
+    if want.is_empty() {
+        return Err(HandsError::Target("empty RuntimeId".into()));
+    }
+    let _sta = StaGuard::enter()?;
+    let automation = create_automation()?;
+    let walker = unsafe { automation.ControlViewWalker() }
+        .map_err(|err| HandsError::Uia(format!("ControlViewWalker: {err}")))?;
+    let root = unsafe { automation.GetRootElement() }
+        .map_err(|err| HandsError::Uia(format!("GetRootElement: {err}")))?;
+    let Some(element) = find_runtime_id(&walker, &root, want) else {
+        return Err(HandsError::Target(format!(
+            "no UIA element with RuntimeId {}",
+            want.iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(".")
+        )));
+    };
+    let rect = unsafe {
+        element
+            .CurrentBoundingRectangle()
+            .map(rect_from_uia)
+            .map_err(|err| HandsError::Uia(format!("CurrentBoundingRectangle: {err}")))?
+    };
+    let role = unsafe {
+        element
+            .CurrentLocalizedControlType()
+            .ok()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "element".into())
+    };
+    let hwnd = native_hwnd(&walker, &element);
+    Ok(ResolvedElement { rect, role, hwnd })
+}
+
+fn find_runtime_id(
+    walker: &IUIAutomationTreeWalker,
+    root: &IUIAutomationElement,
+    want: &[i32],
+) -> Option<IUIAutomationElement> {
+    let mut stack = vec![root.clone()];
+    while let Some(element) = stack.pop() {
+        if let Some(id) = runtime_id(&element)
+            && id == want
+        {
+            return Some(element);
+        }
+        push_children(walker, &element, &mut stack);
+    }
+    None
+}
+
+fn native_hwnd(walker: &IUIAutomationTreeWalker, element: &IUIAutomationElement) -> Option<isize> {
+    let mut current = element.clone();
+    for _ in 0..32 {
+        if let Ok(hwnd) = unsafe { current.CurrentNativeWindowHandle() }
+            && !hwnd.is_invalid()
+        {
+            return Some(hwnd.0 as isize);
+        }
+        match unsafe { walker.GetParentElement(&current) } {
+            Ok(parent) => current = parent,
+            Err(_) => break,
+        }
+    }
+    None
 }
 
 fn sta_collect(detail: Detail, cap: usize) -> Result<UiaSnapshot, HandsError> {
@@ -249,6 +338,27 @@ mod tests {
             found,
             "expected a Notepad Document/Edit (or window) with positive area"
         );
+    }
+
+    #[test]
+    #[ignore = "live desktop; not a CI gate. Run: cargo test -- --ignored"]
+    fn live_resolve_notepad_runtime_id() {
+        let snap = collect(Detail::Dom).expect("live UIA");
+        let node = snap.nodes.iter().find(|n| {
+            let role = n.role.to_ascii_lowercase();
+            let name = n.name.to_ascii_lowercase();
+            (role.contains("document") || role.contains("edit") || name.contains("notepad"))
+                && n.rect.area() > 0
+                && !n.runtime_id.is_empty()
+        });
+        let Some(node) = node else {
+            // No Notepad on this desktop; still prove resolve errors on a missing id.
+            let err = resolve_runtime_id(&[9_999_999, 1]).expect_err("missing id");
+            assert!(err.to_string().contains("no UIA element"), "{err}");
+            return;
+        };
+        let found = resolve_runtime_id(&node.runtime_id).expect("resolve");
+        assert!(found.rect.area() > 0);
     }
 
     #[test]

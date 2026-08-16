@@ -26,6 +26,10 @@ impl Rect {
     pub fn area(self) -> i64 {
         i64::from(self.w.max(0)) * i64::from(self.h.max(0))
     }
+
+    pub fn center(self) -> (i32, i32) {
+        (self.x + self.w / 2, self.y + self.h / 2)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -60,15 +64,19 @@ impl Space {
     }
 
     pub fn cell_rect(self, col: i32, row: i32) -> Rect {
-        let x = self.origin_x + col * self.cell_px;
-        let y = self.origin_y + row * self.cell_px;
-        let right = self.origin_x + self.width;
-        let bottom = self.origin_y + self.height;
+        let x = self
+            .origin_x
+            .saturating_add(col.saturating_mul(self.cell_px));
+        let y = self
+            .origin_y
+            .saturating_add(row.saturating_mul(self.cell_px));
+        let right = self.origin_x.saturating_add(self.width);
+        let bottom = self.origin_y.saturating_add(self.height);
         Rect {
             x,
             y,
-            w: (right - x).clamp(0, self.cell_px),
-            h: (bottom - y).clamp(0, self.cell_px),
+            w: right.saturating_sub(x).clamp(0, self.cell_px),
+            h: bottom.saturating_sub(y).clamp(0, self.cell_px),
         }
     }
 
@@ -78,6 +86,69 @@ impl Space {
         let right = self.origin_x + self.width;
         let bottom = self.origin_y + self.height;
         rect.x >= left && rect.y >= top && rect.x + rect.w <= right && rect.y + rect.h <= bottom
+    }
+
+    pub fn contains_point(self, x: i32, y: i32) -> bool {
+        x >= self.origin_x
+            && y >= self.origin_y
+            && x < self.origin_x + self.width
+            && y < self.origin_y + self.height
+    }
+
+    /// Parse `g:{col}:{row}` with signed integers. `g:0:0` is valid.
+    pub fn parse_cell_id(id: &str) -> Result<(i32, i32), HandsError> {
+        let rest = id.strip_prefix("g:").ok_or_else(|| {
+            HandsError::Target(format!("grid id must start with g: (got '{id}')"))
+        })?;
+        if rest.is_empty() {
+            return Err(HandsError::Target("grid id is empty after g:".into()));
+        }
+        let mut parts = rest.split(':');
+        let col_s = parts
+            .next()
+            .ok_or_else(|| HandsError::Target("grid id missing column".into()))?;
+        let row_s = parts
+            .next()
+            .ok_or_else(|| HandsError::Target("grid id missing row".into()))?;
+        if parts.next().is_some() {
+            return Err(HandsError::Target(format!(
+                "grid id has extra tokens (got '{id}')"
+            )));
+        }
+        if col_s.is_empty() || row_s.is_empty() {
+            return Err(HandsError::Target(format!(
+                "grid id has empty token (got '{id}')"
+            )));
+        }
+        let col = col_s.parse::<i32>().map_err(|_| {
+            HandsError::Target(format!("grid column is not an integer (got '{id}')"))
+        })?;
+        let row = row_s
+            .parse::<i32>()
+            .map_err(|_| HandsError::Target(format!("grid row is not an integer (got '{id}')")))?;
+        Ok((col, row))
+    }
+
+    pub fn clip_rect(self, rect: Rect) -> Rect {
+        let left = rect.x.max(self.origin_x);
+        let top = rect.y.max(self.origin_y);
+        let right = (rect.x.saturating_add(rect.w)).min(self.origin_x.saturating_add(self.width));
+        let bottom = (rect.y.saturating_add(rect.h)).min(self.origin_y.saturating_add(self.height));
+        Rect {
+            x: left,
+            y: top,
+            w: (right - left).max(0),
+            h: (bottom - top).max(0),
+        }
+    }
+
+    pub fn inflate_clip(self, rect: Rect, pad: i32) -> Rect {
+        self.clip_rect(Rect {
+            x: rect.x.saturating_sub(pad),
+            y: rect.y.saturating_sub(pad),
+            w: rect.w.saturating_add(pad.saturating_mul(2)),
+            h: rect.h.saturating_add(pad.saturating_mul(2)),
+        })
     }
 }
 
@@ -241,5 +312,38 @@ mod tests {
             }
         );
         assert_eq!(space.cell_id(249, 179), "g:2:1");
+        assert_eq!(space.cell_rect(2, 1).center(), (225, 140));
+    }
+
+    #[test]
+    fn parse_cell_id_signed_and_rejects() {
+        assert_eq!(Space::parse_cell_id("g:0:0").unwrap(), (0, 0));
+        assert_eq!(Space::parse_cell_id("g:-19:2").unwrap(), (-19, 2));
+        assert!(Space::parse_cell_id("0:0").is_err());
+        assert!(Space::parse_cell_id("g:").is_err());
+        assert!(Space::parse_cell_id("g:1").is_err());
+        assert!(Space::parse_cell_id("g:1:2:3").is_err());
+        assert!(Space::parse_cell_id("g:1:").is_err());
+        assert!(Space::parse_cell_id("").is_err());
+    }
+
+    #[test]
+    fn point_on_edge_inside_one_px_outside() {
+        let space = Space::new(-1920, 0, 3840, 1080).unwrap();
+        assert!(space.contains_point(-1920, 0));
+        assert!(space.contains_point(1919, 1079));
+        assert!(!space.contains_point(1920, 1079));
+        assert!(!space.contains_point(1919, 1080));
+        assert!(!space.contains_point(-1921, 0));
+        let last = space.cell_rect(38, 10);
+        assert!(last.area() > 0);
+        assert!(space.contains(last));
+    }
+
+    #[test]
+    fn extreme_grid_cell_does_not_panic() {
+        let space = Space::new(0, 0, 250, 180).unwrap();
+        let huge = space.cell_rect(i32::MAX, i32::MIN);
+        assert_eq!(huge.area(), 0);
     }
 }

@@ -23,7 +23,7 @@ ledgerful doctor --json
 
 ## Build / test
 
-Crate not scaffolded yet. After it exists:
+The `hands` crate lives in this directory (Windows-first; `rust-toolchain.toml` pins the toolchain).
 
 ```powershell
 cd C:\dev\Helping-Hands\hands
@@ -31,6 +31,13 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+```powershell
+cargo run -- mcp --help
+cargo run -- observe --help
+```
+
+`hands mcp` serves stdio MCP. `hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope (screenshot **path**, 100px grid descriptor, UIA map, capped extract). Image bytes are never inlined.
 
 ## What this is
 

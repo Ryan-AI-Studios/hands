@@ -12,6 +12,14 @@ pub enum HandsError {
     Uia(String),
     #[error("{0}")]
     Observe(String),
+    #[error("{0}")]
+    Target(String),
+    #[error("{0}")]
+    Input(String),
+    #[error("{0}")]
+    Lease(String),
+    #[error("{0}")]
+    Settle(String),
 }
 
 impl HandsError {

@@ -142,7 +142,10 @@ fn map_element(element: &IUIAutomationElement) -> Option<RawNode> {
         } else {
             localized
         };
-        let runtime_id = runtime_id(element).unwrap_or_default();
+        let runtime_id = runtime_id(element)?;
+        if runtime_id.is_empty() {
+            return None;
+        }
         let value = if is_password {
             None
         } else {

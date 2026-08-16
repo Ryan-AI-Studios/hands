@@ -132,18 +132,24 @@ pub struct RawNode {
 }
 
 impl RawNode {
-    pub fn element_id(&self) -> String {
-        format!(
+    pub fn element_id(&self) -> Option<String> {
+        if self.runtime_id.is_empty() {
+            return None;
+        }
+        Some(format!(
             "uia:{}",
             self.runtime_id
                 .iter()
                 .map(i32::to_string)
                 .collect::<Vec<_>>()
                 .join(".")
-        )
+        ))
     }
 
     pub fn passes_filter(&self, detail: Detail) -> bool {
+        if self.element_id().is_none() {
+            return false;
+        }
         if !self.is_control || self.is_offscreen || self.rect.w <= 0 || self.rect.h <= 0 {
             return false;
         }
@@ -153,9 +159,9 @@ impl RawNode {
         }
     }
 
-    pub fn to_element(&self) -> Element {
-        Element {
-            id: self.element_id(),
+    pub fn to_element(&self) -> Option<Element> {
+        Some(Element {
+            id: self.element_id()?,
             role: self.role.clone(),
             text: if self.is_password {
                 None
@@ -163,7 +169,7 @@ impl RawNode {
                 Some(self.name.clone())
             },
             rect: self.rect,
-        }
+        })
     }
 
     pub fn main_text_piece(&self) -> Option<String> {
@@ -212,8 +218,10 @@ pub fn filter_nodes(nodes: &[RawNode], detail: Detail) -> (Vec<Element>, usize) 
             continue;
         }
         matched += 1;
-        if elements.len() < cap {
-            elements.push(node.to_element());
+        if elements.len() < cap
+            && let Some(element) = node.to_element()
+        {
+            elements.push(element);
         }
     }
     (elements, matched)
@@ -339,8 +347,20 @@ mod tests {
     fn password_element_text_is_null() {
         let mut password = node(ControlKind::Edit, "secret");
         password.is_password = true;
-        let el = password.to_element();
+        let el = password.to_element().expect("valid runtime id");
         assert_eq!(el.text, None);
         assert_eq!(el.id, "uia:42.1");
+    }
+
+    #[test]
+    fn empty_runtime_id_is_skipped() {
+        let mut n = node(ControlKind::Button, "OK");
+        n.runtime_id.clear();
+        assert!(!n.passes_filter(Detail::Default));
+        assert!(!n.passes_filter(Detail::Dom));
+        assert!(n.to_element().is_none());
+        let (els, matched) = filter_nodes(&[n], Detail::Default);
+        assert_eq!(matched, 0);
+        assert!(els.is_empty());
     }
 }

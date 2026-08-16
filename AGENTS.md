@@ -38,7 +38,7 @@ Prefer `ledgerful … --json` when parsing. See `.agents/skills/ledgerful` and `
 
 ## Build / test
 
-Crate ships in a later track. When present:
+Crate is present. From this directory:
 
 ```powershell
 cd C:\dev\Helping-Hands\hands
@@ -46,6 +46,15 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+CLI (same observe contract as MCP):
+
+```powershell
+cargo run -- mcp --help
+cargo run -- observe --help
+```
+
+`hands mcp` is the stdio MCP server (one tool: `observe`). `hands observe [--detail dom] [--session-id <id>]` prints the compact envelope on stdout.
 
 Ledgerful verify steps (when configured) must match these real cargo commands.
 

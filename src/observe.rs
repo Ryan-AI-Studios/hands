@@ -64,7 +64,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         elements_truncated: false,
     };
     write_sidecar(&paths.observe_path, &full)?;
-    Ok(cap_envelope(full))
+    finalize_envelope(full)
 }
 
 fn write_sidecar(path: &std::path::Path, envelope: &ObserveEnvelope) -> Result<(), HandsError> {
@@ -93,6 +93,19 @@ pub fn cap_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
         envelope.elements.pop();
     }
     envelope
+}
+
+/// Drop trailing elements to fit 16 KiB. If metadata alone (session_id, paths,
+/// extract, space) still exceeds the budget, fail rather than emit an oversize envelope.
+pub fn finalize_envelope(envelope: ObserveEnvelope) -> Result<ObserveEnvelope, HandsError> {
+    let capped = cap_envelope(envelope);
+    let len = serialized_len(&capped);
+    if len > ENVELOPE_MAX_BYTES {
+        return Err(HandsError::Observe(format!(
+            "observe envelope is {len} bytes after dropping elements (hard max {ENVELOPE_MAX_BYTES})"
+        )));
+    }
+    Ok(capped)
 }
 
 pub fn serialize_envelope(envelope: &ObserveEnvelope) -> Result<String, HandsError> {
@@ -156,5 +169,13 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["space"]["cell_px"], 100);
         assert!(parsed["url"].is_null() || parsed["extract"]["url"].is_null());
+    }
+
+    #[test]
+    fn oversized_session_id_is_tool_error() {
+        let mut raw = fat_envelope(0);
+        raw.session_id = "s".repeat(20_000);
+        let err = finalize_envelope(raw).expect_err("must not emit oversize envelope");
+        assert!(err.to_string().contains("16384"), "{err}");
     }
 }

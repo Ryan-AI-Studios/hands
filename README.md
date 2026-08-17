@@ -44,9 +44,13 @@ cargo run -- wait-settle --help
 cargo run -- stop --help
 cargo run -- confirm --help
 cargo run -- logs --help
+cargo run -- native-host --help
+cargo run -- native-host-manifest --help
 ```
 
-`hands mcp` serves stdio MCP (`observe`, `click`, `hover`, `type`, `key`, `scroll`, `wait_settle`, `stop`, `confirm`, `logs`). `hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope (screenshot **path**, 100px grid descriptor, UIA map, capped extract). Image bytes are never inlined.
+`hands mcp` serves stdio MCP (`observe`, `click`, `hover`, `type`, `key`, `scroll`, `wait_settle`, `stop`, `confirm`, `logs`). `hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope (screenshot **path**, 100px grid descriptor, UIA map, Chrome `chr:` ids when the native host is connected, capped extract). Image bytes are never inlined. Envelope field `chrome_connected` is true when a host or `HANDS_CHROME_SNAPSHOT` fixture is present.
+
+Chrome map artifacts live in `extension/` (unpacked MV3, isolated world, id `fdnpjnnnmfhlpgaabjflhjoepmejcnha`) and `native-host/` (`com.helpinghands.host`). MCP/CLI talk to the host over `\\.\pipe\hands-chrome` (override `HANDS_CHROME_PIPE`). Tests can set `HANDS_CHROME_SNAPSHOT` to a JSON fixture (host-double; do not also hit the pipe). `chr:` ids are a canonical walk index only (`chr:0`, `chr:42` — no leading zeros, sign, or whitespace). Toolbar/DPR conversion is **approximate**; the 0011 live demo stays on the primary monitor. Owner sideload + native-host register is **0011**. No Playwright, CDP, or `--remote-debugging-port`.
 
 This binary owns the confirm fence. `click` and `key enter`/`return` refuse irreversible/gray-zone controls unless a matching domain+category allow exists (`ok: false` plus a compact `fence` object; no cursor move). `type` containing a newline is a tool error — use `key enter` to submit. After a refuse, the harness must call `confirm` (`once` / `session` / `persist`) and retry. Grok is always-approve, so a TUI prompt is not the fence.
 

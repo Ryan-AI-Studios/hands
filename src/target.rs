@@ -1,5 +1,6 @@
-//! Actuation targets: `uia:…`, `g:{col}:{row}`, or physical `{x,y}`.
+//! Actuation targets: `uia:…`, `chr:<u32>`, `g:{col}:{row}`, or physical `{x,y}`.
 
+use crate::chrome;
 use crate::error::HandsError;
 use crate::space::{Rect, Space};
 use crate::uia::{self, ResolvedElement};
@@ -62,6 +63,16 @@ impl Target {
     pub fn resolve(&self, space: Space) -> Result<ResolvedTarget, HandsError> {
         match self {
             Self::ElementId(id) => {
+                if id.starts_with("chr:") {
+                    let hit = chrome::try_resolve(id)?;
+                    let found = ResolvedElement {
+                        rect: hit.rect,
+                        name: hit.name,
+                        role: hit.role,
+                        hwnd: None,
+                    };
+                    return finish_element(id, found, space);
+                }
                 let runtime_id = parse_runtime_id(id)?;
                 let found = uia::resolve_runtime_id(&runtime_id)?;
                 finish_element(id, found, space)
@@ -160,9 +171,8 @@ pub fn parse_element_id(id: &str) -> Result<Target, HandsError> {
         return Ok(Target::ElementId(id.to_string()));
     }
     if id.starts_with("chr:") {
-        return Err(HandsError::Target(
-            "chr: ids are 0005 (Chrome fusion); unknown prefix".into(),
-        ));
+        let n = parse_chr_index(id)?;
+        return Ok(Target::ElementId(format!("chr:{n}")));
     }
     if let Some((prefix, _)) = id.split_once(':') {
         return Err(HandsError::Target(format!(
@@ -170,8 +180,30 @@ pub fn parse_element_id(id: &str) -> Result<Target, HandsError> {
         )));
     }
     Err(HandsError::Target(format!(
-        "element id must start with uia: (got '{id}')"
+        "element id must start with uia: or chr: (got '{id}')"
     )))
+}
+
+pub fn parse_chr_index(id: &str) -> Result<u32, HandsError> {
+    let rest = id.strip_prefix("chr:").ok_or_else(|| {
+        HandsError::Target(format!("element id must start with chr: (got '{id}')"))
+    })?;
+    if rest.is_empty()
+        || rest.starts_with('+')
+        || rest.starts_with('-')
+        || rest.contains('.')
+        || rest.as_bytes().iter().any(|b| !b.is_ascii_digit())
+        || (rest.len() > 1 && rest.starts_with('0'))
+    {
+        return Err(HandsError::Target(format!(
+            "invalid Chrome element id '{id}' (expected chr:<u32>)"
+        )));
+    }
+    rest.parse::<u32>().map_err(|_| {
+        HandsError::Target(format!(
+            "invalid Chrome element id '{id}' (expected chr:<u32>)"
+        ))
+    })
 }
 
 pub fn parse_runtime_id(id: &str) -> Result<Vec<i32>, HandsError> {
@@ -224,17 +256,110 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_chr_bare_uia_and_mixed() {
-        let err = Target::parse(Some("chr:abc"), None, None, None).unwrap_err();
-        assert!(err.to_string().contains("chr:"), "{err}");
+    fn chr_grammar_table() {
+        for id in ["chr:0", "chr:1", "chr:42"] {
+            assert!(
+                matches!(parse_element_id(id).unwrap(), Target::ElementId(s) if s == id),
+                "{id}"
+            );
+        }
+        for id in [
+            "chr:",
+            "chr:abc",
+            "chr:007",
+            "chr: 1",
+            "chr:-1",
+            "chr:+1",
+            "chr:1.0",
+            "chr:4294967296",
+        ] {
+            let err = parse_element_id(id).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("chr:"), "{id}: {msg}");
+            assert!(
+                !msg.to_ascii_lowercase().contains("unknown prefix"),
+                "{id}: {msg}"
+            );
+        }
+        let err = parse_element_id("foo:1").unwrap_err();
+        assert!(err.to_string().contains("unknown"), "{err}");
+    }
+
+    #[test]
+    fn parse_rejects_bare_uia_mixed_and_unknown() {
         let err = Target::parse(Some("uia:"), None, None, None).unwrap_err();
         assert!(err.to_string().contains("bare uia:"), "{err}");
         let err = Target::parse(Some("foo:1"), None, None, None).unwrap_err();
         assert!(err.to_string().contains("unknown"), "{err}");
         assert!(Target::parse(Some("uia:42.1"), Some("g:0:0"), None, None).is_err());
+        assert!(Target::parse(Some("chr:0"), Some("g:0:0"), None, None).is_err());
         assert!(Target::parse(None, None, Some(1), None).is_err());
         assert!(Target::parse(None, None, None, None).is_err());
         assert!(Target::parse(Some("42.1"), None, None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_chr0_from_fixture_center() {
+        let g = crate::chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&crate::chrome::EnvGuard::fixture_path()));
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let hit = Target::ElementId("chr:0".into()).resolve(space).unwrap();
+        assert_eq!(hit.kind, "element");
+        assert_eq!(hit.id.as_deref(), Some("chr:0"));
+        assert_eq!((hit.x, hit.y), (210, 166));
+        assert!(hit.hwnd.is_none());
+        assert_eq!(hit.role, "Edit");
+    }
+
+    #[test]
+    fn resolve_chr_errors_missing_malformed_and_no_pipe() {
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let g = crate::chrome::EnvGuard::lock();
+
+        g.set_snapshot(Some(std::path::Path::new(
+            r"C:\dev\Helping-Hands\hands\tests\fixtures\missing-chrome.json",
+        )));
+        let err = Target::ElementId("chr:0".into())
+            .resolve(space)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chr:") || msg.contains("host") || msg.contains("fixture"),
+            "{msg}"
+        );
+        assert!(
+            !msg.to_ascii_lowercase().contains("unknown prefix"),
+            "{msg}"
+        );
+
+        let bad = std::env::temp_dir().join("hands-target-malformed.json");
+        std::fs::write(&bad, "not-json").unwrap();
+        g.set_snapshot(Some(&bad));
+        let err = Target::ElementId("chr:0".into())
+            .resolve(space)
+            .unwrap_err();
+        let msg = err.to_string();
+        let _ = std::fs::remove_file(&bad);
+        assert!(
+            msg.contains("chr:") || msg.contains("host") || msg.contains("fixture"),
+            "{msg}"
+        );
+        assert!(
+            !msg.to_ascii_lowercase().contains("unknown prefix"),
+            "{msg}"
+        );
+
+        g.set_snapshot(None);
+        g.set_pipe(Some(r"\\.\pipe\hands-chrome-absent-target-0005"));
+        let err = Target::ElementId("chr:0".into())
+            .resolve(space)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("chr:") || msg.contains("host"), "{msg}");
+        assert!(
+            !msg.to_ascii_lowercase().contains("unknown prefix"),
+            "{msg}"
+        );
     }
 
     #[test]

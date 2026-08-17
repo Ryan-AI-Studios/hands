@@ -117,7 +117,7 @@ pub struct HandsServer;
 #[tool_router(server_handler)]
 impl HandsServer {
     #[tool(
-        description = "Capture the desktop: screenshot path, 100px grid descriptor, UIA map, capped extract"
+        description = "Capture the desktop: screenshot path, 100px grid descriptor, UIA map, Chrome chr: ids when the host is connected, capped extract"
     )]
     fn observe(
         &self,
@@ -126,7 +126,9 @@ impl HandsServer {
         Ok(run_observe(params))
     }
 
-    #[tool(description = "Bézier-move and left-click a UIA id, grid cell, or pixel")]
+    #[tool(
+        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel"
+    )]
     fn click(
         &self,
         Parameters(params): Parameters<ClickParams>,
@@ -134,7 +136,9 @@ impl HandsServer {
         Ok(run_actuate(actuate::click(click_req(params))))
     }
 
-    #[tool(description = "Bézier-move to a target and pause 100 ms (no click)")]
+    #[tool(
+        description = "Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms (no click)"
+    )]
     fn hover(
         &self,
         Parameters(params): Parameters<ClickParams>,
@@ -169,7 +173,9 @@ impl HandsServer {
         })))
     }
 
-    #[tool(description = "Scroll the mouse wheel (dy notches, optional dx and target)")]
+    #[tool(
+        description = "Scroll the mouse wheel (dy notches, optional dx and UIA / Chrome `chr:` / grid / pixel target)"
+    )]
     fn scroll(
         &self,
         Parameters(params): Parameters<ScrollParams>,

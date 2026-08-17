@@ -19,16 +19,11 @@ graphify-out/
 /out/
 /dist/
 
-# Agent harness local state (skills under .agents/skills/ are tracked)
+# Agent harness local state (do not ship)
+.agents/
 .claude/
 .codex/
 .opencode/
-.agents/worktrees/
-.codex/worktrees/
-.agents/review_*.md
-.codex/review_*.md
-.agents/*.lock
-.codex/*.lock
 .grok/
 
 # OS / editor

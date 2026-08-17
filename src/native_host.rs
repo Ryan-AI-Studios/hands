@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_ALL, HANDLE, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    CloseHandle, ERROR_BAD_PIPE, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED,
+    ERROR_PIPE_CONNECTED, GENERIC_ALL, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::{
     ACL, ACL_REVISION, AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
@@ -19,7 +19,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe,
 };
 use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject,
@@ -191,7 +191,7 @@ fn serve_pipe() -> Result<(), HandsError> {
         )));
     }
     let _keep_sa = sa;
-    let mut stdin = io::stdin();
+    let stdin = io::stdin();
     let mut stdout = io::stdout();
     let stdin_handle = HANDLE(stdin.as_raw_handle());
     loop {
@@ -205,22 +205,21 @@ fn serve_pipe() -> Result<(), HandsError> {
                 continue;
             }
         };
-        if let Err(err) = forward_one(&mut stdout, &mut stdin, stdin_handle, &mut pipe, &req) {
+        if let Err(err) = forward_one(&mut stdout, stdin_handle, &mut pipe, &req) {
             eprintln!("native-host: forward: {err}");
         }
         let _ = unsafe { DisconnectNamedPipe(handle) };
     }
 }
 
-fn forward_one<W: Write, R: Read, P: Write>(
+fn forward_one<W: Write, P: Write>(
     chrome_out: &mut W,
-    chrome_in: &mut R,
     chrome_in_handle: HANDLE,
     pipe: &mut P,
     req: &Value,
 ) -> Result<(), HandsError> {
     write_frame(chrome_out, req)?;
-    let reply = read_frame_timeout(chrome_in, chrome_in_handle, HOST_FORWARD_TIMEOUT)?;
+    let reply = read_frame_timeout(chrome_in_handle, HOST_FORWARD_TIMEOUT)?;
     write_pipe_frame(pipe, &reply)
 }
 
@@ -306,21 +305,20 @@ fn overlapped_exact(
         if pending {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                let _ = unsafe { CancelIoEx(handle, Some(&raw const ov)) };
-                let _ = unsafe { CloseHandle(event) };
-                return Err(client_timeout());
+                return Err(cancel_overlapped(handle, &raw const ov, event, None));
             }
             let ms = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
             let wait = unsafe { WaitForSingleObject(event, ms) };
             if wait == WAIT_TIMEOUT {
-                let _ = unsafe { CancelIoEx(handle, Some(&raw const ov)) };
-                let _ = unsafe { CloseHandle(event) };
-                return Err(client_timeout());
+                return Err(cancel_overlapped(handle, &raw const ov, event, None));
             }
             if wait != WAIT_OBJECT_0 {
-                let _ = unsafe { CancelIoEx(handle, Some(&raw const ov)) };
-                let _ = unsafe { CloseHandle(event) };
-                return Err(HandsError::Chrome(format!("pipe wait failed ({})", wait.0)));
+                return Err(cancel_overlapped(
+                    handle,
+                    &raw const ov,
+                    event,
+                    Some(HandsError::Chrome(format!("pipe wait failed ({})", wait.0))),
+                ));
             }
         }
         let mut transferred = 0u32;
@@ -338,6 +336,23 @@ fn overlapped_exact(
     Ok(())
 }
 
+fn cancel_overlapped(
+    handle: HANDLE,
+    ov: *const OVERLAPPED,
+    event: HANDLE,
+    err: Option<HandsError>,
+) -> HandsError {
+    let _ = unsafe { CancelIoEx(handle, Some(ov)) };
+    let mut transferred = 0u32;
+    match unsafe { GetOverlappedResult(handle, ov, &raw mut transferred, true) } {
+        Ok(()) => {}
+        Err(e) if e.code() == ERROR_OPERATION_ABORTED.to_hresult() => {}
+        Err(_) => {}
+    }
+    let _ = unsafe { CloseHandle(event) };
+    err.unwrap_or_else(client_timeout)
+}
+
 pub fn client_timeout() -> HandsError {
     HandsError::Chrome(format!(
         "Chrome host client timed out after {CLIENT_TIMEOUT_MS} ms; chr: unavailable"
@@ -352,14 +367,10 @@ fn connect_pipe(handle: HANDLE) -> Result<(), HandsError> {
     }
 }
 
-fn read_frame_timeout<R: Read>(
-    reader: &mut R,
-    handle: HANDLE,
-    timeout: Duration,
-) -> Result<Value, HandsError> {
+fn read_frame_timeout(handle: HANDLE, timeout: Duration) -> Result<Value, HandsError> {
     let deadline = Instant::now() + timeout;
     let mut len_buf = [0u8; 4];
-    read_exact_deadline(reader, handle, &mut len_buf, deadline)?;
+    read_exact_deadline(handle, &mut len_buf, deadline)?;
     let len = usize::try_from(u32::from_le_bytes(len_buf)).unwrap_or(usize::MAX);
     if len > MAX_CHROME_TO_HOST {
         return Err(HandsError::Chrome(format!(
@@ -368,47 +379,58 @@ fn read_frame_timeout<R: Read>(
     }
     let mut buf = vec![0u8; len];
     if len > 0 {
-        read_exact_deadline(reader, handle, &mut buf, deadline)?;
+        read_exact_deadline(handle, &mut buf, deadline)?;
     }
     serde_json::from_slice(&buf)
         .map_err(|err| HandsError::Chrome(format!("Chrome→host json decode: {err}")))
 }
 
-fn read_exact_deadline<R: Read>(
-    reader: &mut R,
+fn stdin_closed() -> HandsError {
+    HandsError::Chrome("Chrome stdin closed during host-forward".into())
+}
+
+fn host_forward_timeout() -> HandsError {
+    HandsError::Chrome("Chrome host-forward timed out after 2 s".into())
+}
+
+fn read_exact_deadline(
     handle: HANDLE,
     buf: &mut [u8],
     deadline: Instant,
 ) -> Result<(), HandsError> {
     let mut filled = 0usize;
     while filled < buf.len() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(HandsError::Chrome(
-                "Chrome host-forward timed out after 2 s".into(),
-            ));
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return Err(host_forward_timeout());
         }
-        let ms = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
-        let wait = unsafe { WaitForSingleObject(handle, ms) };
-        if wait == WAIT_TIMEOUT {
-            return Err(HandsError::Chrome(
-                "Chrome host-forward timed out after 2 s".into(),
-            ));
-        }
-        if wait != WAIT_OBJECT_0 {
-            return Err(HandsError::Chrome(format!(
-                "Chrome stdin wait failed ({})",
-                wait.0
-            )));
-        }
-        match reader.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(HandsError::Chrome(
-                    "Chrome stdin closed during host-forward".into(),
-                ));
+        let mut avail = 0u32;
+        match unsafe { PeekNamedPipe(handle, None, 0, None, Some(&raw mut avail), None) } {
+            Ok(()) => {}
+            Err(err)
+                if err.code() == ERROR_BROKEN_PIPE.to_hresult()
+                    || err.code() == ERROR_BAD_PIPE.to_hresult() =>
+            {
+                return Err(stdin_closed());
             }
-            Ok(n) => filled += n,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => {
+                return Err(HandsError::Chrome(format!("Chrome stdin peek: {err}")));
+            }
+        }
+        let need = buf.len() - filled;
+        if (avail as usize) < need {
+            std::thread::sleep(Duration::from_millis(8));
+            continue;
+        }
+        let mut n = 0u32;
+        match unsafe { ReadFile(handle, Some(&mut buf[filled..]), Some(&raw mut n), None) } {
+            Ok(()) if n == 0 => return Err(stdin_closed()),
+            Ok(()) => filled += n as usize,
+            Err(err)
+                if err.code() == ERROR_BROKEN_PIPE.to_hresult()
+                    || err.code() == ERROR_BAD_PIPE.to_hresult() =>
+            {
+                return Err(stdin_closed());
+            }
             Err(err) => {
                 return Err(HandsError::Chrome(format!("Chrome stdin read: {err}")));
             }
@@ -601,5 +623,56 @@ mod tests {
             format!("chrome-extension://{EXTENSION_ID}/")
         );
         assert!(!v["allowed_origins"][0].as_str().unwrap().contains('*'));
+    }
+
+    fn make_anon_pipe() -> (HANDLE, HANDLE) {
+        use windows::Win32::System::Pipes::CreatePipe;
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        unsafe { CreatePipe(&raw mut read, &raw mut write, None, 0) }.expect("CreatePipe");
+        (read, write)
+    }
+
+    #[test]
+    fn silent_host_forward_times_out_within_budget() {
+        let (read, write) = make_anon_pipe();
+        let started = Instant::now();
+        let err = read_exact_deadline(
+            read,
+            &mut [0u8; 4],
+            Instant::now() + Duration::from_millis(80),
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        let _ = unsafe { CloseHandle(read) };
+        let _ = unsafe { CloseHandle(write) };
+        let msg = err.to_string();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "silent stdin hung {elapsed:?}: {msg}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "timeout too fast ({elapsed:?}): {msg}"
+        );
+        assert!(msg.contains("timed out after 2 s"), "{msg}");
+    }
+
+    #[test]
+    fn closed_pipe_peek_is_stdin_closed_fast() {
+        let (read, write) = make_anon_pipe();
+        let _ = unsafe { CloseHandle(write) };
+        let started = Instant::now();
+        let err = read_exact_deadline(read, &mut [0u8; 4], Instant::now() + Duration::from_secs(2))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        let _ = unsafe { CloseHandle(read) };
+        let msg = err.to_string();
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "closed pipe burned budget {elapsed:?}: {msg}"
+        );
+        assert!(msg.contains("stdin closed"), "{msg}");
+        assert!(!msg.contains("timed out"), "{msg}");
     }
 }

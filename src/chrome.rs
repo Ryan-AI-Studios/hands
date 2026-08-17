@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::fs;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
@@ -14,6 +15,8 @@ use crate::error::HandsError;
 use crate::extract::{Card, Detail, Element, take_chars};
 use crate::native_host::{CLIENT_TIMEOUT_MS, client_timeout, exchange_pipe_deadline, pipe_name};
 use crate::space::Rect;
+
+static LAST_PIPE_DETAIL: Mutex<Detail> = Mutex::new(Detail::Default);
 
 pub const SNAPSHOT_ENV: &str = "HANDS_CHROME_SNAPSHOT";
 pub const PIPE_ENV: &str = "HANDS_CHROME_PIPE";
@@ -268,17 +271,35 @@ fn href_ok(href: &str) -> bool {
     !t.to_ascii_lowercase().starts_with("javascript:")
 }
 
+fn store_last_pipe_detail(detail: Detail) {
+    *LAST_PIPE_DETAIL.lock().unwrap_or_else(|e| e.into_inner()) = detail;
+}
+
+fn last_pipe_detail() -> Detail {
+    *LAST_PIPE_DETAIL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn resolve_request(id: &str, detail: Detail) -> serde_json::Value {
+    let mut req = serde_json::json!({"op": "resolve", "id": id});
+    if detail == Detail::Dom {
+        req["detail"] = serde_json::Value::String("dom".into());
+    }
+    req
+}
+
 fn pipe_snapshot(detail: Detail) -> Result<ChromeMap, HandsError> {
     let mut req = serde_json::json!({"op": "snapshot"});
     if detail == Detail::Dom {
         req["detail"] = serde_json::Value::String("dom".into());
     }
     let reply = pipe_request(&req)?;
-    parse_host_reply(&reply)
+    let map = parse_host_reply(&reply)?;
+    store_last_pipe_detail(detail);
+    Ok(map)
 }
 
 fn pipe_resolve(id: &str) -> Result<ChromeMap, HandsError> {
-    let req = serde_json::json!({"op": "resolve", "id": id});
+    let req = resolve_request(id, last_pipe_detail());
     let reply = pipe_request(&req).map_err(|err| {
         HandsError::Chrome(format!(
             "Chrome host is not connected (pipe); cannot resolve {id}: {err}"
@@ -545,6 +566,25 @@ mod tests {
         );
         assert_eq!(map.cards[0].title, "car 0");
         assert_eq!(map.cards[7].title, "car 7");
+    }
+
+    #[test]
+    fn resolve_request_includes_dom_detail() {
+        let g = EnvGuard::lock();
+        g.set_snapshot(None);
+        store_last_pipe_detail(Detail::Default);
+        let default = resolve_request("chr:0", Detail::Default);
+        assert_eq!(default["op"], "resolve");
+        assert_eq!(default["id"], "chr:0");
+        assert!(default.get("detail").is_none());
+        let dom = resolve_request("chr:0", Detail::Dom);
+        assert_eq!(dom["detail"], "dom");
+        store_last_pipe_detail(Detail::Dom);
+        let replay = resolve_request("chr:1", last_pipe_detail());
+        assert_eq!(replay["detail"], "dom");
+        store_last_pipe_detail(Detail::Default);
+        let after_reset = resolve_request("chr:0", last_pipe_detail());
+        assert!(after_reset.get("detail").is_none());
     }
 
     #[test]

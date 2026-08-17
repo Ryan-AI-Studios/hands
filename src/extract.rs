@@ -209,11 +209,19 @@ pub struct Element {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Card {
+    pub title: String,
+    pub price: String,
+    pub href: String,
+    pub rect: Rect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Extract {
     pub title: String,
     pub url: Option<String>,
     pub main_text: String,
-    pub cards: Vec<serde_json::Value>,
+    pub cards: Vec<Card>,
 }
 
 pub fn filter_nodes(nodes: &[RawNode], detail: Detail) -> (Vec<Element>, usize) {
@@ -235,20 +243,67 @@ pub fn filter_nodes(nodes: &[RawNode], detail: Detail) -> (Vec<Element>, usize) 
 }
 
 pub fn extract_from_nodes(title: &str, nodes: &[RawNode]) -> Extract {
+    Extract {
+        title: take_chars(title, TITLE_MAX_CHARS),
+        url: None,
+        main_text: join_main_text(nodes),
+        cards: Vec::new(),
+    }
+}
+
+pub fn join_main_text(nodes: &[RawNode]) -> String {
     let mut main_text = String::new();
     for node in nodes {
         if let Some(piece) = node.main_text_piece() {
+            if !main_text.is_empty() {
+                main_text.push('\n');
+            }
             main_text.push_str(&piece);
             if main_text.chars().count() >= MAIN_TEXT_MAX_CHARS {
                 break;
             }
         }
     }
+    take_chars(&main_text, MAIN_TEXT_MAX_CHARS)
+}
+
+pub fn http_https_url(raw: Option<&str>) -> Option<String> {
+    let t = raw?.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let https = t.len() >= 8 && t[..8].eq_ignore_ascii_case("https://");
+    let http = t.len() >= 7 && t[..7].eq_ignore_ascii_case("http://");
+    if https || http {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
+pub fn extract_fused(
+    uia_title: &str,
+    uia_nodes: &[RawNode],
+    chrome_url: Option<&str>,
+    chrome_title: &str,
+    chrome_main: &str,
+    cards: Vec<Card>,
+) -> Extract {
+    let title = if chrome_title.trim().is_empty() {
+        uia_title
+    } else {
+        chrome_title
+    };
+    let main_text = if chrome_main.trim().is_empty() {
+        join_main_text(uia_nodes)
+    } else {
+        take_chars(chrome_main, MAIN_TEXT_MAX_CHARS)
+    };
     Extract {
         title: take_chars(title, TITLE_MAX_CHARS),
-        url: None,
-        main_text: take_chars(&main_text, MAIN_TEXT_MAX_CHARS),
-        cards: Vec::new(),
+        url: http_https_url(chrome_url),
+        main_text,
+        cards,
     }
 }
 
@@ -357,6 +412,32 @@ mod tests {
         let el = password.to_element().expect("valid runtime id");
         assert_eq!(el.text, None);
         assert_eq!(el.id, "uia:42.1");
+    }
+
+    #[test]
+    fn uia_main_text_joins_pieces_with_newline() {
+        let a = node(ControlKind::Document, "hello");
+        let b = node(ControlKind::Edit, "world");
+        let extract = extract_from_nodes("T", &[a, b]);
+        assert_eq!(extract.main_text, "hello\nworld");
+        assert_eq!(extract.url, None);
+        assert!(extract.cards.is_empty());
+    }
+
+    #[test]
+    fn http_https_url_rejects_chrome_and_about() {
+        assert_eq!(
+            http_https_url(Some("https://cars.com/search")),
+            Some("https://cars.com/search".into())
+        );
+        assert_eq!(
+            http_https_url(Some("http://example.com")),
+            Some("http://example.com".into())
+        );
+        assert_eq!(http_https_url(Some("chrome://extensions")), None);
+        assert_eq!(http_https_url(Some("about:blank")), None);
+        assert_eq!(http_https_url(Some("")), None);
+        assert_eq!(http_https_url(None), None);
     }
 
     #[test]

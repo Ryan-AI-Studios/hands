@@ -1,0 +1,5 @@
+; Example only. NEVER applied by 0005. Owner sideload + register is 0011.
+;
+; REG ADD "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.helpinghands.host" /ve /t REG_SZ /d "C:\path\to\hands\native-host\com.helpinghands.host.json" /f
+;
+; Fill `path` in com.helpinghands.host.json (or `hands native-host-manifest --exe`) with the absolute hands.exe before registering.

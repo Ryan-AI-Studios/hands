@@ -1,0 +1,43 @@
+{
+  "url": "https://cars.com/search",
+  "title": "Cars.com",
+  "main_text": "Search cars\n2020 Honda Civic\n$12,345",
+  "metrics": {
+    "screenX": 100,
+    "screenY": 50,
+    "outerWidth": 1280,
+    "outerHeight": 800,
+    "innerWidth": 1280,
+    "innerHeight": 720,
+    "devicePixelRatio": 1.0
+  },
+  "elements": [
+    {
+      "id": "chr:0",
+      "role": "Edit",
+      "text": "Search",
+      "rectCss": { "left": 10, "top": 20, "width": 200, "height": 32 }
+    },
+    {
+      "id": "chr:1",
+      "role": "Edit",
+      "text": null,
+      "rectCss": { "left": 10, "top": 60, "width": 200, "height": 32 }
+    },
+    {
+      "id": "chr:2",
+      "role": "Hyperlink",
+      "text": "2020 Honda Civic",
+      "href": "https://cars.com/vehicledetail/abc",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 }
+    }
+  ],
+  "cards": [
+    {
+      "title": "2020 Honda Civic",
+      "price": "$12,345",
+      "href": "https://cars.com/vehicledetail/abc",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 }
+    }
+  ]
+}

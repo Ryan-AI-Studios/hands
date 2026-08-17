@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Helping Hands",
+  "version": "0.1.0",
+  "description": "Isolated-world Chrome map for Helping Hands. No CDP.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu1VtHuRbTRFc7rTM8d/XtjHV/V9ohNTPgHAgZPbXTiU5oCS+0uKaNnBKrlAs11bIYG7he0K3JrG3Umig0c+XMv0j5rBKWHw9mRnsSrRYXJAhp49GUG6MTX2DPw5J57/NeRNkSLP/cABOUoz4NkMAKuTIv+9w2e6rriAkUbbmLprIaZzabI/Dq9Z4FXPHv5eGhbFdp4jMwR7O51eyWc7MSR2o0eynaWUUi0/ZnbN9QWw6VQX9fqzDBg4Q3oI4AO9gzb9OHrb2fKZckEC7MFQJsb45/2oPGZmu6/wPLt/fkxAHPSxRhDCEy85f+Z4KJCJqRiZGMTcsGzcadDCwf71aOwIDAQAB",
+  "permissions": ["nativeMessaging"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "sw.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false,
+      "world": "ISOLATED"
+    }
+  ]
+}

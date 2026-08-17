@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use hands::{
-    ActuateRequest, Detail, HandsError, ObserveRequest, actuate, allows, ensure_dpi, logs, observe,
-    serialize_envelope,
+    ActuateRequest, Detail, HandsError, ObserveRequest, actuate, allows, ensure_dpi, logs,
+    native_host, observe, serialize_envelope,
 };
 
 #[derive(Parser)]
@@ -19,18 +19,18 @@ struct Cli {
 enum Command {
     /// Serve the MCP server over stdio
     Mcp,
-    /// Capture the desktop and print a compact observe envelope
+    /// Capture the desktop: screenshot path, 100px grid, UIA map, Chrome `chr:` ids when connected
     Observe {
-        /// `dom` for a fuller UIA dump (still skips offscreen/zero-size)
+        /// `dom` for a fuller UIA + Chrome walk (still skips offscreen/zero-size)
         #[arg(long, value_enum)]
         detail: Option<DetailArg>,
         /// Explicit session id (otherwise sniff env, else mint)
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Bézier-move and left-click a target
+    /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel
     Click {
-        #[arg(long)]
+        #[arg(long, help = "UIA id, Chrome chr: id, grid cell, or pixel")]
         element_id: Option<String>,
         #[arg(long)]
         grid: Option<String>,
@@ -41,9 +41,9 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Bézier-move and pause 100 ms
+    /// Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms
     Hover {
-        #[arg(long)]
+        #[arg(long, help = "UIA id, Chrome chr: id, grid cell, or pixel")]
         element_id: Option<String>,
         #[arg(long)]
         grid: Option<String>,
@@ -68,13 +68,13 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Scroll the wheel (notches). Optional target hovers first.
+    /// Scroll the wheel (notches). Optional UIA / Chrome `chr:` / grid / pixel target hovers first.
     Scroll {
         #[arg(long)]
         dy: i32,
         #[arg(long)]
         dx: Option<i32>,
-        #[arg(long)]
+        #[arg(long, help = "UIA id, Chrome chr: id, grid cell, or pixel")]
         element_id: Option<String>,
         #[arg(long)]
         grid: Option<String>,
@@ -127,6 +127,20 @@ enum Command {
         #[arg(long)]
         tail: Option<usize>,
     },
+    /// Chrome-spawned native-messaging speaker (stdio frames + named pipe; no desk lease)
+    NativeHost {
+        /// Origin from Chrome (`chrome-extension://<id>/`). Override: HANDS_NATIVE_ORIGIN.
+        origin: Option<String>,
+        #[arg(long = "parent-window", hide = true, allow_hyphen_values = true)]
+        parent_window: Option<String>,
+    },
+    /// Print a filled native-host manifest JSON (does not write the registry)
+    NativeHostManifest {
+        #[arg(long)]
+        extension_id: Option<String>,
+        #[arg(long)]
+        exe: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -157,10 +171,21 @@ impl From<DetailArg> for Detail {
     }
 }
 
+fn cli_args() -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args
+        .get(1)
+        .is_some_and(|a| a.to_string_lossy().starts_with("chrome-extension://"))
+    {
+        args.insert(1, "native-host".into());
+    }
+    args
+}
+
 #[tokio::main]
 async fn main() {
     let dpi = ensure_dpi();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(cli_args());
     let result = match cli.command {
         Command::Mcp => {
             if let Err(err) = &dpi {
@@ -196,6 +221,13 @@ async fn main() {
                 fail(err);
             }
             logs_main(session_id, list, tail)
+        }
+        Command::NativeHost {
+            origin,
+            parent_window: _,
+        } => native_host::run(origin.as_deref()),
+        Command::NativeHostManifest { extension_id, exe } => {
+            native_host_manifest_main(extension_id, exe)
         }
         other => {
             if let Err(err) = dpi {
@@ -347,7 +379,12 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             session_id,
             ..ActuateRequest::default()
         }))?,
-        Command::Mcp | Command::Observe { .. } | Command::Confirm { .. } | Command::Logs { .. } => {
+        Command::Mcp
+        | Command::Observe { .. }
+        | Command::Confirm { .. }
+        | Command::Logs { .. }
+        | Command::NativeHost { .. }
+        | Command::NativeHostManifest { .. } => {
             unreachable!()
         }
     };
@@ -362,6 +399,24 @@ fn pack(result: Result<hands::ActuateEnvelope, HandsError>) -> Result<(String, b
     let envelope = result?;
     let json = actuate::serialize_envelope(&envelope)?;
     Ok((json, envelope.ok))
+}
+
+fn native_host_manifest_main(
+    extension_id: Option<String>,
+    exe: Option<String>,
+) -> Result<(), HandsError> {
+    let id = extension_id.unwrap_or_else(|| native_host::EXTENSION_ID.to_string());
+    let exe = match exe {
+        Some(p) => p,
+        None => std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "hands.exe".into()),
+    };
+    let value = native_host::manifest_json(&id, &exe);
+    let json = serde_json::to_string_pretty(&value)
+        .map_err(|err| HandsError::Chrome(format!("native-host-manifest: {err}")))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn fail(err: HandsError) -> ! {

@@ -1,0 +1,9 @@
+{
+  "name": "com.helpinghands.host",
+  "description": "Helping Hands native messaging host",
+  "path": "hands.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://fdnpjnnnmfhlpgaabjflhjoepmejcnha/"
+  ]
+}

@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::space::Rect;
 
@@ -200,7 +200,7 @@ impl RawNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Element {
     pub id: String,
     pub role: String,
@@ -208,7 +208,7 @@ pub struct Element {
     pub rect: Rect,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Card {
     pub title: String,
     pub price: String,
@@ -216,7 +216,7 @@ pub struct Card {
     pub rect: Rect,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Extract {
     pub title: String,
     pub url: Option<String>,

@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
@@ -14,7 +14,7 @@ use crate::error::HandsError;
 
 pub const CELL_PX: i32 = 100;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
@@ -32,13 +32,18 @@ impl Rect {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Space {
     pub origin_x: i32,
     pub origin_y: i32,
     pub width: i32,
     pub height: i32,
+    #[serde(default = "default_cell_px")]
     pub cell_px: i32,
+}
+
+fn default_cell_px() -> i32 {
+    CELL_PX
 }
 
 impl Space {

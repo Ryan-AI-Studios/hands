@@ -12,6 +12,7 @@ use crate::fence;
 use crate::lease;
 use crate::logs;
 use crate::observe::{ObserveRequest, observe, serialize_envelope};
+use crate::pick::{self, GroundRequest, PickRequest};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ObserveParams {
@@ -108,6 +109,38 @@ pub struct ConfirmParams {
     pub revoke: Option<bool>,
     #[serde(default)]
     pub list: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PickParams {
+    pub query: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub observe_path: Option<String>,
+    #[serde(default)]
+    pub elements_json: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GroundParams {
+    pub query: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub observe_path: Option<String>,
+    #[serde(default)]
+    pub screenshot: Option<String>,
+    #[serde(default)]
+    pub element_id: Option<String>,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+    #[serde(default)]
+    pub w: Option<i32>,
+    #[serde(default)]
+    pub h: Option<i32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -256,6 +289,26 @@ impl HandsServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(run_logs(params))
     }
+
+    #[tool(
+        description = "On-demand local Gemma helper at 127.0.0.1:8081 that picks one allowlisted element id from a text list. Not observe. 8081 down is a tool error."
+    )]
+    fn pick(
+        &self,
+        Parameters(params): Parameters<PickParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_pick_tool(params))
+    }
+
+    #[tool(
+        description = "On-demand local Gemma helper: PNG crop when /v1/models reports multimodal, else text pick. Not observe. 8081 down is a tool error; degrades without mmproj."
+    )]
+    fn ground(
+        &self,
+        Parameters(params): Parameters<GroundParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_ground_tool(params))
+    }
 }
 
 fn click_req(params: ClickParams) -> ActuateRequest {
@@ -302,6 +355,40 @@ fn run_confirm(params: ConfirmParams) -> CallToolResult {
         params.list.unwrap_or(false),
     )
     .and_then(|env| allows::serialize_confirm(&env))
+    {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
+fn run_pick_tool(params: PickParams) -> CallToolResult {
+    match pick::run_pick(PickRequest {
+        session_id: params.session_id,
+        query: params.query,
+        elements: None,
+        observe_path: params.observe_path,
+        elements_json: params.elements_json,
+    })
+    .and_then(|env| pick::serialize_pick(&env))
+    {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
+fn run_ground_tool(params: GroundParams) -> CallToolResult {
+    match pick::run_ground(GroundRequest {
+        session_id: params.session_id,
+        query: params.query,
+        observe_path: params.observe_path,
+        screenshot: params.screenshot,
+        element_id: params.element_id,
+        x: params.x,
+        y: params.y,
+        w: params.w,
+        h: params.h,
+    })
+    .and_then(|env| pick::serialize_pick(&env))
     {
         Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),

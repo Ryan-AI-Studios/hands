@@ -167,7 +167,7 @@ pub fn display_path(path: &Path) -> String {
     }
 }
 
-fn utc_compact() -> String {
+pub(crate) fn utc_compact() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

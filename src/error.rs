@@ -26,6 +26,8 @@ pub enum HandsError {
     Logs(String),
     #[error("{0}")]
     Chrome(String),
+    #[error("{0}")]
+    Gemma(String),
 }
 
 impl HandsError {

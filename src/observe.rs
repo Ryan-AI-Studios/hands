@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::capture::{capture_virtual_screen, display_path};
 use crate::chrome;
@@ -31,9 +31,9 @@ pub struct ObserveEnvelope {
     pub chrome_connected: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObserveSidecar {
-    pub schema: &'static str,
+    pub schema: String,
     pub session_id: String,
     pub screenshot_path: String,
     pub observe_path: String,
@@ -86,7 +86,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
 
 fn write_sidecar(path: &std::path::Path, envelope: &ObserveEnvelope) -> Result<(), HandsError> {
     let sidecar = ObserveSidecar {
-        schema: OBSERVE_SCHEMA,
+        schema: OBSERVE_SCHEMA.to_string(),
         session_id: envelope.session_id.clone(),
         screenshot_path: envelope.screenshot_path.clone(),
         observe_path: envelope.observe_path.clone(),

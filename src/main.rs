@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use hands::{
-    ActuateRequest, Detail, HandsError, ObserveRequest, actuate, allows, attach, ensure_dpi, logs,
-    native_host, observe, serialize_envelope,
+    ActuateRequest, Detail, GroundRequest, HandsError, ObserveRequest, PickRequest, actuate,
+    allows, attach, ensure_dpi, logs, native_host, observe, pick, serialize_envelope,
+    serialize_pick,
 };
 
 #[derive(Parser)]
@@ -126,6 +127,38 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
+    /// On-demand local Gemma pick (text list). No desk lease. 8081 down is a tool error.
+    Pick {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        elements_json: Option<String>,
+        #[arg(long)]
+        observe_path: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// On-demand local Gemma ground (crop if multimodal, else text). No desk lease.
+    Ground {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        observe_path: Option<String>,
+        #[arg(long)]
+        screenshot: Option<String>,
+        #[arg(long)]
+        element_id: Option<String>,
+        #[arg(long)]
+        x: Option<i32>,
+        #[arg(long)]
+        y: Option<i32>,
+        #[arg(long)]
+        w: Option<i32>,
+        #[arg(long)]
+        h: Option<i32>,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
     /// Tail or list session JSONL audit logs (does not install the desk lease; does not mint)
     Logs {
         #[arg(long, required_unless_present = "list")]
@@ -226,6 +259,43 @@ async fn main() {
             }
             attach_main(plan, session_id)
         }
+        Command::Pick {
+            query,
+            elements_json,
+            observe_path,
+            session_id,
+        } => {
+            if let Err(err) = dpi {
+                fail(err);
+            }
+            pick_main(query, elements_json, observe_path, session_id)
+        }
+        Command::Ground {
+            query,
+            observe_path,
+            screenshot,
+            element_id,
+            x,
+            y,
+            w,
+            h,
+            session_id,
+        } => {
+            if let Err(err) = dpi {
+                fail(err);
+            }
+            ground_main(GroundRequest {
+                session_id,
+                query,
+                observe_path,
+                screenshot,
+                element_id,
+                x,
+                y,
+                w,
+                h,
+            })
+        }
         Command::Logs {
             session_id,
             list,
@@ -286,6 +356,37 @@ fn confirm_main(
         list,
     )?;
     let json = allows::serialize_confirm(&envelope)?;
+    println!("{json}");
+    if !envelope.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn pick_main(
+    query: String,
+    elements_json: Option<String>,
+    observe_path: Option<String>,
+    session_id: Option<String>,
+) -> Result<(), HandsError> {
+    let envelope = pick::run_pick(PickRequest {
+        session_id,
+        query,
+        elements: None,
+        observe_path,
+        elements_json,
+    })?;
+    let json = serialize_pick(&envelope)?;
+    println!("{json}");
+    if !envelope.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn ground_main(req: GroundRequest) -> Result<(), HandsError> {
+    let envelope = pick::run_ground(req)?;
+    let json = serialize_pick(&envelope)?;
     println!("{json}");
     if !envelope.ok {
         std::process::exit(1);
@@ -407,6 +508,8 @@ fn input_main(command: Command) -> Result<(), HandsError> {
         | Command::Observe { .. }
         | Command::Confirm { .. }
         | Command::Attach { .. }
+        | Command::Pick { .. }
+        | Command::Ground { .. }
         | Command::Logs { .. }
         | Command::NativeHost { .. }
         | Command::NativeHostManifest { .. } => {

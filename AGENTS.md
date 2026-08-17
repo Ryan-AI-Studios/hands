@@ -16,7 +16,7 @@ Remote: https://github.com/Ryan-AI-Studios/hands
 | `C:\dev\Helping-Hands\` (except this folder) | Planning docs, ADRs |
 | `C:\dev\Helping-Hands\conductor\` | Track registry / specs / plans |
 
-**Never** commit `conductor/`, `docs/adr/`, `SHARED-UNDERSTANDING.md`, or planner handoff into this repo.
+**Never** commit `conductor/`, `docs/adr/`, `SHARED-UNDERSTANDING.md`, planner handoff, or `.agents/` into this repo.
 
 ## Tools (always product cwd)
 

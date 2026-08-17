@@ -5,6 +5,7 @@ use rmcp::{ServiceExt, schemars, tool, tool_router};
 
 use crate::actuate::{self, ActuateRequest};
 use crate::allows;
+use crate::attach;
 use crate::error::HandsError;
 use crate::extract::Detail;
 use crate::fence;
@@ -83,6 +84,14 @@ pub struct WaitSettleParams {
 pub struct StopParams {
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AttachParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub plan: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -219,6 +228,16 @@ impl HandsServer {
     }
 
     #[tool(
+        description = "Attach to daily Chrome if open; else launch chrome.exe with no automation flags and about:blank. Does not sideload. Does not kill Chrome."
+    )]
+    fn attach(
+        &self,
+        Parameters(params): Parameters<AttachParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_attach(params))
+    }
+
+    #[tool(
         description = "Grant, revoke, or list confirm-fence allows (once / session / persist). After a refuse, call confirm then retry."
     )]
     fn confirm(
@@ -260,6 +279,15 @@ fn run_observe(params: ObserveParams) -> CallToolResult {
 fn run_actuate(result: Result<crate::actuate::ActuateEnvelope, HandsError>) -> CallToolResult {
     match result.and_then(|env| actuate::serialize_envelope(&env).map(|j| (env.ok, j))) {
         Ok((_ok, json)) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
+fn run_attach(params: AttachParams) -> CallToolResult {
+    match attach::run_attach(params.session_id.as_deref(), params.plan.unwrap_or(false))
+        .and_then(|env| attach::serialize_attach(&env))
+    {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
     }
 }

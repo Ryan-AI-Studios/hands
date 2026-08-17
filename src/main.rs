@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use hands::{
-    ActuateRequest, Detail, HandsError, ObserveRequest, actuate, allows, ensure_dpi, logs,
+    ActuateRequest, Detail, HandsError, ObserveRequest, actuate, allows, attach, ensure_dpi, logs,
     native_host, observe, serialize_envelope,
 };
 
@@ -118,6 +118,14 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
+    /// Attach to daily Chrome if open; else launch chrome.exe with no automation flags (no desk lease)
+    Attach {
+        /// Report what would happen; never spawn
+        #[arg(long)]
+        plan: bool,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
     /// Tail or list session JSONL audit logs (does not install the desk lease; does not mint)
     Logs {
         #[arg(long, required_unless_present = "list")]
@@ -212,6 +220,12 @@ async fn main() {
             }
             confirm_main(domain, category, mode, revoke, list, session_id)
         }
+        Command::Attach { plan, session_id } => {
+            if let Err(err) = dpi {
+                fail(err);
+            }
+            attach_main(plan, session_id)
+        }
         Command::Logs {
             session_id,
             list,
@@ -272,6 +286,16 @@ fn confirm_main(
         list,
     )?;
     let json = allows::serialize_confirm(&envelope)?;
+    println!("{json}");
+    if !envelope.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn attach_main(plan: bool, session_id: Option<String>) -> Result<(), HandsError> {
+    let envelope = attach::run_attach(session_id.as_deref(), plan)?;
+    let json = attach::serialize_attach(&envelope)?;
     println!("{json}");
     if !envelope.ok {
         std::process::exit(1);
@@ -382,6 +406,7 @@ fn input_main(command: Command) -> Result<(), HandsError> {
         Command::Mcp
         | Command::Observe { .. }
         | Command::Confirm { .. }
+        | Command::Attach { .. }
         | Command::Logs { .. }
         | Command::NativeHost { .. }
         | Command::NativeHostManifest { .. } => {

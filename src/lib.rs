@@ -5,6 +5,7 @@ compile_error!("hands is Windows-first");
 
 pub mod actuate;
 pub mod allows;
+pub mod attach;
 pub mod bezier;
 pub mod capture;
 pub mod chrome;

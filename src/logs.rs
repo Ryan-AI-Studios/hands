@@ -711,6 +711,11 @@ pub(crate) fn reset_last_session_for_test() {
 }
 
 #[cfg(test)]
+pub(crate) fn with_test_env<T>(f: impl FnOnce() -> T) -> T {
+    tests::with_test_env(f)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::allows::{self, AllowMode};

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::capture::{capture_virtual_screen, display_path};
+use crate::challenge::{self, ChallengeInfo};
 use crate::chrome;
 use crate::error::HandsError;
 use crate::extract::{Detail, Element, Extract, extract_from_nodes, extract_fused, filter_nodes};
@@ -29,6 +30,7 @@ pub struct ObserveEnvelope {
     pub elements_total: usize,
     pub elements_truncated: bool,
     pub chrome_connected: bool,
+    pub challenge: ChallengeInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +45,8 @@ pub struct ObserveSidecar {
     pub elements_total: usize,
     pub elements_truncated: bool,
     pub chrome_connected: bool,
+    #[serde(default)]
+    pub challenge: ChallengeInfo,
 }
 
 pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
@@ -59,6 +63,13 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let (extract, elements, elements_total, chrome_connected) =
         fuse_maps(req.detail, &snap.title, &snap.nodes, chrome);
     crate::fence::note_last_url(extract.url.as_deref());
+    let hit = challenge::detect_from_extract(
+        &extract.title,
+        extract.url.as_deref(),
+        &extract.main_text,
+        &elements,
+    );
+    let challenge = challenge::apply_observe(&session_id, hit);
 
     let full = ObserveEnvelope {
         session_id,
@@ -70,6 +81,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         elements_total,
         elements_truncated: false,
         chrome_connected,
+        challenge,
     };
     write_sidecar(&paths.observe_path, &full)?;
     let envelope = finalize_envelope(full)?;
@@ -96,6 +108,7 @@ fn write_sidecar(path: &std::path::Path, envelope: &ObserveEnvelope) -> Result<(
         elements_total: envelope.elements_total,
         elements_truncated: false,
         chrome_connected: envelope.chrome_connected,
+        challenge: envelope.challenge.clone(),
     };
     let json = serde_json::to_string_pretty(&sidecar)
         .map_err(|err| HandsError::Observe(format!("sidecar serialize: {err}")))?;
@@ -203,7 +216,47 @@ mod tests {
             elements_total: n,
             elements_truncated: false,
             chrome_connected: false,
+            challenge: ChallengeInfo::default(),
         }
+    }
+
+    #[test]
+    fn challenge_survives_16kib_shrink() {
+        let mut raw = fat_envelope(400);
+        raw.challenge = ChallengeInfo {
+            present: true,
+            kind: Some("recaptcha".into()),
+            attempts: 2,
+            yielded: true,
+            reason: Some("i'm not a robot".into()),
+        };
+        let capped = cap_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(json.len() <= ENVELOPE_MAX_BYTES);
+        assert!(capped.challenge.present);
+        assert!(capped.challenge.yielded);
+        assert_eq!(capped.challenge.kind.as_deref(), Some("recaptcha"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["challenge"]["present"], true);
+        assert_eq!(parsed["challenge"]["yielded"], true);
+    }
+
+    #[test]
+    fn sidecar_missing_challenge_deserializes() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [],
+            "elements_total": 0,
+            "elements_truncated": false,
+            "chrome_connected": false
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        assert_eq!(side.challenge, ChallengeInfo::default());
     }
 
     #[test]

@@ -6,6 +6,7 @@ use rmcp::{ServiceExt, schemars, tool, tool_router};
 use crate::actuate::{self, ActuateRequest};
 use crate::allows;
 use crate::attach;
+use crate::challenge::{self, ChallengeRequest};
 use crate::error::HandsError;
 use crate::extract::Detail;
 use crate::fence;
@@ -141,6 +142,18 @@ pub struct GroundParams {
     pub w: Option<i32>,
     #[serde(default)]
     pub h: Option<i32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ChallengeParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<bool>,
+    #[serde(default)]
+    pub watch: Option<bool>,
+    #[serde(default)]
+    pub observe_path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -309,6 +322,16 @@ impl HandsServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(run_ground_tool(params))
     }
+
+    #[tool(
+        description = "Detect/status/watch a visible challenge UI. Two observe-cycles that used actuation then yield. Resume when the UI is gone. Not a solver. Idle is not resume."
+    )]
+    fn challenge(
+        &self,
+        Parameters(params): Parameters<ChallengeParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_challenge_tool(params))
+    }
 }
 
 fn click_req(params: ClickParams) -> ActuateRequest {
@@ -389,6 +412,20 @@ fn run_ground_tool(params: GroundParams) -> CallToolResult {
         h: params.h,
     })
     .and_then(|env| pick::serialize_pick(&env))
+    {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
+fn run_challenge_tool(params: ChallengeParams) -> CallToolResult {
+    match challenge::run_challenge(ChallengeRequest {
+        session_id: params.session_id,
+        status: params.status.unwrap_or(false),
+        watch: params.watch.unwrap_or(false),
+        observe_path: params.observe_path,
+    })
+    .and_then(|env| challenge::serialize_challenge(&env))
     {
         Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),

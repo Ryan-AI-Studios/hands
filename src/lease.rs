@@ -79,6 +79,9 @@ impl LeaseMachine {
     }
 
     pub fn rearm_if_idle(&mut self, now: Instant) {
+        if challenge_hold() {
+            return;
+        }
         if self.frozen
             && let Some(since) = self.since
             && now.duration_since(since) >= IDLE_REARM
@@ -131,6 +134,9 @@ impl Default for LeaseMachine {
 type FreezeListener = Arc<dyn Fn(FreezeCause) + Send + Sync>;
 
 static FROZEN: AtomicBool = AtomicBool::new(false);
+static CHALLENGE_HOLD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_NOW_OFFSET_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_FREEZE_MS: AtomicU64 = AtomicU64::new(0);
 /// Non-zero means a notify is pending. Pause/Stop values are never overwritten
 /// by Physical. `take_pending_cause` swaps this back to `CAUSE_NONE`.
@@ -139,14 +145,28 @@ static CLOCK0: OnceLock<Instant> = OnceLock::new();
 static LISTENERS: Mutex<Vec<FreezeListener>> = Mutex::new(Vec::new());
 
 fn now_ms() -> u64 {
-    CLOCK0
+    let elapsed = CLOCK0
         .get_or_init(Instant::now)
         .elapsed()
         .as_millis()
-        .min(u128::from(u64::MAX)) as u64
+        .min(u128::from(u64::MAX)) as u64;
+    #[cfg(test)]
+    let elapsed = elapsed.saturating_add(TEST_NOW_OFFSET_MS.load(Ordering::SeqCst));
+    elapsed
+}
+
+pub fn set_challenge_hold(on: bool) {
+    CHALLENGE_HOLD.store(on, Ordering::SeqCst);
+}
+
+pub fn challenge_hold() -> bool {
+    CHALLENGE_HOLD.load(Ordering::SeqCst)
 }
 
 fn rearm_if_idle() {
+    if CHALLENGE_HOLD.load(Ordering::SeqCst) {
+        return;
+    }
     if !FROZEN.load(Ordering::SeqCst) {
         return;
     }
@@ -377,7 +397,14 @@ pub(crate) fn reset_for_test() {
     FROZEN.store(false, Ordering::SeqCst);
     LAST_FREEZE_MS.store(0, Ordering::SeqCst);
     LAST_CAUSE.store(CAUSE_NONE, Ordering::SeqCst);
+    CHALLENGE_HOLD.store(false, Ordering::SeqCst);
+    TEST_NOW_OFFSET_MS.store(0, Ordering::SeqCst);
     LISTENERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+#[cfg(test)]
+pub(crate) fn force_idle_elapsed_for_test() {
+    TEST_NOW_OFFSET_MS.store(IDLE_REARM.as_millis() as u64 + 1, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -546,5 +573,56 @@ mod tests {
         note_key(u32::from(VK_PAUSE.0), true);
         assert_eq!(take_pending_cause(), Some(FreezeCause::Pause));
         assert_eq!(take_pending_cause(), None);
+    }
+
+    #[test]
+    fn physical_plus_hold_does_not_rearm_after_3s() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let mut m = LeaseMachine::new();
+        let t0 = Instant::now();
+        set_challenge_hold(true);
+        m.on_mouse(false, t0);
+        assert!(m.is_frozen(t0 + Duration::from_secs(3)));
+        set_challenge_hold(false);
+        assert!(!m.is_frozen(t0 + Duration::from_secs(3)));
+        reset_for_test();
+    }
+
+    #[test]
+    fn hold_off_restores_2s_rearm() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let mut m = LeaseMachine::new();
+        let t0 = Instant::now();
+        m.on_mouse(false, t0);
+        assert!(m.is_frozen(t0 + Duration::from_millis(1999)));
+        assert!(!m.is_frozen(t0 + Duration::from_millis(2000)));
+    }
+
+    #[test]
+    fn pause_mid_hold_is_still_pause() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let mut m = LeaseMachine::new();
+        let t0 = Instant::now();
+        set_challenge_hold(true);
+        m.on_mouse(false, t0);
+        m.on_key(u32::from(VK_PAUSE.0), true, t0);
+        assert_eq!(m.last_cause(), Some(FreezeCause::Pause));
+        assert!(m.is_frozen(t0 + Duration::from_secs(3)));
+        reset_for_test();
+    }
+
+    #[test]
+    fn atomics_hold_suppresses_idle_rearm() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        set_challenge_hold(true);
+        note_mouse(false);
+        force_idle_elapsed_for_test();
+        assert!(is_frozen());
+        set_challenge_hold(false);
+        assert!(!is_frozen());
     }
 }

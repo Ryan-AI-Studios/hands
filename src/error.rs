@@ -28,6 +28,8 @@ pub enum HandsError {
     Chrome(String),
     #[error("{0}")]
     Gemma(String),
+    #[error("{0}")]
+    Challenge(String),
 }
 
 impl HandsError {

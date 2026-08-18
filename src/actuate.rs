@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 use crate::bezier::Rng;
+use crate::challenge::{self, ChallengeInfo, YIELD_ERROR};
 use crate::error::HandsError;
 use crate::fence::{self, FenceInfo};
 use crate::foreground;
@@ -39,6 +40,8 @@ pub struct ActuateEnvelope {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fence: Option<FenceInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge: Option<ChallengeInfo>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,7 +108,34 @@ fn base(
         foregrounded,
         error,
         fence: None,
+        challenge: None,
     })
+}
+
+fn refuse_yield(session_id: String, target: ActuateTarget) -> Result<ActuateEnvelope, HandsError> {
+    finalize_envelope(ActuateEnvelope {
+        session_id,
+        ok: false,
+        frozen: lease::is_frozen(),
+        target,
+        retried: false,
+        settled: false,
+        foregrounded: false,
+        error: Some(YIELD_ERROR.into()),
+        fence: None,
+        challenge: Some(challenge::snapshot()),
+    })
+}
+
+fn refuse_if_yielded(
+    session_id: &str,
+    target: ActuateTarget,
+) -> Result<Option<ActuateEnvelope>, HandsError> {
+    if challenge::yielded() {
+        Ok(Some(refuse_yield(session_id.to_string(), target)?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn refuse_fence(
@@ -123,6 +153,7 @@ fn refuse_fence(
         foregrounded: false,
         error: None,
         fence: Some(fence),
+        challenge: None,
     })
 }
 
@@ -245,12 +276,16 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
     let info = resolved_info(resolved.kind, resolved.id.clone(), resolved.x, resolved.y);
+    if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
+        return Ok(env);
+    }
     fence::ensure_installed();
     match fence::gate_click(&session_id, &resolved) {
         Ok(None) => {}
         Ok(Some(info_fence)) => return refuse_fence(session_id, info, info_fence),
         Err(err) => return fail(session_id, info, err, false, false, false),
     }
+    challenge::note_actuation_if_proceeding(false);
     remember_target(resolved.rect);
     let mut rng = Rng::from_time();
     let roi = settle::default_roi(space, Some(resolved.rect), (resolved.x, resolved.y));
@@ -334,6 +369,9 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     };
     remember_target(resolved.rect);
     let info = resolved_info(resolved.kind, resolved.id.clone(), resolved.x, resolved.y);
+    if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
+        return Ok(env);
+    }
     let mut rng = Rng::from_time();
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
@@ -366,6 +404,9 @@ fn type_text_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
     };
     let info = none_target();
+    if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
+        return Ok(env);
+    }
     let Some(text) = req.text.as_deref() else {
         return fail(
             session_id,
@@ -389,6 +430,7 @@ fn type_text_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Err(err) = ensure_dpi() {
         return fail(session_id, info, err, false, false, false);
     }
+    challenge::note_actuation();
     match input::type_text(text) {
         Ok(_) => base(session_id, info, true, false, false, false, false, None),
         Err(err) => fail(session_id, info, err, false, false, false),
@@ -416,6 +458,9 @@ fn key_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             false,
         );
     };
+    if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
+        return Ok(env);
+    }
     if input::is_enter_key(name) {
         fence::ensure_installed();
         match fence::gate_enter(&session_id) {
@@ -427,6 +472,7 @@ fn key_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Err(err) = ensure_dpi() {
         return fail(session_id, info, err, false, false, false);
     }
+    challenge::note_actuation();
     match input::named_key(name) {
         Ok(()) => base(session_id, info, true, false, false, false, false, None),
         Err(err) => fail(session_id, info, err, false, false, false),
@@ -456,6 +502,9 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         req.element_id.is_some() || req.grid.is_some() || req.x.is_some() || req.y.is_some();
     let mut foregrounded = false;
     let mut info = none_target();
+    if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
+        return Ok(env);
+    }
     if has_target {
         match hover_inner(ActuateRequest {
             session_id: Some(session_id.clone()),
@@ -475,6 +524,7 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             Err(err) => return fail(session_id, info, err, false, false, false),
         }
     }
+    challenge::note_actuation();
     match input::scroll_wheel(dy, req.dx) {
         Ok(()) => base(
             session_id,
@@ -609,6 +659,7 @@ mod tests {
             foregrounded: false,
             error: None,
             fence: None,
+            challenge: None,
         };
         let err = finalize_envelope(env).expect_err("must not emit oversize");
         assert!(err.to_string().contains("16384"), "{err}");
@@ -616,6 +667,10 @@ mod tests {
 
     #[test]
     fn type_trailing_newline_is_tool_error() {
+        let _g = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::challenge::reset_for_test();
         let env = type_text(ActuateRequest {
             session_id: Some("t-newline".into()),
             text: Some("hello\n".into()),
@@ -631,6 +686,10 @@ mod tests {
 
     #[test]
     fn type_cr_is_tool_error() {
+        let _g = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::challenge::reset_for_test();
         let env = type_text(ActuateRequest {
             session_id: Some("t-cr".into()),
             text: Some("hello\r".into()),
@@ -639,5 +698,62 @@ mod tests {
         .unwrap();
         assert!(!env.ok);
         assert!(env.error.unwrap_or_default().contains("newline"));
+    }
+
+    fn yield_machine() {
+        let hit = crate::challenge::DetectHit {
+            present: true,
+            kind: Some(crate::challenge::ChallengeKind::Recaptcha),
+            reason: Some("i'm not a robot".into()),
+        };
+        crate::challenge::apply_observe("s-act", hit.clone());
+        crate::challenge::note_actuation();
+        crate::challenge::apply_observe("s-act", hit.clone());
+        crate::challenge::note_actuation();
+        crate::challenge::apply_observe("s-act", hit);
+        assert!(crate::challenge::yielded());
+    }
+
+    #[test]
+    fn yielded_click_refuses_without_sendinput() {
+        let _g = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::challenge::reset_for_test();
+        yield_machine();
+        let env = refuse_if_yielded(
+            "s-act",
+            ActuateTarget {
+                kind: "pixel".into(),
+                id: None,
+                x: 1,
+                y: 1,
+            },
+        )
+        .unwrap()
+        .expect("yield refuse");
+        assert!(!env.ok);
+        assert_eq!(env.error.as_deref(), Some(YIELD_ERROR));
+        assert!(env.challenge.as_ref().is_some_and(|c| c.yielded));
+        crate::challenge::reset_for_test();
+    }
+
+    #[test]
+    fn fence_refused_click_leaves_actuation_flag_clear() {
+        let _g = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::challenge::reset_for_test();
+        let hit = crate::challenge::DetectHit {
+            present: true,
+            kind: Some(crate::challenge::ChallengeKind::Recaptcha),
+            reason: Some("i'm not a robot".into()),
+        };
+        crate::challenge::apply_observe("s-act", hit.clone());
+        crate::challenge::note_actuation_if_proceeding(true);
+        crate::challenge::apply_observe("s-act", hit);
+        assert_eq!(crate::challenge::snapshot().attempts, 0);
+        assert!(!crate::challenge::snapshot().yielded);
+        crate::challenge::reset_for_test();
     }
 }

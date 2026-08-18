@@ -1323,6 +1323,7 @@ mod tests {
             elements_total: n,
             elements_truncated: false,
             chrome_connected: false,
+            challenge: crate::challenge::ChallengeInfo::default(),
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
         path

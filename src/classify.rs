@@ -237,7 +237,7 @@ fn name_is_phrase(name: &str, phrase: &str) -> bool {
     name == phrase.to_ascii_lowercase()
 }
 
-fn contains_phrase(haystack: &str, phrase: &str) -> bool {
+pub(crate) fn contains_phrase(haystack: &str, phrase: &str) -> bool {
     let hay: Vec<char> = haystack.to_lowercase().chars().collect();
     let needle: Vec<char> = phrase.to_lowercase().chars().collect();
     if needle.is_empty() || hay.len() < needle.len() {

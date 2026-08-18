@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use hands::{
     ActuateRequest, Detail, GroundRequest, HandsError, ObserveRequest, PickRequest, actuate,
-    allows, attach, ensure_dpi, logs, native_host, observe, pick, serialize_envelope,
+    allows, attach, challenge, ensure_dpi, logs, native_host, observe, pick, serialize_envelope,
     serialize_pick,
 };
 
@@ -159,6 +159,17 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
+    /// Detect / status / watch a visible challenge UI (no desk lease; not a solver)
+    Challenge {
+        #[arg(long)]
+        status: bool,
+        #[arg(long)]
+        watch: bool,
+        #[arg(long)]
+        observe_path: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
     /// Tail or list session JSONL audit logs (does not install the desk lease; does not mint)
     Logs {
         #[arg(long, required_unless_present = "list")]
@@ -296,6 +307,17 @@ async fn main() {
                 h,
             })
         }
+        Command::Challenge {
+            status,
+            watch,
+            observe_path,
+            session_id,
+        } => {
+            if let Err(err) = dpi {
+                fail(err);
+            }
+            challenge_main(status, watch, observe_path, session_id)
+        }
         Command::Logs {
             session_id,
             list,
@@ -397,6 +419,26 @@ fn ground_main(req: GroundRequest) -> Result<(), HandsError> {
 fn attach_main(plan: bool, session_id: Option<String>) -> Result<(), HandsError> {
     let envelope = attach::run_attach(session_id.as_deref(), plan)?;
     let json = attach::serialize_attach(&envelope)?;
+    println!("{json}");
+    if !envelope.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn challenge_main(
+    status: bool,
+    watch: bool,
+    observe_path: Option<String>,
+    session_id: Option<String>,
+) -> Result<(), HandsError> {
+    let envelope = challenge::run_challenge(challenge::ChallengeRequest {
+        session_id,
+        status,
+        watch,
+        observe_path,
+    })?;
+    let json = challenge::serialize_challenge(&envelope)?;
     println!("{json}");
     if !envelope.ok {
         std::process::exit(1);
@@ -510,6 +552,7 @@ fn input_main(command: Command) -> Result<(), HandsError> {
         | Command::Attach { .. }
         | Command::Pick { .. }
         | Command::Ground { .. }
+        | Command::Challenge { .. }
         | Command::Logs { .. }
         | Command::NativeHost { .. }
         | Command::NativeHostManifest { .. } => {

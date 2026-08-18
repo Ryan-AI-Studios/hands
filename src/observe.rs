@@ -63,6 +63,7 @@ pub struct FuseOpts {
     pub viewport: Option<Rect>,
     pub chrome_is_foreground: bool,
     pub virtual_screen: Option<Rect>,
+    pub popup_rect: Option<Rect>,
 }
 
 pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
@@ -78,7 +79,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let chrome_is_foreground = foreground::is_chrome();
     let snap = uia::collect(req.detail)?;
     let chrome = chrome::try_snapshot(req.detail);
-    let (extract, elements, elements_total, chrome_connected) = fuse_maps(
+    let (mut extract, mut elements, elements_total, chrome_connected) = fuse_maps(
         req.detail,
         &snap.title,
         &snap.nodes,
@@ -87,8 +88,10 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
             viewport,
             chrome_is_foreground,
             virtual_screen: Some(space.as_rect()),
+            popup_rect: snap.popup_rect,
         },
     );
+    crate::dialogs::promote(&mut extract, &mut elements);
     crate::fence::note_last_url(extract.url.as_deref());
     let hit = challenge::detect_from_extract(
         &extract.title,
@@ -158,8 +161,10 @@ pub fn cap_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
     envelope
 }
 
-/// Default path: 20-element cap, then pop from the end to 4 KiB, then shrink `main_text`.
-/// Never drops cards or `challenge`. 16 KiB hard fail stays in `finalize_envelope`.
+/// Default path: 20-element cap, then pop non-dialog elements from the end to
+/// 4 KiB, then shrink `main_text`. Never drops cards, `challenge`, or
+/// `extract.dialogs` first. Last resort: pop extra dialogs after `main_text`
+/// is empty. 16 KiB hard fail stays in `finalize_envelope`.
 pub fn cap_default_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
     if envelope.elements.len() > VIEWPORT_ENVELOPE_ELEMENT_CAP {
         envelope.elements.truncate(VIEWPORT_ENVELOPE_ELEMENT_CAP);
@@ -169,13 +174,42 @@ pub fn cap_default_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
         return envelope;
     }
     envelope.elements_truncated = true;
-    while !envelope.elements.is_empty() && serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
-        envelope.elements.pop();
-    }
+    pop_non_dialog_elements(&mut envelope);
     if serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
         shrink_main_text_to_fit(&mut envelope, DEFAULT_ENVELOPE_MAX_BYTES);
     }
+    if serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES
+        && envelope.extract.main_text.is_empty()
+    {
+        while envelope.extract.dialogs.len() > 1
+            && serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES
+        {
+            let Some(dropped) = envelope.extract.dialogs.pop() else {
+                break;
+            };
+            envelope.elements.retain(|el| el.id != dropped.id);
+        }
+    }
     envelope
+}
+
+fn pop_non_dialog_elements(envelope: &mut ObserveEnvelope) {
+    let dialog_ids: std::collections::HashSet<String> = envelope
+        .extract
+        .dialogs
+        .iter()
+        .map(|d| d.id.clone())
+        .collect();
+    while serialized_len(envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
+        let Some(idx) = envelope
+            .elements
+            .iter()
+            .rposition(|el| !dialog_ids.contains(&el.id))
+        else {
+            break;
+        };
+        envelope.elements.remove(idx);
+    }
 }
 
 fn shrink_main_text_to_fit(envelope: &mut ObserveEnvelope, max_bytes: usize) {
@@ -316,7 +350,11 @@ fn fuse_maps_default(
 
 fn in_viewport(rect: Rect, opts: &FuseOpts) -> bool {
     match (opts.viewport, opts.virtual_screen) {
-        (Some(viewport), Some(screen)) => rect.intersects(viewport) && rect.intersects(screen),
+        (Some(viewport), Some(screen)) => {
+            rect.intersects(screen)
+                && (rect.intersects(viewport)
+                    || opts.popup_rect.is_some_and(|popup| rect.intersects(popup)))
+        }
         _ => false,
     }
 }
@@ -352,7 +390,7 @@ fn filter_viewport_elements(elements: Vec<Element>, opts: &FuseOpts) -> Vec<Elem
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::{Card, ControlKind, Element, RawNode};
+    use crate::extract::{Card, ControlKind, DialogHit, Element, RawNode};
     use crate::space::Rect;
 
     fn covering_opts(chrome_is_foreground: bool) -> FuseOpts {
@@ -370,6 +408,7 @@ mod tests {
                 w: 1920,
                 h: 1080,
             }),
+            popup_rect: None,
         }
     }
 
@@ -388,6 +427,7 @@ mod tests {
                 w: 1920,
                 h: 1080,
             }),
+            popup_rect: None,
         }
     }
 
@@ -418,6 +458,7 @@ mod tests {
                 url: None,
                 main_text: "hello".into(),
                 cards: Vec::new(),
+                dialogs: Vec::new(),
             },
             elements: (0..n)
                 .map(|i| Element {
@@ -586,6 +627,7 @@ mod tests {
                     w: 1920,
                     h: 1080,
                 }),
+                popup_rect: None,
             },
         );
         assert!(connected);
@@ -866,6 +908,7 @@ mod tests {
                     w: 1920,
                     h: 1080,
                 }),
+                popup_rect: None,
             },
         );
         assert!(connected);
@@ -947,8 +990,265 @@ mod tests {
         let main = include_str!("main.rs");
         assert!(mcp.contains("viewport"), "mcp observe description");
         assert!(mcp.contains("detail=dom") || mcp.contains("detail=dom"));
+        assert!(mcp.contains("extract.dialogs") || mcp.contains("dialogs"));
         assert!(main.contains("viewport") || main.contains("foreground"));
         assert!(main.contains("dom"));
+        assert!(main.contains("dialogs") || main.contains("extract.dialogs"));
+    }
+
+    fn dialog_el(id: &str, text: &str, rect: Rect) -> Element {
+        Element {
+            id: id.into(),
+            role: "Button".into(),
+            text: Some(text.into()),
+            rect,
+        }
+    }
+
+    fn dialog_hit(id: &str, text: &str, kind: &str) -> DialogHit {
+        DialogHit {
+            id: id.into(),
+            role: "Button".into(),
+            text: text.into(),
+            rect: Rect {
+                x: 200,
+                y: 200,
+                w: 80,
+                h: 24,
+            },
+            kind: kind.into(),
+        }
+    }
+
+    #[test]
+    fn fixture_plus_continue_as_leads_envelope() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let mut nodes = viewport_buttons(8);
+        nodes.push(uia_node(
+            42,
+            "Continue as Ryan",
+            Rect {
+                x: 220,
+                y: 240,
+                w: 120,
+                h: 28,
+            },
+        ));
+        nodes.extend(desktop_noise());
+        let (mut extract, mut elements, elements_total, chrome_connected) = fuse_maps(
+            Detail::Default,
+            "UIA",
+            &nodes,
+            Some(map),
+            fixture_opts(true),
+        );
+        crate::dialogs::promote(&mut extract, &mut elements);
+        assert_eq!(extract.dialogs.len(), 1);
+        assert_eq!(extract.dialogs[0].kind, "account");
+        assert_eq!(extract.dialogs[0].id, "uia:1.42");
+        assert_eq!(elements[0].id, "uia:1.42");
+        let raw = ObserveEnvelope {
+            session_id: "sess".into(),
+            screenshot_path: "C:\\tmp\\observe.png".into(),
+            observe_path: "C:\\tmp\\observe.json".into(),
+            space: Space::new(0, 0, 1920, 1080).unwrap(),
+            viewport: fixture_opts(true).viewport,
+            extract,
+            elements,
+            elements_total,
+            elements_truncated: false,
+            chrome_connected,
+            challenge: ChallengeInfo::default(),
+        };
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert_eq!(capped.extract.dialogs[0].id, "uia:1.42");
+        assert_eq!(capped.elements[0].id, "uia:1.42");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["extract"]["dialogs"][0]["kind"], "account");
+    }
+
+    #[test]
+    fn chrome_cookie_chr_is_promoted() {
+        let cookie = dialog_el(
+            "chr:8",
+            "Accept cookies",
+            Rect {
+                x: 200,
+                y: 200,
+                w: 90,
+                h: 24,
+            },
+        );
+        let chrome = chrome::ChromeMap {
+            url: Some("https://cars.com/search".into()),
+            title: "Cars.com".into(),
+            main_text: "listings".into(),
+            elements: vec![
+                dialog_el(
+                    "chr:0",
+                    "Search",
+                    Rect {
+                        x: 110,
+                        y: 150,
+                        w: 80,
+                        h: 24,
+                    },
+                ),
+                cookie,
+            ],
+            cards: vec![],
+        };
+        let (mut extract, mut elements, _total, connected) = fuse_maps(
+            Detail::Default,
+            "UIA",
+            &[],
+            Some(chrome),
+            fixture_opts(true),
+        );
+        assert!(connected);
+        crate::dialogs::promote(&mut extract, &mut elements);
+        assert_eq!(extract.dialogs.len(), 1);
+        assert_eq!(extract.dialogs[0].kind, "cookie");
+        assert_eq!(extract.dialogs[0].id, "chr:8");
+        assert_eq!(elements[0].id, "chr:8");
+    }
+
+    #[test]
+    fn dialogs_cards_and_challenge_survive_4kib_shrink() {
+        let mut raw = fat_envelope(400);
+        raw.extract.main_text = "M".repeat(3000);
+        raw.extract.cards = (0..8)
+            .map(|i| Card {
+                title: format!("2024 Toyota Camry {i}"),
+                price: "$19,999".into(),
+                href: format!("https://cars.com/vehicledetail/{i}"),
+                rect: Rect {
+                    x: 110,
+                    y: 230,
+                    w: 300,
+                    h: 80,
+                },
+            })
+            .collect();
+        raw.extract.dialogs = vec![
+            dialog_hit("uia:d.0", "Continue as Ryan", "account"),
+            dialog_hit("chr:8", "Accept cookies", "cookie"),
+            dialog_hit("uia:d.2", "Manage cookies", "cookie"),
+            dialog_hit("uia:d.3", "Not now", "dialog"),
+        ];
+        raw.elements.splice(
+            0..0,
+            raw.extract.dialogs.iter().map(|d| Element {
+                id: d.id.clone(),
+                role: d.role.clone(),
+                text: Some(d.text.clone()),
+                rect: d.rect,
+            }),
+        );
+        raw.challenge = ChallengeInfo {
+            present: true,
+            kind: Some("recaptcha".into()),
+            attempts: 2,
+            yielded: true,
+            reason: Some("i'm not a robot".into()),
+        };
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        assert_eq!(capped.extract.dialogs.len(), 4);
+        assert_eq!(capped.extract.cards.len(), 8);
+        assert!(capped.challenge.present);
+        assert!(capped.elements.iter().any(|e| e.id == "uia:d.0"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["extract"]["dialogs"].as_array().unwrap().len(), 4);
+        assert_eq!(parsed["extract"]["cards"].as_array().unwrap().len(), 8);
+        assert_eq!(parsed["challenge"]["present"], true);
+    }
+
+    #[test]
+    fn empty_dialogs_omitted_from_json() {
+        let raw = fat_envelope(2);
+        assert!(raw.extract.dialogs.is_empty());
+        let json = serialize_envelope(&raw).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["extract"].get("dialogs").is_none());
+    }
+
+    #[test]
+    fn sidecar_missing_dialogs_deserializes() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [],
+            "elements_total": 0,
+            "elements_truncated": false,
+            "chrome_connected": false
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        assert!(side.extract.dialogs.is_empty());
+        assert_eq!(side.viewport, None);
+    }
+
+    #[test]
+    fn popup_rect_membership_union() {
+        let popup = Rect {
+            x: 1400,
+            y: 80,
+            w: 220,
+            h: 180,
+        };
+        let nodes = vec![uia_node(
+            77,
+            "Continue as Ryan",
+            Rect {
+                x: 1410,
+                y: 100,
+                w: 160,
+                h: 28,
+            },
+        )];
+        let mut opts = fixture_opts(false);
+        opts.popup_rect = Some(popup);
+        let (mut extract, mut elements, total, _connected) =
+            fuse_maps(Detail::Default, "Chrome", &nodes, None, opts);
+        assert_eq!(total, 1);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].id, "uia:1.77");
+        crate::dialogs::promote(&mut extract, &mut elements);
+        assert_eq!(extract.dialogs[0].id, "uia:1.77");
+        assert_eq!(elements[0].id, "uia:1.77");
+    }
+
+    #[test]
+    fn all_frames_still_false_and_no_dwm() {
+        let manifest = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/extension/manifest.json"
+        ));
+        assert!(
+            manifest.contains("\"all_frames\": false"),
+            "all_frames must stay false"
+        );
+        assert_eq!(crate::extract::DEFAULT_ELEMENT_CAP, 250);
+        assert_eq!(VIEWPORT_ENVELOPE_ELEMENT_CAP, 20);
+        assert!(include_str!("pick.rs").contains("fn cap_elements"));
     }
 
     #[test]

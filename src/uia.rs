@@ -3,7 +3,7 @@
 //! COM is initialized STA (`COINIT_APARTMENTTHREADED`) on a dedicated OS thread
 //! because tokio's multi-thread runtime is the wrong apartment for IUIAutomation.
 
-use windows::Win32::Foundation::{POINT, RECT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoUninitialize, SAFEARRAY,
@@ -15,7 +15,9 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
     IUIAutomationValuePattern, UIA_ValuePatternId,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GW_ENABLEDPOPUP, GetForegroundWindow, GetWindow, GetWindowRect,
+};
 
 use crate::error::HandsError;
 use crate::extract::{ControlKind, Detail, MAIN_TEXT_MAX_CHARS, RawNode};
@@ -24,6 +26,7 @@ use crate::space::Rect;
 pub struct UiaSnapshot {
     pub title: String,
     pub nodes: Vec<RawNode>,
+    pub popup_rect: Option<Rect>,
 }
 
 #[derive(Debug, Clone)]
@@ -255,25 +258,80 @@ fn sta_collect(detail: Detail, cap: usize) -> Result<UiaSnapshot, HandsError> {
     let title = foreground_title(&automation);
     let walker = unsafe { automation.ControlViewWalker() }
         .map_err(|err| HandsError::Uia(format!("ControlViewWalker: {err}")))?;
-    let nodes = match detail {
+    let (nodes, popup_rect) = match detail {
         Detail::Dom => {
             let root = unsafe { automation.GetRootElement() }
                 .map_err(|err| HandsError::Uia(format!("GetRootElement: {err}")))?;
-            walk_control_view(&walker, &root, detail, cap)?
+            (walk_control_view(&walker, &root, detail, cap)?, None)
         }
-        Detail::Default => {
-            let hwnd = unsafe { GetForegroundWindow() };
-            if hwnd.is_invalid() {
-                Vec::new()
-            } else {
-                match unsafe { automation.ElementFromHandle(hwnd) } {
-                    Ok(root) => walk_control_view(&walker, &root, detail, cap)?,
-                    Err(_) => Vec::new(),
-                }
-            }
-        }
+        Detail::Default => collect_default(&automation, &walker, cap)?,
     };
-    Ok(UiaSnapshot { title, nodes })
+    Ok(UiaSnapshot {
+        title,
+        nodes,
+        popup_rect,
+    })
+}
+
+/// Default walk: `ElementFromHandle(fg)` plus fail-closed owned popup.
+/// Reuses the FG HWND already obtained — no second `GetForegroundWindow`.
+fn collect_default(
+    automation: &IUIAutomation,
+    walker: &IUIAutomationTreeWalker,
+    cap: usize,
+) -> Result<(Vec<RawNode>, Option<Rect>), HandsError> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return Ok((Vec::new(), None));
+    }
+    let mut nodes = match unsafe { automation.ElementFromHandle(hwnd) } {
+        Ok(root) => walk_control_view(walker, &root, Detail::Default, cap)?,
+        Err(_) => Vec::new(),
+    };
+    let popup_rect = prepend_owned_popup(automation, walker, hwnd, cap, &mut nodes);
+    Ok((nodes, popup_rect))
+}
+
+/// `GW_ENABLEDPOPUP` on the FG HWND already in hand. If the popup HWND equals
+/// `fg` (Microsoft: none) or the handle fails, skip — never `GetRootElement`.
+fn prepend_owned_popup(
+    automation: &IUIAutomation,
+    walker: &IUIAutomationTreeWalker,
+    fg: HWND,
+    cap: usize,
+    nodes: &mut Vec<RawNode>,
+) -> Option<Rect> {
+    let popup = unsafe { GetWindow(fg, GW_ENABLEDPOPUP) }.ok()?;
+    if popup.is_invalid() || popup == fg {
+        return None;
+    }
+    let extra = match unsafe { automation.ElementFromHandle(popup) } {
+        Ok(root) => walk_control_view(walker, &root, Detail::Default, cap).ok()?,
+        Err(_) => return None,
+    };
+    let rect = hwnd_outer_rect(popup)?;
+    let mut combined = extra;
+    combined.append(nodes);
+    *nodes = combined;
+    Some(rect)
+}
+
+fn hwnd_outer_rect(hwnd: HWND) -> Option<Rect> {
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &raw mut rect) }.is_err() {
+        return None;
+    }
+    let w = rect.right.saturating_sub(rect.left);
+    let h = rect.bottom.saturating_sub(rect.top);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some(Rect {
+        x: rect.left,
+        y: rect.top,
+        w,
+        h,
+    })
 }
 
 fn create_automation() -> Result<IUIAutomation, HandsError> {

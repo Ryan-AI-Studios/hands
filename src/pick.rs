@@ -1319,6 +1319,7 @@ mod tests {
                         h: 2,
                     },
                 }],
+                dialogs: Vec::new(),
             },
             elements,
             elements_total: n,

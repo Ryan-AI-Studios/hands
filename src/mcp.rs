@@ -7,6 +7,7 @@ use crate::actuate::{self, ActuateRequest};
 use crate::allows;
 use crate::attach;
 use crate::challenge::{self, ChallengeRequest};
+use crate::dotask::{self, DoTaskRequest};
 use crate::error::HandsError;
 use crate::extract::Detail;
 use crate::fence;
@@ -154,6 +155,17 @@ pub struct ChallengeParams {
     pub watch: Option<bool>,
     #[serde(default)]
     pub observe_path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DoTaskParams {
+    pub goal: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub max_steps: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -332,6 +344,16 @@ impl HandsServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(run_challenge_tool(params))
     }
+
+    #[tool(
+        description = "Optional client of Hands primitives: loop the caller's model (xAI/Grok default) over observe/click/attach/pick/challenge-status. No auto-confirm. Stops on fence or challenge yield. Not a solver."
+    )]
+    fn do_task(
+        &self,
+        Parameters(params): Parameters<DoTaskParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_dotask_tool(params))
+    }
 }
 
 fn click_req(params: ClickParams) -> ActuateRequest {
@@ -412,6 +434,20 @@ fn run_ground_tool(params: GroundParams) -> CallToolResult {
         h: params.h,
     })
     .and_then(|env| pick::serialize_pick(&env))
+    {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
+fn run_dotask_tool(params: DoTaskParams) -> CallToolResult {
+    match dotask::run_dotask(DoTaskRequest {
+        goal: params.goal,
+        session_id: params.session_id,
+        model: params.model,
+        max_steps: params.max_steps,
+    })
+    .and_then(|env| dotask::serialize_dotask(&env))
     {
         Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),

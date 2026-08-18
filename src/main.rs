@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use hands::{
     ActuateRequest, Detail, GroundRequest, HandsError, ObserveRequest, PickRequest, actuate,
-    allows, attach, challenge, ensure_dpi, logs, native_host, observe, pick, serialize_envelope,
-    serialize_pick,
+    allows, attach, challenge, dotask, ensure_dpi, logs, native_host, observe, pick,
+    serialize_envelope, serialize_pick,
 };
 
 #[derive(Parser)]
@@ -156,6 +156,17 @@ enum Command {
         w: Option<i32>,
         #[arg(long)]
         h: Option<i32>,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Loop the caller's model over shipped primitives (installs the desk lease; no fence bypass)
+    DoTask {
+        #[arg(long)]
+        goal: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        max_steps: Option<u32>,
         #[arg(long)]
         session_id: Option<String>,
     },
@@ -546,6 +557,21 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             session_id,
             ..ActuateRequest::default()
         }))?,
+        Command::DoTask {
+            goal,
+            model,
+            max_steps,
+            session_id,
+        } => {
+            let envelope = dotask::run_dotask(dotask::DoTaskRequest {
+                goal,
+                session_id,
+                model,
+                max_steps,
+            })?;
+            let json = dotask::serialize_dotask(&envelope)?;
+            (json, envelope.ok)
+        }
         Command::Mcp
         | Command::Observe { .. }
         | Command::Confirm { .. }

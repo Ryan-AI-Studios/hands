@@ -30,6 +30,8 @@ pub enum HandsError {
     Gemma(String),
     #[error("{0}")]
     Challenge(String),
+    #[error("{0}")]
+    DoTask(String),
 }
 
 impl HandsError {

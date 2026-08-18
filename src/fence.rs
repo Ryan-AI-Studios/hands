@@ -2,7 +2,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::allows::{self, AllowHit};
 use crate::classify::{self, Evidence, Verdict};
@@ -15,7 +15,7 @@ static INSTALLED: OnceLock<()> = OnceLock::new();
 // Per-process only: CLI observe then a new CLI click process will not share this slot.
 static LAST_URL: Mutex<Option<String>> = Mutex::new(None);
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FenceInfo {
     pub domain: String,
     pub category: String,

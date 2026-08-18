@@ -11,6 +11,7 @@ pub mod capture;
 pub mod challenge;
 pub mod chrome;
 pub mod classify;
+pub mod dotask;
 pub mod error;
 pub mod extract;
 pub mod fence;

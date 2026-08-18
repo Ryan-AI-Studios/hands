@@ -6,6 +6,7 @@ pub const TITLE_MAX_CHARS: usize = 200;
 pub const MAIN_TEXT_MAX_CHARS: usize = 1500;
 pub const DEFAULT_ELEMENT_CAP: usize = 250;
 pub const DOM_ELEMENT_CAP: usize = 2000;
+pub const VIEWPORT_ENVELOPE_ELEMENT_CAP: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
@@ -362,6 +363,7 @@ mod tests {
 
     #[test]
     fn default_cap_250_and_dom_cap_2000() {
+        assert_eq!(VIEWPORT_ENVELOPE_ELEMENT_CAP, 20);
         let nodes: Vec<RawNode> = (0..300)
             .map(|i| {
                 let mut n = node(ControlKind::Button, "b");

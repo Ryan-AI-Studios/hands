@@ -30,6 +30,17 @@ impl Rect {
     pub fn center(self) -> (i32, i32) {
         (self.x + self.w / 2, self.y + self.h / 2)
     }
+
+    /// Inclusive-edge AABB. Touch-on-edge counts; zero-area does not.
+    pub fn intersects(self, other: Rect) -> bool {
+        if self.w <= 0 || self.h <= 0 || other.w <= 0 || other.h <= 0 {
+            return false;
+        }
+        self.x <= other.x.saturating_add(other.w)
+            && other.x <= self.x.saturating_add(self.w)
+            && self.y <= other.y.saturating_add(other.h)
+            && other.y <= self.y.saturating_add(self.h)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +93,15 @@ impl Space {
             y,
             w: right.saturating_sub(x).clamp(0, self.cell_px),
             h: bottom.saturating_sub(y).clamp(0, self.cell_px),
+        }
+    }
+
+    pub fn as_rect(self) -> Rect {
+        Rect {
+            x: self.origin_x,
+            y: self.origin_y,
+            w: self.width,
+            h: self.height,
         }
     }
 
@@ -350,5 +370,88 @@ mod tests {
         let space = Space::new(0, 0, 250, 180).unwrap();
         let huge = space.cell_rect(i32::MAX, i32::MIN);
         assert_eq!(huge.area(), 0);
+    }
+
+    #[test]
+    fn space_as_rect_matches_origin_and_size() {
+        let space = Space::new(-1920, 0, 3840, 1080).unwrap();
+        assert_eq!(
+            space.as_rect(),
+            Rect {
+                x: -1920,
+                y: 0,
+                w: 3840,
+                h: 1080
+            }
+        );
+    }
+
+    #[test]
+    fn rect_intersects_table() {
+        let a = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        };
+        let overlap = Rect {
+            x: 5,
+            y: 5,
+            w: 10,
+            h: 10,
+        };
+        let touch_right = Rect {
+            x: 10,
+            y: 0,
+            w: 10,
+            h: 10,
+        };
+        let touch_bottom = Rect {
+            x: 0,
+            y: 10,
+            w: 10,
+            h: 10,
+        };
+        let disjoint = Rect {
+            x: 11,
+            y: 0,
+            w: 10,
+            h: 10,
+        };
+        let disjoint_y = Rect {
+            x: 0,
+            y: 11,
+            w: 10,
+            h: 10,
+        };
+        let zero_w = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 10,
+        };
+        let zero_h = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 0,
+        };
+        let negative = Rect {
+            x: 0,
+            y: 0,
+            w: -1,
+            h: 10,
+        };
+        assert!(a.intersects(overlap));
+        assert!(overlap.intersects(a));
+        assert!(a.intersects(touch_right));
+        assert!(touch_right.intersects(a));
+        assert!(a.intersects(touch_bottom));
+        assert!(!a.intersects(disjoint));
+        assert!(!a.intersects(disjoint_y));
+        assert!(!a.intersects(zero_w));
+        assert!(!zero_w.intersects(a));
+        assert!(!a.intersects(zero_h));
+        assert!(!a.intersects(negative));
     }
 }

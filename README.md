@@ -371,7 +371,7 @@ cargo run -- native-host-manifest --help
 
 `hands mcp` serves stdio MCP (`observe`, `click`, `hover`, `type`, `key`, `scroll`, `wait_settle`, `stop`, `confirm`, `attach`, `pick`, `ground`, `challenge`, `do_task`, `logs`).
 
-`hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope (screenshot **path**, 100px grid descriptor, UIA map, Chrome `chr:` ids when the native host is connected, capped extract, `challenge` status). Image bytes are never inlined. Envelope field `chrome_connected` is true when a host or `HANDS_CHROME_SNAPSHOT` fixture is present. **`observe` does not launch Chrome.** **`observe` does not call Gemma.**
+`hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope. Default observe is the foreground window (≤20 elements, ≤4 KiB envelope); sidecar / `detail=dom` hold the rest. Screenshot is still the virtual-screen **path**. `chr:` ids appear only when Chrome is the foreground window; `chrome_connected` remains an honest host-up bit. Image bytes are never inlined. **`observe` does not launch Chrome.** **`observe` does not call Gemma.**
 
 `hands pick` / `hands ground` call local Gemma at `http://127.0.0.1:8081` (`HANDS_GEMMA_URL`, loopback http only). `HANDS_GEMMA_TIMEOUT_MS` (default 90000, min 5000), `HANDS_GEMMA_FORCE_TEXT` (`1`/`true`/`yes`) skips images, `HANDS_GEMMA_API_KEY` optional Bearer (never logged). **8081 down is a tool error.** `pick` always sends a text list. `ground` sends a PNG crop only when `/v1/models` reports multimodal. These do **not** install the desk lease.
 

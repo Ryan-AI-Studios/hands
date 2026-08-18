@@ -1,11 +1,13 @@
 //! Offer a window to the foreground. Failure is not a hard error.
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, IsIconic, SW_RESTORE, SetForegroundWindow,
-    ShowWindow, WindowFromPoint,
+    GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+    SW_RESTORE, SetForegroundWindow, ShowWindow, WindowFromPoint,
 };
+
+use crate::space::Rect;
 
 pub fn offer(hwnd: Option<isize>, point: (i32, i32)) -> bool {
     let hwnd = hwnd
@@ -84,5 +86,59 @@ pub fn hwnd_raw(hwnd: HWND) -> Option<isize> {
         None
     } else {
         Some(hwnd.0 as isize)
+    }
+}
+
+/// Foreground window outer rect via `GetWindowRect`. Invalid / fail / non-positive → `None`.
+pub fn viewport_rect() -> Option<Rect> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return None;
+    }
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &raw mut rect) }.is_err() {
+        return None;
+    }
+    let w = rect.right.saturating_sub(rect.left);
+    let h = rect.bottom.saturating_sub(rect.top);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some(Rect {
+        x: rect.left,
+        y: rect.top,
+        w,
+        h,
+    })
+}
+
+/// True when the foreground class is `Chrome_WidgetWin_1` (not `_0`).
+pub fn is_chrome() -> bool {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return false;
+    }
+    class_name(hwnd) == crate::attach::CHROME_CLASS
+}
+
+fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if n <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..n as usize])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_class_is_widget_win_1_not_zero() {
+        assert_eq!(crate::attach::CHROME_CLASS, "Chrome_WidgetWin_1");
+        assert_ne!(crate::attach::CHROME_CLASS, "Chrome_WidgetWin_0");
+        let _ = is_chrome();
+        let _ = viewport_rect();
     }
 }

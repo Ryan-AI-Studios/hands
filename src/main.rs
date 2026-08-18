@@ -20,9 +20,9 @@ struct Cli {
 enum Command {
     /// Serve the MCP server over stdio
     Mcp,
-    /// Capture the desktop: screenshot path, 100px grid, UIA map, Chrome `chr:` ids when connected
+    /// Capture the foreground viewport: screenshot path (virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope
     Observe {
-        /// `dom` for a fuller UIA + Chrome walk (still skips offscreen/zero-size)
+        /// `dom` for the fat desktop + Chrome walk (16 KiB shrink; still skips offscreen/zero-size)
         #[arg(long, value_enum)]
         detail: Option<DetailArg>,
         /// Explicit session id (otherwise sniff env, else mint)

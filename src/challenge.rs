@@ -1202,6 +1202,7 @@ mod tests {
             screenshot_path: "C:\\tmp\\x.png".into(),
             observe_path: path.to_string_lossy().into(),
             space: Space::new(0, 0, 100, 100).unwrap(),
+            viewport: None,
             extract: Extract {
                 title: title.into(),
                 url: url.map(str::to_string),

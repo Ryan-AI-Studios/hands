@@ -1303,6 +1303,7 @@ mod tests {
             screenshot_path: display_path(screenshot),
             observe_path: display_path(&path),
             space,
+            viewport: None,
             extract: Extract {
                 title: "T".into(),
                 url: None,

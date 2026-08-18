@@ -941,6 +941,24 @@ mod tests {
             "",
             &[],
         ));
+        assert_clear(hit(
+            "cars.com",
+            Some("https://www.cars.com/"),
+            "",
+            &[("button", "Continue as Ryan")],
+        ));
+        assert_clear(hit(
+            "cars.com",
+            Some("https://www.cars.com/"),
+            "",
+            &[("button", "Accept cookies")],
+        ));
+        assert_clear(hit(
+            "cars.com",
+            Some("https://www.cars.com/"),
+            "",
+            &[("button", "Accept all cookies")],
+        ));
     }
 
     #[test]
@@ -1208,6 +1226,7 @@ mod tests {
                 url: url.map(str::to_string),
                 main_text: String::new(),
                 cards: Vec::new(),
+                dialogs: Vec::new(),
             },
             elements: Vec::new(),
             elements_total: 0,

@@ -218,11 +218,22 @@ pub struct Card {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogHit {
+    pub id: String,
+    pub role: String,
+    pub text: String,
+    pub rect: Rect,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Extract {
     pub title: String,
     pub url: Option<String>,
     pub main_text: String,
     pub cards: Vec<Card>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dialogs: Vec<DialogHit>,
 }
 
 pub fn filter_nodes(nodes: &[RawNode], detail: Detail) -> (Vec<Element>, usize) {
@@ -249,6 +260,7 @@ pub fn extract_from_nodes(title: &str, nodes: &[RawNode]) -> Extract {
         url: None,
         main_text: join_main_text(nodes),
         cards: Vec::new(),
+        dialogs: Vec::new(),
     }
 }
 
@@ -305,6 +317,7 @@ pub fn extract_fused(
         url: http_https_url(chrome_url),
         main_text,
         cards,
+        dialogs: Vec::new(),
     }
 }
 

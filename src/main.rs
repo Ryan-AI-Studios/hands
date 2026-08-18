@@ -20,7 +20,7 @@ struct Cli {
 enum Command {
     /// Serve the MCP server over stdio
     Mcp,
-    /// Capture the foreground viewport: screenshot path (virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope
+    /// Capture the foreground viewport: screenshot path (virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope. extract.dialogs leads when a cookie / account / dialog is visible.
     Observe {
         /// `dom` for the fat desktop + Chrome walk (16 KiB shrink; still skips offscreen/zero-size)
         #[arg(long, value_enum)]

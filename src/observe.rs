@@ -4,13 +4,18 @@ use crate::capture::{capture_virtual_screen, display_path};
 use crate::challenge::{self, ChallengeInfo};
 use crate::chrome;
 use crate::error::HandsError;
-use crate::extract::{Detail, Element, Extract, extract_from_nodes, extract_fused, filter_nodes};
+use crate::extract::{
+    Detail, Element, Extract, VIEWPORT_ENVELOPE_ELEMENT_CAP, extract_from_nodes, extract_fused,
+    filter_nodes,
+};
+use crate::foreground;
 use crate::logs;
 use crate::session::resolve_session_id_from_os;
-use crate::space::{Space, ensure_dpi, virtual_screen};
+use crate::space::{Rect, Space, ensure_dpi, virtual_screen};
 use crate::uia;
 
 pub const ENVELOPE_MAX_BYTES: usize = 16_384;
+pub const DEFAULT_ENVELOPE_MAX_BYTES: usize = 4096;
 pub const OBSERVE_SCHEMA: &str = "hands.observe/v1";
 
 #[derive(Debug, Clone)]
@@ -25,6 +30,8 @@ pub struct ObserveEnvelope {
     pub screenshot_path: String,
     pub observe_path: String,
     pub space: Space,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<Rect>,
     pub extract: Extract,
     pub elements: Vec<Element>,
     pub elements_total: usize,
@@ -40,6 +47,8 @@ pub struct ObserveSidecar {
     pub screenshot_path: String,
     pub observe_path: String,
     pub space: Space,
+    #[serde(default)]
+    pub viewport: Option<Rect>,
     pub extract: Extract,
     pub elements: Vec<Element>,
     pub elements_total: usize,
@@ -47,6 +56,13 @@ pub struct ObserveSidecar {
     pub chrome_connected: bool,
     #[serde(default)]
     pub challenge: ChallengeInfo,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FuseOpts {
+    pub viewport: Option<Rect>,
+    pub chrome_is_foreground: bool,
+    pub virtual_screen: Option<Rect>,
 }
 
 pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
@@ -58,10 +74,21 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let screenshot_path = display_path(&paths.screenshot_path);
     let observe_path = display_path(&paths.observe_path);
 
+    let viewport = foreground::viewport_rect();
+    let chrome_is_foreground = foreground::is_chrome();
     let snap = uia::collect(req.detail)?;
     let chrome = chrome::try_snapshot(req.detail);
-    let (extract, elements, elements_total, chrome_connected) =
-        fuse_maps(req.detail, &snap.title, &snap.nodes, chrome);
+    let (extract, elements, elements_total, chrome_connected) = fuse_maps(
+        req.detail,
+        &snap.title,
+        &snap.nodes,
+        chrome,
+        FuseOpts {
+            viewport,
+            chrome_is_foreground,
+            virtual_screen: Some(space.as_rect()),
+        },
+    );
     crate::fence::note_last_url(extract.url.as_deref());
     let hit = challenge::detect_from_extract(
         &extract.title,
@@ -76,6 +103,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         screenshot_path,
         observe_path,
         space,
+        viewport,
         extract,
         elements,
         elements_total,
@@ -84,7 +112,10 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         challenge,
     };
     write_sidecar(&paths.observe_path, &full)?;
-    let envelope = finalize_envelope(full)?;
+    let envelope = match req.detail {
+        Detail::Default => finalize_envelope(cap_default_envelope(full))?,
+        Detail::Dom => finalize_envelope(full)?,
+    };
     logs::ensure_installed();
     logs::remember_session(&envelope.session_id);
     let _ = logs::record_observe(
@@ -103,6 +134,7 @@ fn write_sidecar(path: &std::path::Path, envelope: &ObserveEnvelope) -> Result<(
         screenshot_path: envelope.screenshot_path.clone(),
         observe_path: envelope.observe_path.clone(),
         space: envelope.space,
+        viewport: envelope.viewport,
         extract: envelope.extract.clone(),
         elements: envelope.elements.clone(),
         elements_total: envelope.elements_total,
@@ -124,6 +156,48 @@ pub fn cap_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
         envelope.elements.pop();
     }
     envelope
+}
+
+/// Default path: 20-element cap, then pop from the end to 4 KiB, then shrink `main_text`.
+/// Never drops cards or `challenge`. 16 KiB hard fail stays in `finalize_envelope`.
+pub fn cap_default_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
+    if envelope.elements.len() > VIEWPORT_ENVELOPE_ELEMENT_CAP {
+        envelope.elements.truncate(VIEWPORT_ENVELOPE_ELEMENT_CAP);
+    }
+    envelope.elements_truncated = envelope.elements.len() < envelope.elements_total;
+    if serialized_len(&envelope) <= DEFAULT_ENVELOPE_MAX_BYTES {
+        return envelope;
+    }
+    envelope.elements_truncated = true;
+    while !envelope.elements.is_empty() && serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
+        envelope.elements.pop();
+    }
+    if serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
+        shrink_main_text_to_fit(&mut envelope, DEFAULT_ENVELOPE_MAX_BYTES);
+    }
+    envelope
+}
+
+fn shrink_main_text_to_fit(envelope: &mut ObserveEnvelope, max_bytes: usize) {
+    if serialized_len(envelope) <= max_bytes {
+        return;
+    }
+    let chars: Vec<char> = envelope.extract.main_text.chars().collect();
+    if chars.is_empty() {
+        return;
+    }
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        envelope.extract.main_text = chars[..mid].iter().collect();
+        if serialized_len(envelope) <= max_bytes {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    envelope.extract.main_text = chars[..lo].iter().collect();
 }
 
 /// Drop trailing elements to fit 16 KiB. If metadata alone (session_id, paths,
@@ -155,9 +229,21 @@ pub fn fuse_maps(
     uia_title: &str,
     uia_nodes: &[crate::extract::RawNode],
     chrome: Option<chrome::ChromeMap>,
+    opts: FuseOpts,
+) -> (Extract, Vec<Element>, usize, bool) {
+    match detail {
+        Detail::Dom => fuse_maps_dom(uia_title, uia_nodes, chrome),
+        Detail::Default => fuse_maps_default(uia_title, uia_nodes, chrome, opts),
+    }
+}
+
+fn fuse_maps_dom(
+    uia_title: &str,
+    uia_nodes: &[crate::extract::RawNode],
+    chrome: Option<chrome::ChromeMap>,
 ) -> (Extract, Vec<Element>, usize, bool) {
     let chrome_connected = chrome.is_some();
-    let (uia_els, uia_matched) = filter_nodes(uia_nodes, detail);
+    let (uia_els, uia_matched) = filter_nodes(uia_nodes, Detail::Dom);
     let (chrome_els, chrome_n, extract) = match chrome {
         Some(map) => {
             let n = map.elements.len();
@@ -175,18 +261,150 @@ pub fn fuse_maps(
     };
     let mut elements = chrome_els;
     elements.extend(uia_els);
-    let cap = detail.element_cap();
+    let cap = Detail::Dom.element_cap();
     if elements.len() > cap {
         elements.truncate(cap);
     }
     (extract, elements, chrome_n + uia_matched, chrome_connected)
 }
 
+fn fuse_maps_default(
+    uia_title: &str,
+    uia_nodes: &[crate::extract::RawNode],
+    chrome: Option<chrome::ChromeMap>,
+    opts: FuseOpts,
+) -> (Extract, Vec<Element>, usize, bool) {
+    let chrome_connected = chrome.is_some();
+    if opts.viewport.is_none() {
+        return (
+            extract_from_nodes(uia_title, uia_nodes),
+            Vec::new(),
+            0,
+            chrome_connected,
+        );
+    }
+    let (uia_els, uia_matched) = filter_viewport_nodes(uia_nodes, &opts);
+    if opts.chrome_is_foreground
+        && let Some(map) = chrome
+    {
+        let chrome_els = filter_viewport_elements(map.elements, &opts);
+        let chrome_n = chrome_els.len();
+        let extract = extract_fused(
+            uia_title,
+            uia_nodes,
+            map.url.as_deref(),
+            &map.title,
+            &map.main_text,
+            map.cards,
+        );
+        let mut elements = chrome_els;
+        elements.extend(uia_els);
+        let cap = Detail::Default.element_cap();
+        if elements.len() > cap {
+            elements.truncate(cap);
+        }
+        return (extract, elements, chrome_n + uia_matched, true);
+    }
+    let extract = extract_from_nodes(uia_title, uia_nodes);
+    let mut elements = uia_els;
+    let cap = Detail::Default.element_cap();
+    if elements.len() > cap {
+        elements.truncate(cap);
+    }
+    (extract, elements, uia_matched, chrome_connected)
+}
+
+fn in_viewport(rect: Rect, opts: &FuseOpts) -> bool {
+    match (opts.viewport, opts.virtual_screen) {
+        (Some(viewport), Some(screen)) => rect.intersects(viewport) && rect.intersects(screen),
+        _ => false,
+    }
+}
+
+fn filter_viewport_nodes(
+    nodes: &[crate::extract::RawNode],
+    opts: &FuseOpts,
+) -> (Vec<Element>, usize) {
+    let cap = Detail::Default.element_cap();
+    let mut elements = Vec::new();
+    let mut matched = 0usize;
+    for node in nodes {
+        if !node.passes_filter(Detail::Default) || !in_viewport(node.rect, opts) {
+            continue;
+        }
+        matched += 1;
+        if elements.len() < cap
+            && let Some(element) = node.to_element()
+        {
+            elements.push(element);
+        }
+    }
+    (elements, matched)
+}
+
+fn filter_viewport_elements(elements: Vec<Element>, opts: &FuseOpts) -> Vec<Element> {
+    elements
+        .into_iter()
+        .filter(|el| in_viewport(el.rect, opts))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::{Card, Element};
+    use crate::extract::{Card, ControlKind, Element, RawNode};
     use crate::space::Rect;
+
+    fn covering_opts(chrome_is_foreground: bool) -> FuseOpts {
+        FuseOpts {
+            viewport: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            }),
+            chrome_is_foreground,
+            virtual_screen: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            }),
+        }
+    }
+
+    fn fixture_opts(chrome_is_foreground: bool) -> FuseOpts {
+        FuseOpts {
+            viewport: Some(Rect {
+                x: 100,
+                y: 50,
+                w: 1280,
+                h: 800,
+            }),
+            chrome_is_foreground,
+            virtual_screen: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            }),
+        }
+    }
+
+    fn uia_node(id: i32, name: &str, rect: Rect) -> RawNode {
+        RawNode {
+            runtime_id: vec![1, id],
+            role: "Button".into(),
+            name: name.to_string(),
+            value: None,
+            is_password: false,
+            rect,
+            control_kind: ControlKind::Button,
+            is_control: true,
+            is_offscreen: false,
+            is_keyboard_focusable: true,
+        }
+    }
 
     fn fat_envelope(n: usize) -> ObserveEnvelope {
         ObserveEnvelope {
@@ -194,6 +412,7 @@ mod tests {
             screenshot_path: "C:\\tmp\\observe.png".into(),
             observe_path: "C:\\tmp\\observe.json".into(),
             space: Space::new(0, 0, 1920, 1080).unwrap(),
+            viewport: None,
             extract: Extract {
                 title: "Title".into(),
                 url: None,
@@ -326,8 +545,13 @@ mod tests {
             cards: vec![],
         };
         let nodes: Vec<RawNode> = (0..5).map(uia).collect();
-        let (extract, els, total, connected) =
-            fuse_maps(Detail::Default, "UIA title", &nodes, Some(chrome));
+        let (extract, els, total, connected) = fuse_maps(
+            Detail::Default,
+            "UIA title",
+            &nodes,
+            Some(chrome),
+            covering_opts(true),
+        );
         assert!(connected);
         assert_eq!(extract.url.as_deref(), Some("https://cars.com/search"));
         assert_eq!(extract.title, "Cars.com");
@@ -343,7 +567,27 @@ mod tests {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
         let map = chrome::try_snapshot(Detail::Default).expect("fixture");
-        let (extract, els, _total, connected) = fuse_maps(Detail::Default, "UIA", &[], Some(map));
+        let (extract, els, _total, connected) = fuse_maps(
+            Detail::Default,
+            "UIA",
+            &[],
+            Some(map),
+            FuseOpts {
+                viewport: Some(Rect {
+                    x: 100,
+                    y: 50,
+                    w: 1280,
+                    h: 800,
+                }),
+                chrome_is_foreground: true,
+                virtual_screen: Some(Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1920,
+                    h: 1080,
+                }),
+            },
+        );
         assert!(connected);
         assert_eq!(extract.url.as_deref(), Some("https://cars.com/search"));
         assert!(els.iter().any(|e| e.id == "chr:0"));
@@ -358,7 +602,8 @@ mod tests {
 
     #[test]
     fn absent_chrome_extract_is_uia_only() {
-        let (extract, els, total, connected) = fuse_maps(Detail::Default, "Desktop", &[], None);
+        let (extract, els, total, connected) =
+            fuse_maps(Detail::Default, "Desktop", &[], None, covering_opts(false));
         assert!(!connected);
         assert_eq!(extract.url, None);
         assert!(extract.cards.is_empty());
@@ -414,5 +659,308 @@ mod tests {
         assert_eq!(capped.extract.cards.len(), 1);
         assert_eq!(capped.extract.cards[0].price, "$12,345");
         assert!(serialize_envelope(&capped).unwrap().len() <= ENVELOPE_MAX_BYTES);
+    }
+
+    fn desktop_noise() -> Vec<RawNode> {
+        vec![
+            uia_node(
+                9001,
+                "Taskbar",
+                Rect {
+                    x: 0,
+                    y: 1040,
+                    w: 1920,
+                    h: 40,
+                },
+            ),
+            uia_node(
+                9002,
+                "Windows PowerShell",
+                Rect {
+                    x: 2000,
+                    y: 0,
+                    w: 400,
+                    h: 800,
+                },
+            ),
+            uia_node(
+                9003,
+                "Hidden title",
+                Rect {
+                    x: -31976,
+                    y: 0,
+                    w: 200,
+                    h: 32,
+                },
+            ),
+        ]
+    }
+
+    fn viewport_buttons(n: i32) -> Vec<RawNode> {
+        (0..n)
+            .map(|i| {
+                uia_node(
+                    i,
+                    &format!("ok{i}"),
+                    Rect {
+                        x: 200,
+                        y: 200,
+                        w: 20,
+                        h: 20,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn noise_ids() -> [&'static str; 3] {
+        ["uia:1.9001", "uia:1.9002", "uia:1.9003"]
+    }
+
+    #[test]
+    fn default_fuse_drops_desktop_noise_keeps_fixture_chr() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let mut nodes = viewport_buttons(5);
+        nodes.extend(desktop_noise());
+        let (extract, els, total, connected) = fuse_maps(
+            Detail::Default,
+            "UIA",
+            &nodes,
+            Some(map),
+            fixture_opts(true),
+        );
+        assert!(connected);
+        assert_eq!(extract.url.as_deref(), Some("https://cars.com/search"));
+        assert!(els.iter().any(|e| e.id == "chr:0"));
+        assert!(els.iter().any(|e| e.id.starts_with("uia:1.")));
+        for id in noise_ids() {
+            assert!(
+                !els.iter().any(|e| e.id == id),
+                "noise id {id} leaked into default fuse"
+            );
+        }
+        assert!(!els.iter().any(|e| e.text.as_deref() == Some("Taskbar")));
+        assert!(
+            !els.iter()
+                .any(|e| e.text.as_deref() == Some("Windows PowerShell"))
+        );
+        assert!(!els.iter().any(|e| e.rect.x <= -30_000));
+        assert_eq!(total, 3 + 5);
+    }
+
+    #[test]
+    fn default_envelope_fits_4kib_and_caps_20() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let mut nodes = viewport_buttons(40);
+        nodes.extend(desktop_noise());
+        let (extract, elements, elements_total, chrome_connected) = fuse_maps(
+            Detail::Default,
+            "UIA",
+            &nodes,
+            Some(map),
+            fixture_opts(true),
+        );
+        assert_eq!(elements_total, 3 + 40);
+        assert!(elements.len() > VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        for id in noise_ids() {
+            assert!(!elements.iter().any(|e| e.id == id));
+        }
+        let raw = ObserveEnvelope {
+            session_id: "sess".into(),
+            screenshot_path: "C:\\tmp\\observe.png".into(),
+            observe_path: "C:\\tmp\\observe.json".into(),
+            space: Space::new(0, 0, 1920, 1080).unwrap(),
+            viewport: fixture_opts(true).viewport,
+            extract,
+            elements,
+            elements_total,
+            elements_truncated: false,
+            chrome_connected,
+            challenge: ChallengeInfo::default(),
+        };
+        assert!(raw.viewport.is_some());
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert!(capped.elements_truncated);
+        assert_eq!(capped.elements_total, 43);
+        assert!(capped.elements.iter().any(|e| e.id == "chr:0"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(!parsed["viewport"].is_null());
+    }
+
+    #[test]
+    fn dom_fuse_can_include_noise_and_more_than_20() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let mut nodes = viewport_buttons(25);
+        nodes.extend(desktop_noise());
+        let (_extract, els, total, connected) =
+            fuse_maps(Detail::Dom, "UIA", &nodes, Some(map), fixture_opts(true));
+        assert!(connected);
+        assert!(els.len() > VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert!(total > VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert!(els.iter().any(|e| e.id == "uia:1.9001"));
+        assert!(els.iter().any(|e| e.id == "uia:1.9002"));
+        assert!(els.iter().any(|e| e.id == "uia:1.9003"));
+    }
+
+    #[test]
+    fn chrome_connected_but_not_foreground_has_no_chr() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let nodes = vec![uia_node(
+            7,
+            "Document",
+            Rect {
+                x: 200,
+                y: 200,
+                w: 40,
+                h: 40,
+            },
+        )];
+        let (extract, els, total, connected) = fuse_maps(
+            Detail::Default,
+            "Notepad",
+            &nodes,
+            Some(map),
+            fixture_opts(false),
+        );
+        assert!(connected);
+        assert!(!els.iter().any(|e| e.id.starts_with("chr:")));
+        assert_eq!(extract.url, None);
+        assert_eq!(extract.title, "Notepad");
+        assert!(els.iter().any(|e| e.id == "uia:1.7"));
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn no_foreground_viewport_empties_default_elements() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let mut nodes = viewport_buttons(8);
+        nodes.extend(desktop_noise());
+        let (extract, els, total, connected) = fuse_maps(
+            Detail::Default,
+            "Desktop",
+            &nodes,
+            Some(map),
+            FuseOpts {
+                viewport: None,
+                chrome_is_foreground: true,
+                virtual_screen: Some(Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1920,
+                    h: 1080,
+                }),
+            },
+        );
+        assert!(connected);
+        assert!(els.is_empty());
+        assert_eq!(total, 0);
+        assert_eq!(extract.url, None);
+        assert_eq!(extract.title, "Desktop");
+    }
+
+    #[test]
+    fn challenge_and_cards_survive_4kib_shrink() {
+        let mut raw = fat_envelope(400);
+        raw.extract.main_text = "M".repeat(3000);
+        raw.extract.cards = vec![Card {
+            title: "2020 Honda Civic".into(),
+            price: "$12,345".into(),
+            href: "https://cars.com/vehicledetail/abc".into(),
+            rect: Rect {
+                x: 110,
+                y: 230,
+                w: 300,
+                h: 80,
+            },
+        }];
+        raw.challenge = ChallengeInfo {
+            present: true,
+            kind: Some("recaptcha".into()),
+            attempts: 2,
+            yielded: true,
+            reason: Some("i'm not a robot".into()),
+        };
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert!(capped.challenge.present);
+        assert!(capped.challenge.yielded);
+        assert_eq!(capped.challenge.kind.as_deref(), Some("recaptcha"));
+        assert_eq!(capped.extract.cards.len(), 1);
+        assert_eq!(capped.extract.cards[0].price, "$12,345");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["challenge"]["present"], true);
+        assert_eq!(parsed["extract"]["cards"][0]["price"], "$12,345");
+    }
+
+    #[test]
+    fn sidecar_missing_viewport_deserializes() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [],
+            "elements_total": 0,
+            "elements_truncated": false,
+            "chrome_connected": false
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        assert_eq!(side.viewport, None);
+        assert_eq!(side.challenge, ChallengeInfo::default());
+    }
+
+    #[test]
+    fn pick_still_uses_default_element_cap() {
+        assert!(include_str!("pick.rs").contains("DEFAULT_ELEMENT_CAP"));
+        assert_eq!(crate::extract::DEFAULT_ELEMENT_CAP, 250);
+        assert_eq!(VIEWPORT_ENVELOPE_ELEMENT_CAP, 20);
+    }
+
+    #[test]
+    fn mcp_and_cli_mention_viewport_and_dom() {
+        let mcp = include_str!("mcp.rs");
+        let main = include_str!("main.rs");
+        assert!(mcp.contains("viewport"), "mcp observe description");
+        assert!(mcp.contains("detail=dom") || mcp.contains("detail=dom"));
+        assert!(main.contains("viewport") || main.contains("foreground"));
+        assert!(main.contains("dom"));
+    }
+
+    #[test]
+    fn cargo_forbids_dwm() {
+        let cargo = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        assert!(
+            !cargo.contains("Win32_Graphics_Dwm"),
+            "Cargo.toml must not enable DWM"
+        );
+        assert!(
+            !cargo.to_ascii_lowercase().contains("dwmget"),
+            "Cargo.toml must not mention DwmGet"
+        );
     }
 }

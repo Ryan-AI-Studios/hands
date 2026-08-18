@@ -255,9 +255,24 @@ fn sta_collect(detail: Detail, cap: usize) -> Result<UiaSnapshot, HandsError> {
     let title = foreground_title(&automation);
     let walker = unsafe { automation.ControlViewWalker() }
         .map_err(|err| HandsError::Uia(format!("ControlViewWalker: {err}")))?;
-    let root = unsafe { automation.GetRootElement() }
-        .map_err(|err| HandsError::Uia(format!("GetRootElement: {err}")))?;
-    let nodes = walk_control_view(&walker, &root, detail, cap)?;
+    let nodes = match detail {
+        Detail::Dom => {
+            let root = unsafe { automation.GetRootElement() }
+                .map_err(|err| HandsError::Uia(format!("GetRootElement: {err}")))?;
+            walk_control_view(&walker, &root, detail, cap)?
+        }
+        Detail::Default => {
+            let hwnd = unsafe { GetForegroundWindow() };
+            if hwnd.is_invalid() {
+                Vec::new()
+            } else {
+                match unsafe { automation.ElementFromHandle(hwnd) } {
+                    Ok(root) => walk_control_view(&walker, &root, detail, cap)?,
+                    Err(_) => Vec::new(),
+                }
+            }
+        }
+    };
     Ok(UiaSnapshot { title, nodes })
 }
 

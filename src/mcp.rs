@@ -184,7 +184,7 @@ pub struct HandsServer;
 #[tool_router(server_handler)]
 impl HandsServer {
     #[tool(
-        description = "Capture the desktop: screenshot path, 100px grid descriptor, UIA map, Chrome chr: ids when the host is connected, capped extract"
+        description = "Capture the foreground window viewport: screenshot path (full virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope. detail=dom is the fat desktop + Chrome walk (16 KiB)."
     )]
     fn observe(
         &self,

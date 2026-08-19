@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use hands::{
     ActuateRequest, Detail, GroundRequest, HandsError, ObserveRequest, PickRequest, actuate,
-    allows, attach, challenge, dotask, ensure_dpi, logs, native_host, observe, pick,
+    allows, attach, challenge, dotask, ensure_dpi, host_doctor, logs, native_host, observe, pick,
     serialize_envelope, serialize_pick,
 };
 
@@ -208,6 +208,8 @@ enum Command {
         #[arg(long)]
         exe: Option<String>,
     },
+    /// Read-only native-host JSON/HKCU/pipe doctor (does not write the registry; does not kill Chrome)
+    NativeHostDoctor,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -350,6 +352,7 @@ async fn main() {
         Command::NativeHostManifest { extension_id, exe } => {
             native_host_manifest_main(extension_id, exe)
         }
+        Command::NativeHostDoctor => native_host_doctor_main(),
         other => {
             if let Err(err) = dpi {
                 fail(err);
@@ -585,7 +588,8 @@ fn input_main(command: Command) -> Result<(), HandsError> {
         | Command::Challenge { .. }
         | Command::Logs { .. }
         | Command::NativeHost { .. }
-        | Command::NativeHostManifest { .. } => {
+        | Command::NativeHostManifest { .. }
+        | Command::NativeHostDoctor => {
             unreachable!()
         }
     };
@@ -600,6 +604,13 @@ fn pack(result: Result<hands::ActuateEnvelope, HandsError>) -> Result<(String, b
     let envelope = result?;
     let json = actuate::serialize_envelope(&envelope)?;
     Ok((json, envelope.ok))
+}
+
+fn native_host_doctor_main() -> Result<(), HandsError> {
+    let report = host_doctor::run();
+    let json = host_doctor::serialize_report(&report)?;
+    println!("{json}");
+    Ok(())
 }
 
 fn native_host_manifest_main(
@@ -629,6 +640,15 @@ fn fail(err: HandsError) -> ! {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn native_host_doctor_parses() {
+        let cli = Cli::try_parse_from(["hands", "native-host-doctor"]).expect("parse");
+        match cli.command {
+            Command::NativeHostDoctor => {}
+            _ => panic!("expected NativeHostDoctor"),
+        }
+    }
 
     #[test]
     fn scroll_dy_space_separated_negative_six() {

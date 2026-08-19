@@ -11,6 +11,7 @@ use crate::dotask::{self, DoTaskRequest};
 use crate::error::HandsError;
 use crate::extract::Detail;
 use crate::fence;
+use crate::host_doctor;
 use crate::lease;
 use crate::logs;
 use crate::observe::{ObserveRequest, observe, serialize_envelope};
@@ -168,6 +169,9 @@ pub struct DoTaskParams {
     pub max_steps: Option<u32>,
 }
 
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct NativeHostDoctorParams {}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LogsParams {
     #[serde(default)]
@@ -184,7 +188,7 @@ pub struct HandsServer;
 #[tool_router(server_handler)]
 impl HandsServer {
     #[tool(
-        description = "Capture the foreground window viewport: screenshot path (full virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope. extract.dialogs leads when a cookie / account / dialog is visible. Elements carry grid (g:col:row of the resolved center); prefer that over guessing. detail=dom is the fat desktop + Chrome walk (16 KiB)."
+        description = "Capture the foreground window viewport: screenshot path (full virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope. extract.dialogs leads when a cookie / account / dialog is visible. Elements carry grid (g:col:row of the resolved center); prefer that over guessing. detail=dom is the fat desktop + Chrome walk (16 KiB). chrome_connected: false includes chrome_hint pointing at native-host-doctor."
     )]
     fn observe(
         &self,
@@ -354,6 +358,16 @@ impl HandsServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(run_dotask_tool(params))
     }
+
+    #[tool(
+        description = "Read-only native-host JSON/HKCU/pipe doctor. Does not write HKCU. Does not kill Chrome."
+    )]
+    fn native_host_doctor(
+        &self,
+        Parameters(_params): Parameters<NativeHostDoctorParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_native_host_doctor())
+    }
 }
 
 fn click_req(params: ClickParams) -> ActuateRequest {
@@ -476,6 +490,13 @@ fn run_logs(params: LogsParams) -> CallToolResult {
     )
     .and_then(|env| logs::serialize_logs(&env))
     {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
+fn run_native_host_doctor() -> CallToolResult {
+    match host_doctor::serialize_report(&host_doctor::run()) {
         Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
     }

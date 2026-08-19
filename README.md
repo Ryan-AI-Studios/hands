@@ -310,7 +310,7 @@ Fence / yield still hard-stop the loop. Missing key → skip, not a failed insta
 
 Gray-zone **free**: cookie Accept, dismiss sign-in / Not now. **Do not** click dealer **Check Availability** unless you mean to confirm a lead.
 
-`hands scroll --dy -6` currently fails under PowerShell (`-6` parsed as a flag). Use `--dy=-6` if clap accepts it, or a positive `dy` until that is fixed.
+`hands scroll --dy -6` scrolls toward the user (page-down). `--dy=-6` is also valid.
 
 ### Rollback (does not kill Chrome)
 

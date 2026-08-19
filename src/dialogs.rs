@@ -279,6 +279,7 @@ mod tests {
             main_text: String::new(),
             cards: Vec::new(),
             dialogs: Vec::new(),
+            ..Default::default()
         };
         let mut elements = vec![
             el("chr:0", "Button", "Search"),

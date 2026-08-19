@@ -12,7 +12,11 @@ use windows::Win32::System::Pipes::WaitNamedPipeW;
 use windows::core::PCWSTR;
 
 use crate::error::HandsError;
-use crate::extract::{Card, Detail, Element, take_chars};
+use crate::extract::{
+    CARD_DEALER_CAP, CARD_DISTANCE_CAP, CARD_MILES_CAP, CARD_OF_CAP, Card, Detail, EMPTY_STATE_CAP,
+    Element, LOCAL_MATCHES_CAP, ListingMeta, RADIUS_CAP, RESULT_COUNT_CAP, ZIP_CAP, take_chars,
+    take_opt_chars,
+};
 use crate::native_host::{CLIENT_TIMEOUT_MS, client_timeout, exchange_pipe_deadline, pipe_name};
 use crate::space::Rect;
 
@@ -35,6 +39,7 @@ pub struct ChromeMap {
     pub main_text: String,
     pub elements: Vec<Element>,
     pub cards: Vec<Card>,
+    pub listing: ListingMeta,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +100,14 @@ struct RawCard {
     href: String,
     #[serde(rename = "rectCss")]
     rect_css: CssRect,
+    #[serde(default)]
+    miles: Option<String>,
+    #[serde(default)]
+    dealer: Option<String>,
+    #[serde(default)]
+    distance: Option<String>,
+    #[serde(rename = "of", default)]
+    listing_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,6 +123,16 @@ struct RawSnapshot {
     #[serde(default)]
     cards: Vec<RawCard>,
     metrics: ChromeMetrics,
+    #[serde(default)]
+    result_count: Option<String>,
+    #[serde(default)]
+    local_matches: Option<String>,
+    #[serde(default)]
+    empty_state: Option<String>,
+    #[serde(default)]
+    zip: Option<String>,
+    #[serde(default)]
+    radius: Option<String>,
 }
 
 pub fn css_rect_to_physical(metrics: &ChromeMetrics, rect: &CssRect) -> Option<Rect> {
@@ -240,6 +263,10 @@ fn map_from_raw(raw: RawSnapshot) -> ChromeMap {
             price: take_chars(&card.price, CARD_PRICE_CAP),
             href: take_chars(&card.href, CARD_HREF_CAP),
             rect,
+            miles: take_opt_chars(card.miles, CARD_MILES_CAP),
+            dealer: take_opt_chars(card.dealer, CARD_DEALER_CAP),
+            distance: take_opt_chars(card.distance, CARD_DISTANCE_CAP),
+            listing_of: take_opt_chars(card.listing_of, CARD_OF_CAP),
         });
     }
     ChromeMap {
@@ -248,6 +275,13 @@ fn map_from_raw(raw: RawSnapshot) -> ChromeMap {
         main_text: raw.main_text.unwrap_or_default(),
         elements,
         cards,
+        listing: ListingMeta {
+            result_count: take_opt_chars(raw.result_count, RESULT_COUNT_CAP),
+            local_matches: take_opt_chars(raw.local_matches, LOCAL_MATCHES_CAP),
+            empty_state: take_opt_chars(raw.empty_state, EMPTY_STATE_CAP),
+            zip: take_opt_chars(raw.zip, ZIP_CAP),
+            radius: take_opt_chars(raw.radius, RADIUS_CAP),
+        },
     }
 }
 
@@ -329,6 +363,11 @@ fn pipe_resolve(id: &str) -> Result<ChromeMap, HandsError> {
             elements: vec![raw],
             cards: Vec::new(),
             metrics,
+            result_count: None,
+            local_matches: None,
+            empty_state: None,
+            zip: None,
+            radius: None,
         }));
     }
     parse_host_reply(&reply)
@@ -527,6 +566,12 @@ mod tests {
         assert!(map.elements.iter().any(|e| e.text.is_none()));
         assert_eq!(map.cards.len(), 1);
         assert_eq!(map.cards[0].price, "$12,345");
+        assert_eq!(map.cards[0].miles.as_deref(), Some("32,145 mi"));
+        assert_eq!(map.cards[0].dealer.as_deref(), Some("Capital Toyota"));
+        assert_eq!(map.cards[0].distance.as_deref(), Some("12 mi away"));
+        assert!(map.cards[0].miles.is_some());
+        assert!(map.cards[0].dealer.is_some());
+        assert!(map.cards[0].distance.is_some());
         assert!(!map.main_text.to_ascii_lowercase().contains("hunter"));
     }
 
@@ -549,11 +594,11 @@ mod tests {
         let mut cards = String::new();
         for i in 0..9 {
             cards.push_str(&format!(
-                r#"{{"title":"car {i}","price":"$1.0{i}","href":"https://cars.com/{i}","rectCss":{{"left":1,"top":1,"width":10,"height":10}}}},"#
+                r#"{{"title":"car {i}","price":"$1.0{i}","href":"https://cars.com/{i}","rectCss":{{"left":1,"top":1,"width":10,"height":10}},"miles":"32,145 mi","dealer":"Capital Toyota","distance":"12 mi away"}},"#
             ));
         }
         cards.push_str(
-            r#"{"title":"js","price":"$0.00","href":"javascript:alert(1)","rectCss":{"left":1,"top":1,"width":10,"height":10}}"#,
+            r#"{"title":"js","price":"$0.00","href":"javascript:alert(1)","rectCss":{"left":1,"top":1,"width":10,"height":10},"miles":"12,000 mi","dealer":"JS Dealer","distance":"3 mi away"}"#,
         );
         let json = format!(
             r#"{{"url":"https://cars.com/search","title":"T","main_text":"x","metrics":{{"screenX":0,"screenY":0,"outerWidth":100,"outerHeight":100,"innerWidth":100,"innerHeight":100,"devicePixelRatio":1}},"elements":[],"cards":[{cards}]}}"#
@@ -567,6 +612,72 @@ mod tests {
         );
         assert_eq!(map.cards[0].title, "car 0");
         assert_eq!(map.cards[7].title, "car 7");
+        assert_eq!(map.cards[0].miles.as_deref(), Some("32,145 mi"));
+        assert_eq!(map.cards[0].dealer.as_deref(), Some("Capital Toyota"));
+        assert_eq!(map.cards[0].distance.as_deref(), Some("12 mi away"));
+        assert!(
+            map.cards
+                .iter()
+                .all(|c| c.miles.is_some() && c.dealer.is_some() && c.distance.is_some())
+        );
+    }
+
+    #[test]
+    fn empty_state_snapshot_enriches_listing_meta() {
+        // Top-level listing keys (not a nested `listing` object).
+        let json = r#"{
+            "url":"https://www.cars.com/shopping/results/?zip=32309&maximum_distance=50",
+            "title":"Cars.com",
+            "main_text":"Nothing fits those filters. Try a larger radius.",
+            "metrics":{"screenX":0,"screenY":0,"outerWidth":100,"outerHeight":100,"innerWidth":100,"innerHeight":100,"devicePixelRatio":1},
+            "elements":[],
+            "cards":[]
+        }"#;
+        let map = parse_snapshot_bytes(json.as_bytes()).expect("parse");
+        assert!(map.cards.is_empty());
+        let extract = crate::extract::extract_fused(
+            "UIA",
+            &[],
+            map.url.as_deref(),
+            &map.title,
+            &map.main_text,
+            map.cards,
+            map.listing,
+        );
+        assert!(
+            extract
+                .empty_state
+                .as_deref()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("nothing fits those filters")
+        );
+        assert_eq!(extract.zip.as_deref(), Some("32309"));
+        assert_eq!(extract.radius.as_deref(), Some("50 mi"));
+        assert!(extract.cards.is_empty());
+        let json_js = r#"{
+            "url":"https://www.cars.com/shopping/results/?zip=32309&maximum_distance=50",
+            "title":"Cars.com",
+            "main_text":"Sorry, nothing fits those filters. Try a larger radius.",
+            "empty_state":"Sorry, nothing fits those filters.",
+            "metrics":{"screenX":0,"screenY":0,"outerWidth":100,"outerHeight":100,"innerWidth":100,"innerHeight":100,"devicePixelRatio":1},
+            "elements":[],
+            "cards":[]
+        }"#;
+        let map_js = parse_snapshot_bytes(json_js.as_bytes()).expect("parse");
+        let extract_js = crate::extract::extract_fused(
+            "UIA",
+            &[],
+            map_js.url.as_deref(),
+            &map_js.title,
+            &map_js.main_text,
+            map_js.cards,
+            map_js.listing,
+        );
+        assert_eq!(
+            extract_js.empty_state.as_deref(),
+            Some("Sorry, nothing fits those filters.")
+        );
     }
 
     #[test]

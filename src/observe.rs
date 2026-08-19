@@ -92,6 +92,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         },
     );
     crate::dialogs::promote(&mut extract, &mut elements);
+    stamp_grid(space, &mut elements);
     crate::fence::note_last_url(extract.url.as_deref());
     let hit = challenge::detect_from_extract(
         &extract.title,
@@ -128,6 +129,12 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         envelope.elements_total,
     );
     Ok(envelope)
+}
+
+fn stamp_grid(space: Space, elements: &mut [Element]) {
+    for el in elements {
+        el.grid = Some(space.cell_id_of_center(el.rect));
+    }
 }
 
 fn write_sidecar(path: &std::path::Path, envelope: &ObserveEnvelope) -> Result<(), HandsError> {
@@ -471,6 +478,7 @@ mod tests {
                         w: 12,
                         h: 12,
                     },
+                    grid: None,
                 })
                 .collect(),
             elements_total: n,
@@ -581,6 +589,7 @@ mod tests {
                         w: 8,
                         h: 8,
                     },
+                    grid: None,
                 })
                 .collect(),
             cards: vec![],
@@ -669,6 +678,7 @@ mod tests {
                     w: 200,
                     h: 32,
                 },
+                grid: None,
             },
         );
         raw.elements_total = 401;
@@ -799,7 +809,7 @@ mod tests {
         let map = chrome::try_snapshot(Detail::Default).expect("fixture");
         let mut nodes = viewport_buttons(40);
         nodes.extend(desktop_noise());
-        let (extract, elements, elements_total, chrome_connected) = fuse_maps(
+        let (extract, mut elements, elements_total, chrome_connected) = fuse_maps(
             Detail::Default,
             "UIA",
             &nodes,
@@ -811,11 +821,13 @@ mod tests {
         for id in noise_ids() {
             assert!(!elements.iter().any(|e| e.id == id));
         }
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        stamp_grid(space, &mut elements);
         let raw = ObserveEnvelope {
             session_id: "sess".into(),
             screenshot_path: "C:\\tmp\\observe.png".into(),
             observe_path: "C:\\tmp\\observe.json".into(),
-            space: Space::new(0, 0, 1920, 1080).unwrap(),
+            space,
             viewport: fixture_opts(true).viewport,
             extract,
             elements,
@@ -836,6 +848,7 @@ mod tests {
         assert!(capped.elements_truncated);
         assert_eq!(capped.elements_total, 43);
         assert!(capped.elements.iter().any(|e| e.id == "chr:0"));
+        assert!(capped.elements.iter().all(|e| e.grid.is_some()));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!parsed["viewport"].is_null());
     }
@@ -940,6 +953,7 @@ mod tests {
             yielded: true,
             reason: Some("i'm not a robot".into()),
         };
+        stamp_grid(raw.space, &mut raw.elements);
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
         assert!(
@@ -953,6 +967,7 @@ mod tests {
         assert_eq!(capped.challenge.kind.as_deref(), Some("recaptcha"));
         assert_eq!(capped.extract.cards.len(), 1);
         assert_eq!(capped.extract.cards[0].price, "$12,345");
+        assert!(capped.elements.iter().all(|e| e.grid.is_some()));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["challenge"]["present"], true);
         assert_eq!(parsed["extract"]["cards"][0]["price"], "$12,345");
@@ -994,6 +1009,8 @@ mod tests {
         assert!(main.contains("viewport") || main.contains("foreground"));
         assert!(main.contains("dom"));
         assert!(main.contains("dialogs") || main.contains("extract.dialogs"));
+        assert!(mcp.contains("grid") && mcp.contains("g:col:row"));
+        assert!(main.contains("grid") && main.contains("g:col:row"));
     }
 
     fn dialog_el(id: &str, text: &str, rect: Rect) -> Element {
@@ -1002,6 +1019,7 @@ mod tests {
             role: "Button".into(),
             text: Some(text.into()),
             rect,
+            grid: None,
         }
     }
 
@@ -1152,6 +1170,7 @@ mod tests {
                 role: d.role.clone(),
                 text: Some(d.text.clone()),
                 rect: d.rect,
+                grid: None,
             }),
         );
         raw.challenge = ChallengeInfo {
@@ -1161,6 +1180,7 @@ mod tests {
             yielded: true,
             reason: Some("i'm not a robot".into()),
         };
+        stamp_grid(raw.space, &mut raw.elements);
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
         assert!(
@@ -1172,6 +1192,7 @@ mod tests {
         assert_eq!(capped.extract.cards.len(), 8);
         assert!(capped.challenge.present);
         assert!(capped.elements.iter().any(|e| e.id == "uia:d.0"));
+        assert!(capped.elements.iter().all(|e| e.grid.is_some()));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["extract"]["dialogs"].as_array().unwrap().len(), 4);
         assert_eq!(parsed["extract"]["cards"].as_array().unwrap().len(), 8);
@@ -1204,6 +1225,93 @@ mod tests {
         let side: ObserveSidecar = serde_json::from_str(json).unwrap();
         assert!(side.extract.dialogs.is_empty());
         assert_eq!(side.viewport, None);
+    }
+
+    #[test]
+    fn stamp_grid_fixture_chr0_is_g21() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let (_extract, mut elements, _total, _connected) =
+            fuse_maps(Detail::Default, "UIA", &[], Some(map), fixture_opts(true));
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        stamp_grid(space, &mut elements);
+        let chr0 = elements.iter().find(|e| e.id == "chr:0").expect("chr:0");
+        assert_eq!(
+            chr0.rect,
+            Rect {
+                x: 110,
+                y: 150,
+                w: 200,
+                h: 32,
+            }
+        );
+        assert_eq!(chr0.rect.center(), (210, 166));
+        assert_eq!(chr0.grid.as_deref(), Some("g:2:1"));
+        assert_eq!(chr0.grid.as_ref().unwrap(), &space.cell_id(210, 166));
+    }
+
+    #[test]
+    fn stamp_grid_negative_origin_is_not_g00() {
+        let space = Space::new(-1920, 0, 3840, 1080).unwrap();
+        let mut elements = vec![Element {
+            id: "chr:origin".into(),
+            role: "Edit".into(),
+            text: Some("origin".into()),
+            rect: Rect {
+                x: -1,
+                y: -1,
+                w: 2,
+                h: 2,
+            },
+            grid: None,
+        }];
+        stamp_grid(space, &mut elements);
+        assert_eq!(elements[0].rect.center(), (0, 0));
+        assert_eq!(elements[0].grid.as_deref(), Some("g:19:0"));
+        assert_ne!(elements[0].grid.as_deref(), Some("g:0:0"));
+    }
+
+    #[test]
+    fn sidecar_missing_grid_deserializes() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [{"id":"chr:0","role":"Edit","text":"Search","rect":{"x":110,"y":150,"w":200,"h":32}}],
+            "elements_total": 1,
+            "elements_truncated": false,
+            "chrome_connected": false
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        assert_eq!(side.elements.len(), 1);
+        assert_eq!(side.elements[0].id, "chr:0");
+        assert_eq!(side.elements[0].grid, None);
+    }
+
+    #[test]
+    fn empty_grid_omitted_from_serialized_json() {
+        let el = Element {
+            id: "chr:0".into(),
+            role: "Edit".into(),
+            text: Some("Search".into()),
+            rect: Rect {
+                x: 110,
+                y: 150,
+                w: 200,
+                h: 32,
+            },
+            grid: None,
+        };
+        let raw = serde_json::to_value(&el).unwrap();
+        assert!(raw.get("grid").is_none());
+        let mut elements = vec![el];
+        stamp_grid(Space::new(0, 0, 1920, 1080).unwrap(), &mut elements);
+        let stamped = serde_json::to_value(&elements[0]).unwrap();
+        assert_eq!(stamped["grid"], "g:2:1");
     }
 
     #[test]

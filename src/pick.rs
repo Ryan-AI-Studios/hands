@@ -1203,6 +1203,7 @@ mod tests {
             role: "Button".into(),
             text: Some("Search".into()),
             rect: Rect { x, y, w: 40, h: 16 },
+            grid: None,
         }
     }
 
@@ -1639,6 +1640,7 @@ mod tests {
                 w: 1,
                 h: 1,
             },
+            grid: None,
         };
         let (_, user) = build_pick_prompt("q", std::slice::from_ref(&long));
         assert!(!user.contains(&"x".repeat(81)));

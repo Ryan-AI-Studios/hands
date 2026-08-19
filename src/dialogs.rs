@@ -170,6 +170,7 @@ mod tests {
                 w: 40,
                 h: 16,
             },
+            grid: None,
         }
     }
 

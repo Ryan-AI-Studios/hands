@@ -79,6 +79,11 @@ impl Space {
         format!("g:{col}:{row}")
     }
 
+    pub fn cell_id_of_center(self, rect: Rect) -> String {
+        let (x, y) = rect.center();
+        self.cell_id(x, y)
+    }
+
     pub fn cell_rect(self, col: i32, row: i32) -> Rect {
         let x = self
             .origin_x
@@ -290,6 +295,32 @@ mod tests {
         assert_eq!(space.cell_id(-1, 99), "g:19:0");
         assert_eq!(space.cell_id(0, 0), "g:19:0");
         assert_eq!(space.cell_id(0, 100), "g:19:1");
+    }
+
+    #[test]
+    fn cell_id_of_center_live_shaped_search_box() {
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let rect = Rect {
+            x: 46,
+            y: 620,
+            w: 903,
+            h: 56,
+        };
+        assert_eq!(rect.center(), (497, 648));
+        assert_eq!(space.cell_id_of_center(rect), "g:4:6");
+    }
+
+    #[test]
+    fn cell_id_of_center_negative_origin_not_g00() {
+        let space = Space::new(-1920, 0, 3840, 1080).unwrap();
+        let rect = Rect {
+            x: -1,
+            y: -1,
+            w: 2,
+            h: 2,
+        };
+        assert_eq!(rect.center(), (0, 0));
+        assert_eq!(space.cell_id_of_center(rect), "g:19:0");
     }
 
     #[test]

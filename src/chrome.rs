@@ -221,6 +221,7 @@ fn map_from_raw(raw: RawSnapshot) -> ChromeMap {
             role: node.role.unwrap_or_else(|| "Other".into()),
             text: node.text,
             rect,
+            grid: None,
         });
     }
     let mut cards = Vec::new();

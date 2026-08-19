@@ -17,6 +17,7 @@ pub mod error;
 pub mod extract;
 pub mod fence;
 pub mod foreground;
+pub mod host_doctor;
 pub mod input;
 pub mod lease;
 pub mod logs;

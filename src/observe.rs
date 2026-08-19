@@ -37,6 +37,8 @@ pub struct ObserveEnvelope {
     pub elements_total: usize,
     pub elements_truncated: bool,
     pub chrome_connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chrome_hint: Option<String>,
     pub challenge: ChallengeInfo,
 }
 
@@ -54,6 +56,8 @@ pub struct ObserveSidecar {
     pub elements_total: usize,
     pub elements_truncated: bool,
     pub chrome_connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_hint: Option<String>,
     #[serde(default)]
     pub challenge: ChallengeInfo,
 }
@@ -113,6 +117,11 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         elements_total,
         elements_truncated: false,
         chrome_connected,
+        chrome_hint: if chrome_connected {
+            None
+        } else {
+            Some("Chrome host down — run hands native-host-doctor (MCP: native_host_doctor)".into())
+        },
         challenge,
     };
     write_sidecar(&paths.observe_path, &full)?;
@@ -150,6 +159,7 @@ fn write_sidecar(path: &std::path::Path, envelope: &ObserveEnvelope) -> Result<(
         elements_total: envelope.elements_total,
         elements_truncated: false,
         chrome_connected: envelope.chrome_connected,
+        chrome_hint: envelope.chrome_hint.clone(),
         challenge: envelope.challenge.clone(),
     };
     let json = serde_json::to_string_pretty(&sidecar)
@@ -169,9 +179,9 @@ pub fn cap_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
 }
 
 /// Default path: 20-element cap, then pop non-dialog elements from the end to
-/// 4 KiB, then shrink `main_text`. Never drops cards, `challenge`, or
-/// `extract.dialogs` first. Last resort: pop extra dialogs after `main_text`
-/// is empty. 16 KiB hard fail stays in `finalize_envelope`.
+/// 4 KiB, then shrink `main_text`. Never drops cards, `challenge`,
+/// `chrome_hint`, or `extract.dialogs` first. Last resort: pop extra dialogs
+/// after `main_text` is empty. 16 KiB hard fail stays in `finalize_envelope`.
 pub fn cap_default_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
     if envelope.elements.len() > VIEWPORT_ENVELOPE_ELEMENT_CAP {
         envelope.elements.truncate(VIEWPORT_ENVELOPE_ELEMENT_CAP);
@@ -484,6 +494,7 @@ mod tests {
             elements_total: n,
             elements_truncated: false,
             chrome_connected: false,
+            chrome_hint: None,
             challenge: ChallengeInfo::default(),
         }
     }
@@ -834,6 +845,7 @@ mod tests {
             elements_total,
             elements_truncated: false,
             chrome_connected,
+            chrome_hint: None,
             challenge: ChallengeInfo::default(),
         };
         assert!(raw.viewport.is_some());
@@ -1011,6 +1023,70 @@ mod tests {
         assert!(main.contains("dialogs") || main.contains("extract.dialogs"));
         assert!(mcp.contains("grid") && mcp.contains("g:col:row"));
         assert!(main.contains("grid") && main.contains("g:col:row"));
+        assert!(mcp.contains("chrome_hint"), "mcp observe description");
+        assert!(
+            mcp.contains("native-host-doctor") || mcp.contains("native_host_doctor"),
+            "mcp observe description points at native-host-doctor"
+        );
+    }
+
+    #[test]
+    fn disconnected_serialize_includes_chrome_hint() {
+        let mut env = fat_envelope(0);
+        env.chrome_connected = false;
+        env.chrome_hint = Some(
+            "Chrome host down — run hands native-host-doctor (MCP: native_host_doctor)".into(),
+        );
+        let json = serialize_envelope(&env).unwrap();
+        assert!(json.contains("chrome_hint"));
+        assert!(json.contains("native-host-doctor"));
+    }
+
+    #[test]
+    fn connected_serialize_omits_chrome_hint() {
+        let mut env = fat_envelope(0);
+        env.chrome_connected = true;
+        env.chrome_hint = None;
+        let json = serialize_envelope(&env).unwrap();
+        assert!(!json.contains("chrome_hint"));
+    }
+
+    #[test]
+    fn sidecar_missing_chrome_hint_deserializes() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [],
+            "elements_total": 0,
+            "elements_truncated": false,
+            "chrome_connected": false
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        assert_eq!(side.chrome_hint, None);
+    }
+
+    #[test]
+    fn chrome_hint_survives_4kib_cap() {
+        let mut raw = fat_envelope(400);
+        raw.chrome_connected = false;
+        raw.chrome_hint = Some(
+            "Chrome host down — run hands native-host-doctor (MCP: native_host_doctor)".into(),
+        );
+        let capped = cap_default_envelope(raw);
+        assert!(
+            capped
+                .chrome_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("native-host-doctor")),
+            "chrome_hint must survive 4 KiB shrink"
+        );
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(json.contains("chrome_hint"));
+        assert!(json.contains("native-host-doctor"));
     }
 
     fn dialog_el(id: &str, text: &str, rect: Rect) -> Element {
@@ -1078,6 +1154,7 @@ mod tests {
             elements_total,
             elements_truncated: false,
             chrome_connected,
+            chrome_hint: None,
             challenge: ChallengeInfo::default(),
         };
         let capped = cap_default_envelope(raw);

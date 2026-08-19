@@ -1232,6 +1232,7 @@ mod tests {
             elements_total: 0,
             elements_truncated: false,
             chrome_connected: false,
+            chrome_hint: None,
             challenge: ChallengeInfo::default(),
         };
         std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();

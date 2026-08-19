@@ -655,6 +655,29 @@ mod tests {
         assert_eq!(extract.zip.as_deref(), Some("32309"));
         assert_eq!(extract.radius.as_deref(), Some("50 mi"));
         assert!(extract.cards.is_empty());
+        let json_js = r#"{
+            "url":"https://www.cars.com/shopping/results/?zip=32309&maximum_distance=50",
+            "title":"Cars.com",
+            "main_text":"Sorry, nothing fits those filters. Try a larger radius.",
+            "empty_state":"Sorry, nothing fits those filters.",
+            "metrics":{"screenX":0,"screenY":0,"outerWidth":100,"outerHeight":100,"innerWidth":100,"innerHeight":100,"devicePixelRatio":1},
+            "elements":[],
+            "cards":[]
+        }"#;
+        let map_js = parse_snapshot_bytes(json_js.as_bytes()).expect("parse");
+        let extract_js = crate::extract::extract_fused(
+            "UIA",
+            &[],
+            map_js.url.as_deref(),
+            &map_js.title,
+            &map_js.main_text,
+            map_js.cards,
+            map_js.listing,
+        );
+        assert_eq!(
+            extract_js.empty_state.as_deref(),
+            Some("Sorry, nothing fits those filters.")
+        );
     }
 
     #[test]

@@ -602,6 +602,81 @@ pub fn enrich_listing(extract: &mut Extract) {
     }
 }
 
+/// Dealer from a **card-scoped** blob only (already-collected card innerText).
+/// Strip title / price / miles / distance / `of`; leftover is the dealer candidate.
+/// Never call this on page `main_text` — that would guess from the footer.
+pub fn parse_dealer(card_text: &str, title: &str, price: &str) -> Option<String> {
+    let mut rest = card_text.to_string();
+    if !title.trim().is_empty() {
+        rest = rest.replace(title.trim(), " ");
+    }
+    if !price.trim().is_empty() {
+        rest = rest.replace(price.trim(), " ");
+    }
+    if let Some(miles) = parse_miles(&rest) {
+        rest = rest.replace(&miles, " ");
+    }
+    if let Some(distance) = parse_distance(&rest) {
+        rest = rest.replace(&distance, " ");
+    }
+    if let Some(of) = parse_listing_of(&rest) {
+        rest = rest.replace(&of, " ");
+    }
+    rest = strip_price_tokens(&rest);
+    let rest = collapse_ws(&rest);
+    if rest.chars().count() < 2 || !rest.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let lower = rest.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "used" | "new" | "save" | "view" | "details" | "more"
+    ) {
+        return None;
+    }
+    Some(take_chars(&rest, CARD_DEALER_CAP))
+}
+
+fn collapse_ws(text: &str) -> String {
+    let mut out = String::new();
+    let mut prev_space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn strip_price_tokens(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '$' || c == '€' || c == '£' {
+            let rest = &text[i + c.len_utf8()..];
+            let digits = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit() || *ch == ',' || *ch == '.')
+                .count();
+            if digits > 0 {
+                for _ in 0..digits {
+                    chars.next();
+                }
+                out.push(' ');
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn find_empty_phrase(lower: &str, phrase: &str) -> Option<usize> {
     let bytes = lower.as_bytes();
     let mut search = 0;
@@ -1015,6 +1090,42 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("0 matches")
         );
+    }
+
+    #[test]
+    fn parse_dealer_from_card_text_not_footer() {
+        let card = "2024 Toyota Camry 32,145 mi 12 mi away Capital Toyota $19,999 1 of 6";
+        assert_eq!(
+            parse_dealer(card, "2024 Toyota Camry", "$19,999").as_deref(),
+            Some("Capital Toyota")
+        );
+        assert_eq!(
+            parse_dealer("2024 Camry Capital Toyota", "2024 Camry", "").as_deref(),
+            Some("Capital Toyota")
+        );
+        assert!(
+            parse_dealer("2024 Toyota Camry $19,999", "2024 Toyota Camry", "$19,999").is_none()
+        );
+        let mut extract = Extract {
+            title: "Results".into(),
+            url: None,
+            main_text: "Capital Toyota footer nav".into(),
+            cards: vec![Card {
+                title: "2024 Camry".into(),
+                price: "$19,999".into(),
+                href: "https://cars.com/1".into(),
+                rect: Rect {
+                    x: 1,
+                    y: 1,
+                    w: 2,
+                    h: 2,
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        enrich_listing(&mut extract);
+        assert!(extract.cards[0].dealer.is_none());
     }
 
     #[test]

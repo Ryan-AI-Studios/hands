@@ -384,7 +384,7 @@ function collectCards() {
     };
     const miles = cardMiles(el, text);
     if (miles) card.miles = miles;
-    const dealer = cardDealer(el);
+    const dealer = cardDealer(el, text, title, price);
     if (dealer) card.dealer = dealer;
     const distance = cardDistance(text);
     if (distance) card.distance = distance;
@@ -420,7 +420,7 @@ function cardMiles(el, text) {
   return m ? cap(m[0].replace(/\s+/g, " ").trim(), CARD_MILES_CAP) : "";
 }
 
-function cardDealer(el) {
+function cardDealer(el, text, title, price) {
   const item = itempropText(el, "seller");
   if (item) {
     return cap(item, CARD_DEALER_CAP);
@@ -429,7 +429,27 @@ function cardDealer(el) {
   if (data) {
     return cap(data, CARD_DEALER_CAP);
   }
-  return "";
+  let rest = String(text || "");
+  if (title) {
+    rest = rest.split(title).join(" ");
+  }
+  if (price) {
+    rest = rest.split(price).join(" ");
+  }
+  rest = rest.replace(/(\d{1,3}(?:,\d{3})+|\d{4,})\s*(mi|miles)\b(?!\s*away)/ig, " ");
+  rest = rest.replace(/\d[\d,]*\s*(mi|miles)\s+away\b/ig, " ");
+  rest = rest.replace(/shipping from\b[^.\n]*/ig, " ");
+  rest = rest.replace(/\b\d+\s+of\s+\d+\b/ig, " ");
+  rest = rest.replace(/[$€£][\d,]+(?:\.\d{2})?/g, " ");
+  rest = rest.replace(/\s+/g, " ").trim();
+  if (rest.length < 2 || !/[A-Za-z]/.test(rest)) {
+    return "";
+  }
+  const junk = /^(used|new|save|view|details|more)$/i;
+  if (junk.test(rest)) {
+    return "";
+  }
+  return cap(rest, CARD_DEALER_CAP);
 }
 
 function cardDistance(text) {
@@ -526,7 +546,23 @@ function parseEmptyState(text) {
   for (let i = 0; i < phrases.length; i += 1) {
     const idx = indexOfEmptyPhrase(lower, phrases[i]);
     if (idx !== -1) {
-      return cap(text.slice(idx, idx + phrases[i].length), EMPTY_STATE_CAP);
+      let start = 0;
+      for (let j = idx - 1; j >= 0; j -= 1) {
+        if (".!?\n\r".indexOf(text.charAt(j)) !== -1) {
+          start = j + 1;
+          break;
+        }
+      }
+      const afterPhrase = idx + phrases[i].length;
+      let end = text.length;
+      for (let j = afterPhrase; j < text.length; j += 1) {
+        if (".!?\n\r".indexOf(text.charAt(j)) !== -1) {
+          end = j + 1;
+          break;
+        }
+      }
+      const sentence = text.slice(start, end).trim();
+      return sentence ? cap(sentence, EMPTY_STATE_CAP) : "";
     }
   }
   return "";

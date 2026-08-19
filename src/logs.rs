@@ -11,7 +11,7 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::error::HandsError;
 use crate::lease::{self, FreezeCause};
-use crate::observe::ENVELOPE_MAX_BYTES;
+use crate::observe::{DEFAULT_ENVELOPE_MAX_BYTES, ENVELOPE_MAX_BYTES};
 
 pub const LOGS_SCHEMA: &str = "hands.logs/v1";
 pub const DEFAULT_TAIL: usize = 50;
@@ -540,14 +540,14 @@ pub fn serialize_logs(envelope: &LogsEnvelope) -> Result<String, HandsError> {
     Ok(json)
 }
 
-fn fit_envelope(mut envelope: LogsEnvelope) -> Result<LogsEnvelope, HandsError> {
-    while serialize_logs_len(&envelope) > ENVELOPE_MAX_BYTES && !envelope.events.is_empty() {
+fn fit_envelope(mut envelope: LogsEnvelope, max_bytes: usize) -> Result<LogsEnvelope, HandsError> {
+    while serialize_logs_len(&envelope) > max_bytes && !envelope.events.is_empty() {
         envelope.events.remove(0);
         envelope.truncated = true;
     }
-    if serialize_logs_len(&envelope) > ENVELOPE_MAX_BYTES {
+    if serialize_logs_len(&envelope) > max_bytes {
         return Err(HandsError::Logs(format!(
-            "logs envelope is {} bytes after dropping events (hard max {ENVELOPE_MAX_BYTES})",
+            "logs envelope is {} bytes after dropping events (hard max {max_bytes})",
             serialize_logs_len(&envelope)
         )));
     }
@@ -573,14 +573,22 @@ pub fn read_tail(session_id: &str, tail: Option<usize>) -> Result<LogsEnvelope, 
     } else {
         all
     };
-    fit_envelope(LogsEnvelope {
-        session_id: Some(id.to_string()),
-        ok: true,
-        events,
-        truncated: truncated_by_tail,
-        sessions: None,
-        error: None,
-    })
+    let max_bytes = if tail.is_none() {
+        DEFAULT_ENVELOPE_MAX_BYTES
+    } else {
+        ENVELOPE_MAX_BYTES
+    };
+    fit_envelope(
+        LogsEnvelope {
+            session_id: Some(id.to_string()),
+            ok: true,
+            events,
+            truncated: truncated_by_tail,
+            sessions: None,
+            error: None,
+        },
+        max_bytes,
+    )
 }
 
 fn list_entries() -> Result<Vec<SessionInfo>, HandsError> {
@@ -1018,6 +1026,11 @@ mod tests {
             let env = read_tail("s-fat", Some(200)).unwrap();
             let json = serialize_logs(&env).unwrap();
             assert!(json.len() <= ENVELOPE_MAX_BYTES, "len {}", json.len());
+            assert!(
+                json.len() > DEFAULT_ENVELOPE_MAX_BYTES,
+                "explicit --tail must keep the 16 KiB budget, got {}",
+                json.len()
+            );
             assert!(env.truncated);
             assert!(!env.events.is_empty());
             let first = env.events[0].observe.as_ref().unwrap().elements_total;
@@ -1031,6 +1044,111 @@ mod tests {
                 .elements_total;
             assert!(last > first, "newest last: {first}..{last}");
         });
+    }
+
+    fn fat_observe(session_id: &str, i: usize) -> Event {
+        Event {
+            schema: LOGS_SCHEMA.into(),
+            ts: now_ts(),
+            session_id: session_id.into(),
+            kind: "tool".into(),
+            tool: Some("observe".into()),
+            ok: Some(true),
+            error: None,
+            target: None,
+            fence: None,
+            confirm: None,
+            observe: Some(LogObserve {
+                detail: "default".into(),
+                screenshot_path: format!("C:\\tmp\\{}\\shot.png", "x".repeat(400)),
+                elements_total: i,
+            }),
+            type_meta: None,
+            key: None,
+            yield_info: None,
+        }
+    }
+
+    fn kind_only(session_id: &str, kind: &str) -> Event {
+        Event {
+            schema: LOGS_SCHEMA.into(),
+            ts: now_ts(),
+            session_id: session_id.into(),
+            kind: kind.into(),
+            tool: None,
+            ok: None,
+            error: None,
+            target: None,
+            fence: None,
+            confirm: None,
+            observe: None,
+            type_meta: None,
+            key: None,
+            yield_info: None,
+        }
+    }
+
+    #[test]
+    fn default_none_fits_4kib_and_keeps_newest_stop() {
+        with_test_env(|| {
+            for i in 0..80 {
+                record(fat_observe("s-4k", i)).unwrap();
+            }
+            record(kind_only("s-4k", "pause")).unwrap();
+            record(kind_only("s-4k", "stop")).unwrap();
+            let env = run_logs(Some("s-4k"), false, None).unwrap();
+            let json = serialize_logs(&env).unwrap();
+            assert!(
+                json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+                "len {}",
+                json.len()
+            );
+            assert!(json.len() <= ENVELOPE_MAX_BYTES, "len {}", json.len());
+            assert!(env.truncated);
+            assert!(!env.events.is_empty());
+            assert_eq!(env.events.last().unwrap().kind, "stop");
+        });
+    }
+
+    #[test]
+    fn short_session_default_is_not_truncated() {
+        with_test_env(|| {
+            record(tool_event("s-short", "click")).unwrap();
+            record(tool_event("s-short", "hover")).unwrap();
+            record(tool_event("s-short", "type")).unwrap();
+            let env = run_logs(Some("s-short"), false, None).unwrap();
+            assert!(!env.truncated);
+            assert_eq!(env.events.len(), 3);
+            assert_eq!(env.events[0].tool.as_deref(), Some("click"));
+            assert_eq!(env.events[2].tool.as_deref(), Some("type"));
+        });
+    }
+
+    #[test]
+    fn mcp_and_cli_mention_tail_budget() {
+        let mcp = include_str!("mcp.rs");
+        let main_prod = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            mcp.contains("newest-last") && mcp.contains("4 KiB") && mcp.contains("truncated"),
+            "mcp logs description"
+        );
+        assert!(
+            mcp.contains("16 KiB") && mcp.contains("pause/stop"),
+            "mcp logs description"
+        );
+        assert!(
+            (main_prod.contains("newest-last") || main_prod.contains("Newest-last"))
+                && main_prod.contains("4 KiB")
+                && main_prod.contains("truncated"),
+            "cli logs about/--tail"
+        );
+        assert!(
+            main_prod.contains("16 KiB") && main_prod.contains("pause/stop"),
+            "cli logs about/--tail"
+        );
     }
 
     #[test]

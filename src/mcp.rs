@@ -312,7 +312,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Read session JSONL audit events (tail) or list session files. Does not mint a session id."
+        description = "Read session JSONL audit events as a newest-last tail (default ≤4 KiB, truncated when dropped) or list session files. Explicit tail N (1..=200) still ≤16 KiB. Newest pause/stop in the slice survives. Does not mint a session id."
     )]
     fn logs(
         &self,

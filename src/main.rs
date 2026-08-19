@@ -71,9 +71,13 @@ enum Command {
     },
     /// Scroll the wheel (notches). Optional UIA / Chrome `chr:` / grid / pixel target hovers first.
     Scroll {
-        #[arg(long)]
+        #[arg(
+            long,
+            allow_negative_numbers = true,
+            help = "signed notches; negative = toward the user (page-down). Example: --dy -6"
+        )]
         dy: i32,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         dx: Option<i32>,
         #[arg(long, help = "UIA id, Chrome chr: id, grid cell, or pixel")]
         element_id: Option<String>,
@@ -619,4 +623,79 @@ fn native_host_manifest_main(
 fn fail(err: HandsError) -> ! {
     eprintln!("{}", err.tool_message());
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn scroll_dy_space_separated_negative_six() {
+        let cli = Cli::try_parse_from(["hands", "scroll", "--dy", "-6"]).expect("parse");
+        match cli.command {
+            Command::Scroll { dy, dx, .. } => {
+                assert_eq!(dy, -6);
+                assert_eq!(dx, None);
+            }
+            _ => panic!("expected Scroll"),
+        }
+    }
+
+    #[test]
+    fn scroll_dy_equals_negative_six() {
+        let cli = Cli::try_parse_from(["hands", "scroll", "--dy=-6"]).expect("parse");
+        match cli.command {
+            Command::Scroll { dy, .. } => assert_eq!(dy, -6),
+            _ => panic!("expected Scroll"),
+        }
+    }
+
+    #[test]
+    fn scroll_dx_space_separated_negative() {
+        let cli =
+            Cli::try_parse_from(["hands", "scroll", "--dy", "3", "--dx", "-2"]).expect("parse");
+        match cli.command {
+            Command::Scroll { dy, dx, .. } => {
+                assert_eq!(dy, 3);
+                assert_eq!(dx, Some(-2));
+            }
+            _ => panic!("expected Scroll"),
+        }
+    }
+
+    #[test]
+    fn scroll_dy_positive_six() {
+        let cli = Cli::try_parse_from(["hands", "scroll", "--dy", "6"]).expect("parse");
+        match cli.command {
+            Command::Scroll { dy, .. } => assert_eq!(dy, 6),
+            _ => panic!("expected Scroll"),
+        }
+    }
+
+    #[test]
+    fn scroll_long_help_contains_dy_space_negative_six() {
+        let cmd = Cli::command();
+        let scroll = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "scroll")
+            .expect("scroll subcommand");
+        let help = scroll.clone().render_long_help().to_string();
+        assert!(
+            help.contains("--dy -6"),
+            "long-help should mention --dy -6, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn scroll_dy_help_is_not_numeric() {
+        if let Ok(cli) = Cli::try_parse_from(["hands", "scroll", "--dy", "--help"]) {
+            match cli.command {
+                Command::Scroll { dy, .. } => {
+                    panic!("--dy --help must not parse as numeric dy={dy}")
+                }
+                _ => panic!("--dy --help must not parse as a command"),
+            }
+        }
+    }
 }

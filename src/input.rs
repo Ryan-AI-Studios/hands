@@ -461,6 +461,14 @@ mod tests {
     }
 
     #[test]
+    fn negative_six_notches_is_two_s_complement_dword() {
+        assert_eq!(
+            (-6i32).saturating_mul(WHEEL_DELTA as i32) as u32,
+            (-720i32) as u32
+        );
+    }
+
+    #[test]
     fn restore_helper_uses_saved_or_empty() {
         let saved: Vec<u16> = "hello".encode_utf16().collect();
         assert_eq!(restore_op(Some(&saved)), ClipboardOp::Set(saved.clone()));

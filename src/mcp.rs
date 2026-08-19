@@ -241,7 +241,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Scroll the mouse wheel (dy notches, optional dx and UIA / Chrome `chr:` / grid / pixel target)"
+        description = "Scroll the mouse wheel (signed dy notches; negative = toward the user; optional dx and UIA / Chrome `chr:` / grid / pixel target)"
     )]
     fn scroll(
         &self,

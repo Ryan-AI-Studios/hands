@@ -185,12 +185,13 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Tail or list session JSONL audit logs (does not install the desk lease; does not mint)
+    /// Newest-last session JSONL tail (default ≤4 KiB, truncated when dropped; --tail N still ≤16 KiB). Newest pause/stop stays. Does not install the desk lease; does not mint. On-disk JSONL unbounded.
     Logs {
         #[arg(long, required_unless_present = "list")]
         session_id: Option<String>,
         #[arg(long)]
         list: bool,
+        /// Event count (clamp 1..=200). Default 50 then ≤4 KiB. With --tail, last N then ≤16 KiB.
         #[arg(long)]
         tail: Option<usize>,
     },
@@ -704,6 +705,30 @@ mod tests {
         assert!(
             help.contains("--dy -6"),
             "long-help should mention --dy -6, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn logs_help_mentions_tail_budget() {
+        let cmd = Cli::command();
+        let logs = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "logs")
+            .expect("logs subcommand");
+        let about = logs.get_about().map(|s| s.to_string()).unwrap_or_default();
+        let help = logs.clone().render_long_help().to_string();
+        let blob = format!("{about}\n{help}");
+        assert!(
+            blob.contains("4 KiB"),
+            "logs help should mention default 4 KiB:\n{blob}"
+        );
+        assert!(
+            blob.contains("truncated"),
+            "logs help should mention truncated:\n{blob}"
+        );
+        assert!(
+            blob.contains("16 KiB"),
+            "logs help should mention 16 KiB --tail:\n{blob}"
         );
     }
 

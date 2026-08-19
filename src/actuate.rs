@@ -42,6 +42,8 @@ pub struct ActuateEnvelope {
     pub fence: Option<FenceInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub challenge: Option<ChallengeInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roi: Option<Rect>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -67,6 +69,10 @@ fn remember_target(rect: Rect) {
     }
 }
 
+/// Process-local last click/hover rect. Standalone `wait_settle` does not read this
+/// (bare default is the foreground window). Kept so `remember_target` stays the writer
+/// (hover yield leftover: remember still happens before `refuse_if_yielded`).
+#[allow(dead_code)]
 fn last_target() -> Option<Rect> {
     LAST_TARGET.lock().ok().and_then(|g| *g)
 }
@@ -109,6 +115,7 @@ fn base(
         error,
         fence: None,
         challenge: None,
+        roi: None,
     })
 }
 
@@ -124,6 +131,7 @@ fn refuse_yield(session_id: String, target: ActuateTarget) -> Result<ActuateEnve
         error: Some(YIELD_ERROR.into()),
         fence: None,
         challenge: Some(challenge::snapshot()),
+        roi: None,
     })
 }
 
@@ -154,6 +162,7 @@ fn refuse_fence(
         error: None,
         fence: Some(fence),
         challenge: None,
+        roi: None,
     })
 }
 
@@ -552,23 +561,47 @@ fn wait_settle_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError>
         Ok(s) => s,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
-    let roi = match explicit_roi(&req) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            let cursor = input::cursor_pos().unwrap_or((0, 0));
-            settle::default_roi(space, last_target(), cursor)
-        }
+    let explicit = match explicit_roi(&req) {
+        Ok(v) => v,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
+    };
+    let (roi, title_hwnd, origin) = match explicit {
+        Some(raw) => (space.clip_rect(raw), None, (raw.x, raw.y)),
+        None => {
+            let hwnd = foreground::foreground_hwnd();
+            let fg = hwnd.and_then(foreground::window_rect);
+            match settle::default_wait_roi(space, fg) {
+                Ok(r) => (r, hwnd, (r.x, r.y)),
+                Err(err) => {
+                    return fail(session_id, none_target(), err, false, false, false);
+                }
+            }
+        }
     };
     let info = ActuateTarget {
         kind: "roi".into(),
         id: None,
-        x: roi.x,
-        y: roi.y,
+        x: origin.0,
+        y: origin.1,
+    };
+    let with_roi = |env: ActuateEnvelope| {
+        let mut env = env;
+        env.roi = Some(roi);
+        finalize_envelope(env)
     };
     match settle::wait_settle(space, roi) {
-        Ok((settled, _)) => base(session_id, info, true, false, false, settled, false, None),
-        Err(err) => fail(session_id, info, err, false, false, false),
+        Ok((settled, _)) => {
+            let caption = foreground::title(title_hwnd);
+            let settled = if settle::title_blocks_settled(&caption) {
+                false
+            } else {
+                settled
+            };
+            with_roi(base(
+                session_id, info, true, false, false, settled, false, None,
+            )?)
+        }
+        Err(err) => with_roi(fail(session_id, info, err, false, false, false)?),
     }
 }
 
@@ -666,9 +699,102 @@ mod tests {
             error: None,
             fence: None,
             challenge: None,
+            roi: None,
         };
         let err = finalize_envelope(env).expect_err("must not emit oversize");
         assert!(err.to_string().contains("16384"), "{err}");
+    }
+
+    fn sample_target() -> ActuateTarget {
+        ActuateTarget {
+            kind: "roi".into(),
+            id: None,
+            x: 10,
+            y: 20,
+        }
+    }
+
+    #[test]
+    fn wait_settle_envelope_includes_roi() {
+        let env = ActuateEnvelope {
+            session_id: "s".into(),
+            ok: true,
+            frozen: false,
+            target: sample_target(),
+            retried: false,
+            settled: true,
+            foregrounded: false,
+            error: None,
+            fence: None,
+            challenge: None,
+            roi: Some(Rect {
+                x: 10,
+                y: 20,
+                w: 800,
+                h: 600,
+            }),
+        };
+        let json = serialize_envelope(&env).expect("json");
+        assert!(json.contains("\"roi\""), "{json}");
+        assert!(json.contains("\"w\":800"), "{json}");
+        assert!(json.contains("\"h\":600"), "{json}");
+        assert!(json.contains("\"x\":10"), "{json}");
+        assert!(json.contains("\"y\":20"), "{json}");
+    }
+
+    #[test]
+    fn click_envelope_omits_roi() {
+        let env = ActuateEnvelope {
+            session_id: "s".into(),
+            ok: true,
+            frozen: false,
+            target: ActuateTarget {
+                kind: "element".into(),
+                id: Some("uia:1".into()),
+                x: 40,
+                y: 50,
+            },
+            retried: false,
+            settled: true,
+            foregrounded: true,
+            error: None,
+            fence: None,
+            challenge: None,
+            roi: None,
+        };
+        let json = serialize_envelope(&env).expect("json");
+        assert!(!json.contains("\"roi\""), "{json}");
+    }
+
+    #[test]
+    fn wait_settle_inner_default_does_not_use_last_target_or_cursor() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn wait_settle_inner").expect("wait_settle_inner");
+        let rest = &src[start..];
+        let end = rest
+            .find("\nfn explicit_roi")
+            .expect("explicit_roi follows");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("last_target("),
+            "default wait_settle must not call last_target:\n{body}"
+        );
+        assert!(
+            !body.contains("default_roi("),
+            "default wait_settle must not call settle::default_roi:\n{body}"
+        );
+        assert!(
+            !body.contains("cursor_pos("),
+            "default wait_settle must not fall back to cursor:\n{body}"
+        );
+        assert!(
+            body.contains("default_wait_roi"),
+            "default wait_settle must use default_wait_roi:\n{body}"
+        );
+        assert!(
+            body.contains("title_blocks_settled"),
+            "standalone wait_settle must apply title honesty:\n{body}"
+        );
     }
 
     #[test]

@@ -4,6 +4,15 @@ const CARD_TITLE_CAP = 80;
 const CARD_PRICE_CAP = 24;
 const CARD_HREF_CAP = 200;
 const CARD_CAP = 8;
+const CARD_MILES_CAP = 16;
+const CARD_DEALER_CAP = 48;
+const CARD_DISTANCE_CAP = 40;
+const CARD_OF_CAP = 12;
+const RESULT_COUNT_CAP = 24;
+const LOCAL_MATCHES_CAP = 24;
+const EMPTY_STATE_CAP = 120;
+const ZIP_CAP = 10;
+const RADIUS_CAP = 16;
 const PRICE_RE = /\$|€|£|\d[\d,]*\.\d{2}/;
 
 const DEFAULT_SELECTOR = [
@@ -55,7 +64,7 @@ function buildSnapshot(detail) {
       elements.push(payload);
     }
   }
-  return {
+  const snap = {
     url: location.href || "",
     title: document.title || "",
     main_text: mainText(),
@@ -63,6 +72,13 @@ function buildSnapshot(detail) {
     cards: collectCards(),
     metrics: metrics,
   };
+  const listing = collectListingMeta();
+  if (listing.result_count) snap.result_count = listing.result_count;
+  if (listing.local_matches) snap.local_matches = listing.local_matches;
+  if (listing.empty_state) snap.empty_state = listing.empty_state;
+  if (listing.zip) snap.zip = listing.zip;
+  if (listing.radius) snap.radius = listing.radius;
+  return snap;
 }
 
 function buildResolve(id, detail) {
@@ -360,14 +376,178 @@ function collectCards() {
     if (!title) {
       continue;
     }
-    out.push({
+    const card = {
       title: title,
       price: price,
       href: cap(href, CARD_HREF_CAP),
       rectCss: rect,
-    });
+    };
+    const miles = cardMiles(el, text);
+    if (miles) card.miles = miles;
+    const dealer = cardDealer(el);
+    if (dealer) card.dealer = dealer;
+    const distance = cardDistance(text);
+    if (distance) card.distance = distance;
+    const ofText = cardOf(text);
+    if (ofText) card.of = ofText;
+    out.push(card);
   }
   return out;
+}
+
+function itempropText(el, name) {
+  const node = el.querySelector("[itemprop=\"" + name + "\"]");
+  if (!node) {
+    return "";
+  }
+  const content = attr(node, "content");
+  if (content) {
+    return content;
+  }
+  return (node.innerText || "").replace(/\s+/g, " ").trim();
+}
+
+function cardMiles(el, text) {
+  const item = itempropText(el, "mileageFromOdometer");
+  if (item) {
+    return cap(item, CARD_MILES_CAP);
+  }
+  const data = attr(el, "data-mileage");
+  if (data) {
+    return cap(data, CARD_MILES_CAP);
+  }
+  const m = text.match(/(\d{1,3}(?:,\d{3})+|\d{4,})\s*(mi|miles)\b(?!\s*away)/i);
+  return m ? cap(m[0].replace(/\s+/g, " ").trim(), CARD_MILES_CAP) : "";
+}
+
+function cardDealer(el) {
+  const item = itempropText(el, "seller");
+  if (item) {
+    return cap(item, CARD_DEALER_CAP);
+  }
+  const data = attr(el, "data-dealer");
+  if (data) {
+    return cap(data, CARD_DEALER_CAP);
+  }
+  return "";
+}
+
+function cardDistance(text) {
+  const away = text.match(/\d[\d,]*\s*(mi|miles)\s+away\b/i);
+  if (away) {
+    return cap(away[0].replace(/\s+/g, " ").trim(), CARD_DISTANCE_CAP);
+  }
+  const ship = text.match(/shipping from\b[^.\n]*/i);
+  if (ship) {
+    return cap(ship[0].replace(/\s+/g, " ").trim(), CARD_DISTANCE_CAP);
+  }
+  return "";
+}
+
+function cardOf(text) {
+  const m = text.match(/\b(\d+)\s+of\s+(\d+)\b/i);
+  return m ? cap(m[1] + " of " + m[2], CARD_OF_CAP) : "";
+}
+
+function collectListingMeta() {
+  const heading = document.querySelector("h1,h2,[role=\"heading\"]");
+  const headingText = heading
+    ? (heading.innerText || "").replace(/\s+/g, " ").trim()
+    : "";
+  const text = (headingText + "\n" + mainText()).trim();
+  const meta = {};
+  let zip = "";
+  let radius = "";
+  const params = new URLSearchParams(location.search || "");
+  zip = (params.get("zip") || "").trim();
+  const maxDist = (params.get("maximum_distance") || "").trim();
+  if (maxDist) {
+    radius = maxDist + " mi";
+  }
+  const within = text.match(
+    /within\s+(\d[\d,]*)\s*(mi|miles)\s+of\s+(\d{5}(?:-\d{4})?)/i
+  );
+  if (within) {
+    if (!radius) {
+      radius = within[1] + " mi";
+    }
+    if (!zip) {
+      zip = within[3];
+    }
+  }
+  if (zip) {
+    meta.zip = cap(zip, ZIP_CAP);
+  }
+  if (radius) {
+    meta.radius = cap(radius, RADIUS_CAP);
+  }
+  const countSrc = headingText || text;
+  const count = parseResultCount(countSrc);
+  if (count) {
+    meta.result_count = count;
+  }
+  const local = parseLocalMatches(text);
+  if (local && local !== count) {
+    meta.local_matches = local;
+  }
+  const empty = parseEmptyState(text);
+  if (empty) {
+    meta.empty_state = empty;
+  }
+  return meta;
+}
+
+function parseResultCount(text) {
+  const m = text.match(/(\d[\d,]*)\+?\s+(matches|cars|results)\b/i);
+  if (!m) {
+    return "";
+  }
+  return cap(m[0].replace(/\s+/g, " ").trim(), RESULT_COUNT_CAP);
+}
+
+function parseLocalMatches(text) {
+  const m = text.match(/\b(\d+)\s+local\b/i);
+  return m ? cap(m[1] + " local", LOCAL_MATCHES_CAP) : "";
+}
+
+function parseEmptyState(text) {
+  const phrases = [
+    "nothing fits those filters",
+    "we couldn't find",
+    "we couldnt find",
+    "we couldn\u2019t find",
+    "0 matches",
+    "no cars match",
+    "no results",
+    "try a larger radius",
+    "expand your search",
+  ];
+  const lower = text.toLowerCase();
+  for (let i = 0; i < phrases.length; i += 1) {
+    const idx = indexOfEmptyPhrase(lower, phrases[i]);
+    if (idx !== -1) {
+      return cap(text.slice(idx, idx + phrases[i].length), EMPTY_STATE_CAP);
+    }
+  }
+  return "";
+}
+
+function indexOfEmptyPhrase(lower, phrase) {
+  let search = 0;
+  while (search <= lower.length) {
+    const idx = lower.indexOf(phrase, search);
+    if (idx === -1) {
+      return -1;
+    }
+    const before = idx === 0 || !/\d/.test(lower.charAt(idx - 1));
+    const afterCh = lower.charAt(idx + phrase.length);
+    const after = !afterCh || !/[A-Za-z0-9]/.test(afterCh);
+    if (before && after) {
+      return idx;
+    }
+    search = idx + 1;
+  }
+  return -1;
 }
 
 function cardHref(el) {

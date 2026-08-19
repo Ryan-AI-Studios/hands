@@ -37,7 +37,10 @@
       "title": "2020 Honda Civic",
       "price": "$12,345",
       "href": "https://cars.com/vehicledetail/abc",
-      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 }
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "32,145 mi",
+      "dealer": "Capital Toyota",
+      "distance": "12 mi away"
     }
   ]
 }

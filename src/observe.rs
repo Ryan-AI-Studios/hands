@@ -305,6 +305,7 @@ fn fuse_maps_dom(
                 &map.title,
                 &map.main_text,
                 map.cards,
+                map.listing,
             );
             (map.elements, n, extract)
         }
@@ -347,6 +348,7 @@ fn fuse_maps_default(
             &map.title,
             &map.main_text,
             map.cards,
+            map.listing,
         );
         let mut elements = chrome_els;
         elements.extend(uia_els);
@@ -476,6 +478,7 @@ mod tests {
                 main_text: "hello".into(),
                 cards: Vec::new(),
                 dialogs: Vec::new(),
+                ..Default::default()
             },
             elements: (0..n)
                 .map(|i| Element {
@@ -604,6 +607,7 @@ mod tests {
                 })
                 .collect(),
             cards: vec![],
+            listing: crate::extract::ListingMeta::default(),
         };
         let nodes: Vec<RawNode> = (0..5).map(uia).collect();
         let (extract, els, total, connected) = fuse_maps(
@@ -655,6 +659,9 @@ mod tests {
         assert!(els.iter().any(|e| e.id == "chr:0"));
         assert_eq!(extract.cards.len(), 1);
         assert_eq!(extract.cards[0].price, "$12,345");
+        assert!(extract.cards[0].miles.is_some());
+        assert!(extract.cards[0].dealer.is_some());
+        assert!(extract.cards[0].distance.is_some());
         crate::fence::note_last_url(extract.url.as_deref());
         assert_eq!(
             crate::fence::last_url().as_deref(),
@@ -715,6 +722,7 @@ mod tests {
                 w: 300,
                 h: 80,
             },
+            ..Default::default()
         }];
         let raw_len = serialize_envelope(&raw).unwrap().len();
         assert!(raw_len > ENVELOPE_MAX_BYTES, "fixture too small: {raw_len}");
@@ -957,6 +965,7 @@ mod tests {
                 w: 300,
                 h: 80,
             },
+            ..Default::default()
         }];
         raw.challenge = ChallengeInfo {
             present: true,
@@ -1027,6 +1036,14 @@ mod tests {
         assert!(
             mcp.contains("native-host-doctor") || mcp.contains("native_host_doctor"),
             "mcp observe description points at native-host-doctor"
+        );
+        assert!(
+            mcp.contains("miles") && mcp.contains("dealer") && mcp.contains("empty_state"),
+            "mcp observe description mentions listing fields"
+        );
+        assert!(
+            main.contains("miles") && main.contains("dealer") && main.contains("empty_state"),
+            "cli observe help mentions listing fields"
         );
     }
 
@@ -1201,6 +1218,7 @@ mod tests {
                 cookie,
             ],
             cards: vec![],
+            listing: crate::extract::ListingMeta::default(),
         };
         let (mut extract, mut elements, _total, connected) = fuse_maps(
             Detail::Default,
@@ -1232,6 +1250,10 @@ mod tests {
                     w: 300,
                     h: 80,
                 },
+                miles: Some("32,145 mi".into()),
+                dealer: Some("Capital Toyota".into()),
+                distance: Some("12 mi away".into()),
+                listing_of: None,
             })
             .collect();
         raw.extract.dialogs = vec![
@@ -1273,6 +1295,9 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["extract"]["dialogs"].as_array().unwrap().len(), 4);
         assert_eq!(parsed["extract"]["cards"].as_array().unwrap().len(), 8);
+        assert_eq!(parsed["extract"]["cards"][0]["miles"], "32,145 mi");
+        assert_eq!(parsed["extract"]["cards"][0]["dealer"], "Capital Toyota");
+        assert_eq!(parsed["extract"]["cards"][0]["distance"], "12 mi away");
         assert_eq!(parsed["challenge"]["present"], true);
     }
 
@@ -1447,5 +1472,104 @@ mod tests {
             !cargo.to_ascii_lowercase().contains("dwmget"),
             "Cargo.toml must not mention DwmGet"
         );
+    }
+
+    #[test]
+    fn sidecar_missing_listing_fields_deserializes() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[{"title":"c","price":"$1","href":"https://example.com","rect":{"x":1,"y":1,"w":2,"h":2}}]},
+            "elements": [],
+            "elements_total": 0,
+            "elements_truncated": false,
+            "chrome_connected": false
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        assert!(side.extract.result_count.is_none());
+        assert!(side.extract.local_matches.is_none());
+        assert!(side.extract.empty_state.is_none());
+        assert!(side.extract.zip.is_none());
+        assert!(side.extract.radius.is_none());
+        assert_eq!(side.extract.cards.len(), 1);
+        assert!(side.extract.cards[0].miles.is_none());
+        assert!(side.extract.cards[0].dealer.is_none());
+        assert!(side.extract.cards[0].distance.is_none());
+        assert!(side.extract.cards[0].listing_of.is_none());
+    }
+
+    #[test]
+    fn empty_listing_fields_omitted_from_envelope_json() {
+        let raw = fat_envelope(2);
+        assert!(raw.extract.result_count.is_none());
+        assert!(raw.extract.empty_state.is_none());
+        let json = serialize_envelope(&raw).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for key in [
+            "result_count",
+            "local_matches",
+            "empty_state",
+            "zip",
+            "radius",
+        ] {
+            assert!(
+                parsed["extract"].get(key).is_none(),
+                "{key} should be omitted"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_state_from_main_text_is_not_challenge() {
+        let extract = extract_fused(
+            "Results",
+            &[],
+            Some("https://www.cars.com/shopping/results/?zip=32309&maximum_distance=50"),
+            "Cars.com",
+            "Nothing fits those filters. Try a larger radius.",
+            Vec::new(),
+            crate::extract::ListingMeta::default(),
+        );
+        assert!(
+            extract
+                .empty_state
+                .as_deref()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("nothing fits those filters")
+        );
+        assert!(extract.cards.is_empty());
+        let hit = challenge::detect_from_extract(
+            &extract.title,
+            extract.url.as_deref(),
+            &extract.main_text,
+            &[],
+        );
+        assert!(!hit.present);
+        let mut env = fat_envelope(0);
+        env.extract = extract;
+        env.challenge = ChallengeInfo::default();
+        assert!(!env.challenge.present);
+        let json = serialize_envelope(&env).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["challenge"]["present"], false);
+    }
+
+    #[test]
+    fn zip_and_radius_from_cars_url_when_empty() {
+        let extract = extract_fused(
+            "Results",
+            &[],
+            Some("https://www.cars.com/shopping/results/?zip=32309&maximum_distance=50"),
+            "Cars.com",
+            "listings",
+            Vec::new(),
+            crate::extract::ListingMeta::default(),
+        );
+        assert_eq!(extract.zip.as_deref(), Some("32309"));
+        assert_eq!(extract.radius.as_deref(), Some("50 mi"));
     }
 }

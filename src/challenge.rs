@@ -1227,6 +1227,7 @@ mod tests {
                 main_text: String::new(),
                 cards: Vec::new(),
                 dialogs: Vec::new(),
+                ..Default::default()
             },
             elements: Vec::new(),
             elements_total: 0,

@@ -188,7 +188,7 @@ pub struct HandsServer;
 #[tool_router(server_handler)]
 impl HandsServer {
     #[tool(
-        description = "Capture the foreground window viewport: screenshot path (full virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope. extract.dialogs leads when a cookie / account / dialog is visible. Elements carry grid (g:col:row of the resolved center); prefer that over guessing. detail=dom is the fat desktop + Chrome walk (16 KiB). chrome_connected: false includes chrome_hint pointing at native-host-doctor."
+        description = "Capture the foreground window viewport: screenshot path (full virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope. extract.dialogs leads when a cookie / account / dialog is visible. Cards may include miles/dealer/distance; extract.empty_state holds empty-radius copy. Elements carry grid (g:col:row of the resolved center); prefer that over guessing. detail=dom is the fat desktop + Chrome walk (16 KiB). chrome_connected: false includes chrome_hint pointing at native-host-doctor."
     )]
     fn observe(
         &self,

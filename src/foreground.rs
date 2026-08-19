@@ -3,8 +3,8 @@
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-    SW_RESTORE, SetForegroundWindow, ShowWindow, WindowFromPoint,
+    GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+    IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow, WindowFromPoint,
 };
 
 use crate::space::Rect;
@@ -89,12 +89,14 @@ pub fn hwnd_raw(hwnd: HWND) -> Option<isize> {
     }
 }
 
-/// Foreground window outer rect via `GetWindowRect`. Invalid / fail / non-positive → `None`.
-pub fn viewport_rect() -> Option<Rect> {
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.is_invalid() {
-        return None;
-    }
+pub fn foreground_hwnd() -> Option<isize> {
+    hwnd_raw(unsafe { GetForegroundWindow() })
+}
+
+/// Outer rect via `GetWindowRect`. Invalid / fail / non-positive → `None`.
+pub fn window_rect(hwnd: isize) -> Option<Rect> {
+    let hwnd = raw_hwnd(hwnd);
+    hwnd_raw(hwnd)?;
     let mut rect = RECT::default();
     if unsafe { GetWindowRect(hwnd, &raw mut rect) }.is_err() {
         return None;
@@ -110,6 +112,39 @@ pub fn viewport_rect() -> Option<Rect> {
         w,
         h,
     })
+}
+
+/// Foreground window outer rect via `GetWindowRect`. Invalid / fail / non-positive → `None`.
+pub fn viewport_rect() -> Option<Rect> {
+    foreground_hwnd().and_then(window_rect)
+}
+
+/// Caption via `GetWindowTextW` (256 wchar, same as `class_name`). `None` = current FG.
+/// Invalid HWND / empty caption → empty string (title gate does not fire).
+pub fn title(hwnd: Option<isize>) -> String {
+    let hwnd = match hwnd {
+        Some(raw) => {
+            let h = raw_hwnd(raw);
+            if hwnd_raw(h).is_none() {
+                return String::new();
+            }
+            h
+        }
+        None => {
+            let h = unsafe { GetForegroundWindow() };
+            if h.is_invalid() {
+                return String::new();
+            }
+            h
+        }
+    };
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    if n <= 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
 }
 
 /// True when the foreground class is `Chrome_WidgetWin_1` (not `_0`).
@@ -140,5 +175,7 @@ mod tests {
         assert_ne!(crate::attach::CHROME_CLASS, "Chrome_WidgetWin_0");
         let _ = is_chrome();
         let _ = viewport_rect();
+        assert_eq!(title(Some(0)), "");
+        let _ = title(None);
     }
 }

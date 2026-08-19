@@ -263,7 +263,9 @@ impl HandsServer {
         })))
     }
 
-    #[tool(description = "Wait until an ROI stops changing (pixel delta)")]
+    #[tool(
+        description = "Wait until an ROI stops changing (pixel delta). Default ROI is the foreground window (GetWindowRect, same as observe viewport); envelope includes roi. Explicit x,y,w,h still all-or-nothing."
+    )]
     fn wait_settle(
         &self,
         Parameters(params): Parameters<WaitSettleParams>,

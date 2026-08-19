@@ -3,9 +3,12 @@
 use std::time::{Duration, Instant};
 
 use crate::capture::{RoiFrame, capture_roi};
+use crate::classify::contains_phrase;
 use crate::error::HandsError;
 use crate::lease;
 use crate::space::{Rect, Space};
+
+const TITLE_BLOCK_NEEDLES: &[&str] = &["just a moment", "performing security verification"];
 
 pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const FRAME_GAP: Duration = Duration::from_millis(50);
@@ -49,6 +52,29 @@ pub fn default_roi(space: Space, last_target: Option<Rect>, cursor: (i32, i32)) 
         w: CURSOR_ROI,
         h: CURSOR_ROI,
     })
+}
+
+/// Foreground-window ROI for standalone `wait_settle`. Does not use last-target or cursor.
+pub fn default_wait_roi(space: Space, fg: Option<Rect>) -> Result<Rect, HandsError> {
+    let Some(rect) = fg else {
+        return Err(HandsError::Settle(
+            "wait_settle default ROI needs a foreground window".into(),
+        ));
+    };
+    let clipped = space.clip_rect(rect);
+    if clipped.area() == 0 {
+        return Err(HandsError::Settle(
+            "wait_settle default ROI has zero area after clipping the foreground window".into(),
+        ));
+    }
+    Ok(clipped)
+}
+
+/// Cloudflare interstitial captions that must not report `settled: true`.
+pub fn title_blocks_settled(title: &str) -> bool {
+    TITLE_BLOCK_NEEDLES
+        .iter()
+        .any(|needle| contains_phrase(title, needle))
 }
 
 pub fn wait_settle(space: Space, roi: Rect) -> Result<(bool, RoiFrame), HandsError> {
@@ -127,5 +153,103 @@ mod tests {
             c[i * 4] = 20;
         }
         assert!(changed_ratio(&a, &c) < RATIO_LIMIT);
+    }
+
+    fn desk() -> Space {
+        Space::new(0, 0, 1920, 1080).expect("desk")
+    }
+
+    #[test]
+    fn default_wait_roi_clips_foreground() {
+        let space = desk();
+        let fg = Rect {
+            x: 100,
+            y: 80,
+            w: 800,
+            h: 600,
+        };
+        let roi = default_wait_roi(space, Some(fg)).expect("clip");
+        assert_eq!(roi, space.clip_rect(fg));
+        let overhang = Rect {
+            x: 1800,
+            y: 80,
+            w: 800,
+            h: 600,
+        };
+        let clipped = default_wait_roi(space, Some(overhang)).expect("partial clip");
+        assert_eq!(clipped, space.clip_rect(overhang));
+        assert!(clipped.area() > 0);
+        assert_eq!(clipped.w, 120);
+    }
+
+    #[test]
+    fn default_wait_roi_none_or_zero_names_foreground() {
+        let space = desk();
+        let none_err = default_wait_roi(space, None).expect_err("none");
+        assert!(none_err.to_string().contains("foreground"), "{none_err}");
+        let zero = Rect {
+            x: 3000,
+            y: 0,
+            w: 10,
+            h: 10,
+        };
+        let zero_err = default_wait_roi(space, Some(zero)).expect_err("zero");
+        assert!(zero_err.to_string().contains("foreground"), "{zero_err}");
+        assert_eq!(space.clip_rect(zero).area(), 0);
+    }
+
+    #[test]
+    fn default_roi_prefers_last_target_inflate_over_cursor() {
+        let space = desk();
+        let last = Rect {
+            x: 100,
+            y: 100,
+            w: 20,
+            h: 20,
+        };
+        let cursor = (900, 700);
+        let roi = default_roi(space, Some(last), cursor);
+        let inflated = space.inflate_clip(last, INFLATE_PAD);
+        assert_eq!(roi, inflated);
+        let half = CURSOR_ROI / 2;
+        let around_cursor = space.clip_rect(Rect {
+            x: cursor.0 - half,
+            y: cursor.1 - half,
+            w: CURSOR_ROI,
+            h: CURSOR_ROI,
+        });
+        assert_ne!(roi, around_cursor);
+    }
+
+    #[test]
+    fn title_blocks_settled_table() {
+        let cases = [
+            ("Just a moment...", true),
+            ("Performing security verification", true),
+            ("cars.com: Camry", false),
+            ("Continue as Ryan", false),
+            ("Accept cookies", false),
+            ("", false),
+        ];
+        for (title, blocked) in cases {
+            assert_eq!(title_blocks_settled(title), blocked, "title {title:?}");
+        }
+    }
+
+    #[test]
+    fn wait_settle_pixel_loop_does_not_title_gate() {
+        let src = include_str!("settle.rs");
+        let start = src.find("pub fn wait_settle(").expect("wait_settle");
+        let rest = &src[start..];
+        let end = rest.find("\n#[cfg(test)]").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            !body.contains("title_blocks_settled"),
+            "title gate must stay out of settle::wait_settle:\n{body}"
+        );
+        assert!(
+            !body.contains("challenge::"),
+            "wait_settle must not call challenge:\n{body}"
+        );
     }
 }

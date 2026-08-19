@@ -90,7 +90,7 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Wait until an ROI stops changing
+    /// Wait until an ROI stops changing. Default is the foreground window (GetWindowRect, same as observe viewport); envelope includes roi.
     WaitSettle {
         #[arg(long)]
         x: Option<i32>,
@@ -704,6 +704,26 @@ mod tests {
         assert!(
             help.contains("--dy -6"),
             "long-help should mention --dy -6, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn wait_settle_help_mentions_foreground_and_roi() {
+        let cmd = Cli::command();
+        let wait = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "wait-settle")
+            .expect("wait-settle subcommand");
+        let about = wait.get_about().map(|s| s.to_string()).unwrap_or_default();
+        let help = wait.clone().render_long_help().to_string();
+        let blob = format!("{about}\n{help}");
+        assert!(
+            blob.contains("foreground"),
+            "wait-settle help should mention foreground window:\n{blob}"
+        );
+        assert!(
+            blob.contains("roi"),
+            "wait-settle help should mention envelope roi:\n{blob}"
         );
     }
 

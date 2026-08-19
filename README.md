@@ -386,7 +386,7 @@ Chrome artifacts: `extension/` (unpacked MV3, isolated world, id `fdnpjnnnmfhlpg
 
 This binary owns the confirm fence. `click` and `key enter`/`return` refuse irreversible/gray-zone controls unless a matching domain+category allow exists. `type` containing a newline is a tool error — use `key enter` to submit. After a refuse, call `confirm` (`once` / `session` / `persist`) and retry. Grok is always-approve; the TUI is not the fence.
 
-Input commands (`click` / `hover` / `type` / `key` / `scroll` / `wait-settle`) install a desk lease for that process: physical mouse/keyboard freezes injection; Pause/Break always aborts and wipes session/once allows (persist stays). **Logs stay** under `%LOCALAPPDATA%\hands\logs\` (`HANDS_LOGS_DIR`). `hands confirm`, `attach`, `pick`, `ground`, `challenge`, and `logs` do **not** install the lease. `hands do-task` **does**. One-shot CLI `stop` clears session allows; injection stop is a no-op unless that process holds the lease (use MCP `stop` or Pause/Break during a live command).
+Input commands (`click` / `hover` / `type` / `key` / `scroll` / `wait-settle`) install a desk lease for that process: physical mouse/keyboard freezes injection; Pause/Break always aborts and wipes session/once allows (persist stays). **Logs stay** under `%LOCALAPPDATA%\hands\logs\` (`HANDS_LOGS_DIR`). `hands confirm`, `attach`, `pick`, `ground`, `challenge`, and `logs` do **not** install the lease. `hands do-task` **does**. CLI `stop` posts a desk-wide request (`%LOCALAPPDATA%\hands\stop-request.json`, override `HANDS_STOP_REQUEST_PATH`); another Hands `type` / `hover` honors it as Stop, session allows wipe, and logs stay. Pause/Break still works during a live command.
 
 ## What this is
 

@@ -3,10 +3,14 @@
 //! Low-level hooks run on a dedicated `hands-lease` thread that pumps messages.
 //! Hook procs only store flags — no UIA, capture, file I/O, or allow-store locks.
 
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Power::{
     ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
@@ -22,6 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::error::HandsError;
 
 pub const IDLE_REARM: Duration = Duration::from_secs(2);
+pub const STOP_REQUEST_SCHEMA: &str = "hands.stop/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseState {
@@ -137,6 +142,13 @@ static FROZEN: AtomicBool = AtomicBool::new(false);
 static CHALLENGE_HOLD: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_NOW_OFFSET_MS: AtomicU64 = AtomicU64::new(0);
+/// Tests skip desk-file ingest unless a test clears this (leftover LOCALAPPDATA).
+#[cfg(test)]
+static INGEST_SKIP: AtomicBool = AtomicBool::new(true);
+#[cfg(test)]
+static FREEZE_AFTER_POLLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static POLL_HITS: AtomicUsize = AtomicUsize::new(0);
 static LAST_FREEZE_MS: AtomicU64 = AtomicU64::new(0);
 /// Non-zero means a notify is pending. Pause/Stop values are never overwritten
 /// by Physical. `take_pending_cause` swaps this back to `CAUSE_NONE`.
@@ -213,6 +225,7 @@ pub fn subscribe(cb: impl Fn(FreezeCause) + Send + Sync + 'static) {
 }
 
 pub fn is_frozen() -> bool {
+    ingest_stop_request();
     rearm_if_idle();
     FROZEN.load(Ordering::SeqCst)
 }
@@ -227,6 +240,9 @@ pub fn freeze_now_with(cause: FreezeCause) {
 }
 
 pub fn poll() -> Result<(), HandsError> {
+    ingest_stop_request();
+    #[cfg(test)]
+    maybe_freeze_after_polls();
     rearm_if_idle();
     flush_notify();
     if FROZEN.load(Ordering::SeqCst) {
@@ -236,6 +252,190 @@ pub fn poll() -> Result<(), HandsError> {
     } else {
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StopRequestFile {
+    schema: String,
+    at_unix_ms: u64,
+}
+
+pub fn stop_request_is_fresh(at_unix_ms: u64, now_ms: u64) -> bool {
+    let ttl = IDLE_REARM.as_millis() as u64;
+    if at_unix_ms > now_ms {
+        // Small future skew is still fresh; a far-future stamp is malformed.
+        at_unix_ms - now_ms <= ttl
+    } else {
+        now_ms - at_unix_ms <= ttl
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn stop_request_path() -> Result<PathBuf, HandsError> {
+    if let Ok(p) = std::env::var("HANDS_STOP_REQUEST_PATH")
+        && !p.trim().is_empty()
+    {
+        return Ok(PathBuf::from(p));
+    }
+    let base = std::env::var("LOCALAPPDATA")
+        .map_err(|_| HandsError::Lease("LOCALAPPDATA is not set".into()))?;
+    Ok(PathBuf::from(base).join("hands").join("stop-request.json"))
+}
+
+/// Write a fresh desk-wide stop request. Does not freeze this process.
+pub fn request_stop() -> Result<PathBuf, HandsError> {
+    let path = stop_request_path()?;
+    let body = StopRequestFile {
+        schema: STOP_REQUEST_SCHEMA.into(),
+        at_unix_ms: unix_now_ms(),
+    };
+    let json = serde_json::to_string(&body)
+        .map_err(|err| HandsError::Lease(format!("serialize stop request: {err}")))?;
+    atomic_write_stop(&path, json.as_bytes())?;
+    Ok(path)
+}
+
+fn ingest_skip() -> bool {
+    #[cfg(test)]
+    {
+        INGEST_SKIP.load(Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn ingest_stop_request() {
+    if ingest_skip() {
+        return;
+    }
+    let Ok(path) = stop_request_path() else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(file) = serde_json::from_slice::<StopRequestFile>(&bytes) else {
+        return;
+    };
+    if file.schema != STOP_REQUEST_SCHEMA {
+        return;
+    }
+    if stop_request_is_fresh(file.at_unix_ms, unix_now_ms()) {
+        freeze_now_with(FreezeCause::Stop);
+    }
+}
+
+fn atomic_write_stop(path: &Path, data: &[u8]) -> Result<(), HandsError> {
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(dir).map_err(|err| {
+            HandsError::Lease(format!(
+                "create dir {} for {}: {err}",
+                dir.display(),
+                path.display()
+            ))
+        })?;
+    }
+    let tmp_name = format!(
+        "{}.tmp-{}",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("stop-request"),
+        uuid::Uuid::new_v4()
+    );
+    let tmp = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(&tmp_name),
+        _ => PathBuf::from(&tmp_name),
+    };
+    std::fs::write(&tmp, data).map_err(|err| {
+        HandsError::Lease(format!(
+            "write temp {} for {}: {err}",
+            tmp.display(),
+            path.display()
+        ))
+    })?;
+    if path.exists() {
+        if path.is_dir() {
+            return Err(HandsError::Lease(format!(
+                "stop request path is a directory: {}",
+                path.display()
+            )));
+        }
+        let bak_name = format!(
+            "{}.bak-{}",
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("stop-request"),
+            uuid::Uuid::new_v4()
+        );
+        let bak = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(&bak_name),
+            _ => PathBuf::from(&bak_name),
+        };
+        if let Err(err) = std::fs::rename(path, &bak) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(HandsError::Lease(format!("park {}: {err}", path.display())));
+        }
+        if let Err(err) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::rename(&bak, path);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(HandsError::Lease(format!(
+                "rename onto {}: {err}",
+                path.display()
+            )));
+        }
+        let _ = std::fs::remove_file(&bak);
+    } else if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(HandsError::Lease(format!(
+            "rename onto {}: {err}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_freeze_after_polls() {
+    let threshold = FREEZE_AFTER_POLLS.load(Ordering::SeqCst);
+    if threshold == 0 {
+        return;
+    }
+    let n = POLL_HITS.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+    if n >= threshold {
+        freeze_now_with(FreezeCause::Stop);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct IngestGuard;
+
+#[cfg(test)]
+impl Drop for IngestGuard {
+    fn drop(&mut self) {
+        INGEST_SKIP.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn enable_stop_ingest_for_test() -> IngestGuard {
+    INGEST_SKIP.store(false, Ordering::SeqCst);
+    IngestGuard
+}
+
+#[cfg(test)]
+pub(crate) fn set_freeze_after_polls_for_test(n: usize) {
+    POLL_HITS.store(0, Ordering::SeqCst);
+    FREEZE_AFTER_POLLS.store(n, Ordering::SeqCst);
 }
 
 fn take_pending_cause() -> Option<FreezeCause> {
@@ -399,6 +599,9 @@ pub(crate) fn reset_for_test() {
     LAST_CAUSE.store(CAUSE_NONE, Ordering::SeqCst);
     CHALLENGE_HOLD.store(false, Ordering::SeqCst);
     TEST_NOW_OFFSET_MS.store(0, Ordering::SeqCst);
+    INGEST_SKIP.store(true, Ordering::SeqCst);
+    FREEZE_AFTER_POLLS.store(0, Ordering::SeqCst);
+    POLL_HITS.store(0, Ordering::SeqCst);
     LISTENERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
@@ -624,5 +827,166 @@ mod tests {
         assert!(is_frozen());
         set_challenge_hold(false);
         assert!(!is_frozen());
+    }
+
+    #[test]
+    fn stop_request_fresh_vs_stale() {
+        assert!(stop_request_is_fresh(10_000, 10_000));
+        assert!(stop_request_is_fresh(10_000, 12_000));
+        assert!(!stop_request_is_fresh(10_000, 12_001));
+        assert!(!stop_request_is_fresh(10_000, 13_000));
+        assert!(stop_request_is_fresh(10_000, 9_000));
+        assert!(stop_request_is_fresh(12_000, 10_000));
+        assert!(!stop_request_is_fresh(12_001, 10_000));
+        assert!(!stop_request_is_fresh(15_000, 10_000));
+    }
+
+    fn with_stop_request_path<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let dir = std::env::temp_dir().join(format!("hands-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stop-request.json");
+        let prev = std::env::var_os("HANDS_STOP_REQUEST_PATH");
+        unsafe {
+            std::env::set_var("HANDS_STOP_REQUEST_PATH", &path);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&path)));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HANDS_STOP_REQUEST_PATH", v) },
+            None => unsafe { std::env::remove_var("HANDS_STOP_REQUEST_PATH") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
+    fn write_stop_at(path: &std::path::Path, at_unix_ms: u64) {
+        let body = serde_json::to_string(&StopRequestFile {
+            schema: STOP_REQUEST_SCHEMA.into(),
+            at_unix_ms,
+        })
+        .unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn fresh_stop_request_poll_delivers_stop() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        with_stop_request_path(|path| {
+            let _ingest = enable_stop_ingest_for_test();
+            write_stop_at(path, unix_now_ms());
+            let (seen, cb) = collect_causes();
+            subscribe(cb);
+            let err = poll().expect_err("fresh stop must freeze");
+            assert!(err.to_string().contains("frozen"), "{err}");
+            assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Stop]);
+        });
+        reset_for_test();
+    }
+
+    #[test]
+    fn request_stop_then_poll_delivers_stop() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        with_stop_request_path(|path| {
+            let _ingest = enable_stop_ingest_for_test();
+            let written = request_stop().expect("write");
+            assert_eq!(written, path);
+            let (seen, cb) = collect_causes();
+            subscribe(cb);
+            let err = poll().expect_err("request_stop must freeze on poll");
+            assert!(err.to_string().contains("frozen"), "{err}");
+            assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Stop]);
+        });
+        reset_for_test();
+    }
+
+    #[test]
+    fn stale_stop_request_does_not_freeze() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        with_stop_request_path(|path| {
+            let _ingest = enable_stop_ingest_for_test();
+            write_stop_at(path, unix_now_ms().saturating_sub(3_000));
+            let (seen, cb) = collect_causes();
+            subscribe(cb);
+            poll().expect("stale file is ignored");
+            assert!(!is_frozen());
+            assert!(seen.lock().unwrap().is_empty());
+        });
+        reset_for_test();
+    }
+
+    #[test]
+    fn missing_stop_request_does_not_freeze() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        with_stop_request_path(|path| {
+            let _ingest = enable_stop_ingest_for_test();
+            assert!(!path.exists());
+            let (seen, cb) = collect_causes();
+            subscribe(cb);
+            poll().expect("missing file is ignored");
+            assert!(!is_frozen());
+            assert!(seen.lock().unwrap().is_empty());
+        });
+        reset_for_test();
+    }
+
+    #[test]
+    fn far_future_stop_request_does_not_freeze() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        with_stop_request_path(|path| {
+            let _ingest = enable_stop_ingest_for_test();
+            write_stop_at(path, unix_now_ms().saturating_add(60_000));
+            let (seen, cb) = collect_causes();
+            subscribe(cb);
+            poll().expect("far-future stamp is malformed, not a kill switch");
+            assert!(!is_frozen());
+            assert!(seen.lock().unwrap().is_empty());
+        });
+        reset_for_test();
+    }
+
+    #[test]
+    fn request_stop_rejects_directory_path() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let dir = std::env::temp_dir().join(format!("hands-stop-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var_os("HANDS_STOP_REQUEST_PATH");
+        unsafe {
+            std::env::set_var("HANDS_STOP_REQUEST_PATH", &dir);
+        }
+        let err = request_stop().expect_err("directory must not be renamed");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HANDS_STOP_REQUEST_PATH", v) },
+            None => unsafe { std::env::remove_var("HANDS_STOP_REQUEST_PATH") },
+        }
+        assert!(dir.is_dir(), "must not consume the override directory");
+        let _ = std::fs::remove_dir_all(&dir);
+        reset_for_test();
+        assert!(
+            err.to_string().contains("directory"),
+            "error must name the directory, got {err}"
+        );
+    }
+
+    #[test]
+    fn reset_for_test_skips_ingest_even_if_file_exists() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        with_stop_request_path(|path| {
+            write_stop_at(path, unix_now_ms());
+            let (seen, cb) = collect_causes();
+            subscribe(cb);
+            poll().expect("reset_for_test must skip leftover file");
+            assert!(!is_frozen());
+            assert!(seen.lock().unwrap().is_empty());
+        });
+        reset_for_test();
     }
 }

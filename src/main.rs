@@ -103,7 +103,7 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Halt injected input (no-op unless an MCP lease is live in this process)
+    /// Halt injected input across Hands processes (same as Pause/Break)
     Stop {
         #[arg(long)]
         session_id: Option<String>,
@@ -704,6 +704,31 @@ mod tests {
         assert!(
             help.contains("--dy -6"),
             "long-help should mention --dy -6, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn stop_help_is_not_noop() {
+        let cmd = Cli::command();
+        let stop = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "stop")
+            .expect("stop subcommand");
+        let about = stop.get_about().map(|s| s.to_string()).unwrap_or_default();
+        let help = stop.clone().render_long_help().to_string();
+        for blob in [about.as_str(), help.as_str()] {
+            assert!(
+                !blob.contains("no-op"),
+                "stop help still says no-op:\n{blob}"
+            );
+            assert!(
+                !blob.contains("unless an MCP lease"),
+                "stop help still says no-op-unless:\n{blob}"
+            );
+        }
+        assert!(
+            about.contains("Pause/Break") || help.contains("Pause/Break"),
+            "stop help should mention Pause/Break:\n{about}\n{help}"
         );
     }
 

@@ -377,8 +377,7 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
         return fail(session_id, info, err, foregrounded, false, false);
     }
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    if let Err(err) = lease::poll() {
+    if let Err(err) = hover_dwell() {
         return fail(session_id, info, err, foregrounded, false, false);
     }
     base(
@@ -583,58 +582,65 @@ fn explicit_roi(req: &ActuateRequest) -> Result<Option<Rect>, HandsError> {
     }
 }
 
-/// CLI `stop` with no live MCP lease is a documented no-op.
+pub const HOVER_DWELL_MS: u64 = 100;
+pub const HOVER_DWELL_SLICE_MS: u64 = 10;
+
+pub fn hover_dwell_slice_count() -> u64 {
+    HOVER_DWELL_MS.div_ceil(HOVER_DWELL_SLICE_MS)
+}
+
+fn hover_dwell() -> Result<(), HandsError> {
+    let mut left = HOVER_DWELL_MS;
+    while left > 0 {
+        let step = left.min(HOVER_DWELL_SLICE_MS);
+        std::thread::sleep(std::time::Duration::from_millis(step));
+        left -= step;
+        lease::poll()?;
+    }
+    Ok(())
+}
+
+/// MCP `stop` — posts a desk-wide request, then freezes this process.
 pub fn stop(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     after_actuate("stop", stop_inner(req), None, None)
 }
 
 fn stop_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    let session_id = match session(&req) {
-        Ok(id) => id,
-        Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
-    };
-    logs::ensure_installed();
-    fence::ensure_installed();
-    lease::freeze_now_with(lease::FreezeCause::Stop);
-    let frozen = lease::is_frozen();
-    base(
-        session_id,
-        none_target(),
-        true,
-        frozen,
-        false,
-        false,
-        false,
-        if frozen {
-            None
-        } else {
-            Some("no live MCP lease (CLI stop is a no-op after the process exits)".into())
-        },
-    )
+    stop_shared(req)
 }
 
-/// CLI `stop` without installing hooks — documented no-op.
+/// CLI `stop` without installing hooks — posts the same desk-wide request.
 pub fn stop_cli_noop(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     after_actuate("stop", stop_cli_noop_inner(req), None, None)
 }
 
 fn stop_cli_noop_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
+    stop_shared(req)
+}
+
+fn stop_shared(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let session_id = match session(&req) {
         Ok(id) => id,
         Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
     };
     logs::ensure_installed();
     fence::ensure_installed();
+    let write_err = lease::request_stop().err();
     lease::freeze_now_with(lease::FreezeCause::Stop);
+    let frozen = lease::is_frozen();
+    let (ok, error) = match write_err {
+        Some(err) => (false, Some(err.tool_message())),
+        None => (true, None),
+    };
     base(
         session_id,
         none_target(),
-        true,
+        ok,
+        frozen,
         false,
         false,
         false,
-        false,
-        Some("no live MCP lease; Pause/Break still works during a CLI input command".into()),
+        error,
     )
 }
 
@@ -736,6 +742,135 @@ mod tests {
         assert_eq!(env.error.as_deref(), Some(YIELD_ERROR));
         assert!(env.challenge.as_ref().is_some_and(|c| c.yielded));
         crate::challenge::reset_for_test();
+    }
+
+    #[test]
+    fn hover_dwell_is_ten_slices() {
+        assert_eq!(HOVER_DWELL_MS, 100);
+        assert_eq!(HOVER_DWELL_SLICE_MS, 10);
+        assert_eq!(hover_dwell_slice_count(), 10);
+    }
+
+    fn with_stop_env<T>(f: impl FnOnce() -> T) -> T {
+        crate::allows::with_test_env(|| crate::logs::with_test_env(f))
+    }
+
+    fn with_stop_request_path<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let dir = std::env::temp_dir().join(format!("hands-actuate-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stop-request.json");
+        let prev = std::env::var_os("HANDS_STOP_REQUEST_PATH");
+        unsafe {
+            std::env::set_var("HANDS_STOP_REQUEST_PATH", &path);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&path)));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HANDS_STOP_REQUEST_PATH", v) },
+            None => unsafe { std::env::remove_var("HANDS_STOP_REQUEST_PATH") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
+    #[test]
+    fn cli_and_mcp_stop_post_file_and_share_success_envelope() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        with_stop_env(|| {
+            with_stop_request_path(|path| {
+                let cli = stop_cli_noop(ActuateRequest {
+                    session_id: Some("s-stop-cli".into()),
+                    ..ActuateRequest::default()
+                })
+                .unwrap();
+                assert!(cli.ok, "{cli:?}");
+                assert!(cli.frozen);
+                assert!(cli.error.is_none());
+                assert!(path.exists(), "CLI stop must write the request file");
+                let body = std::fs::read_to_string(path).unwrap();
+                assert!(body.contains("hands.stop/v1"), "{body}");
+                assert!(!body.contains("no-op"), "{body}");
+
+                lease::reset_for_test();
+                let mcp = stop(ActuateRequest {
+                    session_id: Some("s-stop-mcp".into()),
+                    ..ActuateRequest::default()
+                })
+                .unwrap();
+                assert!(mcp.ok, "{mcp:?}");
+                assert!(mcp.frozen);
+                assert!(mcp.error.is_none());
+            });
+        });
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn stop_write_failure_still_freezes_and_names_path() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        with_stop_env(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("hands-actuate-stop-fail-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let blocker = dir.join("blocker");
+            std::fs::write(&blocker, b"x").unwrap();
+            let bad = blocker.join("stop-request.json");
+            let prev = std::env::var_os("HANDS_STOP_REQUEST_PATH");
+            unsafe {
+                std::env::set_var("HANDS_STOP_REQUEST_PATH", &bad);
+            }
+            let env = stop_cli_noop(ActuateRequest {
+                session_id: Some("s-stop-fail".into()),
+                ..ActuateRequest::default()
+            })
+            .unwrap();
+            match prev {
+                Some(v) => unsafe { std::env::set_var("HANDS_STOP_REQUEST_PATH", v) },
+                None => unsafe { std::env::remove_var("HANDS_STOP_REQUEST_PATH") },
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            lease::reset_for_test();
+            assert!(!env.ok, "{env:?}");
+            assert!(env.frozen);
+            let err = env.error.unwrap_or_default();
+            assert!(
+                err.contains(&bad.display().to_string()),
+                "error must name the path, got {err}"
+            );
+        });
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn stop_sources_drop_noop_wording() {
+        let actuate = include_str!("actuate.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production actuate.rs");
+        let readme = include_str!("../README.md");
+        let agents = include_str!("../AGENTS.md");
+        let main = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production main.rs");
+        for blob in [actuate, readme, agents, main] {
+            assert!(
+                !blob.contains("no-op unless an MCP lease"),
+                "leftover no-op-unless string"
+            );
+            assert!(
+                !blob.contains("no-op after the process exits"),
+                "leftover no-op-after string"
+            );
+            assert!(
+                !blob.contains("no live MCP lease; Pause/Break still works"),
+                "leftover CLI no-op string"
+            );
+        }
     }
 
     #[test]

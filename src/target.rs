@@ -388,4 +388,31 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn stamped_search_box_cell_is_hittable_neighbor_is_not() {
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let rect = Rect {
+            x: 46,
+            y: 620,
+            w: 903,
+            h: 56,
+        };
+        assert_eq!(rect.center(), (497, 648));
+        assert_eq!(space.cell_id_of_center(rect), "g:4:6");
+
+        let hit = Target::Grid { col: 4, row: 6 }.resolve(space).unwrap();
+        assert_eq!((hit.x, hit.y), (450, 650));
+        assert!(hit.x >= rect.x && hit.x < rect.x + rect.w);
+        assert!(hit.y >= rect.y && hit.y < rect.y + rect.h);
+        assert_eq!((hit.x, hit.y), space.cell_rect(4, 6).center());
+
+        let miss = Target::Grid { col: 2, row: 5 }.resolve(space).unwrap();
+        assert_eq!((miss.x, miss.y), (250, 550));
+        let inside = miss.x >= rect.x
+            && miss.x < rect.x + rect.w
+            && miss.y >= rect.y
+            && miss.y < rect.y + rect.h;
+        assert!(!inside);
+    }
 }

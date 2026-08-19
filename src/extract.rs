@@ -177,6 +177,7 @@ impl RawNode {
                 Some(self.name.clone())
             },
             rect: self.rect,
+            grid: None,
         })
     }
 
@@ -207,6 +208,8 @@ pub struct Element {
     pub role: String,
     pub text: Option<String>,
     pub rect: Rect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

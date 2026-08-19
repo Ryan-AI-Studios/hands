@@ -25,6 +25,7 @@ use crate::lease;
 use crate::space::Space;
 
 pub const TYPE_UNICODE_MAX: usize = 32;
+pub const TYPE_PACE_MS: u64 = 12;
 const CF_UNICODETEXT: u32 = 13;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,10 @@ pub fn send_inputs(inputs: &[INPUT]) -> Result<(), HandsError> {
     if inputs.is_empty() {
         return Ok(());
     }
+    #[cfg(test)]
+    if let Some(hook) = send_hook() {
+        return hook(inputs);
+    }
     let cb = std::mem::size_of::<INPUT>() as i32;
     let sent = unsafe { SendInput(inputs, cb) };
     if sent as usize != inputs.len() {
@@ -68,6 +73,24 @@ pub fn send_inputs(inputs: &[INPUT]) -> Result<(), HandsError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+type SendHook = fn(&[INPUT]) -> Result<(), HandsError>;
+
+#[cfg(test)]
+thread_local! {
+    static SEND_HOOK: std::cell::Cell<Option<SendHook>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn send_hook() -> Option<SendHook> {
+    SEND_HOOK.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn set_send_inputs_hook(hook: Option<SendHook>) {
+    SEND_HOOK.with(|c| c.set(hook));
 }
 
 pub fn cursor_pos() -> Result<(i32, i32), HandsError> {
@@ -226,7 +249,8 @@ pub fn type_text(text: &str) -> Result<TypePath, HandsError> {
 }
 
 fn type_unicode(text: &str) -> Result<(), HandsError> {
-    for ch in text.chars() {
+    let total = text.chars().count();
+    for (i, ch) in text.chars().enumerate() {
         lease::poll()?;
         match ch {
             '\n' => tap_vk(VK_RETURN)?,
@@ -241,6 +265,9 @@ fn type_unicode(text: &str) -> Result<(), HandsError> {
                     up?;
                 }
             }
+        }
+        if i + 1 < total {
+            std::thread::sleep(Duration::from_millis(TYPE_PACE_MS));
         }
     }
     lease::poll()
@@ -440,6 +467,14 @@ fn empty_and_set(units: &[u16]) -> Result<(), HandsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_sends(_inputs: &[INPUT]) -> Result<(), HandsError> {
+        SENT_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 
     #[test]
     fn type_threshold_32_scalars() {
@@ -448,6 +483,42 @@ mod tests {
         assert_eq!(type_path_for(&"x".repeat(33)), TypePath::Clipboard);
         assert_eq!(type_path_for(&"é".repeat(32)), TypePath::Unicode);
         assert_eq!(type_path_for(&"é".repeat(33)), TypePath::Clipboard);
+        let _ = TYPE_PACE_MS;
+        assert_eq!(type_path_for(&"x".repeat(33)), TypePath::Clipboard);
+    }
+
+    #[test]
+    fn unicode_mid_string_abort_leaves_remaining_unsent() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        SENT_CALLS.store(0, Ordering::SeqCst);
+        set_send_inputs_hook(Some(count_sends));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lease::set_freeze_after_polls_for_test(5);
+            type_text(&"x".repeat(32))
+        }));
+        set_send_inputs_hook(None);
+        lease::reset_for_test();
+        let err = match result {
+            Ok(Err(err)) => err,
+            Ok(Ok(path)) => panic!("must freeze mid-string, typed via {path:?}"),
+            Err(p) => std::panic::resume_unwind(p),
+        };
+        assert!(
+            err.to_string().contains("frozen"),
+            "expected lease freeze, got {err}"
+        );
+        let sent_calls = SENT_CALLS.load(Ordering::SeqCst);
+        // BMP `x` is one UTF-16 unit: down + up = 2 send_inputs per scalar.
+        let sent_scalars = sent_calls / 2;
+        assert!(
+            sent_scalars > 0,
+            "at least one scalar should have been sent"
+        );
+        assert!(
+            sent_scalars < 32,
+            "remaining scalars must stay unsent; scalars={sent_scalars} calls={sent_calls}"
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub mod mcp;
 pub mod native_host;
 pub mod observe;
 pub mod pick;
+pub mod preprocess;
 pub mod session;
 pub mod settle;
 pub mod space;

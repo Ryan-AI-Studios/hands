@@ -143,6 +143,7 @@ fn write_png(path: &Path, width: i32, height: i32, pixels: Vec<u8>) -> Result<()
     let img = RgbaImage::from_raw(width as u32, height as u32, pixels).ok_or_else(|| {
         HandsError::Capture("pixel buffer size does not match virtual-screen size".to_string())
     })?;
+    let img = crate::preprocess::for_vlm(img);
     img.save(path)
         .map_err(|err| HandsError::Capture(format!("PNG encode failed: {err}")))
 }

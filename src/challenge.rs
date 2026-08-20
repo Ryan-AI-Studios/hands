@@ -216,13 +216,19 @@ pub fn detect(input: &DetectInput<'_>) -> DetectHit {
     let (host, path) = host_and_path(url);
     let mut cands: Vec<Cand> = Vec::new();
 
+    let mut host_classified = false;
     if let Some(host) = host.as_deref()
         && let Some((kind, reason)) = match_host(host, &path)
     {
         push_cand(&mut cands, kind, reason, 0);
+        host_classified = true;
     }
 
-    if let Some(phrase) = matching_phrase(input.title, INTERSTITIAL_TITLE_PHRASES) {
+    // Host kind wins (CF /cdn-cgi stays turnstile). Interstitial titles fill the
+    // origin-URL miss (cars.com callback) when match_host is silent.
+    if !host_classified
+        && let Some(phrase) = matching_phrase(input.title, INTERSTITIAL_TITLE_PHRASES)
+    {
         push_cand(
             &mut cands,
             ChallengeKind::Interstitial,
@@ -241,22 +247,22 @@ pub fn detect(input: &DetectInput<'_>) -> DetectHit {
         element_blob.push_str(text);
     }
     let element_blob = element_blob.as_str();
-    for &phrase in INTERSTITIAL_BODY_PHRASES {
-        if contains_phrase(input.main_text, phrase) || contains_phrase(element_blob, phrase) {
-            push_cand(
-                &mut cands,
-                ChallengeKind::Interstitial,
-                phrase.to_string(),
-                1,
-            );
+    if !host_classified {
+        for &phrase in INTERSTITIAL_BODY_PHRASES {
+            if contains_phrase(input.main_text, phrase) || contains_phrase(element_blob, phrase) {
+                push_cand(
+                    &mut cands,
+                    ChallengeKind::Interstitial,
+                    phrase.to_string(),
+                    1,
+                );
+            }
         }
     }
     let all_surfaces = [input.title, url, input.main_text, element_blob];
     let token_surfaces = [input.title, url, element_blob];
 
-    let host_hit = host
-        .as_deref()
-        .is_some_and(|h| match_host(h, &path).is_some());
+    let host_hit = host_classified;
     let vendor_on_token_surface = vendor_token_hit(&token_surfaces);
     let cf_on_any = surfaces_have_token(&all_surfaces, "cloudflare");
     let turnstile_on_any = surfaces_have_token(&all_surfaces, "turnstile");
@@ -998,6 +1004,24 @@ mod tests {
                 &[],
             ),
             ChallengeKind::Interstitial,
+        );
+        assert_kind(
+            hit(
+                "t",
+                Some("https://example.com:443/cdn-cgi/challenge-platform/h/b"),
+                "",
+                &[],
+            ),
+            ChallengeKind::Interstitial,
+        );
+        assert_kind(
+            hit(
+                "Checking if the site connection is secure",
+                Some("https://www.cloudflare.com/cdn-cgi/challenge-platform/h/b"),
+                "",
+                &[],
+            ),
+            ChallengeKind::Turnstile,
         );
         assert_kind(
             hit("cars.com", None, "Performing security verification", &[]),

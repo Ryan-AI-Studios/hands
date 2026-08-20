@@ -417,12 +417,20 @@ fn read_exact_deadline(
             }
         }
         let need = buf.len() - filled;
-        if (avail as usize) < need {
+        if avail == 0 {
             std::thread::sleep(Duration::from_millis(8));
             continue;
         }
+        let take = need.min(avail as usize);
         let mut n = 0u32;
-        match unsafe { ReadFile(handle, Some(&mut buf[filled..]), Some(&raw mut n), None) } {
+        match unsafe {
+            ReadFile(
+                handle,
+                Some(&mut buf[filled..filled + take]),
+                Some(&raw mut n),
+                None,
+            )
+        } {
             Ok(()) if n == 0 => return Err(stdin_closed()),
             Ok(()) => filled += n as usize,
             Err(err)
@@ -674,5 +682,91 @@ mod tests {
         );
         assert!(msg.contains("stdin closed"), "{msg}");
         assert!(!msg.contains("timed out"), "{msg}");
+    }
+
+    #[test]
+    fn large_json_frame_drains_past_anon_pipe_buffer() {
+        use windows::Win32::System::Pipes::{CreatePipe, GetNamedPipeInfo};
+
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        unsafe { CreatePipe(&raw mut read, &raw mut write, None, 4096) }.expect("CreatePipe");
+
+        let mut out_buf = 0u32;
+        if unsafe { GetNamedPipeInfo(write, None, Some(&raw mut out_buf), None, None) }.is_err()
+            || out_buf == 0
+        {
+            out_buf = 4096;
+        }
+        let min_frame = (out_buf as usize).max(64 * 1024) + 1;
+        let value = json!({"pad": "a".repeat(min_frame)});
+        let mut frame = Vec::new();
+        write_pipe_frame(&mut frame, &value).expect("encode framed JSON");
+        assert!(
+            frame.len() > out_buf as usize,
+            "fixture must exceed pipe buffer (frame {} vs nOutBufferSize {}); pad more",
+            frame.len(),
+            out_buf
+        );
+        assert!(
+            frame.len() > 64 * 1024,
+            "fixture must exceed 64 KiB floor (frame {})",
+            frame.len()
+        );
+        let frame_len = frame.len();
+        // HANDLE is !Send; the integer is the process-wide write-end kernel object
+        // used only on the writer thread.
+        let write_bits = write.0 as usize;
+
+        let writer = std::thread::spawn(move || {
+            let write = HANDLE(write_bits as *mut std::ffi::c_void);
+            let mut n = 0u32;
+            let result =
+                unsafe { WriteFile(write, Some(frame.as_slice()), Some(&raw mut n), None) };
+            let _ = unsafe { CloseHandle(write) };
+            result.map(|_| n)
+        });
+
+        let started = Instant::now();
+        let decoded = read_frame_timeout(read, Duration::from_secs(2)).expect("drain large frame");
+        let elapsed = started.elapsed();
+        let _ = unsafe { CloseHandle(read) };
+        let written = writer.join().expect("writer thread").expect("WriteFile");
+        assert_eq!(
+            written as usize, frame_len,
+            "writer must complete the frame"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "large-frame drain hung {elapsed:?} (deadline 2 s)"
+        );
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn read_exact_deadline_drains_partial_avail() {
+        let src = include_str!("native_host.rs");
+        let skip = concat!("(avail as usize) < ", "need");
+        assert!(
+            !src.contains(skip),
+            "must not skip ReadFile until the whole remainder is buffered"
+        );
+        assert!(
+            src.contains("need.min(avail") || src.contains("min(need, avail"),
+            "ReadFile must take min(need, avail)"
+        );
+        assert!(
+            src.contains("filled..filled + take") || src.contains("filled..filled+take"),
+            "ReadFile must target buf[filled..filled+take]"
+        );
+        assert!(
+            src.contains("avail == 0"),
+            "sleep only when Peek reports no bytes"
+        );
+        let wait_until = concat!("WaitForSingleObject", " until avail");
+        assert!(
+            !src.contains(wait_until),
+            "must not WaitForSingleObject until the whole remainder is buffered"
+        );
     }
 }

@@ -83,7 +83,7 @@ A visible challenge UI is two **observe-cycles that used actuation**, then yield
 
 `hands attach [--plan] [--session-id <id>]` attaches to daily Chrome (`Chrome_WidgetWin_1` + `chrome.exe`) or launches `chrome.exe about:blank` with no `--` flags. `--plan` never spawns. `HANDS_CHROME_EXE` set + missing file is a hard error. Attach does not sideload and does not kill Chrome. Sideload/register is **0011**.
 
-Chrome fusion: unpacked MV3 at `extension/` (id `fdnpjnnnmfhlpgaabjflhjoepmejcnha`), host name `com.helpinghands.host`, pipe `\\.\pipe\hands-chrome` (`HANDS_CHROME_PIPE`). `HANDS_CHROME_SNAPSHOT` is a host-double fixture (no Chrome). `chr:` is `chr:<u32>` only (no leading zeros except `chr:0`). Toolbar/DPR conversion is **approximate**; 0011 demo on the primary monitor. Sideload/register is **0011**. No CDP. `hands native-host` is Chrome-spawned (no desk lease); `hands native-host-manifest` prints filled JSON.
+Chrome fusion: unpacked MV3 at `extension/` (id `fdnpjnnnmfhlpgaabjflhjoepmejcnha`), host name `com.helpinghands.host`, pipe `\\.\pipe\hands-chrome` (`HANDS_CHROME_PIPE`). `HANDS_CHROME_SNAPSHOT` is a host-double fixture (no Chrome). `chr:` is `chr:<u32>` only (no leading zeros except `chr:0`). Toolbar/DPR conversion is **approximate**; 0011 demo on the primary monitor. Sideload/register is **0011**. No CDP. `hands native-host` is Chrome-spawned (no desk lease); `hands native-host-manifest` prints filled JSON. Host-forward drains incrementally (Peek available bytes, `ReadFile` those, 2 s deadline).
 
 Ledgerful verify steps (when configured) must match these real cargo commands.
 

@@ -30,6 +30,7 @@ pub enum ChallengeKind {
     Turnstile,
     Funcaptcha,
     Generic,
+    Interstitial,
 }
 
 impl ChallengeKind {
@@ -40,6 +41,7 @@ impl ChallengeKind {
             Self::Turnstile => "turnstile",
             Self::Funcaptcha => "funcaptcha",
             Self::Generic => "generic",
+            Self::Interstitial => "interstitial",
         }
     }
 }
@@ -174,6 +176,32 @@ const STRONG_PHRASES: &[(&str, ChallengeKind, PhraseNeed)] = &[
     ),
 ];
 
+/// Title needles for Cloudflare-style interstitial pages. `just a moment` is
+/// title-only in `detect` (cart toasts live in `main_text`).
+const INTERSTITIAL_TITLE_PHRASES: &[&str] = &[
+    "just a moment",
+    "performing security verification",
+    "checking if the site connection is secure",
+];
+
+const INTERSTITIAL_BODY_PHRASES: &[&str] = &[
+    "performing security verification",
+    "checking if the site connection is secure",
+];
+
+/// Cloudflare interstitial captions that must not report `settled: true`.
+pub fn title_is_interstitial(title: &str) -> bool {
+    matching_phrase(title, INTERSTITIAL_TITLE_PHRASES).is_some()
+}
+
+fn matching_phrase<'a>(hay: &str, phrases: &[&'a str]) -> Option<&'a str> {
+    phrases
+        .iter()
+        .copied()
+        .filter(|p| contains_phrase(hay, p))
+        .max_by_key(|p| p.len())
+}
+
 const VENDOR_TOKENS: &[(&str, ChallengeKind)] = &[
     ("recaptcha", ChallengeKind::Recaptcha),
     ("hcaptcha", ChallengeKind::Hcaptcha),
@@ -188,10 +216,25 @@ pub fn detect(input: &DetectInput<'_>) -> DetectHit {
     let (host, path) = host_and_path(url);
     let mut cands: Vec<Cand> = Vec::new();
 
+    let mut host_classified = false;
     if let Some(host) = host.as_deref()
         && let Some((kind, reason)) = match_host(host, &path)
     {
         push_cand(&mut cands, kind, reason, 0);
+        host_classified = true;
+    }
+
+    // Host kind wins (CF /cdn-cgi stays turnstile). Interstitial titles fill the
+    // origin-URL miss (cars.com callback) when match_host is silent.
+    if !host_classified
+        && let Some(phrase) = matching_phrase(input.title, INTERSTITIAL_TITLE_PHRASES)
+    {
+        push_cand(
+            &mut cands,
+            ChallengeKind::Interstitial,
+            phrase.to_string(),
+            1,
+        );
     }
 
     let mut element_blob = String::new();
@@ -204,12 +247,22 @@ pub fn detect(input: &DetectInput<'_>) -> DetectHit {
         element_blob.push_str(text);
     }
     let element_blob = element_blob.as_str();
+    if !host_classified {
+        for &phrase in INTERSTITIAL_BODY_PHRASES {
+            if contains_phrase(input.main_text, phrase) || contains_phrase(element_blob, phrase) {
+                push_cand(
+                    &mut cands,
+                    ChallengeKind::Interstitial,
+                    phrase.to_string(),
+                    1,
+                );
+            }
+        }
+    }
     let all_surfaces = [input.title, url, input.main_text, element_blob];
     let token_surfaces = [input.title, url, element_blob];
 
-    let host_hit = host
-        .as_deref()
-        .is_some_and(|h| match_host(h, &path).is_some());
+    let host_hit = host_classified;
     let vendor_on_token_surface = vendor_token_hit(&token_surfaces);
     let cf_on_any = surfaces_have_token(&all_surfaces, "cloudflare");
     let turnstile_on_any = surfaces_have_token(&all_surfaces, "turnstile");
@@ -318,6 +371,12 @@ fn match_host(host: &str, path: &str) -> Option<(ChallengeKind, String)> {
             "/cdn-cgi/challenge-platform".into(),
         ));
     }
+    if path.contains("/cdn-cgi/challenge-platform") {
+        return Some((
+            ChallengeKind::Interstitial,
+            "/cdn-cgi/challenge-platform".into(),
+        ));
+    }
     if host == "funcaptcha.com" || host.ends_with(".funcaptcha.com") {
         return Some((ChallengeKind::Funcaptcha, host));
     }
@@ -353,13 +412,25 @@ fn host_and_path(raw: &str) -> (Option<String>, String) {
     if host_raw.is_empty() || !host_raw.contains('.') {
         return (None, String::new());
     }
-    let path = if host_end < after_user.len() && after_user.as_bytes().get(host_end) == Some(&b'/')
-    {
-        let rest = &after_user[host_end..];
-        let path_end = rest
-            .find(|c: char| c == '?' || c == '#' || c.is_whitespace())
+    // Host stops at `:`; skip `:` + ASCII digits (port) then take `/` path.
+    let after_host = if host_end < after_user.len() {
+        &after_user[host_end..]
+    } else {
+        ""
+    };
+    let after_port = if let Some(rest) = after_host.strip_prefix(':') {
+        let digit_len = rest
+            .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(rest.len());
-        rest[..path_end].to_ascii_lowercase()
+        &rest[digit_len..]
+    } else {
+        after_host
+    };
+    let path = if after_port.starts_with('/') {
+        let path_end = after_port
+            .find(|c: char| c == '?' || c == '#' || c.is_whitespace())
+            .unwrap_or(after_port.len());
+        after_port[..path_end].to_ascii_lowercase()
     } else {
         String::new()
     };
@@ -784,12 +855,15 @@ mod tests {
             ),
             ChallengeKind::Turnstile,
         );
-        assert_clear(hit(
-            "t",
-            Some("https://example.com/cdn-cgi/challenge-platform/h/b/orchestrate"),
-            "",
-            &[],
-        ));
+        assert_kind(
+            hit(
+                "t",
+                Some("https://example.com/cdn-cgi/challenge-platform/h/b/orchestrate"),
+                "",
+                &[],
+            ),
+            ChallengeKind::Interstitial,
+        );
         assert_kind(
             hit(
                 "t",
@@ -799,6 +873,25 @@ mod tests {
             ),
             ChallengeKind::Turnstile,
         );
+        assert_kind(
+            hit(
+                "t",
+                Some("https://www.google.com:443/recaptcha/api2/anchor"),
+                "",
+                &[],
+            ),
+            ChallengeKind::Recaptcha,
+        );
+        assert_kind(
+            hit(
+                "t",
+                Some("https://user:pass@www.google.com/recaptcha/api2/anchor"),
+                "",
+                &[],
+            ),
+            ChallengeKind::Recaptcha,
+        );
+        assert_clear(hit("t", Some("https://example.com:443/products"), "", &[]));
         assert_kind(
             hit(
                 "t",
@@ -875,6 +968,134 @@ mod tests {
         assert_kind(
             hit("t", None, "", &[("document", "geetest puzzle")]),
             ChallengeKind::Generic,
+        );
+    }
+
+    #[test]
+    fn positive_interstitials() {
+        let callback = Some("https://www.cars.com/signin/google_callback/");
+        assert_kind(
+            hit("Just a moment...", callback, "", &[]),
+            ChallengeKind::Interstitial,
+        );
+        assert_kind(
+            hit("Performing security verification", callback, "", &[]),
+            ChallengeKind::Interstitial,
+        );
+        assert_kind(
+            hit("Checking if the site connection is secure", None, "", &[]),
+            ChallengeKind::Interstitial,
+        );
+        assert_clear(hit("cars.com", callback, "", &[]));
+        assert_kind(
+            hit(
+                "t",
+                Some("https://www.cars.com/cdn-cgi/challenge-platform/h/b"),
+                "",
+                &[],
+            ),
+            ChallengeKind::Interstitial,
+        );
+        assert_kind(
+            hit(
+                "t",
+                Some("https://www.cars.com:443/cdn-cgi/challenge-platform/h/b"),
+                "",
+                &[],
+            ),
+            ChallengeKind::Interstitial,
+        );
+        assert_kind(
+            hit(
+                "t",
+                Some("https://example.com:443/cdn-cgi/challenge-platform/h/b"),
+                "",
+                &[],
+            ),
+            ChallengeKind::Interstitial,
+        );
+        assert_kind(
+            hit(
+                "Checking if the site connection is secure",
+                Some("https://www.cloudflare.com/cdn-cgi/challenge-platform/h/b"),
+                "",
+                &[],
+            ),
+            ChallengeKind::Turnstile,
+        );
+        assert_kind(
+            hit("cars.com", None, "Performing security verification", &[]),
+            ChallengeKind::Interstitial,
+        );
+        assert_kind(
+            hit(
+                "cars.com",
+                None,
+                "",
+                &[("document", "Checking if the site connection is secure")],
+            ),
+            ChallengeKind::Interstitial,
+        );
+        assert_clear(hit(
+            "cars.com",
+            None,
+            "please wait just a moment while we load your cart",
+            &[],
+        ));
+        assert_clear(hit(
+            "t",
+            Some("https://www.cars.com/cdn-cgi/scripts/rocket"),
+            "",
+            &[],
+        ));
+    }
+
+    #[test]
+    fn title_is_interstitial_matches_settle_table() {
+        let cases = [
+            ("Just a moment...", true),
+            ("Performing security verification", true),
+            ("Checking if the site connection is secure", true),
+            ("cars.com: Camry", false),
+            ("Continue as Ryan", false),
+            ("Accept cookies", false),
+            ("", false),
+        ];
+        for (title, blocked) in cases {
+            assert_eq!(title_is_interstitial(title), blocked, "title {title:?}");
+        }
+    }
+
+    #[test]
+    fn strong_phrases_does_not_include_just_a_moment() {
+        let src = include_str!("challenge.rs");
+        let start = src.find("const STRONG_PHRASES").expect("STRONG_PHRASES");
+        let rest = &src[start..];
+        let end = rest.find("];").expect("STRONG_PHRASES table end") + 2;
+        let table = &rest[..end];
+        assert!(
+            !table.contains("just a moment"),
+            "STRONG_PHRASES must not contain just a moment:\n{table}"
+        );
+        assert!(
+            !table.contains("it will only take a moment"),
+            "STRONG_PHRASES must not contain it will only take a moment:\n{table}"
+        );
+    }
+
+    #[test]
+    fn mcp_challenge_tool_mentions_interstitial_and_wait() {
+        let src = include_str!("mcp.rs");
+        let start = src.find("fn challenge(").expect("mcp challenge tool");
+        let window = &src[start.saturating_sub(700)..start];
+        let lower = window.to_ascii_lowercase();
+        assert!(
+            lower.contains("interstitial") || lower.contains("just a moment"),
+            "mcp challenge description should name interstitial or Just a moment:\n{window}"
+        );
+        assert!(
+            lower.contains("wait"),
+            "mcp challenge description should mention wait:\n{window}"
         );
     }
 

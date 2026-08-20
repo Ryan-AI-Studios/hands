@@ -3,12 +3,9 @@
 use std::time::{Duration, Instant};
 
 use crate::capture::{RoiFrame, capture_roi};
-use crate::classify::contains_phrase;
 use crate::error::HandsError;
 use crate::lease;
 use crate::space::{Rect, Space};
-
-const TITLE_BLOCK_NEEDLES: &[&str] = &["just a moment", "performing security verification"];
 
 pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const FRAME_GAP: Duration = Duration::from_millis(50);
@@ -72,9 +69,7 @@ pub fn default_wait_roi(space: Space, fg: Option<Rect>) -> Result<Rect, HandsErr
 
 /// Cloudflare interstitial captions that must not report `settled: true`.
 pub fn title_blocks_settled(title: &str) -> bool {
-    TITLE_BLOCK_NEEDLES
-        .iter()
-        .any(|needle| contains_phrase(title, needle))
+    crate::challenge::title_is_interstitial(title)
 }
 
 pub fn wait_settle(space: Space, roi: Rect) -> Result<(bool, RoiFrame), HandsError> {
@@ -226,6 +221,7 @@ mod tests {
         let cases = [
             ("Just a moment...", true),
             ("Performing security verification", true),
+            ("Checking if the site connection is secure", true),
             ("cars.com: Camry", false),
             ("Continue as Ryan", false),
             ("Accept cookies", false),

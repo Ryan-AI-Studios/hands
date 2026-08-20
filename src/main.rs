@@ -180,7 +180,7 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Detect / status / watch a visible challenge UI (no desk lease; not a solver)
+    /// Detect / status / watch a visible challenge UI. Interstitial titles and origin /cdn-cgi/challenge-platform/ set present; wait (wait_settle / --watch); do not click the wall. Two-try yield still for puzzles. No desk lease; not a solver; idle is not resume
     Challenge {
         #[arg(long)]
         status: bool,
@@ -711,6 +711,30 @@ mod tests {
         assert!(
             help.contains("--dy -6"),
             "long-help should mention --dy -6, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn challenge_help_mentions_interstitial_and_wait() {
+        let cmd = Cli::command();
+        let challenge = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "challenge")
+            .expect("challenge subcommand");
+        let about = challenge
+            .get_about()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let help = challenge.clone().render_long_help().to_string();
+        let blob = format!("{about}\n{help}");
+        let lower = blob.to_ascii_lowercase();
+        assert!(
+            lower.contains("interstitial") || blob.contains("Just a moment"),
+            "challenge help should mention interstitial or Just a moment:\n{blob}"
+        );
+        assert!(
+            lower.contains("wait"),
+            "challenge help should mention wait:\n{blob}"
         );
     }
 

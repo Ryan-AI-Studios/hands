@@ -1541,6 +1541,22 @@ mod tests {
     }
 
     #[test]
+    fn detect_from_extract_just_a_moment_google_callback_is_interstitial() {
+        let hit = challenge::detect_from_extract(
+            "Just a moment...",
+            Some("https://www.cars.com/signin/google_callback/"),
+            "",
+            &[],
+        );
+        assert!(hit.present, "{hit:?}");
+        assert_eq!(
+            hit.kind.map(|k| k.as_str()),
+            Some("interstitial"),
+            "{hit:?}"
+        );
+    }
+
+    #[test]
     fn empty_state_from_main_text_is_not_challenge() {
         let extract = extract_fused(
             "Results",

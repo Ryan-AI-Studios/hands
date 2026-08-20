@@ -259,7 +259,7 @@ pub fn diagnose(inputs: Inputs) -> Report {
             "snapshot",
             false,
             "pipe up but snapshot failed within 400 ms",
-            "Pipe is up but snapshot failed within 400 ms. Reload the extension (Chrome caches the host list). If a later observe stalls ~2 s, that is the PR #9 PeekNamedPipe leftover — stop and report; do not patch.",
+            "Pipe is up but snapshot failed within 400 ms. Reload the extension (Chrome caches the host list).",
         );
     }
 
@@ -1001,5 +1001,41 @@ mod tests {
         );
         assert!(!src.contains(reg_exe), "host_doctor.rs must not {reg_exe}");
         assert!(src.contains("REG ADD"), "advice string REG ADD is allowed");
+        let pr9 = concat!("PR #", "9");
+        let leftover = concat!("PeekNamedPipe ", "leftover");
+        let stop = concat!("stop and ", "report");
+        let patch = concat!("do not ", "patch");
+        assert!(!src.contains(pr9), "host_doctor.rs must not name {pr9}");
+        assert!(
+            !src.contains(leftover),
+            "host_doctor.rs must not name {leftover}"
+        );
+        assert!(!src.contains(stop), "host_doctor.rs must not say {stop}");
+        assert!(!src.contains(patch), "host_doctor.rs must not say {patch}");
+    }
+
+    #[test]
+    fn snapshot_fail_reload_not_leftover() {
+        let (_dir, _exe, json_path) = temp_workspace();
+        let mut inputs = good_inputs(&json_path);
+        inputs.pipe_up = true;
+        inputs.snapshot_ok = false;
+        inputs.snapshot_env_set = false;
+        let report = diagnose(inputs);
+        assert!(!report.ok);
+        let lower = report.next.to_ascii_lowercase();
+        assert!(
+            lower.contains("reload") && lower.contains("extension"),
+            "next={}",
+            report.next
+        );
+        let pr9 = concat!("pr #", "9");
+        let leftover = concat!("peeknamedpipe ", "leftover");
+        let stop = concat!("stop and ", "report");
+        let patch = concat!("do not ", "patch");
+        assert!(!lower.contains(pr9), "next={}", report.next);
+        assert!(!lower.contains(leftover), "next={}", report.next);
+        assert!(!lower.contains(stop), "next={}", report.next);
+        assert!(!lower.contains(patch), "next={}", report.next);
     }
 }

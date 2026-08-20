@@ -196,7 +196,7 @@ Success: JSON has `"chrome_connected": true` and at least one `"id": "chr:…"`.
 | Specified native messaging host not found / not registered | HKCU default must be the **full path to the JSON file**. Restart Chrome. |
 | Access … forbidden | Extension id ≠ `fdnpjnnnmfhlpgaabjflhjoepmejcnha`, or `allowed_origins` typo. |
 | Native host has exited / Error when communicating | Host stderr + Chrome native-messaging log. JSON must be valid (no extra PowerShell). |
-| Observe hangs ~2 s with a connected host | Large-frame pipe stall (known leftover). Stop and report; do not add CDP. |
+| Host-forward still stalls after incremental drain | Remaining stall is a new finding (not the old whole-frame Peek wait). Do not add CDP. |
 
 ### 8. Register Hands as user-scope MCP
 

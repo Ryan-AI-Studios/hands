@@ -1,9 +1,15 @@
 //! Cross-process: process A appends under HANDS_LOGS_DIR; CLI `hands logs` reads it.
 
 use std::process::Command;
+use std::sync::Mutex;
+
+/// `record()` reads process-global `HANDS_LOGS_DIR`. Parallel tests in this
+/// binary must not overwrite each other's env.
+static LOGS_DIR_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn cli_logs_reads_prior_lines_and_does_not_mint() {
+    let _guard = LOGS_DIR_LOCK.lock().unwrap();
     let dir = std::env::temp_dir().join(format!(
         "hands-logs-cli-{}",
         std::time::SystemTime::now()
@@ -83,6 +89,7 @@ fn cli_logs_reads_prior_lines_and_does_not_mint() {
 
 #[test]
 fn cli_logs_default_tail_fits_4kib_and_keeps_newest_stop() {
+    let _guard = LOGS_DIR_LOCK.lock().unwrap();
     let dir = std::env::temp_dir().join(format!(
         "hands-logs-cli-fat-{}",
         std::time::SystemTime::now()

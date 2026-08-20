@@ -44,6 +44,8 @@ pub struct ActuateEnvelope {
     pub challenge: Option<ChallengeInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roi: Option<Rect>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub miss: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -116,6 +118,7 @@ fn base(
         fence: None,
         challenge: None,
         roi: None,
+        miss: None,
     })
 }
 
@@ -132,6 +135,7 @@ fn refuse_yield(session_id: String, target: ActuateTarget) -> Result<ActuateEnve
         fence: None,
         challenge: Some(challenge::snapshot()),
         roi: None,
+        miss: None,
     })
 }
 
@@ -163,6 +167,7 @@ fn refuse_fence(
         fence: Some(fence),
         challenge: None,
         roi: None,
+        miss: None,
     })
 }
 
@@ -271,6 +276,16 @@ pub fn click(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     after_actuate("click", click_inner(req), None, None)
 }
 
+fn click_miss(same: bool, focus_lost: bool) -> Option<&'static str> {
+    if focus_lost {
+        Some("focus_lost")
+    } else if same {
+        Some("no_change")
+    } else {
+        None
+    }
+}
+
 fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let session_id = match session(&req) {
         Ok(id) => id,
@@ -298,42 +313,45 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     remember_target(resolved.rect);
     let mut rng = Rng::from_time();
     let roi = settle::default_roi(space, Some(resolved.rect), (resolved.x, resolved.y));
-    let snapshot = match crate::capture::capture_roi(space, roi) {
-        Ok(f) => f,
-        Err(err) => return fail(session_id, info, err, false, false, false),
-    };
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
         return fail(session_id, info, err, foregrounded, false, false);
     }
+    let snapshot = match crate::capture::capture_roi(space, roi) {
+        Ok(f) => f,
+        Err(err) => return fail(session_id, info, err, foregrounded, false, false),
+    };
     if let Err(err) = input::left_click(&mut rng) {
         return fail(session_id, info, err, foregrounded, false, false);
     }
-    let (settled, after) = match settle::wait_settle(space, roi) {
+    let (mut settled, after) = match settle::wait_settle(space, roi) {
         Ok(v) => v,
         Err(err) => return fail(session_id, info, err, foregrounded, false, false),
     };
-    let same = snapshot.width == after.width
-        && snapshot.height == after.height
-        && settle::changed_ratio(&snapshot.pixels, &after.pixels) < settle::RATIO_LIMIT;
-    if same && lease::poll().is_ok() {
+    let same = settle::roi_unchanged(&snapshot, &after);
+    let focus_lost = foregrounded
+        && resolved.hwnd.is_some()
+        && !foreground::same_top_level(resolved.hwnd, foreground::foreground_hwnd());
+    let mut miss = click_miss(same, focus_lost);
+    let mut retried = false;
+    if miss.is_some() && lease::poll().is_ok() {
+        retried = true;
+        if focus_lost {
+            let _ = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
+        }
         if let Err(err) = input::left_click(&mut rng) {
             return fail(session_id, info, err, foregrounded, true, settled);
         }
-        let (settled2, _) = match settle::wait_settle(space, roi) {
+        let (settled2, after2) = match settle::wait_settle(space, roi) {
             Ok(v) => v,
             Err(err) => return fail(session_id, info, err, foregrounded, true, settled),
         };
-        return base(
-            session_id,
-            info,
-            true,
-            false,
-            true,
-            settled2,
-            foregrounded,
-            None,
-        );
+        settled = settled2;
+        let same = settle::roi_unchanged(&snapshot, &after2);
+        let focus_lost = foregrounded
+            && resolved.hwnd.is_some()
+            && !foreground::same_top_level(resolved.hwnd, foreground::foreground_hwnd());
+        miss = click_miss(same, focus_lost);
     }
     if lease::is_frozen() {
         return base(
@@ -341,22 +359,24 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             info,
             false,
             true,
-            false,
+            retried,
             settled,
             foregrounded,
             Some("desk lease frozen (physical input or Pause/Break)".into()),
         );
     }
-    base(
+    let mut env = base(
         session_id,
         info,
         true,
         false,
-        false,
+        retried,
         settled,
         foregrounded,
         None,
-    )
+    )?;
+    env.miss = miss.map(str::to_string);
+    finalize_envelope(env)
 }
 
 pub fn hover(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -700,6 +720,7 @@ mod tests {
             fence: None,
             challenge: None,
             roi: None,
+            miss: None,
         };
         let err = finalize_envelope(env).expect_err("must not emit oversize");
         assert!(err.to_string().contains("16384"), "{err}");
@@ -733,6 +754,7 @@ mod tests {
                 w: 800,
                 h: 600,
             }),
+            miss: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"roi\""), "{json}");
@@ -740,6 +762,7 @@ mod tests {
         assert!(json.contains("\"h\":600"), "{json}");
         assert!(json.contains("\"x\":10"), "{json}");
         assert!(json.contains("\"y\":20"), "{json}");
+        assert!(!json.contains("\"miss\""), "{json}");
     }
 
     #[test]
@@ -761,9 +784,114 @@ mod tests {
             fence: None,
             challenge: None,
             roi: None,
+            miss: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(!json.contains("\"roi\""), "{json}");
+        assert!(!json.contains("\"miss\""), "{json}");
+    }
+
+    #[test]
+    fn click_envelope_includes_miss_no_change() {
+        let env = ActuateEnvelope {
+            session_id: "s".into(),
+            ok: true,
+            frozen: false,
+            target: ActuateTarget {
+                kind: "element".into(),
+                id: Some("uia:1".into()),
+                x: 40,
+                y: 50,
+            },
+            retried: true,
+            settled: true,
+            foregrounded: true,
+            error: None,
+            fence: None,
+            challenge: None,
+            roi: None,
+            miss: Some("no_change".into()),
+        };
+        let json = serialize_envelope(&env).expect("json");
+        assert!(json.contains("\"miss\":\"no_change\""), "{json}");
+    }
+
+    #[test]
+    fn hover_envelope_omits_miss() {
+        let env = ActuateEnvelope {
+            session_id: "s".into(),
+            ok: true,
+            frozen: false,
+            target: ActuateTarget {
+                kind: "element".into(),
+                id: Some("chr:0".into()),
+                x: 12,
+                y: 34,
+            },
+            retried: false,
+            settled: false,
+            foregrounded: true,
+            error: None,
+            fence: None,
+            challenge: None,
+            roi: None,
+            miss: None,
+        };
+        let json = serialize_envelope(&env).expect("json");
+        assert!(!json.contains("\"miss\""), "{json}");
+        assert!(!json.contains("\"roi\""), "{json}");
+    }
+
+    #[test]
+    fn click_miss_table() {
+        assert_eq!(click_miss(false, false), None);
+        assert_eq!(click_miss(true, false), Some("no_change"));
+        assert_eq!(click_miss(false, true), Some("focus_lost"));
+        assert_eq!(click_miss(true, true), Some("focus_lost"));
+    }
+
+    #[test]
+    fn click_inner_snapshots_after_offer_and_move() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let rest = &src[start..];
+        let end = rest.find("pub fn hover").expect("hover follows");
+        let body = &rest[..end];
+        let offer = body.find("foreground::offer").expect("offer");
+        let move_to = body.find("input::move_to").expect("move_to");
+        let capture = body.find("capture_roi").expect("capture_roi");
+        let click = body.find("left_click").expect("left_click");
+        assert!(
+            capture > offer && capture > move_to && capture < click,
+            "first capture_roi must be after offer and move_to and before first left_click:\n{body}"
+        );
+        assert!(
+            body.contains("default_roi"),
+            "click must use default_roi:\n{body}"
+        );
+        assert!(
+            !body.contains("default_wait_roi"),
+            "click must not use default_wait_roi:\n{body}"
+        );
+        assert!(
+            !body.contains("preprocess::"),
+            "click snapshot must not preprocess:\n{body}"
+        );
+    }
+
+    #[test]
+    fn mcp_click_help_mentions_miss() {
+        let mcp = include_str!("mcp.rs");
+        let start = mcp
+            .find("Bézier-move and left-click")
+            .expect("mcp click description");
+        let rest = &mcp[start..];
+        let end = rest.find("fn click").unwrap_or(rest.len().min(500));
+        let click_desc = &rest[..end];
+        assert!(
+            click_desc.contains("miss") || click_desc.contains("no_change"),
+            "mcp click description should mention miss or no_change:\n{click_desc}"
+        );
     }
 
     #[test]
@@ -794,6 +922,10 @@ mod tests {
         assert!(
             body.contains("title_blocks_settled"),
             "standalone wait_settle must apply title honesty:\n{body}"
+        );
+        assert!(
+            !body.contains("miss:") && !body.contains("env.miss") && !body.contains("click_miss"),
+            "standalone wait_settle must not assign miss:\n{body}"
         );
     }
 

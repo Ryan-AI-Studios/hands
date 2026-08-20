@@ -35,6 +35,10 @@ pub fn changed_ratio(a: &[u8], b: &[u8]) -> f64 {
     changed as f64 / n as f64
 }
 
+pub fn roi_unchanged(a: &RoiFrame, b: &RoiFrame) -> bool {
+    a.width == b.width && a.height == b.height && changed_ratio(&a.pixels, &b.pixels) < RATIO_LIMIT
+}
+
 pub fn default_roi(space: Space, last_target: Option<Rect>, cursor: (i32, i32)) -> Rect {
     if let Some(rect) = last_target {
         let inflated = space.inflate_clip(rect, INFLATE_PAD);
@@ -130,6 +134,48 @@ mod tests {
         assert_eq!(changed_ratio(&a, &b), 0.0);
         b[0] = 19; // delta 9
         assert!((changed_ratio(&a, &b) - 0.01).abs() < 1e-9);
+    }
+
+    fn frame(width: i32, height: i32, pixels: Vec<u8>) -> RoiFrame {
+        RoiFrame {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    #[test]
+    fn roi_unchanged_matches_same_expression() {
+        let a_pix = rgba(1000, 0, 0, 0, 255);
+        let mut below = a_pix.clone();
+        for i in 0..4 {
+            below[i * 4] = 20;
+        }
+        let a = frame(10, 100, a_pix.clone());
+        let b = frame(10, 100, below);
+        let same = a.width == b.width
+            && a.height == b.height
+            && changed_ratio(&a.pixels, &b.pixels) < RATIO_LIMIT;
+        assert_eq!(roi_unchanged(&a, &b), same);
+        assert!(same);
+
+        let mut at_limit = a_pix.clone();
+        for i in 0..5 {
+            at_limit[i * 4] = 20;
+        }
+        let c = frame(10, 100, at_limit);
+        let same_c = a.width == c.width
+            && a.height == c.height
+            && changed_ratio(&a.pixels, &c.pixels) < RATIO_LIMIT;
+        assert_eq!(roi_unchanged(&a, &c), same_c);
+        assert!(!same_c);
+
+        let d = frame(20, 50, a_pix);
+        let same_d = a.width == d.width
+            && a.height == d.height
+            && changed_ratio(&a.pixels, &d.pixels) < RATIO_LIMIT;
+        assert_eq!(roi_unchanged(&a, &d), same_d);
+        assert!(!same_d);
     }
 
     #[test]

@@ -29,7 +29,7 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content.
+    /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content. After click, envelope may include `miss` (`no_change` / `focus_lost`); settle baseline is post-hover ROI pixel-diff; one retry, re-offer on `focus_lost`.
     Click {
         #[arg(
             long,
@@ -798,6 +798,22 @@ mod tests {
         assert!(
             blob.contains("roi"),
             "wait-settle help should mention envelope roi:\n{blob}"
+        );
+    }
+
+    #[test]
+    fn click_help_mentions_miss() {
+        let cmd = Cli::command();
+        let click = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "click")
+            .expect("click subcommand");
+        let about = click.get_about().map(|s| s.to_string()).unwrap_or_default();
+        let help = click.clone().render_long_help().to_string();
+        let blob = format!("{about}\n{help}");
+        assert!(
+            blob.contains("miss") || blob.contains("no_change"),
+            "click help should mention miss or no_change:\n{blob}"
         );
     }
 

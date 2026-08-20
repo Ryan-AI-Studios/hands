@@ -3,8 +3,9 @@
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow, WindowFromPoint,
+    GA_ROOT, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    WindowFromPoint,
 };
 
 use crate::space::Rect;
@@ -86,6 +87,21 @@ pub fn hwnd_raw(hwnd: HWND) -> Option<isize> {
         None
     } else {
         Some(hwnd.0 as isize)
+    }
+}
+
+pub fn same_top_level(a: Option<isize>, b: Option<isize>) -> bool {
+    let (Some(a), Some(b)) = (a, b) else {
+        return false;
+    };
+    if a == b {
+        return true;
+    }
+    let ra = hwnd_raw(unsafe { GetAncestor(raw_hwnd(a), GA_ROOT) });
+    let rb = hwnd_raw(unsafe { GetAncestor(raw_hwnd(b), GA_ROOT) });
+    match (ra, rb) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
     }
 }
 
@@ -177,5 +193,12 @@ mod tests {
         let _ = viewport_rect();
         assert_eq!(title(Some(0)), "");
         let _ = title(None);
+    }
+
+    #[test]
+    fn same_top_level_none_and_equal_hwnd() {
+        assert!(!same_top_level(None, Some(1)));
+        assert!(!same_top_level(None, None));
+        assert!(same_top_level(Some(7), Some(7)));
     }
 }

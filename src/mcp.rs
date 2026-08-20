@@ -198,7 +198,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content."
+        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. After click, envelope may include miss (no_change / focus_lost); settle baseline is post-hover ROI pixel-diff; one retry, re-offer on focus_lost."
     )]
     fn click(
         &self,

@@ -997,6 +997,35 @@ mod tests {
     }
 
     #[test]
+    fn element_id_is_runtime_id_dot_join_not_walk_order() {
+        let mut target = node(ControlKind::Edit, "address");
+        target.runtime_id = vec![42, 591400, 4, 0, 0, 301];
+        assert_eq!(
+            target.element_id().as_deref(),
+            Some("uia:42.591400.4.0.0.301")
+        );
+        assert_ne!(target.element_id().as_deref(), Some("uia:0"));
+        assert_ne!(target.element_id().as_deref(), Some("uia:6"));
+
+        // Seventh node still encodes RuntimeId, not walk order.
+        let mut nodes: Vec<RawNode> = (0..6)
+            .map(|i| {
+                let mut n = node(ControlKind::Button, "b");
+                n.runtime_id = vec![1, i];
+                n
+            })
+            .collect();
+        nodes.push(target);
+        let (els, matched) = filter_nodes(&nodes, Detail::Dom);
+        assert_eq!(matched, 7);
+        assert_eq!(els.len(), 7);
+        assert_eq!(els[6].id, "uia:42.591400.4.0.0.301");
+        assert_ne!(els[6].id, "uia:6");
+        assert_ne!(els[6].id, "uia:0");
+        assert_eq!(els[6].id, nodes[6].element_id().unwrap());
+    }
+
+    #[test]
     fn parse_miles_vs_distance_same_blob() {
         let blob = "2024 Toyota Camry 32,145 mi 12 mi away Capital Toyota";
         assert_eq!(parse_miles(blob).as_deref(), Some("32,145 mi"));

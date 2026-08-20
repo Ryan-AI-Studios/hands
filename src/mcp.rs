@@ -188,7 +188,7 @@ pub struct HandsServer;
 #[tool_router(server_handler)]
 impl HandsServer {
     #[tool(
-        description = "Capture the foreground window viewport: screenshot path (full virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope. extract.dialogs leads when a cookie / account / dialog is visible. Cards may include miles/dealer/distance; extract.empty_state holds empty-radius copy. Elements carry grid (g:col:row of the resolved center); prefer that over guessing. detail=dom is the fat desktop + Chrome walk (16 KiB). chrome_connected: false includes chrome_hint pointing at native-host-doctor."
+        description = "Capture the foreground window viewport: screenshot path (full virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope. extract.dialogs leads when a cookie / account / dialog is visible. Cards may include miles/dealer/distance; extract.empty_state holds empty-radius copy. Elements carry grid (g:col:row of the resolved center); prefer that over guessing. detail=dom is the fat desktop + Chrome walk (16 KiB). chrome_connected: false includes chrome_hint pointing at native-host-doctor. uia: is opaque UIA RuntimeId; chr: is a page-local walk index (chr:0, chr:42, no leading zeros) that dies on navigation (insert-before can shift later indexes) — re-observe. Prefer chr: for Chrome page content (Chrome UIA may churn after navigation)."
     )]
     fn observe(
         &self,
@@ -198,7 +198,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel"
+        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content."
     )]
     fn click(
         &self,
@@ -208,7 +208,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms (no click)"
+        description = "Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms (no click). uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content."
     )]
     fn hover(
         &self,

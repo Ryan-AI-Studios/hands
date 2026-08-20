@@ -20,7 +20,7 @@ struct Cli {
 enum Command {
     /// Serve the MCP server over stdio
     Mcp,
-    /// Capture the foreground viewport: screenshot path (virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope. extract.dialogs leads when a cookie / account / dialog is visible. Cards may include miles/dealer/distance; extract.empty_state holds empty-radius copy. Elements carry grid (g:col:row of the resolved center); prefer that over guessing.
+    /// Capture the foreground viewport: screenshot path (virtual screen), ≤20 on-screen hittable elements, ≤4 KiB envelope. extract.dialogs leads when a cookie / account / dialog is visible. Cards may include miles/dealer/distance; extract.empty_state holds empty-radius copy. Elements carry grid (g:col:row of the resolved center); prefer that over guessing. uia: is opaque UIA RuntimeId; chr: is a page-local walk index (chr:0, chr:42, no leading zeros) that dies on navigation (insert-before can shift later indexes) — re-observe. Prefer chr: for Chrome page content (Chrome UIA may churn after navigation).
     Observe {
         /// `dom` for the fat desktop + Chrome walk (16 KiB shrink; still skips offscreen/zero-size)
         #[arg(long, value_enum)]
@@ -29,9 +29,12 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel
+    /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content.
     Click {
-        #[arg(long, help = "UIA id, Chrome chr: id, grid cell, or pixel")]
+        #[arg(
+            long,
+            help = "UIA RuntimeId (uia:), Chrome page-local chr: walk index (dies on navigation; re-observe; prefer chr: for page content), grid cell, or pixel"
+        )]
         element_id: Option<String>,
         #[arg(long)]
         grid: Option<String>,
@@ -42,9 +45,12 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms
+    /// Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms. `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content.
     Hover {
-        #[arg(long, help = "UIA id, Chrome chr: id, grid cell, or pixel")]
+        #[arg(
+            long,
+            help = "UIA RuntimeId (uia:), Chrome page-local chr: walk index (dies on navigation; re-observe; prefer chr: for page content), grid cell, or pixel"
+        )]
         element_id: Option<String>,
         #[arg(long)]
         grid: Option<String>,
@@ -750,6 +756,33 @@ mod tests {
             blob.contains("roi"),
             "wait-settle help should mention envelope roi:\n{blob}"
         );
+    }
+
+    #[test]
+    fn observe_click_help_mentions_runtime_id_and_page_local() {
+        let cmd = Cli::command();
+        for name in ["observe", "click", "hover"] {
+            let sub = cmd
+                .get_subcommands()
+                .find(|c| c.get_name() == name)
+                .unwrap_or_else(|| panic!("{name} subcommand"));
+            let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();
+            let help = sub.clone().render_long_help().to_string();
+            let blob = format!("{about}\n{help}");
+            let lower = blob.to_ascii_lowercase();
+            assert!(
+                blob.contains("RuntimeId") || lower.contains("runtime id"),
+                "{name} help should mention RuntimeId:\n{blob}"
+            );
+            assert!(
+                lower.contains("page-local") || lower.contains("page local"),
+                "{name} help should mention page-local:\n{blob}"
+            );
+            assert!(
+                lower.contains("navigation") || lower.contains("re-observe"),
+                "{name} help should mention navigation or re-observe:\n{blob}"
+            );
+        }
     }
 
     #[test]

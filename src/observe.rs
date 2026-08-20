@@ -1048,6 +1048,24 @@ mod tests {
     }
 
     #[test]
+    fn mcp_and_cli_mention_runtime_id_and_page_local() {
+        let mcp = include_str!("mcp.rs");
+        let lower = mcp.to_ascii_lowercase();
+        assert!(
+            mcp.contains("RuntimeId") || lower.contains("runtime id"),
+            "mcp.rs must mention RuntimeId"
+        );
+        assert!(
+            lower.contains("page-local") || lower.contains("page local"),
+            "mcp.rs must mention page-local"
+        );
+        assert!(
+            lower.contains("navigation") || lower.contains("re-observe"),
+            "mcp.rs must mention navigation or re-observe"
+        );
+    }
+
+    #[test]
     fn disconnected_serialize_includes_chrome_hint() {
         let mut env = fat_envelope(0);
         env.chrome_connected = false;

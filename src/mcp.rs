@@ -342,7 +342,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Detect/status/watch a visible challenge UI. Two observe-cycles that used actuation then yield. Resume when the UI is gone. Not a solver. Idle is not resume."
+        description = "Detect/status/watch a visible challenge UI. Interstitial titles and origin /cdn-cgi/challenge-platform/ set present; harness waits (wait_settle / --watch); do not click the wall. Two observe-cycles that used actuation then yield (puzzles). Resume when the UI is gone. Not a solver. Idle is not resume."
     )]
     fn challenge(
         &self,

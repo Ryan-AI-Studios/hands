@@ -382,7 +382,7 @@ cargo run -- native-host-manifest --help
 
 `hands attach [--plan] [--session-id <id>]` attaches to a visible `Chrome_WidgetWin_1` whose image is `chrome.exe`, or launches `chrome.exe about:blank` with **zero `--` flags**. `--plan` never spawns. `HANDS_CHROME_EXE` overrides the exe (set + missing file is a hard error). Attach does not sideload, does not kill Chrome, and does not install the desk lease.
 
-Chrome artifacts: `extension/` (unpacked MV3, isolated world, id `fdnpjnnnmfhlpgaabjflhjoepmejcnha`) and `native-host/` (`com.helpinghands.host`). MCP/CLI talk to the host over `\\.\pipe\hands-chrome` (`HANDS_CHROME_PIPE`). Tests may set `HANDS_CHROME_SNAPSHOT` (host-double). `chr:` ids are a walk index (`chr:0`, `chr:42` — no leading zeros).
+Chrome artifacts: `extension/` (unpacked MV3, isolated world, id `fdnpjnnnmfhlpgaabjflhjoepmejcnha`) and `native-host/` (`com.helpinghands.host`). MCP/CLI talk to the host over `\\.\pipe\hands-chrome` (`HANDS_CHROME_PIPE`). Tests may set `HANDS_CHROME_SNAPSHOT` (host-double). `chr:` ids are a page-local walk index (`chr:0`, `chr:42` — no leading zeros); they die on navigation, a DOM insert-before can shift later indexes, and the harness should re-observe. `uia:` is opaque UIA RuntimeId; Chrome UIA may churn after navigation — prefer `chr:` for page content.
 
 This binary owns the confirm fence. `click` and `key enter`/`return` refuse irreversible/gray-zone controls unless a matching domain+category allow exists. `type` containing a newline is a tool error — use `key enter` to submit. After a refuse, call `confirm` (`once` / `session` / `persist`) and retry. Grok is always-approve; the TUI is not the fence.
 

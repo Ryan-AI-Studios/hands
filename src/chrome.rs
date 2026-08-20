@@ -876,4 +876,26 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn content_js_assigns_chr_from_walk_index() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extension");
+        let text = fs::read_to_string(root.join("content.js")).unwrap();
+        assert!(
+            text.contains(r#""chr:" + String(index)"#),
+            "content.js must assign chr: from the querySelectorAll walk index"
+        );
+        assert!(
+            text.contains("querySelectorAll"),
+            "content.js must walk with querySelectorAll"
+        );
+        assert!(
+            !text.contains("data-hands"),
+            "content.js must not grow data-hands identity"
+        );
+        assert!(
+            !text.contains("WeakMap"),
+            "content.js must not grow WeakMap identity"
+        );
+    }
 }

@@ -79,7 +79,7 @@ fn sta_resolve(want: &[i32]) -> Result<ResolvedElement, HandsError> {
         .map_err(|err| HandsError::Uia(format!("GetRootElement: {err}")))?;
     let Some(element) = find_runtime_id(&walker, &root, want) else {
         return Err(HandsError::Target(format!(
-            "no UIA element with RuntimeId {}",
+            "no UIA element with RuntimeId {}; RuntimeId does not survive navigation / a destroyed control; re-observe",
             want.iter()
                 .map(i32::to_string)
                 .collect::<Vec<_>>()
@@ -556,6 +556,36 @@ mod tests {
         };
         let found = resolve_runtime_id(&node.runtime_id).expect("resolve");
         assert!(found.rect.area() > 0);
+    }
+
+    #[test]
+    #[ignore = "live desktop; not a CI gate. Run: cargo test -- --ignored"]
+    fn live_two_observe_notepad_same_runtime_id() {
+        let first = collect(Detail::Dom).expect("live UIA");
+        let second = collect(Detail::Dom).expect("live UIA");
+        let finder = |n: &crate::extract::RawNode| {
+            let role = n.role.to_ascii_lowercase();
+            let name = n.name.to_ascii_lowercase();
+            (role.contains("document") || role.contains("edit") || name.contains("notepad"))
+                && n.rect.area() > 0
+                && !n.runtime_id.is_empty()
+        };
+        let node_a = first.nodes.iter().find(|n| finder(n));
+        let node_b = second.nodes.iter().find(|n| finder(n));
+        let (Some(node_a), Some(node_b)) = (node_a, node_b) else {
+            // No Notepad on this desktop; still prove resolve errors on a missing id.
+            let err = resolve_runtime_id(&[9_999_999, 1]).expect_err("missing id");
+            let msg = err.to_string();
+            assert!(msg.contains("no UIA element"), "{msg}");
+            let lower = msg.to_ascii_lowercase();
+            assert!(
+                lower.contains("re-observe") || lower.contains("navigation"),
+                "{msg}"
+            );
+            return;
+        };
+        assert_eq!(node_a.runtime_id, node_b.runtime_id);
+        assert_eq!(node_a.element_id(), node_b.element_id());
     }
 
     #[test]

@@ -286,6 +286,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_runtime_id_round_trips_0011_address_bar_shape() {
+        assert_eq!(
+            parse_runtime_id("uia:42.591400.4.0.0.301").unwrap(),
+            vec![42, 591400, 4, 0, 0, 301]
+        );
+    }
+
+    #[test]
     fn parse_rejects_bare_uia_mixed_and_unknown() {
         let err = Target::parse(Some("uia:"), None, None, None).unwrap_err();
         assert!(err.to_string().contains("bare uia:"), "{err}");

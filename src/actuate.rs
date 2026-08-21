@@ -72,8 +72,7 @@ fn remember_target(rect: Rect) {
 }
 
 /// Process-local last click/hover rect. Standalone `wait_settle` does not read this
-/// (bare default is the foreground window). Kept so `remember_target` stays the writer
-/// (hover yield leftover: remember still happens before `refuse_if_yielded`).
+/// (bare default is the foreground window). Kept so `remember_target` stays the writer.
 #[allow(dead_code)]
 fn last_target() -> Option<Rect> {
     LAST_TARGET.lock().ok().and_then(|g| *g)
@@ -396,11 +395,11 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         Ok(r) => r,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
-    remember_target(resolved.rect);
     let info = resolved_info(resolved.kind, resolved.id.clone(), resolved.x, resolved.y);
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
+    remember_target(resolved.rect);
     let mut rng = Rng::from_time();
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
@@ -861,9 +860,15 @@ mod tests {
         let move_to = body.find("input::move_to").expect("move_to");
         let capture = body.find("capture_roi").expect("capture_roi");
         let click = body.find("left_click").expect("left_click");
+        let refuse = body.find("refuse_if_yielded").expect("refuse");
+        let remember = body.find("remember_target").expect("remember");
         assert!(
             capture > offer && capture > move_to && capture < click,
             "first capture_roi must be after offer and move_to and before first left_click:\n{body}"
+        );
+        assert!(
+            refuse < remember && remember < move_to,
+            "click_inner must refuse yield before remember_target before move_to:\n{body}"
         );
         assert!(
             body.contains("default_roi"),
@@ -1000,6 +1005,104 @@ mod tests {
         assert_eq!(env.error.as_deref(), Some(YIELD_ERROR));
         assert!(env.challenge.as_ref().is_some_and(|c| c.yielded));
         crate::challenge::reset_for_test();
+    }
+
+    fn distinctive_seed_rect() -> Rect {
+        Rect {
+            x: 12_345,
+            y: 54_321,
+            w: 77,
+            h: 88,
+        }
+    }
+
+    fn in_space_pixel(space: Space) -> (i32, i32) {
+        let x = space.origin_x + space.width / 2;
+        let y = space.origin_y + space.height / 2;
+        assert!(
+            space.contains_point(x, y),
+            "pixel ({x},{y}) must be inside virtual screen {space:?}"
+        );
+        (x, y)
+    }
+
+    fn yield_pixel_req(x: i32, y: i32) -> ActuateRequest {
+        ActuateRequest {
+            session_id: Some("s-act".into()),
+            x: Some(x),
+            y: Some(y),
+            ..ActuateRequest::default()
+        }
+    }
+
+    #[test]
+    fn yielded_hover_does_not_update_last_target() {
+        let _g = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::challenge::reset_for_test();
+        with_stop_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let seed = distinctive_seed_rect();
+            remember_target(seed);
+            yield_machine();
+            let (x, y) = in_space_pixel(space);
+            let env = hover(yield_pixel_req(x, y)).expect("hover envelope");
+            assert!(!env.ok, "{env:?}");
+            assert_eq!(env.error.as_deref(), Some(YIELD_ERROR));
+            assert!(env.challenge.as_ref().is_some_and(|c| c.yielded));
+            assert_eq!(last_target(), Some(seed));
+        });
+        crate::challenge::reset_for_test();
+    }
+
+    #[test]
+    fn yielded_click_does_not_update_last_target() {
+        let _g = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::challenge::reset_for_test();
+        with_stop_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let seed = distinctive_seed_rect();
+            remember_target(seed);
+            yield_machine();
+            let (x, y) = in_space_pixel(space);
+            let env = click(yield_pixel_req(x, y)).expect("click envelope");
+            assert!(!env.ok, "{env:?}");
+            assert_eq!(env.error.as_deref(), Some(YIELD_ERROR));
+            assert!(env.challenge.as_ref().is_some_and(|c| c.yielded));
+            assert_eq!(last_target(), Some(seed));
+        });
+        crate::challenge::reset_for_test();
+    }
+
+    #[test]
+    fn hover_inner_remembers_after_yield_before_move() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn hover_inner").expect("hover_inner");
+        let rest = &src[start..];
+        let end = rest.find("pub fn type_text").expect("type_text follows");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("#[cfg(test)]"),
+            "hover_inner slice must not include tests:\n{body}"
+        );
+        let refuse = body.find("refuse_if_yielded").expect("refuse");
+        let remember = body.find("remember_target").expect("remember");
+        let move_to = body.find("input::move_to").expect("move_to");
+        assert!(
+            refuse < remember && remember < move_to,
+            "hover_inner must refuse yield before remember_target before move_to:\n{body}"
+        );
+        assert!(
+            !body.contains("note_actuation"),
+            "hover must not count as an actuation attempt:\n{body}"
+        );
     }
 
     #[test]

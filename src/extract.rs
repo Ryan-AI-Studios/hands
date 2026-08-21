@@ -552,14 +552,24 @@ pub fn parse_empty_state(text: &str) -> Option<String> {
 
 pub fn parse_zip_radius(url: &str, text: &str) -> (Option<String>, Option<String>) {
     let mut zip = query_value(url, "zip").map(|z| take_chars(z, ZIP_CAP));
-    let mut radius = query_value(url, "maximum_distance")
-        .map(|d| take_chars(&format!("{} mi", d.trim()), RADIUS_CAP));
+    let query_dist = query_value(url, "maximum_distance").map(str::trim);
+    let mut radius = match query_dist {
+        Some(d) if !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(take_chars(&format!("{} mi", d), RADIUS_CAP))
+        }
+        _ => None,
+    };
     let (text_zip, text_radius) = parse_within_zip_radius(text);
     if zip.as_ref().is_none_or(|s| s.is_empty()) {
         zip = text_zip;
     }
     if radius.as_ref().is_none_or(|s| s.is_empty()) {
         radius = text_radius;
+    }
+    if radius.as_ref().is_none_or(|s| s.is_empty())
+        && query_dist.is_some_and(|d| d.eq_ignore_ascii_case("all"))
+    {
+        radius = Some(take_chars("all", RADIUS_CAP));
     }
     (
         zip.filter(|s| !s.is_empty()),
@@ -1166,6 +1176,99 @@ mod tests {
         let (zip, radius) = parse_zip_radius("", "Showing results within 50 miles of 32309");
         assert_eq!(zip.as_deref(), Some("32309"));
         assert_eq!(radius.as_deref(), Some("50 mi"));
+        let nationwide = "https://www.cars.com/shopping/results/?maximum_distance=all&zip=32309";
+        let (zip, radius) = parse_zip_radius(nationwide, "");
+        assert_eq!(zip.as_deref(), Some("32309"));
+        assert_eq!(radius.as_deref(), Some("all"));
+        assert_ne!(radius.as_deref(), Some("all mi"));
+        for token in ["All", "ALL"] {
+            let url = format!(
+                "https://www.cars.com/shopping/results/?maximum_distance={token}&zip=32309"
+            );
+            let (zip, radius) = parse_zip_radius(&url, "");
+            assert_eq!(zip.as_deref(), Some("32309"), "token={token}");
+            assert_eq!(radius.as_deref(), Some("all"), "token={token}");
+        }
+        let (zip, radius) =
+            parse_zip_radius(nationwide, "Showing results within 50 miles of 32309");
+        assert_eq!(zip.as_deref(), Some("32309"));
+        assert_eq!(radius.as_deref(), Some("50 mi"));
+        let garbage = "https://www.cars.com/shopping/results/?maximum_distance=foo&zip=32309";
+        let (zip, radius) = parse_zip_radius(garbage, "");
+        assert_eq!(zip.as_deref(), Some("32309"));
+        assert_eq!(radius, None);
+        let digit_wins = "https://www.cars.com/shopping/results/?maximum_distance=50&zip=32309";
+        let (zip, radius) =
+            parse_zip_radius(digit_wins, "Showing results within 100 miles of 99999");
+        assert_eq!(zip.as_deref(), Some("32309"));
+        assert_eq!(radius.as_deref(), Some("50 mi"));
+    }
+
+    #[test]
+    fn parse_zip_radius_does_not_unguarded_suffix_query() {
+        let src = include_str!("extract.rs");
+        let start = src
+            .find("pub fn parse_zip_radius(")
+            .expect("pub fn parse_zip_radius(");
+        let rest = &src[start..];
+        let end = rest
+            .find("pub fn enrich_listing(")
+            .expect("pub fn enrich_listing(");
+        let slice = &rest[..end];
+        assert!(
+            !slice.contains("#[cfg(test)]") && !slice.contains("mod tests"),
+            "slice must not include tests"
+        );
+        let old = concat!(
+            ".map(|d| take_chars(&format!(\"{} mi\", d.trim()), ",
+            "RADIUS_CAP))"
+        );
+        assert!(
+            !slice.contains(old),
+            "parse_zip_radius must not suffix every maximum_distance"
+        );
+        assert!(
+            slice.contains("is_ascii_digit"),
+            "parse_zip_radius must digit-check the query"
+        );
+        assert!(
+            slice.contains("eq_ignore_ascii_case(\"all\")"),
+            "parse_zip_radius must stamp canonical all"
+        );
+        assert!(
+            !slice.contains("all mi"),
+            "parse_zip_radius must not stamp all mi"
+        );
+    }
+
+    #[test]
+    fn collect_listing_meta_does_not_unguarded_suffix_query() {
+        let src = include_str!("../extension/content.js");
+        let start = src
+            .find("function collectListingMeta(")
+            .expect("function collectListingMeta(");
+        let rest = &src[start..];
+        let end = rest
+            .find("function parseResultCount(")
+            .expect("function parseResultCount(");
+        let slice = &rest[..end];
+        let old = concat!("if (maxDist) {\n    radius = maxDist + ", "\" mi\";\n  }");
+        assert!(
+            !slice.contains(old),
+            "collectListingMeta must not suffix every maxDist"
+        );
+        assert!(
+            slice.contains(r"/^\d+$/"),
+            "collectListingMeta must digit-check maxDist"
+        );
+        assert!(
+            slice.contains(r#"radius = "all""#),
+            "collectListingMeta must stamp canonical all"
+        );
+        assert!(
+            !slice.contains("all mi"),
+            "collectListingMeta must not stamp all mi"
+        );
     }
 
     #[test]

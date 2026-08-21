@@ -341,7 +341,7 @@ fn fuse_maps_default(
     {
         let chrome_els = filter_viewport_elements(map.elements, &opts);
         let chrome_n = chrome_els.len();
-        let extract = extract_fused(
+        let mut extract = extract_fused(
             uia_title,
             uia_nodes,
             map.url.as_deref(),
@@ -352,14 +352,16 @@ fn fuse_maps_default(
         );
         let mut elements = chrome_els;
         elements.extend(uia_els);
+        crate::dialogs::promote(&mut extract, &mut elements);
         let cap = Detail::Default.element_cap();
         if elements.len() > cap {
             elements.truncate(cap);
         }
         return (extract, elements, chrome_n + uia_matched, true);
     }
-    let extract = extract_from_nodes(uia_title, uia_nodes);
+    let mut extract = extract_from_nodes(uia_title, uia_nodes);
     let mut elements = uia_els;
+    crate::dialogs::promote(&mut extract, &mut elements);
     let cap = Detail::Default.element_cap();
     if elements.len() > cap {
         elements.truncate(cap);
@@ -1250,6 +1252,128 @@ mod tests {
         assert_eq!(capped.elements[0].id, "uia:1.42");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["extract"]["dialogs"][0]["kind"], "account");
+    }
+
+    #[test]
+    fn dense_chrome_cap_still_promotes_uia_continue_as() {
+        let chrome = chrome::ChromeMap {
+            url: Some("https://cars.com/search".into()),
+            title: "Cars.com".into(),
+            main_text: "listings".into(),
+            elements: (0..crate::extract::DEFAULT_ELEMENT_CAP)
+                .map(|i| Element {
+                    id: format!("chr:{i}"),
+                    role: if i % 2 == 0 {
+                        "Button".into()
+                    } else {
+                        "Hyperlink".into()
+                    },
+                    text: Some(if i == 0 {
+                        "Search".into()
+                    } else {
+                        format!("ok{i}")
+                    }),
+                    rect: Rect {
+                        x: 110,
+                        y: 150,
+                        w: 80,
+                        h: 24,
+                    },
+                    grid: None,
+                })
+                .collect(),
+            cards: vec![],
+            listing: crate::extract::ListingMeta::default(),
+        };
+        let nodes = vec![uia_node(
+            42,
+            "Continue as Ryan",
+            Rect {
+                x: 220,
+                y: 240,
+                w: 120,
+                h: 28,
+            },
+        )];
+        let (mut extract, mut elements, _total, connected) = fuse_maps(
+            Detail::Default,
+            "UIA",
+            &nodes,
+            Some(chrome),
+            fixture_opts(true),
+        );
+        assert!(connected);
+        crate::dialogs::promote(&mut extract, &mut elements);
+        assert_eq!(extract.dialogs.len(), 1);
+        assert_eq!(extract.dialogs[0].kind, "account");
+        assert_eq!(extract.dialogs[0].id, "uia:1.42");
+        assert_eq!(elements[0].id, "uia:1.42");
+        assert!(elements.len() <= crate::extract::DEFAULT_ELEMENT_CAP);
+        assert_eq!(crate::extract::DEFAULT_ELEMENT_CAP, 250);
+        assert_eq!(VIEWPORT_ENVELOPE_ELEMENT_CAP, 20);
+        assert_eq!(crate::dialogs::DIALOG_CAP, 4);
+        let raw = ObserveEnvelope {
+            session_id: "sess".into(),
+            screenshot_path: "C:\\tmp\\observe.png".into(),
+            observe_path: "C:\\tmp\\observe.json".into(),
+            space: Space::new(0, 0, 1920, 1080).unwrap(),
+            viewport: fixture_opts(true).viewport,
+            extract,
+            elements,
+            elements_total: crate::extract::DEFAULT_ELEMENT_CAP + 1,
+            elements_truncated: false,
+            chrome_connected: connected,
+            chrome_hint: None,
+            challenge: ChallengeInfo::default(),
+        };
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert_eq!(capped.extract.dialogs.len(), 1);
+        assert_eq!(capped.extract.dialogs[0].kind, "account");
+        assert_eq!(capped.extract.dialogs[0].id, "uia:1.42");
+        assert_eq!(capped.elements[0].id, "uia:1.42");
+    }
+
+    #[test]
+    fn fuse_maps_default_promotes_before_truncate() {
+        let src = include_str!("observe.rs");
+        let start = src
+            .find("fn fuse_maps_default(")
+            .expect("fuse_maps_default");
+        let end = src.find("fn in_viewport(").expect("in_viewport");
+        assert!(start < end, "fuse_maps_default must precede in_viewport");
+        let slice = &src[start..end];
+        assert!(
+            !slice.contains("#[cfg(test)]") && !slice.contains("mod tests"),
+            "slice must not include tests:\n{slice}"
+        );
+        let promote = slice
+            .find("dialogs::promote")
+            .expect("fuse_maps_default must call dialogs::promote");
+        if let Some(trunc) = slice.find("elements.truncate") {
+            assert!(
+                promote < trunc,
+                "chrome-FG merge must promote before truncate:\n{slice}"
+            );
+        }
+        let obs_start = src.find("pub fn observe(").expect("observe");
+        let obs_end = src.find("fn cap_envelope(").expect("cap_envelope");
+        assert!(obs_start < obs_end, "observe must precede cap_envelope");
+        let obs = &src[obs_start..obs_end];
+        assert!(
+            obs.contains("dialogs::promote"),
+            "observe() must still call dialogs::promote:\n{obs}"
+        );
+        assert!(
+            !obs.contains("#[cfg(test)]"),
+            "observe slice must not include tests:\n{obs}"
+        );
     }
 
     #[test]

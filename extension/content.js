@@ -481,7 +481,7 @@ function collectListingMeta() {
   const params = new URLSearchParams(location.search || "");
   zip = (params.get("zip") || "").trim();
   const maxDist = (params.get("maximum_distance") || "").trim();
-  if (maxDist) {
+  if (/^\d+$/.test(maxDist)) {
     radius = maxDist + " mi";
   }
   const within = text.match(
@@ -494,6 +494,9 @@ function collectListingMeta() {
     if (!zip) {
       zip = within[3];
     }
+  }
+  if (!radius && /^all$/i.test(maxDist)) {
+    radius = "all";
   }
   if (zip) {
     meta.zip = cap(zip, ZIP_CAP);

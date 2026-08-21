@@ -58,6 +58,7 @@ pub struct AttachEnvelope {
     pub session_id: String,
     pub ok: bool,
     pub attached: bool,
+    /// True iff this invocation's spawn hook / `CreateProcessW` returned `Ok`.
     pub launched: bool,
     pub plan: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -488,7 +489,7 @@ fn ensure_daily_with(plan: bool, hooks: &Hooks<'_>) -> AttachOutcome {
         }
         Err(err) => AttachOutcome {
             attached: false,
-            launched: true,
+            launched: false,
             hwnd: None,
             pid: None,
             exe: Some(exe),
@@ -909,6 +910,59 @@ mod tests {
                 .as_ref()
                 .map(|a| a[1].to_string_lossy().into_owned()),
             Some("about:blank".into())
+        );
+    }
+
+    #[test]
+    fn spawn_err_reports_launched_false() {
+        let spawned = AtomicU32::new(0);
+        let hooks = Hooks {
+            find: &|| None,
+            resolve_exe: &|| Ok(dummy_exe()),
+            spawn: &|_| {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                Err(HandsError::Chrome(
+                    "CreateProcessW chrome.exe: access denied".into(),
+                ))
+            },
+            offer: &|_, _| true,
+        };
+        let out = ensure_daily_with(false, &hooks);
+        assert_eq!(spawned.load(Ordering::SeqCst), 1);
+        assert!(!out.launched);
+        assert!(!out.attached);
+        assert!(out.hwnd.is_none());
+        assert!(out.pid.is_none());
+        assert!(
+            out.error
+                .as_deref()
+                .is_some_and(|e| e.contains("CreateProcessW")),
+            "{:?}",
+            out.error
+        );
+        assert!(out.exe.is_some());
+        let argv = out.argv.as_ref().expect("argv");
+        assert_eq!(argv[1], OsStr::new("about:blank"));
+        assert!(!argv.iter().any(|t| t.to_string_lossy().starts_with("--")));
+        let env = envelope_from("sid".into(), false, out);
+        assert!(!env.ok);
+        assert!(!env.launched);
+        assert!(!env.attached);
+        assert_eq!(env.schema, ATTACH_SCHEMA);
+    }
+
+    #[test]
+    fn spawn_ok_arm_launched_is_literal_true() {
+        let src = include_str!("attach.rs");
+        let production = src.split("#[cfg(test)]").next().expect("production prefix");
+        assert!(
+            production.contains("launched: true"),
+            "spawn Ok arm must set launched: true as a literal"
+        );
+        let forbidden = concat!("launched: win", ".is_some()");
+        assert!(
+            !production.contains(forbidden),
+            "spawn Ok arm must not set launched from win.is_some()"
         );
     }
 

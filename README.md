@@ -191,7 +191,7 @@ Success: JSON has `"chrome_connected": true` and at least one `"id": "chr:…"`.
 
 | Symptom | Fix |
 |---------|-----|
-| first observe `chrome_connected: false` / empty Chrome list | `hands native-host-doctor` (MCP: `native_host_doctor`). Read-only; does not write HKCU. |
+| first observe `chrome_connected: false` / empty Chrome list | `hands native-host-doctor` (MCP: `native_host_doctor`). Read-only; does not write HKCU. Doctor pipe probe is no-wait; a 400 ms snapshot success is not reported as pipe-down. |
 | `chrome_connected: false`, no `hands.exe` with `chrome-extension://` | Reload the extension after a good `REG ADD`. Confirm you sideloaded on **this** profile. |
 | Specified native messaging host not found / not registered | HKCU default must be the **full path to the JSON file**. Restart Chrome. |
 | Access … forbidden | Extension id ≠ `fdnpjnnnmfhlpgaabjflhjoepmejcnha`, or `allowed_origins` typo. |

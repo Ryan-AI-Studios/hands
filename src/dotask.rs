@@ -252,11 +252,16 @@ fn run_dotask_inner(
         Err(err) => error_env(&session_id, &model, 0, None, err.tool_message()),
     };
     let env = shrink_envelope(env)?;
+    let error = if env.stop_reason == StopReason::Error {
+        env.error.as_deref()
+    } else {
+        None
+    };
     let _ = logs::record_actuate(
         &session_id,
         "do_task",
         env.ok,
-        Some(env.stop_reason.as_str()),
+        error,
         None,
         None,
         None,
@@ -814,7 +819,7 @@ fn offered_tools() -> Value {
         ),
         fn_tool(
             "wait_settle",
-            "Wait until an ROI stops changing",
+            "Wait until an ROI stops changing. Default ROI is the foreground window.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1529,6 +1534,49 @@ mod tests {
         (env, transport)
     }
 
+    fn do_task_jsonl_events(session: &str) -> Vec<Value> {
+        let dir = logs::logs_dir().expect("logs dir");
+        let path = dir.join(format!("{session}.jsonl"));
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|v| v.get("tool").and_then(Value::as_str) == Some("do_task"))
+            .collect()
+    }
+
+    fn first_do_task_jsonl(session: &str) -> Value {
+        do_task_jsonl_events(session)
+            .into_iter()
+            .next()
+            .expect("first do_task jsonl")
+    }
+
+    fn last_do_task_jsonl(session: &str) -> Value {
+        do_task_jsonl_events(session)
+            .into_iter()
+            .next_back()
+            .expect("last do_task jsonl")
+    }
+
+    fn assert_start_ok_no_error(session: &str) {
+        let first = first_do_task_jsonl(session);
+        assert_eq!(first.get("ok"), Some(&json!(true)), "{first}");
+        assert!(
+            first.get("error").is_none(),
+            "start do_task must omit error: {first}"
+        );
+    }
+
+    fn assert_checkable_stop_jsonl(session: &str) {
+        assert_start_ok_no_error(session);
+        let last = last_do_task_jsonl(session);
+        assert_eq!(last.get("ok"), Some(&json!(true)), "{last}");
+        assert!(
+            last.get("error").is_none(),
+            "checkable stop must omit error: {last}"
+        );
+    }
+
     #[test]
     fn system_prompt_contains_required_substrings() {
         assert!(SYSTEM_PROMPT.contains("UNTRUSTED"));
@@ -1558,6 +1606,16 @@ mod tests {
                 assert_eq!(env.stop_reason, StopReason::Error);
                 assert_eq!(env.steps, 0);
                 assert_eq!(PRIMITIVE_CALLS.load(Ordering::SeqCst), 0);
+                assert_eq!(env.error.as_deref(), Some("goal must not be empty"));
+                assert_start_ok_no_error("empty-goal");
+                let last = last_do_task_jsonl("empty-goal");
+                assert_eq!(last.get("ok"), Some(&json!(false)), "{last}");
+                assert_eq!(
+                    last.get("error").and_then(Value::as_str),
+                    Some("goal must not be empty"),
+                    "{last}"
+                );
+                assert_ne!(last.get("error").and_then(Value::as_str), Some("error"));
             });
         });
     }
@@ -1578,6 +1636,13 @@ mod tests {
                 assert_eq!(env.steps, 0);
                 assert!(env.error.as_deref().unwrap().contains("API key"));
                 assert_eq!(PRIMITIVE_CALLS.load(Ordering::SeqCst), 0);
+                assert_start_ok_no_error("missing-key");
+                let last = last_do_task_jsonl("missing-key");
+                assert_eq!(last.get("ok"), Some(&json!(false)), "{last}");
+                let logged = last.get("error").and_then(Value::as_str).unwrap_or("");
+                assert_eq!(logged, env.error.as_deref().unwrap(), "{last}");
+                assert!(logged.contains("API key"), "{last}");
+                assert_ne!(logged, "error");
             });
         });
     }
@@ -1721,6 +1786,7 @@ mod tests {
                 assert_eq!(env.schema, DOTASK_SCHEMA);
                 assert_eq!(exec.calls().len(), 1);
                 assert_eq!(exec.calls()[0].0, "observe");
+                assert_checkable_stop_jsonl("done-1");
             });
         });
     }
@@ -1760,6 +1826,7 @@ mod tests {
                 );
                 assert_eq!(CONFIRM_HOOK.load(Ordering::SeqCst), 0);
                 assert_eq!(exec.calls().len(), 1);
+                assert_checkable_stop_jsonl("fence-1");
             });
         });
     }
@@ -1797,6 +1864,7 @@ mod tests {
                 assert_eq!(env.stop_reason, StopReason::Yield);
                 assert_eq!(exec.calls().len(), 1);
                 assert_eq!(env.challenge.as_ref().map(|c| c.yielded), Some(true));
+                assert_checkable_stop_jsonl("yield-1");
             });
         });
     }
@@ -1910,6 +1978,7 @@ mod tests {
                 assert!(env.ok);
                 assert_eq!(env.stop_reason, StopReason::MaxSteps);
                 assert_eq!(env.steps, 1);
+                assert_checkable_stop_jsonl("max-1");
             });
         });
     }
@@ -2162,8 +2231,63 @@ mod tests {
                 let lines: Vec<&str> = text.lines().filter(|l| l.contains("do_task")).collect();
                 assert!(lines.len() >= 2, "{text}");
                 assert!(text.contains("\"tool\":\"do_task\""));
+                assert_checkable_stop_jsonl("log-redact");
             });
         });
+    }
+
+    #[test]
+    fn run_dotask_inner_does_not_log_stop_reason_as_error() {
+        let src = include_str!("dotask.rs");
+        let start = src.find("fn run_dotask_inner").expect("run_dotask_inner");
+        let end = src.find("fn run_loop").expect("run_loop");
+        assert!(start < end, "run_dotask_inner must precede run_loop");
+        let slice = &src[start..end];
+        assert!(
+            !slice.contains("Some(env.stop_reason.as_str())"),
+            "closing record_actuate must not pass stop_reason as error:\n{slice}"
+        );
+        assert!(
+            slice.contains("env.error.as_deref()"),
+            "Error path must log env.error, not the reason enum:\n{slice}"
+        );
+        assert!(
+            !slice.contains("#[cfg(test)]"),
+            "slice must not include test helpers:\n{slice}"
+        );
+        assert!(
+            slice.contains("record_actuate"),
+            "slice must cover the closing record_actuate:\n{slice}"
+        );
+    }
+
+    #[test]
+    fn wait_settle_catalog_names_foreground_window() {
+        let tools = offered_tools();
+        let desc = tools
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some("wait_settle"))
+            .and_then(|t| t.get("description").and_then(Value::as_str))
+            .expect("wait_settle description");
+        assert!(
+            desc.contains("Wait until an ROI stops changing"),
+            "catalog must keep ROI wait wording: {desc}"
+        );
+        assert!(
+            desc.to_ascii_lowercase().contains("foreground window"),
+            "catalog must name the foreground window: {desc}"
+        );
+        let lower = desc.to_ascii_lowercase();
+        assert!(
+            !lower.contains("last-target") && !lower.contains("last_target"),
+            "catalog must not mention last-target: {desc}"
+        );
+        assert!(
+            !lower.contains("cursor"),
+            "catalog must not mention cursor: {desc}"
+        );
     }
 
     #[test]

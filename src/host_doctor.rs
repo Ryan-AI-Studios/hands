@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 use windows::Win32::Foundation::ERROR_SUCCESS;
-use windows::Win32::System::Pipes::WaitNamedPipeW;
+use windows::Win32::System::Pipes::{NMPWAIT_NOWAIT, WaitNamedPipeW};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, REG_EXPAND_SZ, REG_SZ,
     REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
@@ -239,7 +239,8 @@ pub fn diagnose(inputs: Inputs) -> Report {
         b.push("snapshot_env", true, "HANDS_CHROME_SNAPSHOT unset", "");
     }
 
-    if inputs.pipe_up {
+    let pipe_seen = inputs.pipe_up || (inputs.snapshot_ok && !inputs.snapshot_env_set);
+    if pipe_seen {
         b.push("pipe", true, "pipe is up", "");
     } else {
         b.push(
@@ -250,10 +251,12 @@ pub fn diagnose(inputs: Inputs) -> Report {
         );
     }
 
-    if inputs.snapshot_env_set || !inputs.pipe_up {
+    if inputs.snapshot_env_set {
         b.skip("snapshot");
     } else if inputs.snapshot_ok {
         b.push("snapshot", true, "snapshot ok within 400 ms", "");
+    } else if !inputs.pipe_up {
+        b.skip("snapshot");
     } else {
         b.push(
             "snapshot",
@@ -643,7 +646,7 @@ fn to_wide(s: &str) -> Vec<u16> {
 fn pipe_present() -> bool {
     let name = native_host::pipe_name();
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    let ready = unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), 0) };
+    let ready = unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), NMPWAIT_NOWAIT) };
     ready.as_bool()
 }
 
@@ -1012,6 +1015,94 @@ mod tests {
         );
         assert!(!src.contains(stop), "host_doctor.rs must not say {stop}");
         assert!(!src.contains(patch), "host_doctor.rs must not say {patch}");
+    }
+
+    #[test]
+    fn snapshot_ok_counts_as_pipe_up_when_probe_misses() {
+        let (_dir, _exe, json_path) = temp_workspace();
+        let mut inputs = good_inputs(&json_path);
+        inputs.pipe_up = false;
+        inputs.snapshot_ok = true;
+        inputs.snapshot_env_set = false;
+        let report = diagnose(inputs);
+        assert!(report.ok, "next={}", report.next);
+        let lower = report.next.to_ascii_lowercase();
+        assert!(
+            lower.contains("ready") && report.next.contains("https"),
+            "next={}",
+            report.next
+        );
+        assert!(
+            !lower.contains("pipe down") && !lower.contains("not connected"),
+            "next={}",
+            report.next
+        );
+        let pipe = report
+            .checks
+            .iter()
+            .find(|c| c.id == "pipe")
+            .expect("pipe check");
+        assert!(pipe.ok, "pipe detail={}", pipe.detail);
+        let snapshot = report
+            .checks
+            .iter()
+            .find(|c| c.id == "snapshot")
+            .expect("snapshot check");
+        assert!(snapshot.ok, "snapshot detail={}", snapshot.detail);
+    }
+
+    #[test]
+    fn pipe_and_snapshot_both_down_owns_pipe_down_next() {
+        let (_dir, _exe, json_path) = temp_workspace();
+        let mut inputs = good_inputs(&json_path);
+        inputs.pipe_up = false;
+        inputs.snapshot_ok = false;
+        inputs.snapshot_env_set = false;
+        let report = diagnose(inputs);
+        assert!(!report.ok);
+        let lower = report.next.to_ascii_lowercase();
+        assert!(
+            lower.contains("pipe down") || lower.contains("not connected"),
+            "next={}",
+            report.next
+        );
+        assert!(
+            lower.contains("reload") && lower.contains("restart") && lower.contains("https"),
+            "next={}",
+            report.next
+        );
+        let snapshot = report
+            .checks
+            .iter()
+            .find(|c| c.id == "snapshot")
+            .expect("snapshot check");
+        assert!(!snapshot.ok);
+        assert_eq!(snapshot.detail, "not-run");
+    }
+
+    #[test]
+    fn pipe_present_uses_nmpwait_nowait() {
+        let src = include_str!("host_doctor.rs");
+        let start = src.find("fn pipe_present(").expect("fn pipe_present(");
+        let rest = &src[start..];
+        let end = rest
+            .find("fn snapshot_env_is_set(")
+            .expect("fn snapshot_env_is_set(");
+        let slice = &rest[..end];
+        assert!(
+            !slice.contains("#[cfg(test)]") && !slice.contains("mod tests"),
+            "slice must not include tests"
+        );
+        assert!(
+            slice.contains("NMPWAIT_NOWAIT"),
+            "pipe_present must pass NMPWAIT_NOWAIT"
+        );
+        assert!(
+            !slice.contains("NMPWAIT_USE_DEFAULT_WAIT"),
+            "pipe_present must not pass NMPWAIT_USE_DEFAULT_WAIT"
+        );
+        let old = concat!("WaitNamedPipeW(PCWSTR(wide.as_ptr()), ", "0)");
+        assert!(!slice.contains(old), "old timeout 0 must be gone");
     }
 
     #[test]

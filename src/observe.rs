@@ -629,6 +629,10 @@ mod tests {
 
     #[test]
     fn fixture_fuse_sets_chrome_connected_and_url() {
+        let _url = crate::fence::URL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::fence::clear_last_url_for_test();
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
         let map = chrome::try_snapshot(Detail::Default).expect("fixture");
@@ -667,6 +671,7 @@ mod tests {
             crate::fence::last_url().as_deref(),
             Some("https://cars.com/search")
         );
+        crate::fence::clear_last_url_for_test();
     }
 
     #[test]
@@ -918,6 +923,47 @@ mod tests {
         assert_eq!(extract.title, "Notepad");
         assert!(els.iter().any(|e| e.id == "uia:1.7"));
         assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn chrome_then_notepad_observe_keeps_last_url() {
+        let _url = crate::fence::URL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::fence::clear_last_url_for_test();
+        crate::fence::note_last_url(Some("https://cars.com/search"));
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let nodes = vec![uia_node(
+            7,
+            "Document",
+            Rect {
+                x: 200,
+                y: 200,
+                w: 40,
+                h: 40,
+            },
+        )];
+        let (extract, els, total, connected) = fuse_maps(
+            Detail::Default,
+            "Notepad",
+            &nodes,
+            Some(map),
+            fixture_opts(false),
+        );
+        assert!(connected);
+        assert_eq!(extract.url, None);
+        assert!(!els.iter().any(|e| e.id.starts_with("chr:")));
+        assert_eq!(extract.title, "Notepad");
+        assert!(els.iter().any(|e| e.id == "uia:1.7"));
+        assert_eq!(total, 1);
+        crate::fence::note_last_url(extract.url.as_deref());
+        assert_eq!(
+            crate::fence::last_url().as_deref(),
+            Some("https://cars.com/search")
+        );
+        crate::fence::clear_last_url_for_test();
     }
 
     #[test]

@@ -32,11 +32,11 @@ pub enum Gate {
 }
 
 pub fn note_last_url(url: Option<&str>) {
+    let Some(next) = url.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
     if let Ok(mut slot) = LAST_URL.lock() {
-        *slot = url
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        *slot = Some(next.to_string());
     }
 }
 
@@ -61,6 +61,14 @@ fn install_fence() {
 #[cfg(test)]
 pub(crate) fn reinstall_for_test() {
     install_fence();
+}
+
+#[cfg(test)]
+pub(crate) static URL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn clear_last_url_for_test() {
+    *LAST_URL.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 pub fn decide(session_id: &str, evidence: &Evidence, domain: &str) -> Result<Gate, HandsError> {
@@ -237,6 +245,23 @@ mod tests {
         }
     }
 
+    fn notepad_easy_apply() -> Evidence {
+        Evidence {
+            name: "Easy Apply".into(),
+            role: "button".into(),
+            window_title: "Untitled - Notepad".into(),
+            window_class: "Notepad".into(),
+        }
+    }
+
+    fn with_url_slot<T>(f: impl FnOnce() -> T) -> T {
+        let _g = URL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_last_url_for_test();
+        let out = f();
+        clear_last_url_for_test();
+        out
+    }
+
     #[test]
     fn easy_apply_refuses_without_allow() {
         allows::with_test_env(|| {
@@ -333,6 +358,64 @@ mod tests {
             name: String::new(),
             role: String::new(),
         }
+    }
+
+    #[test]
+    fn note_last_url_keeps_on_absent_and_replaces_when_present() {
+        with_url_slot(|| {
+            assert_eq!(last_url(), None);
+            note_last_url(None);
+            assert_eq!(last_url(), None);
+
+            note_last_url(Some("https://cars.com/search"));
+            assert_eq!(last_url().as_deref(), Some("https://cars.com/search"));
+            note_last_url(None);
+            note_last_url(Some(""));
+            note_last_url(Some("   "));
+            assert_eq!(last_url().as_deref(), Some("https://cars.com/search"));
+            assert_eq!(domain_for(&notepad_easy_apply(), None), "cars.com");
+
+            note_last_url(Some("https://www.linkedin.com/jobs"));
+            assert_eq!(last_url().as_deref(), Some("https://www.linkedin.com/jobs"));
+            assert_eq!(domain_for(&notepad_easy_apply(), None), "linkedin.com");
+        });
+    }
+
+    #[test]
+    fn pause_and_stop_do_not_clear_last_url() {
+        let _url = URL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_last_url_for_test();
+        allows::with_test_env(|| {
+            lease::reset_for_test();
+            reinstall_for_test();
+            note_last_url(Some("https://cars.com/search"));
+            lease::freeze_now_with(FreezeCause::Pause);
+            assert_eq!(last_url().as_deref(), Some("https://cars.com/search"));
+            lease::freeze_now_with(FreezeCause::Stop);
+            assert_eq!(last_url().as_deref(), Some("https://cars.com/search"));
+        });
+        clear_last_url_for_test();
+    }
+
+    #[test]
+    fn note_last_url_does_not_assign_mapped_none() {
+        let src = include_str!("fence.rs");
+        let start = src
+            .find("pub fn note_last_url")
+            .expect("production note_last_url");
+        let body = src[start..]
+            .split("pub fn last_url")
+            .next()
+            .expect("note_last_url body");
+        assert!(
+            !body.contains("*slot = url"),
+            "note_last_url must not assign a mapped Option (None would wipe LAST_URL)"
+        );
+        assert!(
+            body.contains(concat!("Some(next", ".to_string())")),
+            "non-empty URL must replace the slot with Some(next.to_string())"
+        );
     }
 
     #[test]

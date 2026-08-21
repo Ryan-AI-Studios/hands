@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::capture::{display_path, utc_compact};
 use crate::error::HandsError;
-use crate::extract::{DEFAULT_ELEMENT_CAP, Element, take_chars};
+use crate::extract::{DEFAULT_ELEMENT_CAP, DOM_ELEMENT_CAP, Element, take_chars};
 use crate::logs::{self, LogTarget};
 use crate::observe::{ENVELOPE_MAX_BYTES, OBSERVE_SCHEMA, ObserveSidecar};
 use crate::session::resolve_session_id_from_os;
@@ -835,6 +835,7 @@ fn build_pick_prompt(query: &str, elements: &[Element]) -> (String, String) {
 fn numbered_list(elements: &[Element]) -> String {
     elements
         .iter()
+        .take(DEFAULT_ELEMENT_CAP)
         .enumerate()
         .map(|(i, el)| {
             let sanitized = sanitize_element_text(el.text.as_deref().unwrap_or(""));
@@ -966,8 +967,8 @@ fn load_sidecar(path: &str) -> Result<ObserveSidecar, HandsError> {
 }
 
 fn cap_elements(elements: &mut Vec<Element>) {
-    if elements.len() > DEFAULT_ELEMENT_CAP {
-        elements.truncate(DEFAULT_ELEMENT_CAP);
+    if elements.len() > DOM_ELEMENT_CAP {
+        elements.truncate(DOM_ELEMENT_CAP);
     }
 }
 
@@ -1249,6 +1250,12 @@ mod tests {
         }
     }
 
+    fn fat_elements(n: usize) -> Vec<Element> {
+        (0..n)
+            .map(|i| sample_el(&format!("chr:{i}"), i as i32, 0))
+            .collect()
+    }
+
     fn health_ok() -> Result<HttpResp, HandsError> {
         Ok(HttpResp {
             status: 200,
@@ -1456,6 +1463,83 @@ mod tests {
         assert!(err.to_string().contains("chr:99"), "{err}");
         let (id, _) = parse_id("I would click chr:0 now", &allow).unwrap();
         assert_eq!(id, "chr:0");
+    }
+
+    #[test]
+    fn cap_elements_keeps_ids_past_default_cap() {
+        let mut els = fat_elements(301);
+        cap_elements(&mut els);
+        assert_eq!(els.len(), 301);
+        let allow = allowlist(&els);
+        assert!(allow.contains("chr:250"));
+        let (id, _) = parse_id(r#"{"id":"chr:250","reason":"later"}"#, &allow).unwrap();
+        assert_eq!(id, "chr:250");
+        let invented = parse_id(r#"{"id":"chr:999","reason":"nope"}"#, &allow).unwrap_err();
+        assert!(invented.to_string().contains("chr:999"), "{invented}");
+        let past = parse_id(r#"{"id":"chr:301","reason":"nope"}"#, &allow).unwrap_err();
+        assert!(past.to_string().contains("chr:301"), "{past}");
+    }
+
+    #[test]
+    fn ground_element_id_past_default_cap_resolves_from_sidecar() {
+        let dir = temp_dir();
+        let shot = dir.join("s.png");
+        write_png(&shot, 8, 8);
+        let els = fat_elements(301);
+        let later = els[250].rect;
+        let path = write_sidecar(&dir, &shot, Space::new(0, 0, 400, 80).unwrap(), els);
+        let req = GroundRequest {
+            session_id: None,
+            query: "q".into(),
+            observe_path: Some(path.to_string_lossy().into_owned()),
+            screenshot: None,
+            element_id: Some("chr:250".into()),
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+        };
+        let inputs = load_ground_inputs(&req).unwrap();
+        assert_eq!(inputs.elements.len(), 301);
+        let rect = resolve_roi(&req, &inputs).unwrap();
+        assert_eq!(rect, later);
+        let missing = GroundRequest {
+            element_id: Some("chr:999".into()),
+            ..req
+        };
+        let err = resolve_roi(&missing, &inputs).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("chr:999"), "{msg}");
+        assert!(msg.contains("not in the observe element list"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pick_prompt_lists_first_default_cap_only() {
+        let els = fat_elements(301);
+        let (_, user) = build_pick_prompt("find later", &els);
+        let numbered: Vec<&str> = user
+            .lines()
+            .filter(|line| line.contains(" | Button | "))
+            .collect();
+        assert_eq!(numbered.len(), DEFAULT_ELEMENT_CAP);
+        assert!(user.contains("1. chr:0 |"));
+        assert!(user.contains("250. chr:249 |"));
+        assert!(
+            !user.contains("chr:250 |"),
+            "later id must not be an element line:\n{user}"
+        );
+        assert!(user.contains(UNTRUSTED_START) && user.contains(UNTRUSTED_END));
+    }
+
+    #[test]
+    fn cap_elements_hard_ceiling_is_dom_cap() {
+        let mut els = fat_elements(2001);
+        cap_elements(&mut els);
+        assert_eq!(els.len(), DOM_ELEMENT_CAP);
+        let allow = allowlist(&els);
+        assert!(allow.contains("chr:1999"));
+        assert!(!allow.contains("chr:2000"));
     }
 
     #[test]

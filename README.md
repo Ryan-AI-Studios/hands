@@ -51,7 +51,7 @@ They must be the **same built exe** (prefer `target\release\hands.exe`). The com
 | Optional Gemma | File `C:\LLM\models\mmproj-gemma-4-E4B-it-Q8_0.gguf` (ggml-org, **not** Unsloth) + router `--mmproj`. Not a Hands compile gate. |
 | Optional `do_task` | `HANDS_XAI_API_KEY` or `XAI_API_KEY`. Missing key is a tool error, not a build failure. |
 
-Forbidden: Playwright, Puppeteer, CDP, `--remote-debugging-port`, `--enable-automation`, CAPTCHA solvers **on daily Chrome**, HKLM, Chrome Web Store publish, committing filled host JSON or harness configs into this repo. Research identity (`attach --identity research` + `challenge --solve`) is the unattended-solver exception.
+Forbidden: Playwright, Puppeteer, CDP, `--remote-debugging-port`, `--enable-automation`, CAPTCHA solvers **on daily Chrome**, using `listen` / ears to auto-solve a checkbox or audio CAPTCHA on any identity, HKLM, Chrome Web Store publish, committing filled host JSON or harness configs into this repo. Research identity (`attach --identity research` + `challenge --solve`) is the unattended-solver exception. `listen` is **not a CAPTCHA solver**.
 
 ### 1. Build the release exe
 
@@ -363,6 +363,7 @@ cargo run -- attach --help
 cargo run -- pick --help
 cargo run -- ground --help
 cargo run -- challenge --help
+cargo run -- listen --help
 cargo run -- do-task --help
 cargo run -- logs --help
 cargo run -- native-host --help
@@ -371,7 +372,7 @@ cargo run -- native-host-manifest --help
 
 ## CLI / MCP contract (short)
 
-`hands mcp` serves stdio MCP (`observe`, `click`, `hover`, `type`, `key`, `scroll`, `wait_settle`, `stop`, `confirm`, `attach`, `pick`, `ground`, `challenge`, `do_task`, `logs`).
+`hands mcp` serves stdio MCP (`observe`, `click`, `hover`, `type`, `key`, `scroll`, `wait_settle`, `stop`, `confirm`, `attach`, `pick`, `ground`, `challenge`, `listen`, `do_task`, `logs`).
 
 `key --name ctrl+l` is Control+L (Chrome omnibox), same allowlist shape as `ctrl+a`.
 
@@ -389,7 +390,9 @@ Chrome artifacts: `extension/` (unpacked MV3, isolated world, id `fdnpjnnnmfhlpg
 
 This binary owns the confirm fence. `click` and `key enter`/`return` refuse irreversible/gray-zone controls unless a matching domain+category allow exists. `type` containing a newline is a tool error — use `key enter` to submit. After a refuse, call `confirm` (`once` / `session` / `persist`) and retry. Grok is always-approve; the TUI is not the fence. The last Chrome http(s) URL survives a later non-Chrome observe in the same process (MCP / `do_task`); CLI observe-then-click is a new process and does not share the slot.
 
-Bare `wait-settle` watches the foreground window (`GetWindowRect`, same as observe viewport), names `roi {x,y,w,h}`, and will not claim `settled: true` on a “Just a moment…” title. Click expected-state is post-hover ROI pixel-diff plus optional `miss` (`no_change` / `focus_lost`); one retry; re-offer on `focus_lost`. Input commands (`click` / `hover` / `type` / `key` / `scroll` / `wait-settle`) install a desk lease for that process: physical mouse/keyboard freezes injection; Pause/Break always aborts and wipes session/once allows (persist stays). **Logs stay** under `%LOCALAPPDATA%\hands\logs\` (`HANDS_LOGS_DIR`). Default `hands logs` is a newest-last ≤4 KiB tail (`truncated` when dropped); `--tail N` still ≤16 KiB; newest pause/stop stays; on-disk JSONL is unbounded. `hands confirm`, `attach`, `pick`, `ground`, `challenge` status/watch, and `logs` do **not** install the lease. `challenge --solve` (research identity only) installs the lease. `hands do-task` **does**. CLI `stop` posts a desk-wide request (`%LOCALAPPDATA%\hands\stop-request.json`, override `HANDS_STOP_REQUEST_PATH`); another Hands `type` / `hover` honors it as Stop, session allows wipe, and logs stay. One successful `stop` writes one desk `stop` JSONL (listener); the tool still writes the session `stop` line; session allows wipe once. Pause/Break still works during a live command.
+Bare `wait-settle` watches the foreground window (`GetWindowRect`, same as observe viewport), names `roi {x,y,w,h}`, and will not claim `settled: true` on a “Just a moment…” title. Click expected-state is post-hover ROI pixel-diff plus optional `miss` (`no_change` / `focus_lost`); one retry; re-offer on `focus_lost`. Input commands (`click` / `hover` / `type` / `key` / `scroll` / `wait-settle`) install a desk lease for that process: physical mouse/keyboard freezes injection; Pause/Break always aborts and wipes session/once allows (persist stays). **Logs stay** under `%LOCALAPPDATA%\hands\logs\` (`HANDS_LOGS_DIR`). Default `hands logs` is a newest-last ≤4 KiB tail (`truncated` when dropped); `--tail N` still ≤16 KiB; newest pause/stop stays; on-disk JSONL is unbounded. `hands listen [--seconds N] [--observe-path <path>] [--session-id <id>]` captures **desktop loopback** (what the speakers play: YouTube, a voicemail in the tab) and returns a compact text transcript. Not observe. **Not a CAPTCHA solver.** Refuses when `challenge.present` (puzzle or interstitial, any identity) before capture and before transcribe. No desk lease. Owner supplies a CPU transcribe binary (`HANDS_LISTEN_BIN` / `HANDS_LISTEN_MODEL`) or HTTP adapter (`HANDS_LISTEN_URL`); do not load that model on the Arc B580 beside `router.bat`. Listen does not POST Gemma; 8081 down is unrelated.
+
+`hands confirm`, `attach`, `pick`, `ground`, `challenge` status/watch, `listen`, and `logs` do **not** install the lease. `challenge --solve` (research identity only) installs the lease. `hands do-task` **does**. CLI `stop` posts a desk-wide request (`%LOCALAPPDATA%\hands\stop-request.json`, override `HANDS_STOP_REQUEST_PATH`); another Hands `type` / `hover` honors it as Stop, session allows wipe, and logs stay. One successful `stop` writes one desk `stop` JSONL (listener); the tool still writes the session `stop` line; session allows wipe once. Pause/Break still works during a live command.
 
 ## What this is
 

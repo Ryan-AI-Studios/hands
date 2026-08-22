@@ -20,6 +20,7 @@ pub mod foreground;
 pub mod host_doctor;
 pub mod input;
 pub mod lease;
+pub mod listen;
 pub mod logs;
 pub mod mcp;
 pub mod native_host;

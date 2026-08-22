@@ -60,6 +60,15 @@ pub fn send_inputs(inputs: &[INPUT]) -> Result<(), HandsError> {
     if inputs.is_empty() {
         return Ok(());
     }
+    if crate::attach::current_identity() == crate::attach::Identity::Research
+        && crate::hid::configured()
+    {
+        return crate::hid::send(inputs);
+    }
+    send_os_inputs(inputs)
+}
+
+fn send_os_inputs(inputs: &[INPUT]) -> Result<(), HandsError> {
     #[cfg(test)]
     if let Some(hook) = send_hook() {
         return hook(inputs);
@@ -91,6 +100,21 @@ fn send_hook() -> Option<SendHook> {
 #[cfg(test)]
 pub(crate) fn set_send_inputs_hook(hook: Option<SendHook>) {
     SEND_HOOK.with(|c| c.set(hook));
+}
+
+#[cfg(test)]
+thread_local! {
+    static SKIP_LIVE_CLIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_skip_live_clipboard(skip: bool) {
+    SKIP_LIVE_CLIP.with(|c| c.set(skip));
+}
+
+#[cfg(test)]
+fn skip_live_clipboard() -> bool {
+    SKIP_LIVE_CLIP.with(|c| c.get())
 }
 
 pub fn cursor_pos() -> Result<(i32, i32), HandsError> {
@@ -236,6 +260,17 @@ pub fn scroll_wheel(dy: i32, dx: Option<i32>) -> Result<(), HandsError> {
 }
 
 pub fn type_text(text: &str) -> Result<TypePath, HandsError> {
+    if crate::attach::current_identity() == crate::attach::Identity::Research
+        && crate::hid::configured()
+    {
+        #[cfg(test)]
+        if skip_live_clipboard() {
+            chord(&[VK_CONTROL, VK_V])?;
+            return Ok(TypePath::Clipboard);
+        }
+        type_clipboard(text)?;
+        return Ok(TypePath::Clipboard);
+    }
     match type_path_for(text) {
         TypePath::Unicode => {
             type_unicode(text)?;
@@ -671,6 +706,21 @@ mod tests {
     fn mcp_and_cli_copy_name_ctrl_l() {
         assert!(include_str!("mcp.rs").contains("ctrl+l"));
         assert!(include_str!("main.rs").contains("ctrl+l"));
+    }
+
+    #[test]
+    fn send_os_inputs_slice_locks_inject() {
+        let src = include_str!("input.rs");
+        let start = src.find("fn send_os_inputs").expect("send_os_inputs");
+        let rest = &src[start..];
+        let end = rest[16..]
+            .find("\nfn ")
+            .map(|i| 16 + i)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(body.contains("SendInput"));
+        assert!(!body.contains("note_hid_own"));
+        assert!(!body.contains("hid::"));
     }
 
     #[test]

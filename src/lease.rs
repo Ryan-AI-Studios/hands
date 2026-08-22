@@ -161,8 +161,11 @@ static LAST_FREEZE_MS: AtomicU64 = AtomicU64::new(0);
 /// Non-zero means a notify is pending. Pause/Stop values are never overwritten
 /// by Physical. `take_pending_cause` swaps this back to `CAUSE_NONE`.
 static LAST_CAUSE: AtomicU8 = AtomicU8::new(CAUSE_NONE);
+static HID_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+static NOTIFY_LOCK: Mutex<()> = Mutex::new(());
 static CLOCK0: OnceLock<Instant> = OnceLock::new();
 static LISTENERS: Mutex<Vec<FreezeListener>> = Mutex::new(Vec::new());
+pub const HID_GRACE_MS: u64 = 50;
 
 fn now_ms() -> u64 {
     let elapsed = CLOCK0
@@ -235,6 +238,7 @@ pub fn subscribe(cb: impl Fn(FreezeCause) + Send + Sync + 'static) {
 pub fn is_frozen() -> bool {
     ingest_stop_request();
     rearm_if_idle();
+    flush_notify();
     FROZEN.load(Ordering::SeqCst)
 }
 
@@ -243,8 +247,37 @@ pub fn freeze_now() {
 }
 
 pub fn freeze_now_with(cause: FreezeCause) {
-    record_freeze(cause);
-    flush_notify();
+    let (pending, listeners) = {
+        let _g = notify_lock();
+        record_freeze(cause);
+        (take_pending_cause(), snapshot_listeners())
+    };
+    deliver_to(pending, listeners);
+}
+
+pub fn note_hid_own() {
+    HID_UNTIL_MS.store(now_ms().saturating_add(HID_GRACE_MS), Ordering::SeqCst);
+}
+
+fn hid_own_active() -> bool {
+    now_ms() < HID_UNTIL_MS.load(Ordering::SeqCst)
+}
+
+fn notify_lock() -> std::sync::MutexGuard<'static, ()> {
+    NOTIFY_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn snapshot_listeners() -> Vec<FreezeListener> {
+    LISTENERS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn deliver_to(cause: Option<FreezeCause>, listeners: Vec<FreezeListener>) {
+    let Some(cause) = cause else {
+        return;
+    };
+    for cb in listeners {
+        cb(cause);
+    }
 }
 
 pub fn poll() -> Result<(), HandsError> {
@@ -456,17 +489,18 @@ fn take_pending_cause() -> Option<FreezeCause> {
 }
 
 pub(crate) fn flush_notify() {
-    let Some(cause) = take_pending_cause() else {
-        return;
+    let (pending, listeners) = {
+        let _g = notify_lock();
+        (take_pending_cause(), snapshot_listeners())
     };
-    let listeners = LISTENERS.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    for cb in listeners {
-        cb(cause);
-    }
+    deliver_to(pending, listeners);
 }
 
 fn note_mouse(injected: bool) {
     if !injected {
+        if hid_own_active() {
+            return;
+        }
         record_freeze(FreezeCause::Physical);
     }
 }
@@ -476,6 +510,9 @@ fn note_key(vk: u32, injected: bool) {
     if pause {
         record_freeze(FreezeCause::Pause);
     } else if !injected {
+        if hid_own_active() {
+            return;
+        }
         record_freeze(FreezeCause::Physical);
     }
 }
@@ -605,6 +642,7 @@ pub(crate) fn reset_for_test() {
     FROZEN.store(false, Ordering::SeqCst);
     LAST_FREEZE_MS.store(0, Ordering::SeqCst);
     LAST_CAUSE.store(CAUSE_NONE, Ordering::SeqCst);
+    HID_UNTIL_MS.store(0, Ordering::SeqCst);
     CHALLENGE_HOLD.store(false, Ordering::SeqCst);
     TEST_NOW_OFFSET_MS.store(0, Ordering::SeqCst);
     INGEST_SKIP.store(true, Ordering::SeqCst);
@@ -616,6 +654,11 @@ pub(crate) fn reset_for_test() {
 #[cfg(test)]
 pub(crate) fn force_idle_elapsed_for_test() {
     TEST_NOW_OFFSET_MS.store(IDLE_REARM.as_millis() as u64 + 1, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn add_now_offset_ms_for_test(delta: u64) {
+    TEST_NOW_OFFSET_MS.fetch_add(delta, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -705,6 +748,30 @@ mod tests {
         flush_notify();
         assert!(!is_frozen());
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn note_key_pause_survives_concurrent_poll() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let join = std::thread::spawn(move || {
+            while !stop2.load(Ordering::SeqCst) {
+                let _ = poll();
+                let _ = is_frozen();
+            }
+        });
+        note_key(u32::from(VK_PAUSE.0), true);
+        flush_notify();
+        stop.store(true, Ordering::SeqCst);
+        let _ = join.join();
+        assert!(
+            seen.lock().unwrap().contains(&FreezeCause::Pause),
+            "Pause must be delivered by poll or pump flush, not dropped"
+        );
     }
 
     #[test]
@@ -842,6 +909,66 @@ mod tests {
         assert!(is_frozen());
         set_challenge_hold(false);
         assert!(!is_frozen());
+    }
+
+    #[test]
+    fn hid_in_flight_non_injected_mouse_does_not_freeze() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        note_hid_own();
+        note_mouse(false);
+        flush_notify();
+        assert!(!is_frozen());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pause_still_freezes_during_hid_window() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        note_hid_own();
+        freeze_now_with(FreezeCause::Pause);
+        assert!(is_frozen());
+        assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Pause]);
+    }
+
+    #[test]
+    fn physical_key_during_hid_window_does_not_freeze() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        note_hid_own();
+        note_key(u32::from(b'A'), false);
+        flush_notify();
+        assert!(!is_frozen());
+        assert!(seen.lock().unwrap().is_empty());
+        add_now_offset_ms_for_test(HID_GRACE_MS + 1);
+        note_key(u32::from(b'A'), false);
+        flush_notify();
+        assert!(is_frozen());
+        assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Physical]);
+    }
+
+    #[test]
+    fn after_hid_grace_non_injected_mouse_freezes() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let (seen, cb) = collect_causes();
+        subscribe(cb);
+        note_hid_own();
+        note_mouse(false);
+        flush_notify();
+        assert!(seen.lock().unwrap().is_empty());
+        add_now_offset_ms_for_test(HID_GRACE_MS + 1);
+        note_mouse(false);
+        flush_notify();
+        assert_eq!(*seen.lock().unwrap(), vec![FreezeCause::Physical]);
+        assert!(is_frozen());
     }
 
     #[test]

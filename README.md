@@ -51,7 +51,7 @@ They must be the **same built exe** (prefer `target\release\hands.exe`). The com
 | Optional Gemma | File `C:\LLM\models\mmproj-gemma-4-E4B-it-Q8_0.gguf` (ggml-org, **not** Unsloth) + router `--mmproj`. Not a Hands compile gate. |
 | Optional `do_task` | `HANDS_XAI_API_KEY` or `XAI_API_KEY`. Missing key is a tool error, not a build failure. |
 
-Forbidden: Playwright, Puppeteer, CDP, `--remote-debugging-port`, `--enable-automation`, CAPTCHA solvers **on daily Chrome**, using `listen` / ears to auto-solve a checkbox or audio CAPTCHA on any identity, HKLM, Chrome Web Store publish, committing filled host JSON or harness configs into this repo. Research identity (`attach --identity research` + `challenge --solve`) is the unattended-solver exception. `listen` is **not a CAPTCHA solver**.
+Forbidden: Playwright, Puppeteer, CDP, `--remote-debugging-port`, `--enable-automation`, CAPTCHA solvers **on daily Chrome**, HID / hiding `LLMHF_INJECTED` **on daily Chrome**, using `listen` / ears to auto-solve a checkbox or audio CAPTCHA on any identity, HKLM, Chrome Web Store publish, committing filled host JSON or harness configs into this repo. Research identity (`attach --identity research` + `challenge --solve`) is the unattended-solver exception. `listen` is **not a CAPTCHA solver**. Research identity may use owner HID (`HANDS_HID_PORT`); daily Chrome stays `SendInput`; do not hide `LLMHF_INJECTED` on Default (owner gadget, not a compile gate).
 
 ### 1. Build the release exe
 

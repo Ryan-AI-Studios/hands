@@ -120,6 +120,7 @@ enum PhraseNeed {
     None,
     Cloudflare,
     CloudflareOrTurnstile,
+    NamedOrRecaptcha,
 }
 
 const STRONG_PHRASES: &[(&str, ChallengeKind, PhraseNeed)] = &[
@@ -157,12 +158,12 @@ const STRONG_PHRASES: &[(&str, ChallengeKind, PhraseNeed)] = &[
     (
         "select all images with",
         ChallengeKind::Recaptcha,
-        PhraseNeed::None,
+        PhraseNeed::NamedOrRecaptcha,
     ),
     (
         "select all squares with",
         ChallengeKind::Recaptcha,
-        PhraseNeed::None,
+        PhraseNeed::NamedOrRecaptcha,
     ),
     (
         "attention required",
@@ -264,6 +265,10 @@ pub fn detect(input: &DetectInput<'_>) -> DetectHit {
 
     let host_hit = host_classified;
     let vendor_on_token_surface = vendor_token_hit(&token_surfaces);
+    let recaptcha_chrome = vendor_on_token_surface == Some(ChallengeKind::Recaptcha)
+        || host
+            .as_deref()
+            .is_some_and(|h| matches!(match_host(h, &path), Some((ChallengeKind::Recaptcha, _))));
     let cf_on_any = surfaces_have_token(&all_surfaces, "cloudflare");
     let turnstile_on_any = surfaces_have_token(&all_surfaces, "turnstile");
 
@@ -278,6 +283,12 @@ pub fn detect(input: &DetectInput<'_>) -> DetectHit {
             PhraseNeed::Cloudflare => cf_on_any || host_is_cloudflare(host.as_deref()),
             PhraseNeed::CloudflareOrTurnstile => {
                 cf_on_any || turnstile_on_any || host_is_cloudflare(host.as_deref())
+            }
+            PhraseNeed::NamedOrRecaptcha => {
+                contains_phrase(input.title, phrase)
+                    || contains_phrase(url, phrase)
+                    || contains_phrase(element_blob, phrase)
+                    || recaptcha_chrome
             }
         };
         if allowed {
@@ -805,6 +816,53 @@ mod tests {
     }
 
     #[test]
+    fn grid_phrase_in_main_text_alone_is_not_present() {
+        assert_clear(hit(
+            "Fingerprint: Bot Detection",
+            Some("https://fingerprint.com/try/bot-detection/"),
+            "Old CAPTCHAs asked you to select all squares with traffic lights. Fingerprint is invisible.",
+            &[],
+        ));
+        assert_clear(hit(
+            "CAPTCHA docs",
+            Some("https://example.com/docs/captcha"),
+            "Old CAPTCHAs asked you to select all images with traffic lights.",
+            &[],
+        ));
+    }
+
+    #[test]
+    fn grid_phrase_on_named_widget_or_recaptcha_chrome_is_present() {
+        assert_kind(
+            hit(
+                "page",
+                None,
+                "",
+                &[("document", "Select all squares with buses")],
+            ),
+            ChallengeKind::Recaptcha,
+        );
+        assert_kind(
+            hit(
+                "page",
+                None,
+                "",
+                &[("iframe", "Select all images with traffic lights")],
+            ),
+            ChallengeKind::Recaptcha,
+        );
+        assert_kind(
+            hit(
+                "t",
+                Some("https://www.google.com/recaptcha/api2/bframe"),
+                "select all squares with traffic lights",
+                &[],
+            ),
+            ChallengeKind::Recaptcha,
+        );
+    }
+
+    #[test]
     fn positive_hosts() {
         assert_kind(
             hit(
@@ -1083,6 +1141,72 @@ mod tests {
         );
     }
 
+    fn strong_phrases_table() -> &'static str {
+        let src = include_str!("challenge.rs");
+        let start = src.find("const STRONG_PHRASES").expect("STRONG_PHRASES");
+        let rest = &src[start..];
+        let end = rest.find("];").expect("STRONG_PHRASES table end");
+        &rest[..end]
+    }
+
+    fn phrase_need_of<'a>(table: &'a str, needle: &str) -> &'a str {
+        let i = table.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let after = &table[i + needle.len()..];
+        let need_i = after
+            .find("PhraseNeed::")
+            .unwrap_or_else(|| panic!("PhraseNeed after {needle}"));
+        let need = &after[need_i..];
+        let end = need.find([',', '\n', ')']).unwrap_or(need.len());
+        need[..end].trim()
+    }
+
+    #[test]
+    fn strong_phrases_grid_rows_are_named_or_recaptcha() {
+        let table = strong_phrases_table();
+        assert!(
+            !table.contains("#[cfg(test)]") && !table.contains("mod tests"),
+            "STRONG_PHRASES slice must stay production-only:\n{table}"
+        );
+        assert!(
+            table.contains("select all images with"),
+            "missing select all images with:\n{table}"
+        );
+        assert!(
+            table.contains("select all squares with"),
+            "missing select all squares with:\n{table}"
+        );
+        assert_eq!(
+            table.matches("PhraseNeed::NamedOrRecaptcha").count(),
+            2,
+            "exactly two NamedOrRecaptcha rows:\n{table}"
+        );
+        assert_eq!(
+            phrase_need_of(table, "select all images with"),
+            "PhraseNeed::NamedOrRecaptcha"
+        );
+        assert_eq!(
+            phrase_need_of(table, "select all squares with"),
+            "PhraseNeed::NamedOrRecaptcha"
+        );
+        assert_ne!(
+            phrase_need_of(table, "select all images with"),
+            "PhraseNeed::None"
+        );
+        assert_ne!(
+            phrase_need_of(table, "select all squares with"),
+            "PhraseNeed::None"
+        );
+        assert_eq!(phrase_need_of(table, "i'm not a robot"), "PhraseNeed::None");
+        assert!(
+            !table.contains("just a moment"),
+            "STRONG_PHRASES must not contain just a moment:\n{table}"
+        );
+        assert!(
+            !table.contains("it will only take a moment"),
+            "STRONG_PHRASES must not contain it will only take a moment:\n{table}"
+        );
+    }
+
     #[test]
     fn mcp_challenge_tool_mentions_interstitial_and_wait() {
         let src = include_str!("mcp.rs");
@@ -1096,6 +1220,24 @@ mod tests {
         assert!(
             lower.contains("wait"),
             "mcp challenge description should mention wait:\n{window}"
+        );
+        assert!(
+            lower.contains("grid copy in page body"),
+            "mcp challenge description should name grid copy in page body:\n{window}"
+        );
+    }
+
+    #[test]
+    fn agents_and_readme_name_grid_copy_in_page_body() {
+        let agents = include_str!("../AGENTS.md").to_ascii_lowercase();
+        let readme = include_str!("../README.md").to_ascii_lowercase();
+        assert!(
+            agents.contains("grid copy in page body"),
+            "AGENTS.md challenge paragraph should name grid copy in page body"
+        );
+        assert!(
+            readme.contains("grid copy in page body"),
+            "README.md challenge paragraph should name grid copy in page body"
         );
     }
 

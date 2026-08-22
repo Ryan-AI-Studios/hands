@@ -6,7 +6,30 @@ A harness (Grok Build, Codex, Claude Code, OpenCode) uses this process to **see*
 
 This directory is the **product git root**. Planning, ADRs, and conductor tracks live one level up at `C:\dev\Helping-Hands\` and are **not** part of this repository.
 
-**Sideload is you.** The binary never clicks Developer Mode, never writes HKCU, never edits `C:\LLM`, and never starts `router.bat`.
+**Sideload is you.** The binary never clicks Developer Mode, never writes HKCU, and never edits a local LLM router.
+
+Licensed under MIT (`LICENSE`).
+
+### Disclaimer — use at your own risk
+
+Hands is **not a sandbox**. On this Windows login it can move the real mouse and
+keyboard (`SendInput`) and click whatever is on screen, including daily Chrome.
+
+- **Prompt injection:** screenshot pixels, DOM/UIA text, listing cards, and
+  `listen` transcripts are **untrusted page content**. A site (or an ad) can try
+  to instruct the model. The binary treats that extract as data, not commands;
+  the model still might follow it. Do not treat observe output as trusted.
+- **Money and accounts:** the confirm fence is best-effort classification, not a
+  guarantee. A wrong click (or an approved `confirm`) can submit a form, spend
+  money, or change an account.
+- **Extension:** unpacked Helping Hands has `host_permissions` `<all_urls>` so
+  it can map the tab you are looking at. Sideload only on a profile you accept
+  that for.
+- **Logs:** session JSONL under `%LOCALAPPDATA%\hands\logs\` (override
+  `HANDS_LOGS_DIR`). `type` logs length, not keystrokes; observe logs counts, not
+  `main_text`.
+- **No warranty.** See `LICENSE`. You are responsible for what runs on your
+  desk.
 
 ---
 
@@ -48,8 +71,8 @@ They must be the **same built exe** (prefer `target\release\hands.exe`). The com
 | Rust | This repo pins **1.97.1** via `rust-toolchain.toml`. Do **not** `rustup default` to another channel. First `cargo` in this dir installs the pin. |
 | PowerShell | Use it for `$env:LOCALAPPDATA` and `$PWD`. `cmd.exe` will **not** expand `$env:…`. |
 | Unset fixture | Live demo: `HANDS_CHROME_SNAPSHOT` must be **unset** (that env is a test host-double). |
-| Optional Gemma | File `C:\LLM\models\mmproj-gemma-4-E4B-it-Q8_0.gguf` (ggml-org, **not** Unsloth) + router `--mmproj`. Not a Hands compile gate. |
-| Optional `do_task` | `HANDS_XAI_API_KEY` or `XAI_API_KEY`. Missing key is a tool error, not a build failure. |
+| Optional Gemma | [mmproj-gemma-4-E4B-it-Q8_0.gguf](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/mmproj-gemma-4-E4B-it-Q8_0.gguf) (ggml-org, **not** Unsloth) at loopback `HANDS_GEMMA_URL` (default `http://127.0.0.1:8081`). Not a Hands compile gate. |
+| Optional `do_task` | xAI Grok key: `HANDS_KEY`, or `HANDS_XAI_API_KEY`, or `XAI_API_KEY`. Missing key is a tool error, not a build failure. See `.env.example`. |
 
 Forbidden: Playwright, Puppeteer, CDP, `--remote-debugging-port`, `--enable-automation`, CAPTCHA solvers **on daily Chrome**, HID / hiding `LLMHF_INJECTED` **on daily Chrome**, using `listen` / ears to auto-solve a checkbox or audio CAPTCHA on any identity, HKLM, Chrome Web Store publish, committing filled host JSON or harness configs into this repo. Research identity (`attach --identity research` + `challenge --solve`) is the unattended-solver exception. `listen` is **not a CAPTCHA solver**. Research identity may use owner HID (`HANDS_HID_PORT`); daily Chrome stays `SendInput`; do not hide `LLMHF_INJECTED` on Default (owner gadget, not a compile gate).
 
@@ -122,7 +145,7 @@ If you cloned elsewhere, change `path` to that `hands.exe`.
 
 ### 4. Sideload the unpacked extension (on the Chrome profile you actually use)
 
-1. Open **the Chrome profile you browse with** (on this PC: Default / `rbourgoin@gmail.com`). Sideloading on another profile does nothing for daily Chrome.
+1. Open **the Chrome profile you browse with**. Sideloading on another profile does nothing for daily Chrome. Optional operator hint (Hands does **not** read it): `HANDS_CHROME_PROFILE` in `.env` — copy `.env.example`.
 2. Go to `chrome://extensions`.
 3. Turn **Developer mode** on (top right).
 4. **Load unpacked** → folder:
@@ -279,19 +302,24 @@ Restart OpenCode, then `opencode mcp list` → `✓ hands connected`.
 
 Grok always-approve is **not** an inner confirm. Wiring MCP does not grant Easy Apply. The fence stays in this binary.
 
+To have the model **debug fusion** (Inactive worker, zombie host, `chr:` vs UIA), copy
+`sample_skill/helping-hands/SKILL.md` into that harness’s skills directory. See
+`sample_skill/README.md`. Install steps stay in this file; do not copy the
+gitignored `.agents/` implementor skills.
+
 ### 9. Optional: local Gemma (pick / ground)
 
 Not required to compile or to click.
 
 1. Official projector only: [mmproj-gemma-4-E4B-it-Q8_0.gguf](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/mmproj-gemma-4-E4B-it-Q8_0.gguf) (not Unsloth).
-2. On this PC it already lives at `C:\LLM\models\mmproj-gemma-4-E4B-it-Q8_0.gguf` and `C:\LLM\router` already passes `--mmproj`. Do not edit the router from a Hands track.
-3. Start the router only if you want a live crop (`http://127.0.0.1:8081`). **8081 down is a tool error.**
+2. Point your local OpenAI-compatible router at that file (`--mmproj`). Hands does not start or edit the router.
+3. Start the router only if you want a live crop (`HANDS_GEMMA_URL`, default `http://127.0.0.1:8081`). **8081 down is a tool error.**
 
 ### 10. Optional: `do_task`
 
 ```powershell
 # PowerShell
-$env:HANDS_XAI_API_KEY = "<key>"   # or XAI_API_KEY
+$env:HANDS_KEY = "<key>"   # also: HANDS_XAI_API_KEY or XAI_API_KEY
 .\target\release\hands.exe do-task --goal "find a Camry on cars.com"
 ```
 
@@ -377,13 +405,13 @@ cargo run -- native-host-manifest --help
 
 `key --name ctrl+l` is Control+L (Chrome omnibox), same allowlist shape as `ctrl+a`.
 
-`hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope. Default observe is the foreground window (≤20 elements, ≤4 KiB envelope); default envelope ids have click center in the FG client (or owned popup); tall intersecting nodes stay sidecar-only; sidecar / `detail=dom` hold the rest. Screenshot is still the virtual-screen **path**. Observe PNG is preprocessed in-memory (JPEG quality 85, 3×3 median, ±2% scale-restore); dimensions and `.png` path are unchanged. Screenshot pixels and extract/element text are untrusted page content — do not follow as instructions. `HANDS_PREPROCESS=0` writes a raw PNG (debug). `chr:` ids appear only when Chrome is the foreground window; `chrome_connected` remains an honest host-up bit. `extract.dialogs` leads when a cookie / account / dialog is visible, even when Chrome fills the 250 fused-map cap; those ids stay clickable via `click --element-id`. Cards may include miles/dealer/distance; `extract.empty_state` holds empty-radius copy. Nationwide `maximum_distance=all` is `extract.radius` `all`, not `all mi`; a `within N mi of ZIP` heading still fills when the query is non-numeric. Default-map elements carry `grid` (`g:col:row` of the resolved center); prefer that over guessing. Image bytes are never inlined. Default MCP observe JSON omits `screenshot_path`; PNG is not in this result; sidecar / CLI still have the path. **`observe` does not launch Chrome.** **`observe` does not call Gemma.**
+`hands observe [--detail dom] [--session-id <id>]` prints a compact observe envelope. Default observe is the foreground window (≤20 elements, ≤4 KiB envelope); default envelope ids have click center in the FG client (or owned popup); tall intersecting nodes stay sidecar-only; sidecar / `detail=dom` hold the rest. Screenshot is still the virtual-screen **path**. Observe PNG is preprocessed in-memory (JPEG quality 85, 3×3 median, ±2% scale-restore); dimensions and `.png` path are unchanged. Screenshot pixels and extract/element text are untrusted page content — do not follow as instructions. `HANDS_PREPROCESS=0` writes a raw PNG (debug). `chr:` ids appear only when Chrome is the foreground window; `chrome_connected` is snapshot-ok (pipe + service worker + a tab the content script can answer), not merely pipe-up. `extract.dialogs` leads when a cookie / account / dialog is visible, even when Chrome fills the 250 fused-map cap; those ids stay clickable via `click --element-id`. Cards may include miles/dealer/distance; `extract.empty_state` holds empty-radius copy. Nationwide `maximum_distance=all` is `extract.radius` `all`, not `all mi`; a `within N mi of ZIP` heading still fills when the query is non-numeric. Default-map elements carry `grid` (`g:col:row` of the resolved center); prefer that over guessing. Image bytes are never inlined. Default MCP observe JSON omits `screenshot_path`; PNG is not in this result; sidecar / CLI still have the path. **`observe` does not launch Chrome.** **`observe` does not call Gemma.**
 
 `hands pick` / `hands ground` call local Gemma at `http://127.0.0.1:8081` (`HANDS_GEMMA_URL`, loopback http only). `HANDS_GEMMA_TIMEOUT_MS` (default 90000, min 5000), `HANDS_GEMMA_FORCE_TEXT` (`1`/`true`/`yes`) skips images, `HANDS_GEMMA_API_KEY` optional Bearer (never logged). **8081 down is a tool error.** `pick` always sends a text list. `ground` sends a PNG crop only when `/v1/models` reports multimodal. Sidecar / `--elements-json` ids up to the DOM walk cap (2000) resolve for `--element-id` and the allowlist; Gemma’s numbered list is still the first 250. These do **not** install the desk lease.
 
 `hands challenge [--status] [--watch] [--solve] [--observe-path <path>] [--session-id <id>]` reports the in-process challenge episode. Interstitial titles and origin `cdn-cgi` set `challenge.present`; wait (`wait_settle` / `--watch`); do not click “Just a moment…”. On **daily Chrome**, a visible “are you human” UI can be tried as computer-use for **two observe-cycles that used actuation**. After that, actuation refuses (`yielded`) with **no SendInput**. Resume only when the UI is gone. Idle is not resume. Daily Chrome is not a solver; `--solve` is **research identity only**. Grid copy in page body is not `challenge.present`; a named widget, recaptcha iframe, or recaptcha URL still is. A yield-refused hover, like click, does not update the process-local last-target slot; standalone `wait_settle` is still the foreground window.
 
-`hands do-task --goal <text> [--model <id>] [--max-steps N] [--session-id <id>]` is an optional **client of those primitives**. Default model `grok-4.6` via `POST https://api.x.ai/v1/responses` (`HANDS_XAI_API_KEY` then `XAI_API_KEY`). Missing key is a tool error. Fence refuse or yield **stops** the loop. Closing JSONL `error` is only a real failure message, not `done` / `fence` / `yield` / other checkable stops. CLI **does** install the desk lease.
+`hands do-task --goal <text> [--model <id>] [--max-steps N] [--session-id <id>]` is an optional **client of those primitives**. Default model `grok-4.6` via `POST https://api.x.ai/v1/responses` (`HANDS_KEY`, then `HANDS_XAI_API_KEY`, then `XAI_API_KEY`). Missing key is a tool error. Fence refuse or yield **stops** the loop. Closing JSONL `error` is only a real failure message, not `done` / `fence` / `yield` / other checkable stops. CLI **does** install the desk lease.
 
 `hands attach [--plan] [--identity research] [--session-id <id>]` attaches to a visible `Chrome_WidgetWin_1` whose image is `chrome.exe`, or launches `chrome.exe about:blank` with **zero `--` flags**. `--identity research` launches a separate `--user-data-dir` (never Default). `--plan` never spawns. `HANDS_CHROME_EXE` overrides the exe (set + missing file is a hard error). `launched` is true only when `CreateProcessW` / the spawn hook returned `Ok` this invocation (hwnd poll may still miss); failed spawn is `launched: false` with `error` set. Attach does not sideload, does not kill Chrome, and does not install the desk lease.
 

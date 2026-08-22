@@ -268,6 +268,16 @@ pub fn serialize_envelope(envelope: &ObserveEnvelope) -> Result<String, HandsErr
         .map_err(|err| HandsError::Observe(format!("envelope serialize: {err}")))
 }
 
+pub fn serialize_mcp_envelope(envelope: &ObserveEnvelope) -> Result<String, HandsError> {
+    let mut value = serde_json::to_value(envelope)
+        .map_err(|err| HandsError::Observe(format!("envelope serialize: {err}")))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("screenshot_path");
+    }
+    serde_json::to_string(&value)
+        .map_err(|err| HandsError::Observe(format!("envelope serialize: {err}")))
+}
+
 fn serialized_len(envelope: &ObserveEnvelope) -> usize {
     serde_json::to_string(envelope)
         .map(|s| s.len())
@@ -1135,6 +1145,93 @@ mod tests {
         assert!(
             lower.contains("navigation") || lower.contains("re-observe"),
             "mcp.rs must mention navigation or re-observe"
+        );
+    }
+
+    fn mcp_fn_slice<'a>(src: &'a str, needle: &str) -> &'a str {
+        let start = src.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let after = &src[start + 1..];
+        let rel = after.find("\nfn ").unwrap_or(after.len());
+        &src[start..start + 1 + rel]
+    }
+
+    #[test]
+    fn serialize_mcp_envelope_omits_screenshot_path_keeps_observe_path() {
+        let env = fat_envelope(0);
+        let mcp_json = serialize_mcp_envelope(&env).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&mcp_json).unwrap();
+        assert!(
+            parsed.get("screenshot_path").is_none(),
+            "MCP JSON must omit screenshot_path: {parsed}"
+        );
+        assert!(
+            parsed.get("observe_path").is_some(),
+            "MCP JSON must keep observe_path: {parsed}"
+        );
+        assert!(parsed.get("session_id").is_some());
+        assert!(parsed.get("elements").is_some());
+        assert!(parsed.get("challenge").is_some());
+
+        let cli_json = serialize_envelope(&env).unwrap();
+        let cli: serde_json::Value = serde_json::from_str(&cli_json).unwrap();
+        assert!(
+            cli.get("screenshot_path").is_some(),
+            "CLI serialize_envelope must keep screenshot_path: {cli}"
+        );
+    }
+
+    #[test]
+    fn observe_envelope_calls_serialize_mcp_envelope_not_serialize_envelope() {
+        let src = include_str!("mcp.rs");
+        let slice = mcp_fn_slice(src, "fn observe_envelope(");
+        assert!(
+            !slice.contains("#[cfg(test)]") && !slice.contains("mod tests"),
+            "observe_envelope slice must stay production-only:\n{slice}"
+        );
+        assert!(
+            slice.contains("serialize_mcp_envelope"),
+            "observe_envelope must call serialize_mcp_envelope:\n{slice}"
+        );
+        assert!(
+            !slice.contains("serialize_envelope(&envelope)"),
+            "observe_envelope must not call serialize_envelope(&envelope):\n{slice}"
+        );
+    }
+
+    #[test]
+    fn run_observe_stays_content_block_text() {
+        let src = include_str!("mcp.rs");
+        let slice = mcp_fn_slice(src, "fn run_observe(");
+        assert!(
+            !slice.contains("#[cfg(test)]") && !slice.contains("mod tests"),
+            "run_observe slice must stay production-only:\n{slice}"
+        );
+        assert!(
+            slice.contains("ContentBlock::text"),
+            "run_observe must stay ContentBlock::text:\n{slice}"
+        );
+        assert!(
+            !slice.contains("ContentBlock::image"),
+            "run_observe must not mention ContentBlock::image:\n{slice}"
+        );
+    }
+
+    #[test]
+    fn mcp_agents_readme_name_png_is_not_in_this_result() {
+        let mcp = include_str!("mcp.rs");
+        assert!(
+            mcp.contains("PNG is not in this result"),
+            "mcp.rs must contain PNG is not in this result"
+        );
+        let agents = include_str!("../AGENTS.md");
+        assert!(
+            agents.contains("PNG is not in this result"),
+            "AGENTS.md must contain PNG is not in this result"
+        );
+        let readme = include_str!("../README.md");
+        assert!(
+            readme.contains("PNG is not in this result"),
+            "README.md must contain PNG is not in this result"
         );
     }
 

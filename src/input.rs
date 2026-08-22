@@ -15,7 +15,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
     VIRTUAL_KEY, VK_A, VK_BACK, VK_C, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
-    VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP, VK_V, VK_X,
+    VK_L, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP, VK_V, VK_X,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, WHEEL_DELTA};
 
@@ -391,6 +391,7 @@ pub fn named_key(name: &str) -> Result<(), HandsError> {
         "ctrl+c" => chord(&[VK_CONTROL, VK_C]),
         "ctrl+v" => chord(&[VK_CONTROL, VK_V]),
         "ctrl+x" => chord(&[VK_CONTROL, VK_X]),
+        "ctrl+l" => chord(&[VK_CONTROL, VK_L]),
         other => Err(HandsError::Input(format!("unknown key '{other}'"))),
     }
 }
@@ -467,13 +468,79 @@ fn empty_and_set(units: &[u16]) -> Result<(), HandsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_EXTENDEDKEY;
 
     static SENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SENT_KEYS: Mutex<Vec<(usize, VIRTUAL_KEY, u16, u32)>> = Mutex::new(Vec::new());
 
     fn count_sends(_inputs: &[INPUT]) -> Result<(), HandsError> {
         SENT_CALLS.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    struct ClearSendHook;
+
+    impl Drop for ClearSendHook {
+        fn drop(&mut self) {
+            set_send_inputs_hook(None);
+        }
+    }
+
+    fn record_key_sends(inputs: &[INPUT]) -> Result<(), HandsError> {
+        let (w_vk, w_scan, dw_flags) = match inputs.first() {
+            Some(input) => {
+                // INPUT union: keyboard chord
+                let ki = unsafe { input.Anonymous.ki };
+                (ki.wVk, ki.wScan, ki.dwFlags.0)
+            }
+            None => (VIRTUAL_KEY(0), 0, 0),
+        };
+        SENT_KEYS.lock().unwrap_or_else(|e| e.into_inner()).push((
+            inputs.len(),
+            w_vk,
+            w_scan,
+            dw_flags,
+        ));
+        Ok(())
+    }
+
+    fn take_recorded_keys() -> Vec<(usize, VIRTUAL_KEY, u16, u32)> {
+        std::mem::take(&mut *SENT_KEYS.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn arm_recorded_keys() -> ClearSendHook {
+        SENT_KEYS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        set_send_inputs_hook(Some(record_key_sends));
+        ClearSendHook
+    }
+
+    fn assert_mod_letter_chord(
+        rec: &[(usize, VIRTUAL_KEY, u16, u32)],
+        modifier: VIRTUAL_KEY,
+        letter: VIRTUAL_KEY,
+    ) {
+        assert_eq!(rec.len(), 4, "four send_inputs of one INPUT each");
+        let expected = [
+            (modifier, 0u32),
+            (letter, 0u32),
+            (letter, KEYEVENTF_KEYUP.0),
+            (modifier, KEYEVENTF_KEYUP.0),
+        ];
+        for (i, ((len, w_vk, w_scan, dw_flags), (exp_vk, exp_flags))) in
+            rec.iter().zip(expected).enumerate()
+        {
+            assert_eq!(*len, 1, "send {i} must be one INPUT");
+            assert_eq!(*w_vk, exp_vk, "send {i} wVk");
+            assert_eq!(*w_scan, 0, "send {i} wScan");
+            assert_eq!(*dw_flags, exp_flags, "send {i} dwFlags");
+            assert_eq!(
+                *dw_flags & KEYEVENTF_EXTENDEDKEY.0,
+                0,
+                "send {i} must not set KEYEVENTF_EXTENDEDKEY"
+            );
+        }
     }
 
     #[test]
@@ -529,6 +596,81 @@ mod tests {
         assert!(is_enter_key("enter"));
         assert!(!is_enter_key("tab"));
         assert!(!is_enter_key("space"));
+        assert!(!is_enter_key("ctrl+l"));
+    }
+
+    #[test]
+    fn ctrl_l_sends_control_then_l_chord() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        let _hook = arm_recorded_keys();
+        named_key("ctrl+l").expect("ctrl+l");
+        assert_mod_letter_chord(&take_recorded_keys(), VK_CONTROL, VK_L);
+    }
+
+    #[test]
+    fn ctrl_l_trims_and_lowercases() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        let _hook = arm_recorded_keys();
+        named_key(" CTRL+L ").expect(" CTRL+L ");
+        assert_mod_letter_chord(&take_recorded_keys(), VK_CONTROL, VK_L);
+    }
+
+    #[test]
+    fn unknown_ctrl_k_t_w_do_not_send() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        let _hook = arm_recorded_keys();
+        for name in ["ctrl+k", "ctrl+t", "ctrl+w"] {
+            SENT_KEYS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let err = named_key(name).expect_err(name);
+            assert!(
+                err.to_string().contains(&format!("unknown key '{name}'")),
+                "expected unknown key '{name}', got {err}"
+            );
+            assert!(
+                take_recorded_keys().is_empty(),
+                "zero send calls for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_a_still_select_all_chord() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        let _hook = arm_recorded_keys();
+        named_key("ctrl+a").expect("ctrl+a");
+        assert_mod_letter_chord(&take_recorded_keys(), VK_CONTROL, VK_A);
+    }
+
+    #[test]
+    fn named_key_source_locks_ctrl_l_allowlist_arm() {
+        let src = include_str!("input.rs");
+        let start = src.find("pub fn named_key(").expect("named_key");
+        let rest = &src[start..];
+        let end = rest
+            .find("fn with_clipboard")
+            .expect("with_clipboard follows");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("#[cfg(test)]") && !body.contains("mod tests"),
+            "named_key body must stay production-only"
+        );
+        assert!(body.contains("\"ctrl+l\" => chord(&[VK_CONTROL, VK_L])"));
+        assert!(body.contains("\"ctrl+a\" => chord(&[VK_CONTROL, VK_A])"));
+        assert!(body.contains("\"ctrl+c\" => chord(&[VK_CONTROL, VK_C])"));
+        assert!(body.contains("\"ctrl+v\" => chord(&[VK_CONTROL, VK_V])"));
+        assert!(body.contains("\"ctrl+x\" => chord(&[VK_CONTROL, VK_X])"));
+        assert!(!body.contains("starts_with(\"ctrl+\")"));
+        assert!(!body.contains("strip_prefix(\"ctrl+\")"));
+    }
+
+    #[test]
+    fn mcp_and_cli_copy_name_ctrl_l() {
+        assert!(include_str!("mcp.rs").contains("ctrl+l"));
+        assert!(include_str!("main.rs").contains("ctrl+l"));
     }
 
     #[test]

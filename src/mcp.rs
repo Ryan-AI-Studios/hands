@@ -232,7 +232,9 @@ impl HandsServer {
         })))
     }
 
-    #[tool(description = "Press a named key (enter, tab, ctrl+a, …)")]
+    #[tool(
+        description = "Press a named key (enter, tab, ctrl+a, ctrl+l, …). ctrl+l is Control+L (Chrome omnibox)."
+    )]
     fn key(
         &self,
         Parameters(params): Parameters<KeyParams>,

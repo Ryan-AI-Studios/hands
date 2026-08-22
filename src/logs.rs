@@ -1258,27 +1258,52 @@ mod tests {
         });
     }
 
+    fn with_stop_request_path<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let dir = std::env::temp_dir().join(format!("hands-logs-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stop-request.json");
+        let prev = std::env::var_os("HANDS_STOP_REQUEST_PATH");
+        unsafe {
+            std::env::set_var("HANDS_STOP_REQUEST_PATH", &path);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&path)));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HANDS_STOP_REQUEST_PATH", v) },
+            None => unsafe { std::env::remove_var("HANDS_STOP_REQUEST_PATH") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
     #[test]
     fn one_stop_writes_one_session_line_and_one_desk_line() {
         let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         with_test_env(|| {
-            lease::reset_for_test();
-            fence::reinstall_for_test();
-            reinstall_for_test();
-            remember_session("s-stop");
-            let env = crate::actuate::stop(crate::actuate::ActuateRequest {
-                session_id: Some("s-stop".into()),
-                ..crate::actuate::ActuateRequest::default()
-            })
-            .unwrap();
-            assert!(env.ok);
-            let session = read_tail("s-stop", None).unwrap();
-            let stops: Vec<_> = session.events.iter().filter(|e| e.kind == "stop").collect();
-            assert_eq!(stops.len(), 1, "{session:?}");
-            assert_eq!(stops[0].tool.as_deref(), Some("stop"));
-            let desk = read_tail("desk", None).unwrap();
-            let desk_stops: Vec<_> = desk.events.iter().filter(|e| e.kind == "stop").collect();
-            assert_eq!(desk_stops.len(), 1, "{desk:?}");
+            with_stop_request_path(|_| {
+                lease::reset_for_test();
+                let _ingest = lease::enable_stop_ingest_for_test();
+                fence::reinstall_for_test();
+                reinstall_for_test();
+                remember_session("s-stop");
+                let env = crate::actuate::stop(crate::actuate::ActuateRequest {
+                    session_id: Some("s-stop".into()),
+                    ..crate::actuate::ActuateRequest::default()
+                })
+                .unwrap();
+                assert!(env.ok);
+                assert!(env.frozen);
+                let session = read_tail("s-stop", None).unwrap();
+                let stops: Vec<_> = session.events.iter().filter(|e| e.kind == "stop").collect();
+                assert_eq!(stops.len(), 1, "{session:?}");
+                assert_eq!(stops[0].tool.as_deref(), Some("stop"));
+                let desk = read_tail("desk", None).unwrap();
+                let desk_stops: Vec<_> = desk.events.iter().filter(|e| e.kind == "stop").collect();
+                assert_eq!(desk_stops.len(), 1, "{desk:?}");
+                assert_eq!(desk_stops[0].tool.as_deref(), None);
+            });
         });
     }
 

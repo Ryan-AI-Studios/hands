@@ -679,7 +679,9 @@ fn stop_shared(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     fence::ensure_installed();
     let write_err = lease::request_stop().err();
     lease::freeze_now_with(lease::FreezeCause::Stop);
-    let frozen = lease::is_frozen();
+    // Do not read is_frozen here — it re-ingests the file we just wrote and fires
+    // Pause/Stop listeners a second time. Envelope frozen is the freeze we just performed.
+    let frozen = true;
     let (ok, error) = match write_err {
         Some(err) => (false, Some(err.tool_message())),
         None => (true, None),
@@ -1079,6 +1081,66 @@ mod tests {
             assert_eq!(last_target(), Some(seed));
         });
         crate::challenge::reset_for_test();
+    }
+
+    #[test]
+    fn stop_shared_does_not_re_ingest_via_is_frozen() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn stop_shared").expect("stop_shared");
+        let rest = &src[start..];
+        let end = rest.find("#[cfg(test)]").expect("tests follow stop_shared");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("#[cfg(test)]"),
+            "stop_shared slice must not include tests:\n{body}"
+        );
+        assert!(
+            body.contains("let frozen = true"),
+            "stop_shared must set frozen true after local freeze:\n{body}"
+        );
+        assert!(
+            !body.contains("let frozen = lease::is_frozen()"),
+            "stop_shared must not re-ingest via is_frozen:\n{body}"
+        );
+    }
+
+    #[test]
+    fn stop_shared_notifies_stop_once_with_ingest_on() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        with_stop_env(|| {
+            with_stop_request_path(|_| {
+                let _ingest = lease::enable_stop_ingest_for_test();
+                fence::reinstall_for_test();
+                logs::reinstall_for_test();
+                let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+                let slot = seen.clone();
+                lease::subscribe(move |cause| {
+                    slot.lock().unwrap_or_else(|e| e.into_inner()).push(cause);
+                });
+                let env = stop_cli_noop(ActuateRequest {
+                    session_id: Some("s-stop-once".into()),
+                    ..ActuateRequest::default()
+                })
+                .unwrap();
+                assert!(env.ok, "{env:?}");
+                assert!(env.frozen);
+                assert_eq!(
+                    *seen.lock().unwrap(),
+                    vec![lease::FreezeCause::Stop],
+                    "same-process stop must notify FreezeCause::Stop once"
+                );
+                let session = logs::read_tail("s-stop-once", None).unwrap();
+                let stops: Vec<_> = session.events.iter().filter(|e| e.kind == "stop").collect();
+                assert_eq!(stops.len(), 1, "{session:?}");
+                assert_eq!(stops[0].tool.as_deref(), Some("stop"));
+                let desk = logs::read_tail("desk", None).unwrap();
+                let desk_stops: Vec<_> = desk.events.iter().filter(|e| e.kind == "stop").collect();
+                assert_eq!(desk_stops.len(), 1, "{desk:?}");
+                assert_eq!(desk_stops[0].tool.as_deref(), None);
+            });
+        });
+        lease::reset_for_test();
     }
 
     #[test]

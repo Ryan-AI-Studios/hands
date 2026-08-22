@@ -1,4 +1,5 @@
-//! Visible challenge detector + episode machine. Not a solver.
+//! Visible challenge detector + episode machine. Not a solver on daily Chrome.
+//! `--solve` lives in `solver.rs` and is research identity only.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -97,6 +98,12 @@ pub struct ChallengeEnvelope {
     pub watched: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solved: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycles: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -508,6 +515,10 @@ impl ChallengeMachine {
         self.yielded
     }
 
+    fn suppress_yield_keep_attempts(&mut self) {
+        self.yielded = false;
+    }
+
     pub fn actuated_since_observe(&self) -> bool {
         self.actuated_since_observe
     }
@@ -549,11 +560,17 @@ fn lock() -> std::sync::MutexGuard<'static, ChallengeMachine> {
 pub fn reset_for_test() {
     *lock() = ChallengeMachine::new();
     lease::set_challenge_hold(false);
+    crate::attach::reset_identity_for_test();
 }
 
 pub fn apply_observe(session_id: &str, hit: DetectHit) -> ChallengeInfo {
     let mut g = lock();
     let just_yielded = g.observe(&hit);
+    if just_yielded && crate::attach::current_identity() == crate::attach::Identity::Research {
+        g.suppress_yield_keep_attempts();
+        lease::set_challenge_hold(g.hold());
+        return g.info();
+    }
     lease::set_challenge_hold(g.hold());
     if just_yielded {
         let reason = g.kind.map(|k| k.as_str()).unwrap_or("challenge-ui");
@@ -645,10 +662,29 @@ pub fn watch_until_gone<C: WatchClock>(
 }
 
 pub fn run_challenge(req: ChallengeRequest) -> Result<ChallengeEnvelope, HandsError> {
+    run_challenge_dispatch(req, false)
+}
+
+pub fn run_challenge_solve(req: ChallengeRequest) -> Result<ChallengeEnvelope, HandsError> {
+    run_challenge_dispatch(req, true)
+}
+
+fn run_challenge_dispatch(
+    req: ChallengeRequest,
+    solve: bool,
+) -> Result<ChallengeEnvelope, HandsError> {
     logs::ensure_installed();
     let session_id = resolve_session_id_from_os(req.session_id.as_deref());
     logs::check_write_id(&session_id)?;
     logs::remember_session(&session_id);
+    if solve && req.watch {
+        return Err(HandsError::Challenge(
+            "solve and watch are mutually exclusive".into(),
+        ));
+    }
+    if solve {
+        return crate::solver::run_solve(session_id);
+    }
     if req.watch {
         return run_watch(session_id);
     }
@@ -681,6 +717,9 @@ fn run_status(
         reason,
         watched: false,
         elapsed_ms: None,
+        solved: None,
+        cycles: None,
+        backend: None,
         error: None,
     })
 }
@@ -707,6 +746,9 @@ fn run_watch(session_id: String) -> Result<ChallengeEnvelope, HandsError> {
             reason: info.reason,
             watched: true,
             elapsed_ms: Some(elapsed_ms),
+            solved: None,
+            cycles: None,
+            backend: None,
             error: None,
         }),
         Err(err) => finalize_envelope(ChallengeEnvelope {
@@ -720,6 +762,9 @@ fn run_watch(session_id: String) -> Result<ChallengeEnvelope, HandsError> {
             reason: snapshot().reason,
             watched: true,
             elapsed_ms: None,
+            solved: None,
+            cycles: None,
+            backend: None,
             error: Some(err.tool_message()),
         }),
     }
@@ -1225,6 +1270,10 @@ mod tests {
             lower.contains("grid copy in page body"),
             "mcp challenge description should name grid copy in page body:\n{window}"
         );
+        assert!(
+            include_str!("mcp.rs").contains("research identity only"),
+            "mcp.rs must contain research identity only"
+        );
     }
 
     #[test]
@@ -1238,6 +1287,24 @@ mod tests {
         assert!(
             readme.contains("grid copy in page body"),
             "README.md challenge paragraph should name grid copy in page body"
+        );
+        let agents_raw = include_str!("../AGENTS.md");
+        let readme_raw = include_str!("../README.md");
+        assert!(
+            agents_raw.contains("research identity only"),
+            "AGENTS.md must name research identity only"
+        );
+        assert!(
+            readme_raw.contains("research identity only"),
+            "README.md must name research identity only"
+        );
+        assert!(
+            agents_raw.contains("--identity research"),
+            "AGENTS.md must name --identity research"
+        );
+        assert!(
+            readme_raw.contains("--identity research"),
+            "README.md must name --identity research"
         );
     }
 
@@ -1459,6 +1526,27 @@ mod tests {
         assert!(yielded());
         assert_eq!(snapshot().attempts, 2);
         reset_for_test();
+    }
+
+    #[test]
+    fn research_apply_observe_suppresses_yield() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        crate::attach::set_identity_for_test(crate::attach::Identity::Research);
+        apply_observe("s-rs", present_hit());
+        note_actuation();
+        apply_observe("s-rs", present_hit());
+        note_actuation();
+        let info = apply_observe("s-rs", present_hit());
+        assert!(info.present);
+        assert_eq!(info.attempts, 2);
+        assert!(!info.yielded);
+        assert!(!yielded());
+        reset_for_test();
+        assert_eq!(
+            crate::attach::current_identity(),
+            crate::attach::Identity::Daily
+        );
     }
 
     struct FakeClock {
@@ -1742,6 +1830,9 @@ mod tests {
             reason: Some("i'm not a robot".into()),
             watched: true,
             elapsed_ms: Some(120_000),
+            solved: None,
+            cycles: None,
+            backend: None,
             error: None,
         };
         let json = serialize_challenge(&env).unwrap();

@@ -1,11 +1,16 @@
 //! Attach to daily Chrome, or launch it with no automation flags.
+//! `--identity research` uses a Hands-owned `--user-data-dir` (never Default).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HWND, LPARAM, RECT};
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_SUCCESS, HANDLE, HWND, LPARAM, RECT, UNICODE_STRING,
+};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, REG_EXPAND_SZ, REG_SZ,
     REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
@@ -26,8 +31,69 @@ use crate::session::resolve_session_id_from_os;
 
 pub const ATTACH_SCHEMA: &str = "hands.attach/v1";
 pub const CHROME_EXE_ENV: &str = "HANDS_CHROME_EXE";
+pub const RESEARCH_USER_DATA_DIR_ENV: &str = "HANDS_RESEARCH_USER_DATA_DIR";
 pub const CHROME_CLASS: &str = "Chrome_WidgetWin_1";
 const LAUNCH_URL: &str = "about:blank";
+const FORBIDDEN_USER_DATA_SUFFIXES: &[&str] = &[
+    r"Google\Chrome\User Data",
+    r"Google\Chrome Beta\User Data",
+    r"Google\Chrome Dev\User Data",
+    r"Google\Chrome SxS\User Data",
+    r"Google\Chrome for Testing\User Data",
+    r"Chromium\User Data",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Identity {
+    Daily,
+    Research,
+}
+
+impl Identity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Research => "research",
+        }
+    }
+}
+
+static IDENTITY: Mutex<Identity> = Mutex::new(Identity::Daily);
+
+fn identity_lock() -> std::sync::MutexGuard<'static, Identity> {
+    IDENTITY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn current_identity() -> Identity {
+    *identity_lock()
+}
+
+fn set_identity(id: Identity) {
+    *identity_lock() = id;
+}
+
+pub fn reset_identity_for_test() {
+    set_identity(Identity::Daily);
+}
+
+pub fn set_identity_for_test(id: Identity) {
+    set_identity(id);
+}
+
+pub fn parse_identity(s: Option<&str>) -> Result<Identity, HandsError> {
+    let Some(raw) = s.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(Identity::Daily);
+    };
+    if raw.eq_ignore_ascii_case("daily") {
+        Ok(Identity::Daily)
+    } else if raw.eq_ignore_ascii_case("research") {
+        Ok(Identity::Research)
+    } else {
+        Err(HandsError::Chrome(format!(
+            "unknown attach identity '{raw}' (daily or research)"
+        )))
+    }
+}
 const APP_PATHS_SUBKEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe";
 const HWND_POLL: Duration = Duration::from_secs(5);
 const INPUT_IDLE_MS: u32 = 5_000;
@@ -50,6 +116,8 @@ pub struct WindowCandidate {
     pub exe: PathBuf,
     pub width: i32,
     pub height: i32,
+    /// `None` if the process command line could not be read.
+    pub command_line: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,6 +137,9 @@ pub struct AttachEnvelope {
     pub exe: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub argv: Option<Vec<String>>,
+    pub identity: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_data_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -116,12 +187,79 @@ pub fn pick_window(cands: impl IntoIterator<Item = WindowCandidate>) -> Option<C
         if !is_chrome_image(&c.exe) {
             return None;
         }
+        if !cmdline_is_daily(&c.command_line) {
+            return None;
+        }
         Some(ChromeWindow {
             hwnd: c.hwnd,
             pid: c.pid,
             exe: c.exe,
         })
     })
+}
+
+pub fn pick_research_window(
+    cands: impl IntoIterator<Item = WindowCandidate>,
+    dir: &Path,
+) -> Option<ChromeWindow> {
+    cands.into_iter().find_map(|c| {
+        if c.class != CHROME_CLASS {
+            return None;
+        }
+        if !(c.visible || c.iconic) {
+            return None;
+        }
+        if !c.iconic && (c.width <= 0 || c.height <= 0) {
+            return None;
+        }
+        if !is_chrome_image(&c.exe) {
+            return None;
+        }
+        if !cmdline_has_dir(&c.command_line, dir) {
+            return None;
+        }
+        Some(ChromeWindow {
+            hwnd: c.hwnd,
+            pid: c.pid,
+            exe: c.exe,
+        })
+    })
+}
+
+fn cmdline_is_daily(cmdline: &Option<String>) -> bool {
+    match cmdline {
+        None => false,
+        Some(s) => !s.to_ascii_lowercase().contains("--user-data-dir"),
+    }
+}
+
+fn cmdline_has_dir(cmdline: &Option<String>, dir: &Path) -> bool {
+    let Some(raw) = cmdline.as_deref() else {
+        return false;
+    };
+    let Some(got) = user_data_dir_from_cmdline(raw) else {
+        return false;
+    };
+    path_compare_key(Path::new(&got)) == path_compare_key(dir)
+}
+
+fn user_data_dir_from_cmdline(cmdline: &str) -> Option<String> {
+    let lower = cmdline.to_ascii_lowercase();
+    let idx = lower.find("--user-data-dir=")?;
+    let rest = cmdline[idx + "--user-data-dir=".len()..].trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let inner = quoted.split('"').next().unwrap_or("");
+        if inner.is_empty() {
+            None
+        } else {
+            Some(inner.to_string())
+        }
+    } else {
+        rest.split_whitespace().next().map(str::to_string)
+    }
 }
 
 pub fn launch_argv(exe: &Path) -> Result<Vec<OsString>, HandsError> {
@@ -143,6 +281,95 @@ pub fn checked_argv(tokens: Vec<OsString>) -> Result<Vec<OsString>, HandsError> 
         ));
     }
     Ok(tokens)
+}
+
+pub fn launch_research_argv(exe: &Path, dir: &Path) -> Result<Vec<OsString>, HandsError> {
+    deny_default_user_data(dir)?;
+    let flag = format!("--user-data-dir={}", dir.display());
+    checked_research_argv(vec![
+        exe.as_os_str().to_os_string(),
+        OsString::from(flag),
+        OsString::from(LAUNCH_URL),
+    ])
+}
+
+pub fn checked_research_argv(tokens: Vec<OsString>) -> Result<Vec<OsString>, HandsError> {
+    let extra_dash = tokens
+        .iter()
+        .enumerate()
+        .any(|(i, t)| i != 1 && t.to_string_lossy().starts_with("--"));
+    if extra_dash {
+        return Err(HandsError::Chrome(
+            "research launch argv must not contain extra -- switches".into(),
+        ));
+    }
+    if tokens.len() != 3 || tokens[2] != OsStr::new(LAUNCH_URL) {
+        return Err(HandsError::Chrome(
+            "research launch argv allowlist is [exe, --user-data-dir=<dir>, about:blank]".into(),
+        ));
+    }
+    let flag = tokens[1].to_string_lossy();
+    if !flag.starts_with("--user-data-dir=") {
+        return Err(HandsError::Chrome(
+            "research launch argv must include --user-data-dir=".into(),
+        ));
+    }
+    Ok(tokens)
+}
+
+pub fn research_user_data_dir() -> Result<PathBuf, HandsError> {
+    let dir = match std::env::var_os(RESEARCH_USER_DATA_DIR_ENV) {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => {
+            let local = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+                HandsError::Chrome(
+                    "LOCALAPPDATA is unset; cannot resolve research user-data-dir".into(),
+                )
+            })?;
+            PathBuf::from(local).join("hands").join("identity-research")
+        }
+    };
+    deny_default_user_data(&dir)?;
+    Ok(dir)
+}
+
+pub fn deny_default_user_data(dir: &Path) -> Result<(), HandsError> {
+    if is_forbidden_user_data(dir) {
+        return Err(HandsError::Chrome(format!(
+            "research user-data-dir must not be a Default Chrome User Data path ({})",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+fn is_forbidden_user_data(dir: &Path) -> bool {
+    let needle = path_compare_key(dir);
+    forbidden_user_data_dirs()
+        .into_iter()
+        .any(|p| path_compare_key(&p) == needle)
+}
+
+fn forbidden_user_data_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let base = PathBuf::from(local);
+        for suffix in FORBIDDEN_USER_DATA_SUFFIXES {
+            out.push(base.join(suffix));
+        }
+    }
+    out
+}
+
+fn path_compare_key(p: &Path) -> String {
+    let raw = std::fs::canonicalize(p)
+        .ok()
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string_lossy().into_owned());
+    raw.trim_start_matches(r"\\?\")
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 pub fn resolve_chrome_exe() -> Result<PathBuf, HandsError> {
@@ -358,11 +585,78 @@ pub fn spawn_chrome(exe: &Path) -> Result<u32, HandsError> {
     Ok(pid)
 }
 
+pub fn spawn_research_chrome(exe: &Path, dir: &Path) -> Result<u32, HandsError> {
+    let argv = launch_research_argv(exe, dir)?;
+    let _ = argv;
+    std::fs::create_dir_all(dir).map_err(|err| {
+        HandsError::Chrome(format!(
+            "create research user-data-dir {}: {err}",
+            dir.display()
+        ))
+    })?;
+    let exe_wide = to_wide(&exe.to_string_lossy());
+    let mut cmd = to_wide(&format!(
+        "\"{}\" --user-data-dir=\"{}\" {LAUNCH_URL}",
+        exe.display(),
+        dir.display()
+    ));
+    let si = STARTUPINFOW {
+        cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap_or(0),
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            PCWSTR(exe_wide.as_ptr()),
+            Some(PWSTR(cmd.as_mut_ptr())),
+            None,
+            None,
+            false,
+            PROCESS_CREATION_FLAGS(0),
+            None,
+            PCWSTR::null(),
+            &raw const si,
+            &raw mut pi,
+        )
+    }
+    .map_err(|err| HandsError::Chrome(format!("CreateProcessW chrome.exe: {err}")))?;
+    let pid = pi.dwProcessId;
+    let _ = unsafe { WaitForInputIdle(pi.hProcess, INPUT_IDLE_MS) };
+    let _ = unsafe { CloseHandle(pi.hProcess) };
+    let _ = unsafe { CloseHandle(pi.hThread) };
+    Ok(pid)
+}
+
 pub fn run_attach(session_id: Option<&str>, plan: bool) -> Result<AttachEnvelope, HandsError> {
+    run_attach_identity(session_id, plan, Identity::Daily)
+}
+
+pub fn run_attach_identity(
+    session_id: Option<&str>,
+    plan: bool,
+    identity: Identity,
+) -> Result<AttachEnvelope, HandsError> {
     let session_id = resolve_session_id_from_os(session_id);
     logs::check_write_id(&session_id)?;
-    let outcome = ensure_daily_with(plan, &Hooks::live());
-    let envelope = envelope_from(session_id, plan, outcome);
+    let (outcome, user_data_dir) = match identity {
+        Identity::Daily => (ensure_daily_with(plan, &Hooks::live()), None),
+        Identity::Research => {
+            let dir = research_user_data_dir()?;
+            let dir_for_hooks = dir.clone();
+            let hooks = Hooks {
+                find: &|| find_research_window(&dir_for_hooks),
+                resolve_exe: &resolve_chrome_exe,
+                spawn: &|exe| spawn_research_chrome(exe, &dir_for_hooks),
+                offer: &offer_hwnd,
+            };
+            let outcome = ensure_research_with(plan, &dir, &hooks);
+            (outcome, Some(dir))
+        }
+    };
+    if outcome.error.is_none() && !plan {
+        set_identity(identity);
+    }
+    let envelope = envelope_from(session_id, plan, identity, user_data_dir, outcome);
     logs::ensure_installed();
     logs::remember_session(&envelope.session_id);
     let _ = logs::record_actuate(
@@ -383,7 +677,13 @@ pub fn serialize_attach(envelope: &AttachEnvelope) -> Result<String, HandsError>
         .map_err(|err| HandsError::Chrome(format!("attach envelope: {err}")))
 }
 
-fn envelope_from(session_id: String, plan: bool, outcome: AttachOutcome) -> AttachEnvelope {
+fn envelope_from(
+    session_id: String,
+    plan: bool,
+    identity: Identity,
+    user_data_dir: Option<PathBuf>,
+    outcome: AttachOutcome,
+) -> AttachEnvelope {
     AttachEnvelope {
         schema: ATTACH_SCHEMA,
         session_id,
@@ -399,16 +699,30 @@ fn envelope_from(session_id: String, plan: bool, outcome: AttachOutcome) -> Atta
                 .map(|t| t.to_string_lossy().into_owned())
                 .collect()
         }),
+        identity: identity.as_str(),
+        user_data_dir: user_data_dir.map(|p| p.display().to_string()),
         error: outcome.error,
     }
 }
 
 fn ensure_daily_with(plan: bool, hooks: &Hooks<'_>) -> AttachOutcome {
+    ensure_with(plan, hooks, launch_argv)
+}
+
+fn ensure_research_with(plan: bool, dir: &Path, hooks: &Hooks<'_>) -> AttachOutcome {
+    ensure_with(plan, hooks, |exe| launch_research_argv(exe, dir))
+}
+
+fn ensure_with(
+    plan: bool,
+    hooks: &Hooks<'_>,
+    make_argv: impl Fn(&Path) -> Result<Vec<OsString>, HandsError>,
+) -> AttachOutcome {
     let found = (hooks.find)();
     let need_exe = plan || found.is_none();
     let resolved = if need_exe {
         match (hooks.resolve_exe)() {
-            Ok(exe) => match launch_argv(&exe) {
+            Ok(exe) => match make_argv(&exe) {
                 Ok(argv) => Ok((exe, argv)),
                 Err(err) => Err(err),
             },
@@ -516,6 +830,10 @@ fn find_chrome_window() -> Option<ChromeWindow> {
     pick_window(enum_candidates())
 }
 
+fn find_research_window(dir: &Path) -> Option<ChromeWindow> {
+    pick_research_window(enum_candidates(), dir)
+}
+
 fn enum_candidates() -> Vec<WindowCandidate> {
     let mut hwnds: Vec<HWND> = Vec::new();
     let _ = unsafe { EnumWindows(Some(collect_hwnds), LPARAM(&raw mut hwnds as isize)) };
@@ -533,6 +851,7 @@ fn enum_candidates() -> Vec<WindowCandidate> {
             continue;
         };
         let (width, height) = window_size(hwnd);
+        let command_line = process_command_line(pid);
         out.push(WindowCandidate {
             hwnd: raw,
             class,
@@ -542,6 +861,7 @@ fn enum_candidates() -> Vec<WindowCandidate> {
             exe,
             width,
             height,
+            command_line,
         });
     }
     out
@@ -584,6 +904,56 @@ fn process_image(pid: u32) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(OsString::from_wide_lossy(&buf[..len])))
+}
+
+fn process_command_line(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let result = unsafe { query_command_line(handle) };
+    let _ = unsafe { CloseHandle(handle) };
+    result
+}
+
+unsafe fn query_command_line(handle: HANDLE) -> Option<String> {
+    let mut needed = 0u32;
+    let _ = unsafe {
+        NtQueryInformationProcess(
+            handle,
+            ProcessCommandLineInformation,
+            std::ptr::null_mut(),
+            0,
+            &raw mut needed,
+        )
+    };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; needed as usize];
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle,
+            ProcessCommandLineInformation,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &raw mut needed,
+        )
+    };
+    if status.is_err() {
+        return None;
+    }
+    let us = unsafe { buf.as_ptr().cast::<UNICODE_STRING>().read_unaligned() };
+    let n = (us.Length as usize) / 2;
+    if us.Buffer.is_null() || n == 0 {
+        return None;
+    }
+    let ptr = us.Buffer.as_ptr();
+    if ptr.is_null() {
+        return None;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
+    Some(String::from_utf16_lossy(slice))
 }
 
 fn is_chrome_image(path: &Path) -> bool {
@@ -657,7 +1027,21 @@ mod tests {
             exe: PathBuf::from(exe),
             width: 800,
             height: 600,
+            command_line: Some(String::new()),
         }
+    }
+
+    fn chrome_cand_cmd(
+        hwnd: isize,
+        class: &str,
+        exe: &str,
+        visible: bool,
+        iconic: bool,
+        command_line: &str,
+    ) -> WindowCandidate {
+        let mut c = chrome_cand(hwnd, class, exe, visible, iconic);
+        c.command_line = Some(command_line.into());
+        c
     }
 
     #[test]
@@ -944,11 +1328,12 @@ mod tests {
         let argv = out.argv.as_ref().expect("argv");
         assert_eq!(argv[1], OsStr::new("about:blank"));
         assert!(!argv.iter().any(|t| t.to_string_lossy().starts_with("--")));
-        let env = envelope_from("sid".into(), false, out);
+        let env = envelope_from("sid".into(), false, Identity::Daily, None, out);
         assert!(!env.ok);
         assert!(!env.launched);
         assert!(!env.attached);
         assert_eq!(env.schema, ATTACH_SCHEMA);
+        assert_eq!(env.identity, "daily");
     }
 
     #[test]
@@ -993,7 +1378,7 @@ mod tests {
         );
         assert!(out.exe.is_none());
         assert!(out.argv.is_none());
-        let env = envelope_from("sid".into(), true, out);
+        let env = envelope_from("sid".into(), true, Identity::Daily, None, out);
         assert!(!env.ok);
     }
 
@@ -1038,6 +1423,7 @@ mod tests {
         assert!(!src.contains("ensure_daily"));
         assert!(!src.contains("spawn_chrome"));
         assert!(!src.contains("HANDS_CHROME_EXE"));
+        assert!(!src.contains("solver::"));
     }
 
     #[test]
@@ -1045,6 +1431,8 @@ mod tests {
         let env = envelope_from(
             "sid".into(),
             true,
+            Identity::Daily,
+            None,
             AttachOutcome {
                 attached: false,
                 launched: false,
@@ -1058,6 +1446,246 @@ mod tests {
         let json = serialize_attach(&env).unwrap();
         assert!(json.contains(ATTACH_SCHEMA));
         assert!(json.contains("about:blank"));
+        assert!(json.contains("\"identity\":\"daily\""));
         assert!(!json.contains("hwnd"));
+        assert!(!json.contains("user_data_dir"));
+    }
+
+    fn fn_slice<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src.find(sig).unwrap_or_else(|| panic!("missing {sig}"));
+        let rest = &src[start..];
+        let after = &rest[sig.len()..];
+        let next_plain = after.find("\nfn ").map(|i| sig.len() + i);
+        let next_pub = after.find("\npub fn ").map(|i| sig.len() + i);
+        let next = [next_plain, next_pub]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..next]
+    }
+
+    #[test]
+    fn launch_argv_and_checked_argv_slices_have_no_user_data_dir() {
+        let src = include_str!("attach.rs");
+        let launch = fn_slice(src, "fn launch_argv(");
+        let checked = fn_slice(src, "fn checked_argv(");
+        assert!(
+            !launch.contains("user-data-dir"),
+            "daily launch_argv must not mention user-data-dir:\n{launch}"
+        );
+        assert!(
+            !checked.contains("user-data-dir"),
+            "daily checked_argv must not mention user-data-dir:\n{checked}"
+        );
+        let research = fn_slice(src, "fn launch_research_argv(");
+        assert!(
+            research.contains("--user-data-dir="),
+            "launch_research_argv must allowlist --user-data-dir=:\n{research}"
+        );
+    }
+
+    #[test]
+    fn launch_research_argv_is_user_data_dir_and_about_blank() {
+        let exe = Path::new(r"C:\Program Files\Google\Chrome\Application\chrome.exe");
+        let dir = Path::new(r"C:\hands-research-profile");
+        let argv = launch_research_argv(exe, dir).unwrap();
+        assert_eq!(argv.len(), 3);
+        assert_eq!(argv[2], OsStr::new("about:blank"));
+        let flags: Vec<_> = argv
+            .iter()
+            .filter(|t| t.to_string_lossy().starts_with("--"))
+            .collect();
+        assert_eq!(flags.len(), 1);
+        assert!(
+            flags[0].to_string_lossy().starts_with("--user-data-dir="),
+            "{flags:?}"
+        );
+        assert!(
+            flags[0]
+                .to_string_lossy()
+                .contains(r"C:\hands-research-profile")
+        );
+    }
+
+    #[test]
+    fn launch_research_argv_rejects_extra_dash_tokens() {
+        let err = checked_research_argv(vec![
+            OsString::from(r"C:\chrome.exe"),
+            OsString::from("--user-data-dir=C:\\research"),
+            OsString::from("about:blank"),
+            OsString::from("--enable-automation"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("--"), "{err}");
+        let err = checked_research_argv(vec![
+            OsString::from(r"C:\chrome.exe"),
+            OsString::from("--user-data-dir=C:\\research"),
+            OsString::from("about:blank"),
+            OsString::from("--remote-debugging-port=9222"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("--"), "{err}");
+        let err = checked_research_argv(vec![
+            OsString::from(r"C:\chrome.exe"),
+            OsString::from("--profile-directory=Default"),
+            OsString::from("about:blank"),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("user-data-dir") || err.to_string().contains("allowlist"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn default_user_data_dir_is_hard_error() {
+        let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"));
+        let def = local.join("Google").join("Chrome").join("User Data");
+        let err = deny_default_user_data(&def).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("default"),
+            "{err}"
+        );
+        let sxs = local.join("Google").join("Chrome SxS").join("User Data");
+        assert!(deny_default_user_data(&sxs).is_err());
+        let ok = PathBuf::from(r"C:\hands-identity-research");
+        assert!(deny_default_user_data(&ok).is_ok());
+    }
+
+    #[test]
+    fn daily_picker_skips_user_data_dir_cmdline() {
+        let research = chrome_cand_cmd(
+            21,
+            CHROME_CLASS,
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            true,
+            false,
+            r#""C:\chrome.exe" --user-data-dir=C:\hands\identity-research about:blank"#,
+        );
+        assert!(pick_window([research]).is_none());
+        let daily = chrome_cand(
+            22,
+            CHROME_CLASS,
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            true,
+            false,
+        );
+        assert_eq!(pick_window([daily]).map(|w| w.hwnd), Some(22));
+        let unknown = chrome_cand(
+            23,
+            CHROME_CLASS,
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            true,
+            false,
+        );
+        let mut unknown = unknown;
+        unknown.command_line = None;
+        assert!(
+            pick_window([unknown.clone()]).is_none(),
+            "unknown cmdline is not daily"
+        );
+        assert!(
+            pick_research_window([unknown], Path::new(r"C:\hands\identity-research")).is_none(),
+            "unknown cmdline is not research"
+        );
+    }
+
+    #[test]
+    fn research_picker_requires_matching_dir() {
+        let dir = Path::new(r"C:\hands\identity-research");
+        let match_cmd = chrome_cand_cmd(
+            31,
+            CHROME_CLASS,
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            true,
+            false,
+            r#""C:\chrome.exe" --user-data-dir=C:\hands\identity-research about:blank"#,
+        );
+        assert_eq!(
+            pick_research_window([match_cmd.clone()], dir).map(|w| w.hwnd),
+            Some(31)
+        );
+        let other = chrome_cand_cmd(
+            32,
+            CHROME_CLASS,
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            true,
+            false,
+            r#""C:\chrome.exe" --user-data-dir=C:\other-profile about:blank"#,
+        );
+        assert!(pick_research_window([other], dir).is_none());
+        let daily = chrome_cand(
+            33,
+            CHROME_CLASS,
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            true,
+            false,
+        );
+        assert!(pick_research_window([daily], dir).is_none());
+        let prefix = chrome_cand_cmd(
+            34,
+            CHROME_CLASS,
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            true,
+            false,
+            r#""C:\chrome.exe" --user-data-dir=C:\hands\identity-research-other about:blank"#,
+        );
+        assert!(
+            pick_research_window([prefix], dir).is_none(),
+            "prefix of the research dir must not match"
+        );
+    }
+
+    #[test]
+    fn parse_identity_default_daily_and_research() {
+        assert_eq!(parse_identity(None).unwrap(), Identity::Daily);
+        assert_eq!(parse_identity(Some("")).unwrap(), Identity::Daily);
+        assert_eq!(parse_identity(Some("daily")).unwrap(), Identity::Daily);
+        assert_eq!(parse_identity(Some("Daily")).unwrap(), Identity::Daily);
+        assert_eq!(
+            parse_identity(Some("research")).unwrap(),
+            Identity::Research
+        );
+        assert_eq!(
+            parse_identity(Some("RESEARCH")).unwrap(),
+            Identity::Research
+        );
+        let err = parse_identity(Some("sneaky")).unwrap_err();
+        assert!(err.to_string().contains("identity"), "{err}");
+    }
+
+    #[test]
+    fn plan_does_not_switch_identity() {
+        reset_identity_for_test();
+        assert_eq!(current_identity(), Identity::Daily);
+        let spawned = AtomicU32::new(0);
+        let dir = PathBuf::from(r"C:\hands-identity-research");
+        let hooks = Hooks {
+            find: &|| None,
+            resolve_exe: &|| Ok(dummy_exe()),
+            spawn: &|_| {
+                spawned.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            },
+            offer: &|_, _| true,
+        };
+        let out = ensure_research_with(true, &dir, &hooks);
+        assert!(!out.launched);
+        assert_eq!(spawned.load(Ordering::SeqCst), 0);
+        let flag = out
+            .argv
+            .as_ref()
+            .and_then(|a| a.iter().find(|t| t.to_string_lossy().starts_with("--")))
+            .map(|t| t.to_string_lossy().into_owned())
+            .expect("research argv flag");
+        assert!(flag.starts_with("--user-data-dir="), "{flag}");
+        assert!(
+            !flag
+                .to_ascii_lowercase()
+                .contains(r"google\chrome\user data")
+        );
+        assert_eq!(current_identity(), Identity::Daily);
+        reset_identity_for_test();
     }
 }

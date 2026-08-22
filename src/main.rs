@@ -38,9 +38,13 @@ enum Command {
         element_id: Option<String>,
         #[arg(long)]
         grid: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            allow_negative_numbers = true,
+            help = "virtual-screen pixel; origin can be negative. Example: --x -100"
+        )]
         x: Option<i32>,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         y: Option<i32>,
         #[arg(long)]
         session_id: Option<String>,
@@ -54,9 +58,9 @@ enum Command {
         element_id: Option<String>,
         #[arg(long)]
         grid: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         x: Option<i32>,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         y: Option<i32>,
         #[arg(long)]
         session_id: Option<String>,
@@ -89,18 +93,22 @@ enum Command {
         element_id: Option<String>,
         #[arg(long)]
         grid: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         x: Option<i32>,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         y: Option<i32>,
         #[arg(long)]
         session_id: Option<String>,
     },
     /// Wait until an ROI stops changing. Default is the foreground window (GetWindowRect, same as observe viewport); envelope includes roi.
     WaitSettle {
-        #[arg(long)]
+        #[arg(
+            long,
+            allow_negative_numbers = true,
+            help = "virtual-screen pixel; origin can be negative. Example: --x -100"
+        )]
         x: Option<i32>,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         y: Option<i32>,
         #[arg(long)]
         w: Option<i32>,
@@ -158,9 +166,9 @@ enum Command {
         screenshot: Option<String>,
         #[arg(long)]
         element_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         x: Option<i32>,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         y: Option<i32>,
         #[arg(long)]
         w: Option<i32>,
@@ -879,5 +887,147 @@ mod tests {
                 _ => panic!("--dy --help must not parse as a command"),
             }
         }
+    }
+
+    #[test]
+    fn click_x_space_separated_negative() {
+        let cli =
+            Cli::try_parse_from(["hands", "click", "--x", "-100", "--y", "20"]).expect("parse");
+        match cli.command {
+            Command::Click { x, y, .. } => {
+                assert_eq!(x, Some(-100));
+                assert_eq!(y, Some(20));
+            }
+            _ => panic!("expected Click"),
+        }
+    }
+
+    #[test]
+    fn click_x_equals_negative() {
+        let cli = Cli::try_parse_from(["hands", "click", "--x=-100", "--y=20"]).expect("parse");
+        match cli.command {
+            Command::Click { x, y, .. } => {
+                assert_eq!(x, Some(-100));
+                assert_eq!(y, Some(20));
+            }
+            _ => panic!("expected Click"),
+        }
+    }
+
+    #[test]
+    fn hover_x_space_separated_negative() {
+        let cli =
+            Cli::try_parse_from(["hands", "hover", "--x", "-100", "--y", "20"]).expect("parse");
+        match cli.command {
+            Command::Hover { x, y, .. } => {
+                assert_eq!(x, Some(-100));
+                assert_eq!(y, Some(20));
+            }
+            _ => panic!("expected Hover"),
+        }
+    }
+
+    #[test]
+    fn wait_settle_x_space_separated_negative() {
+        let cli = Cli::try_parse_from([
+            "hands",
+            "wait-settle",
+            "--x",
+            "-100",
+            "--y",
+            "20",
+            "--w",
+            "50",
+            "--h",
+            "50",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::WaitSettle { x, y, w, h, .. } => {
+                assert_eq!(x, Some(-100));
+                assert_eq!(y, Some(20));
+                assert_eq!(w, Some(50));
+                assert_eq!(h, Some(50));
+            }
+            _ => panic!("expected WaitSettle"),
+        }
+    }
+
+    #[test]
+    fn scroll_x_space_separated_negative() {
+        let cli = Cli::try_parse_from(["hands", "scroll", "--dy", "0", "--x", "-100", "--y", "20"])
+            .expect("parse");
+        match cli.command {
+            Command::Scroll { dy, x, y, .. } => {
+                assert_eq!(dy, 0);
+                assert_eq!(x, Some(-100));
+                assert_eq!(y, Some(20));
+            }
+            _ => panic!("expected Scroll"),
+        }
+    }
+
+    #[test]
+    fn ground_x_space_separated_negative() {
+        let cli = Cli::try_parse_from([
+            "hands", "ground", "--query", "q", "--x", "-100", "--y", "20", "--w", "10", "--h", "10",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Ground { x, y, w, h, .. } => {
+                assert_eq!(x, Some(-100));
+                assert_eq!(y, Some(20));
+                assert_eq!(w, Some(10));
+                assert_eq!(h, Some(10));
+            }
+            _ => panic!("expected Ground"),
+        }
+    }
+
+    #[test]
+    fn click_x_positive() {
+        let cli =
+            Cli::try_parse_from(["hands", "click", "--x", "100", "--y", "20"]).expect("parse");
+        match cli.command {
+            Command::Click { x, y, .. } => {
+                assert_eq!(x, Some(100));
+                assert_eq!(y, Some(20));
+            }
+            _ => panic!("expected Click"),
+        }
+    }
+
+    #[test]
+    fn click_long_help_contains_x_space_negative() {
+        let cmd = Cli::command();
+        let click = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "click")
+            .expect("click subcommand");
+        let help = click.clone().render_long_help().to_string();
+        assert!(
+            help.contains("--x -100"),
+            "long-help should mention --x -100, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn click_x_help_is_not_numeric() {
+        if let Ok(cli) = Cli::try_parse_from(["hands", "click", "--x", "--help"]) {
+            match cli.command {
+                Command::Click { x, .. } => {
+                    panic!("--x --help must not parse as numeric x={x:?}")
+                }
+                _ => panic!("--x --help must not parse as a command"),
+            }
+        }
+    }
+
+    #[test]
+    fn wait_settle_w_space_separated_negative_fails() {
+        assert!(
+            Cli::try_parse_from(["hands", "wait-settle", "--w", "-1"]).is_err(),
+            "wait-settle --w -1 must still fail clap (sizes are not origin)"
+        );
     }
 }

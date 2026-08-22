@@ -312,6 +312,7 @@ Fence / yield still hard-stop the loop. Missing key → skip, not a failed insta
 Gray-zone **free**: cookie Accept, dismiss sign-in / Not now. **Do not** click dealer **Check Availability** unless you mean to confirm a lead.
 
 `hands scroll --dy -6` scrolls toward the user (page-down). `--dy=-6` is also valid.
+`hands click --x -100 --y 20` (and hover / wait-settle / scroll pixel / ground) parse; origin can be negative. `--x=-100` is also valid.
 
 ### Rollback (does not kill Chrome)
 

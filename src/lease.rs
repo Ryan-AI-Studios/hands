@@ -63,11 +63,14 @@ fn cause_from_code(code: u8) -> FreezeCause {
 }
 
 /// Pure state machine — unit-tested without installing hooks.
+/// Challenge hold is a field here. Process-global `CHALLENGE_HOLD` gates only
+/// the atomic `rearm_if_idle` used by hooks / `poll` / `is_frozen()`.
 #[derive(Debug, Clone)]
 pub struct LeaseMachine {
     frozen: bool,
     since: Option<Instant>,
     last_cause: Option<FreezeCause>,
+    hold: bool,
 }
 
 impl LeaseMachine {
@@ -76,6 +79,7 @@ impl LeaseMachine {
             frozen: false,
             since: None,
             last_cause: None,
+            hold: false,
         }
     }
 
@@ -83,8 +87,12 @@ impl LeaseMachine {
         self.last_cause
     }
 
+    pub fn set_hold(&mut self, on: bool) {
+        self.hold = on;
+    }
+
     pub fn rearm_if_idle(&mut self, now: Instant) {
-        if challenge_hold() {
+        if self.hold {
             return;
         }
         if self.frozen
@@ -780,16 +788,13 @@ mod tests {
 
     #[test]
     fn physical_plus_hold_does_not_rearm_after_3s() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_for_test();
         let mut m = LeaseMachine::new();
         let t0 = Instant::now();
-        set_challenge_hold(true);
+        m.set_hold(true);
         m.on_mouse(false, t0);
         assert!(m.is_frozen(t0 + Duration::from_secs(3)));
-        set_challenge_hold(false);
+        m.set_hold(false);
         assert!(!m.is_frozen(t0 + Duration::from_secs(3)));
-        reset_for_test();
     }
 
     #[test]
@@ -805,15 +810,25 @@ mod tests {
 
     #[test]
     fn pause_mid_hold_is_still_pause() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_for_test();
         let mut m = LeaseMachine::new();
         let t0 = Instant::now();
-        set_challenge_hold(true);
+        m.set_hold(true);
         m.on_mouse(false, t0);
         m.on_key(u32::from(VK_PAUSE.0), true, t0);
         assert_eq!(m.last_cause(), Some(FreezeCause::Pause));
         assert!(m.is_frozen(t0 + Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn machine_idle_rearm_ignores_process_challenge_hold() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        set_challenge_hold(true);
+        let mut m = LeaseMachine::new();
+        let t0 = Instant::now();
+        m.on_mouse(false, t0);
+        assert!(m.is_frozen(t0));
+        assert!(!m.is_frozen(t0 + Duration::from_millis(2000)));
         reset_for_test();
     }
 

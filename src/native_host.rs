@@ -194,7 +194,11 @@ fn serve_pipe() -> Result<(), HandsError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let stdin_handle = HANDLE(stdin.as_raw_handle());
+    spawn_chrome_stdin_watch(stdin_handle);
     loop {
+        if chrome_stdin_gone(stdin_handle) {
+            return Ok(());
+        }
         connect_pipe(handle)?;
         let mut pipe = PipeRef(handle);
         let req = match read_frame_limited(&mut pipe, MAX_HOST_TO_CHROME) {
@@ -207,9 +211,52 @@ fn serve_pipe() -> Result<(), HandsError> {
         };
         if let Err(err) = forward_one(&mut stdout, stdin_handle, &mut pipe, &req) {
             eprintln!("native-host: forward: {err}");
+            if chrome_peer_gone(&err) {
+                let _ = unsafe { DisconnectNamedPipe(handle) };
+                return Ok(());
+            }
         }
         let _ = unsafe { DisconnectNamedPipe(handle) };
     }
+}
+
+/// Chrome closed native-messaging stdio (service worker Inactive / disconnect).
+/// Exit so `FILE_FLAG_FIRST_PIPE_INSTANCE` cannot leave a zombie pipe.
+fn spawn_chrome_stdin_watch(stdin_handle: HANDLE) {
+    let bits = stdin_handle.0 as usize;
+    let _ = std::thread::Builder::new()
+        .name("hands-chrome-stdin".into())
+        .spawn(move || {
+            let handle = HANDLE(bits as *mut std::ffi::c_void);
+            loop {
+                if chrome_stdin_gone(handle) {
+                    std::process::exit(0);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+}
+
+fn chrome_stdin_gone(handle: HANDLE) -> bool {
+    let mut avail = 0u32;
+    match unsafe { PeekNamedPipe(handle, None, 0, None, Some(&raw mut avail), None) } {
+        Ok(()) => false,
+        Err(err)
+            if err.code() == ERROR_BROKEN_PIPE.to_hresult()
+                || err.code() == ERROR_BAD_PIPE.to_hresult() =>
+        {
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn chrome_peer_gone(err: &HandsError) -> bool {
+    let s = err.to_string().to_ascii_lowercase();
+    s.contains("stdin closed")
+        || s.contains("broken pipe")
+        || s.contains("pipe is being closed")
+        || s.contains("pipe has been ended")
 }
 
 fn forward_one<W: Write, P: Write>(
@@ -674,6 +721,7 @@ mod tests {
         let err = read_exact_deadline(read, &mut [0u8; 4], Instant::now() + Duration::from_secs(2))
             .unwrap_err();
         let elapsed = started.elapsed();
+        let gone = chrome_stdin_gone(read);
         let _ = unsafe { CloseHandle(read) };
         let msg = err.to_string();
         assert!(
@@ -682,6 +730,42 @@ mod tests {
         );
         assert!(msg.contains("stdin closed"), "{msg}");
         assert!(!msg.contains("timed out"), "{msg}");
+        assert!(gone, "closed write-end must report Chrome stdin gone");
+    }
+
+    #[test]
+    fn open_anon_pipe_is_not_stdin_gone() {
+        let (read, write) = make_anon_pipe();
+        let gone = chrome_stdin_gone(read);
+        let _ = unsafe { CloseHandle(read) };
+        let _ = unsafe { CloseHandle(write) };
+        assert!(!gone, "live Chrome stdin must not look gone");
+    }
+
+    #[test]
+    fn chrome_peer_gone_matches_stdin_closed_and_broken_pipe() {
+        assert!(chrome_peer_gone(&stdin_closed()));
+        assert!(chrome_peer_gone(&HandsError::Chrome(
+            "native-host frame write: The pipe is being closed. (os error 232)".into()
+        )));
+        assert!(!chrome_peer_gone(&host_forward_timeout()));
+    }
+
+    #[test]
+    fn serve_pipe_watches_chrome_stdin_and_exits() {
+        let src = include_str!("native_host.rs");
+        assert!(
+            src.contains("spawn_chrome_stdin_watch"),
+            "host must watch Chrome stdin while blocked in ConnectNamedPipe"
+        );
+        assert!(
+            src.contains("std::process::exit"),
+            "stdin-gone watch must exit so FIRST_PIPE_INSTANCE cannot zombie"
+        );
+        assert!(
+            src.contains("chrome_peer_gone"),
+            "forward errors after Chrome disconnect must end serve_pipe"
+        );
     }
 
     #[test]

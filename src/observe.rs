@@ -83,18 +83,14 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let chrome_is_foreground = foreground::is_chrome();
     let snap = uia::collect(req.detail)?;
     let chrome = chrome::try_snapshot(req.detail);
-    let (mut extract, mut elements, elements_total, chrome_connected) = fuse_maps(
-        req.detail,
-        &snap.title,
-        &snap.nodes,
-        chrome,
-        FuseOpts {
-            viewport,
-            chrome_is_foreground,
-            virtual_screen: Some(space.as_rect()),
-            popup_rect: snap.popup_rect,
-        },
-    );
+    let opts = FuseOpts {
+        viewport,
+        chrome_is_foreground,
+        virtual_screen: Some(space.as_rect()),
+        popup_rect: snap.popup_rect,
+    };
+    let (mut extract, mut elements, elements_total, chrome_connected) =
+        fuse_maps(req.detail, &snap.title, &snap.nodes, chrome, opts);
     crate::dialogs::promote(&mut extract, &mut elements);
     stamp_grid(space, &mut elements);
     crate::fence::note_last_url(extract.url.as_deref());
@@ -106,7 +102,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     );
     let challenge = challenge::apply_observe(&session_id, hit);
 
-    let full = ObserveEnvelope {
+    let mut full = ObserveEnvelope {
         session_id,
         screenshot_path,
         observe_path,
@@ -126,7 +122,10 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     };
     write_sidecar(&paths.observe_path, &full)?;
     let envelope = match req.detail {
-        Detail::Default => finalize_envelope(cap_default_envelope(full))?,
+        Detail::Default => {
+            retain_hittable_centers(&mut full.elements, &opts);
+            finalize_envelope(cap_default_envelope(full))?
+        }
         Detail::Dom => finalize_envelope(full)?,
     };
     logs::ensure_installed();
@@ -380,6 +379,20 @@ fn in_viewport(rect: Rect, opts: &FuseOpts) -> bool {
     }
 }
 
+fn center_in_client(rect: Rect, opts: &FuseOpts) -> bool {
+    match (opts.viewport, opts.virtual_screen) {
+        (Some(viewport), Some(screen)) => {
+            let (cx, cy) = rect.center();
+            screen.contains_point(cx, cy)
+                && (viewport.contains_point(cx, cy)
+                    || opts
+                        .popup_rect
+                        .is_some_and(|popup| popup.contains_point(cx, cy)))
+        }
+        _ => false,
+    }
+}
+
 fn filter_viewport_nodes(
     nodes: &[crate::extract::RawNode],
     opts: &FuseOpts,
@@ -406,6 +419,10 @@ fn filter_viewport_elements(elements: Vec<Element>, opts: &FuseOpts) -> Vec<Elem
         .into_iter()
         .filter(|el| in_viewport(el.rect, opts))
         .collect()
+}
+
+fn retain_hittable_centers(elements: &mut Vec<Element>, opts: &FuseOpts) {
+    elements.retain(|el| center_in_client(el.rect, opts));
 }
 
 #[cfg(test)]
@@ -1093,6 +1110,14 @@ mod tests {
             main.contains("miles") && main.contains("dealer") && main.contains("empty_state"),
             "cli observe help mentions listing fields"
         );
+        assert!(
+            mcp.contains("click center"),
+            "mcp observe description must mention click center"
+        );
+        assert!(
+            main.contains("click center"),
+            "cli observe help must mention click center"
+        );
     }
 
     #[test]
@@ -1632,6 +1657,224 @@ mod tests {
         crate::dialogs::promote(&mut extract, &mut elements);
         assert_eq!(extract.dialogs[0].id, "uia:1.77");
         assert_eq!(elements[0].id, "uia:1.77");
+    }
+
+    #[test]
+    fn tall_intersecting_blob_sidecar_only_sibling_stays() {
+        let opts = covering_opts(true);
+        let tall = Rect {
+            x: 200,
+            y: 80,
+            w: 400,
+            h: 9635,
+        };
+        assert_eq!(tall.center(), (400, 4897));
+        let sibling = Rect {
+            x: 200,
+            y: 200,
+            w: 20,
+            h: 20,
+        };
+        let nodes = vec![uia_node(50, "json blob", tall), uia_node(51, "ok", sibling)];
+        let (_extract, mut elements, elements_total, _connected) =
+            fuse_maps(Detail::Default, "UIA", &nodes, None, opts);
+        assert!(
+            elements.iter().any(|e| e.id == "uia:1.50"),
+            "tall id in default fuse"
+        );
+        assert!(elements.iter().any(|e| e.id == "uia:1.51"));
+        let sidecar = elements.clone();
+        assert!(sidecar.iter().any(|e| e.id == "uia:1.50"));
+        assert!(sidecar.iter().any(|e| e.id == "uia:1.51"));
+        retain_hittable_centers(&mut elements, &opts);
+        assert!(!elements.iter().any(|e| e.id == "uia:1.50"));
+        assert!(elements.iter().any(|e| e.id == "uia:1.51"));
+        let raw = ObserveEnvelope {
+            session_id: "sess".into(),
+            screenshot_path: "C:\\tmp\\observe.png".into(),
+            observe_path: "C:\\tmp\\observe.json".into(),
+            space: Space::new(0, 0, 1920, 1080).unwrap(),
+            viewport: opts.viewport,
+            extract: Extract::default(),
+            elements,
+            elements_total,
+            elements_truncated: false,
+            chrome_connected: false,
+            chrome_hint: None,
+            challenge: ChallengeInfo::default(),
+        };
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert!(!capped.elements.iter().any(|e| e.id == "uia:1.50"));
+        assert!(capped.elements.iter().any(|e| e.id == "uia:1.51"));
+        assert_eq!(capped.elements_total, elements_total);
+    }
+
+    #[test]
+    fn off_screen_y11000_absent_from_default_fuse_and_envelope() {
+        let opts = covering_opts(true);
+        let nodes = vec![uia_node(
+            60,
+            "far card",
+            Rect {
+                x: 200,
+                y: 11000,
+                w: 400,
+                h: 80,
+            },
+        )];
+        let (_extract, mut elements, _total, _connected) =
+            fuse_maps(Detail::Default, "UIA", &nodes, None, opts);
+        assert!(!elements.iter().any(|e| e.id == "uia:1.60"));
+        retain_hittable_centers(&mut elements, &opts);
+        assert!(!elements.iter().any(|e| e.id == "uia:1.60"));
+    }
+
+    #[test]
+    fn one_by_one_skip_link_stays_after_retain() {
+        let opts = covering_opts(true);
+        let skip = Rect {
+            x: 0,
+            y: 207,
+            w: 1,
+            h: 1,
+        };
+        assert_eq!(skip.center(), (0, 207));
+        let nodes = vec![uia_node(70, "skip", skip)];
+        let (_extract, mut elements, _total, _connected) =
+            fuse_maps(Detail::Default, "UIA", &nodes, None, opts);
+        assert!(elements.iter().any(|e| e.id == "uia:1.70"));
+        retain_hittable_centers(&mut elements, &opts);
+        assert!(elements.iter().any(|e| e.id == "uia:1.70"));
+    }
+
+    #[test]
+    fn popup_continue_as_survives_retain() {
+        let popup = Rect {
+            x: 1400,
+            y: 80,
+            w: 220,
+            h: 180,
+        };
+        let continue_as = Rect {
+            x: 1410,
+            y: 100,
+            w: 160,
+            h: 28,
+        };
+        let (cx, cy) = continue_as.center();
+        let mut opts = fixture_opts(false);
+        opts.popup_rect = Some(popup);
+        assert!(!opts.viewport.unwrap().contains_point(cx, cy));
+        assert!(popup.contains_point(cx, cy));
+        let nodes = vec![uia_node(77, "Continue as Ryan", continue_as)];
+        let (_extract, mut elements, total, _connected) =
+            fuse_maps(Detail::Default, "Chrome", &nodes, None, opts);
+        assert_eq!(total, 1);
+        retain_hittable_centers(&mut elements, &opts);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].id, "uia:1.77");
+    }
+
+    #[test]
+    fn dom_fuse_includes_tall_h9635_node() {
+        let tall = Rect {
+            x: 200,
+            y: 80,
+            w: 400,
+            h: 9635,
+        };
+        let nodes = vec![uia_node(50, "json blob", tall)];
+        let (_extract, els, _total, _connected) =
+            fuse_maps(Detail::Dom, "UIA", &nodes, None, covering_opts(true));
+        assert!(els.iter().any(|e| e.id == "uia:1.50"));
+    }
+
+    #[test]
+    fn observe_writes_sidecar_before_retain_before_cap() {
+        let src = include_str!("observe.rs");
+        let start = src.find("pub fn observe(").expect("observe");
+        let end = src.find("fn stamp_grid(").expect("stamp_grid");
+        assert!(start < end, "observe must precede stamp_grid");
+        let slice = &src[start..end];
+        assert!(
+            !slice.contains("#[cfg(test)]") && !slice.contains("mod tests"),
+            "slice must not include tests:\n{slice}"
+        );
+        let sidecar = slice.find("write_sidecar").expect("write_sidecar");
+        let retain = slice
+            .find("retain_hittable_centers")
+            .expect("retain_hittable_centers");
+        let cap = slice
+            .find("cap_default_envelope")
+            .expect("cap_default_envelope");
+        assert!(
+            sidecar < retain && retain < cap,
+            "write_sidecar before retain before cap:\n{slice}"
+        );
+        assert!(
+            slice.contains("retain_hittable_centers(&mut full.elements, &opts)"),
+            "Default arm must retain:\n{slice}"
+        );
+        let dom = slice.find("Detail::Dom").expect("Dom arm");
+        let after_dom = &slice[dom..];
+        assert!(
+            after_dom.contains("finalize_envelope(full)"),
+            "Dom arm must finalize_envelope(full):\n{after_dom}"
+        );
+        assert!(
+            !after_dom.contains("retain_hittable_centers"),
+            "Dom arm must not call retain:\n{after_dom}"
+        );
+    }
+
+    #[test]
+    fn in_viewport_still_intersects() {
+        let src = include_str!("observe.rs");
+        let start = src.find("fn in_viewport(").expect("in_viewport");
+        let end = src.find("fn center_in_client(").expect("center_in_client");
+        assert!(start < end, "in_viewport must precede center_in_client");
+        let slice = &src[start..end];
+        assert!(
+            !slice.contains("#[cfg(test)]") && !slice.contains("mod tests"),
+            "slice must not include tests:\n{slice}"
+        );
+        assert!(
+            slice.contains("rect.intersects"),
+            "in_viewport must still use rect.intersects:\n{slice}"
+        );
+        assert!(
+            slice.contains("intersects"),
+            "in_viewport must contain intersects:\n{slice}"
+        );
+    }
+
+    #[test]
+    fn center_in_client_uses_rect_center() {
+        let src = include_str!("observe.rs");
+        let start = src.find("fn center_in_client(").expect("center_in_client");
+        let end = src
+            .find("fn filter_viewport_nodes(")
+            .expect("filter_viewport_nodes");
+        assert!(
+            start < end,
+            "center_in_client must precede filter_viewport_nodes"
+        );
+        let slice = &src[start..end];
+        assert!(
+            !slice.contains("#[cfg(test)]") && !slice.contains("mod tests"),
+            "slice must not include tests:\n{slice}"
+        );
+        assert!(
+            slice.contains("rect.center()"),
+            "center_in_client must call rect.center():\n{slice}"
+        );
     }
 
     #[test]

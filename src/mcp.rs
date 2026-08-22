@@ -198,7 +198,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. After click, envelope may include miss (no_change / focus_lost); settle baseline is post-hover ROI pixel-diff; one retry, re-offer on focus_lost."
+        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. After click, envelope may include miss (no_change / focus_lost); settle baseline is post-hover ROI pixel-diff; one retry, re-offer on focus_lost. Pixel x/y are virtual-screen (may be negative)."
     )]
     fn click(
         &self,
@@ -264,7 +264,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Wait until an ROI stops changing (pixel delta). Default ROI is the foreground window (GetWindowRect, same as observe viewport); envelope includes roi. Explicit x,y,w,h still all-or-nothing."
+        description = "Wait until an ROI stops changing (pixel delta). Default ROI is the foreground window (GetWindowRect, same as observe viewport); envelope includes roi. Explicit x,y,w,h still all-or-nothing. Pixel x/y are virtual-screen (may be negative)."
     )]
     fn wait_settle(
         &self,

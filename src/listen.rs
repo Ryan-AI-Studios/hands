@@ -93,9 +93,13 @@ pub fn serialize_listen(env: &ListenEnvelope) -> Result<String, HandsError> {
 
 pub fn run_listen(req: ListenRequest) -> Result<ListenEnvelope, HandsError> {
     let capture = WasapiLoopback;
-    match selected_backend()? {
-        Some(backend) => run_listen_with(req, &capture, Some(&*backend)),
-        None => run_listen_with(req, &capture, None),
+    match selected_backend() {
+        Ok(Some(backend)) => run_listen_with(req, &capture, Some(&*backend)),
+        Ok(None) => run_listen_with(req, &capture, None),
+        Err(err) => {
+            let session_id = resolve_session_id_from_os(req.session_id.as_deref());
+            Err(log_listen_err(&session_id, err))
+        }
     }
 }
 
@@ -105,18 +109,20 @@ pub fn run_listen_with(
     backend: Option<&dyn TranscribeBackend>,
 ) -> Result<ListenEnvelope, HandsError> {
     let session_id = resolve_session_id_from_os(req.session_id.as_deref());
-    logs::check_write_id(&session_id)?;
+    logs::check_write_id(&session_id).map_err(|err| log_listen_err(&session_id, err))?;
     let seconds = clamp_seconds(req.seconds);
     let observe_path = req.observe_path.as_deref();
 
-    if challenge_present(observe_path)? {
+    if challenge_present(observe_path).map_err(|err| log_listen_err(&session_id, err))? {
         return finish(refuse_present(&session_id, seconds, None));
     }
 
-    let pcm = capture.capture_pcm(seconds)?;
+    let pcm = capture
+        .capture_pcm(seconds)
+        .map_err(|err| log_listen_err(&session_id, err))?;
     let pcm = normalize_pcm(pcm);
 
-    if challenge_present(observe_path)? {
+    if challenge_present(observe_path).map_err(|err| log_listen_err(&session_id, err))? {
         return finish(refuse_present(&session_id, seconds, None));
     }
 
@@ -163,7 +169,9 @@ pub fn run_listen_with(
             tmp
         }
     };
-    let raw = backend.transcribe(&wav_for_backend, &pcm)?;
+    let raw = backend
+        .transcribe(&wav_for_backend, &pcm)
+        .map_err(|err| log_listen_err(&session_id, err))?;
     let (transcript, truncated) = cap_transcript(&raw);
     finish(ListenEnvelope {
         schema: LISTEN_SCHEMA.into(),
@@ -178,6 +186,23 @@ pub fn run_listen_with(
         wav_path,
         error: None,
     })
+}
+
+fn log_listen_err(session_id: &str, err: HandsError) -> HandsError {
+    logs::ensure_installed();
+    logs::remember_session(session_id);
+    let msg = err.to_string();
+    let _ = logs::record_actuate(
+        session_id,
+        "listen",
+        false,
+        Some(&msg),
+        None,
+        None,
+        None,
+        None,
+    );
+    err
 }
 
 fn finish(env: ListenEnvelope) -> Result<ListenEnvelope, HandsError> {

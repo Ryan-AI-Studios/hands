@@ -280,7 +280,9 @@ impl HandsServer {
         })))
     }
 
-    #[tool(description = "Abort injected input and freeze the desk lease (same as Pause/Break)")]
+    #[tool(
+        description = "Abort injected input and freeze the desk lease (same as Pause/Break). One successful stop writes one desk stop JSONL."
+    )]
     fn stop(
         &self,
         Parameters(params): Parameters<StopParams>,

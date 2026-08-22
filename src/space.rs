@@ -41,6 +41,14 @@ impl Rect {
             && self.y <= other.y.saturating_add(other.h)
             && other.y <= self.y.saturating_add(self.h)
     }
+
+    /// Half-open; exclusive far edge. Zero or negative size is empty.
+    pub fn contains_point(self, x: i32, y: i32) -> bool {
+        if self.w <= 0 || self.h <= 0 {
+            return false;
+        }
+        x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,5 +492,50 @@ mod tests {
         assert!(!zero_w.intersects(a));
         assert!(!a.intersects(zero_h));
         assert!(!a.intersects(negative));
+    }
+
+    #[test]
+    fn rect_contains_point_table() {
+        let a = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        };
+        assert!(a.contains_point(0, 0));
+        assert!(a.contains_point(5, 5));
+        assert!(a.contains_point(9, 9));
+        assert!(!a.contains_point(10, 0));
+        assert!(!a.contains_point(0, 10));
+        assert!(!a.contains_point(10, 10));
+        assert!(!a.contains_point(-1, 0));
+        let zero_w = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 10,
+        };
+        let zero_h = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 0,
+        };
+        let negative_w = Rect {
+            x: 0,
+            y: 0,
+            w: -1,
+            h: 10,
+        };
+        let negative_h = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: -1,
+        };
+        assert!(!zero_w.contains_point(0, 0));
+        assert!(!zero_h.contains_point(0, 0));
+        assert!(!negative_w.contains_point(0, 0));
+        assert!(!negative_h.contains_point(0, 0));
     }
 }

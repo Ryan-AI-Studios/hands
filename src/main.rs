@@ -72,9 +72,12 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Press a named key or combo
+    /// Press a named key or combo. ctrl+l is Control+L (Chrome omnibox).
     Key {
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "named key or combo; ctrl+l is Control+L (Chrome omnibox)"
+        )]
         name: String,
         #[arg(long)]
         session_id: Option<String>,
@@ -663,6 +666,29 @@ mod tests {
             Command::NativeHostDoctor => {}
             _ => panic!("expected NativeHostDoctor"),
         }
+    }
+
+    #[test]
+    fn key_name_ctrl_l_parses() {
+        let cli = Cli::try_parse_from(["hands", "key", "--name", "ctrl+l"]).expect("parse");
+        match cli.command {
+            Command::Key { name, .. } => assert_eq!(name, "ctrl+l"),
+            _ => panic!("expected Key"),
+        }
+    }
+
+    #[test]
+    fn key_long_help_contains_ctrl_l() {
+        let cmd = Cli::command();
+        let key = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "key")
+            .expect("key subcommand");
+        let help = key.clone().render_long_help().to_string();
+        assert!(
+            help.contains("ctrl+l"),
+            "long-help should mention ctrl+l, got:\n{help}"
+        );
     }
 
     #[test]

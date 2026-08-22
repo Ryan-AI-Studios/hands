@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use hands::{
     ActuateRequest, Detail, GroundRequest, HandsError, ObserveRequest, PickRequest, actuate,
-    allows, attach, challenge, dotask, ensure_dpi, host_doctor, logs, native_host, observe, pick,
-    serialize_envelope, serialize_pick,
+    allows, attach, challenge, dotask, ensure_dpi, host_doctor, listen, logs, native_host, observe,
+    pick, serialize_envelope, serialize_pick,
 };
 
 #[derive(Parser)]
@@ -194,6 +194,15 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
+    /// On-demand content loopback transcript (YouTube / voicemail). Not observe. This is not a CAPTCHA solver. Refuses when challenge present. No desk lease.
+    Listen {
+        #[arg(long)]
+        seconds: Option<u32>,
+        #[arg(long)]
+        observe_path: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
     /// Detect / status / watch a visible challenge UI. Interstitial titles and origin /cdn-cgi/challenge-platform/ set present; wait (wait_settle / --watch); do not click the wall. Two-try yield still for puzzles on daily Chrome. No desk lease; not a solver on daily Chrome; --solve is research identity only; idle is not resume. Grid copy in page body is not present; a named widget / recaptcha iframe / recaptcha URL still is
     Challenge {
         #[arg(long)]
@@ -352,6 +361,16 @@ async fn main() {
                 h,
             })
         }
+        Command::Listen {
+            seconds,
+            observe_path,
+            session_id,
+        } => {
+            if let Err(err) = dpi {
+                fail(err);
+            }
+            listen_main(seconds, observe_path, session_id)
+        }
         Command::Challenge {
             status,
             watch,
@@ -471,6 +490,24 @@ fn attach_main(
     let identity = attach::parse_identity(identity.as_deref())?;
     let envelope = attach::run_attach_identity(session_id.as_deref(), plan, identity)?;
     let json = attach::serialize_attach(&envelope)?;
+    println!("{json}");
+    if !envelope.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn listen_main(
+    seconds: Option<u32>,
+    observe_path: Option<String>,
+    session_id: Option<String>,
+) -> Result<(), HandsError> {
+    let envelope = listen::run_listen(listen::ListenRequest {
+        session_id,
+        seconds,
+        observe_path,
+    })?;
+    let json = listen::serialize_listen(&envelope)?;
     println!("{json}");
     if !envelope.ok {
         std::process::exit(1);
@@ -626,6 +663,7 @@ fn input_main(command: Command) -> Result<(), HandsError> {
         | Command::Pick { .. }
         | Command::Ground { .. }
         | Command::Challenge { .. }
+        | Command::Listen { .. }
         | Command::Logs { .. }
         | Command::NativeHost { .. }
         | Command::NativeHostManifest { .. }
@@ -799,6 +837,34 @@ mod tests {
         assert!(
             blob.contains("research identity only"),
             "challenge help should name research identity only:\n{blob}"
+        );
+    }
+
+    #[test]
+    fn listen_help_names_loopback_and_not_solver() {
+        let cmd = Cli::command();
+        let listen = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "listen")
+            .expect("listen subcommand");
+        let about = listen
+            .get_about()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let help = listen.clone().render_long_help().to_string();
+        let blob = format!("{about}\n{help}");
+        let lower = blob.to_ascii_lowercase();
+        assert!(
+            lower.contains("loopback") || lower.contains("content"),
+            "listen help should name content loopback:\n{blob}"
+        );
+        assert!(
+            lower.contains("not a captcha solver"),
+            "listen help should say not a CAPTCHA solver:\n{blob}"
+        );
+        assert!(
+            lower.contains("challenge present") || lower.contains("refuses when challenge"),
+            "listen help should refuse when challenge present:\n{blob}"
         );
     }
 

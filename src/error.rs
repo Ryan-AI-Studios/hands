@@ -31,6 +31,8 @@ pub enum HandsError {
     #[error("{0}")]
     Challenge(String),
     #[error("{0}")]
+    Listen(String),
+    #[error("{0}")]
     DoTask(String),
 }
 

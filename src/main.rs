@@ -140,11 +140,14 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Attach to daily Chrome if open; else launch chrome.exe with no automation flags (no desk lease)
+    /// Attach to daily Chrome if open; else launch chrome.exe with no automation flags (no desk lease). --identity research launches a separate --user-data-dir (never Default); omit identity is daily Chrome with no -- flags
     Attach {
         /// Report what would happen; never spawn
         #[arg(long)]
         plan: bool,
+        /// `daily` (default) or `research`
+        #[arg(long)]
+        identity: Option<String>,
         #[arg(long)]
         session_id: Option<String>,
     },
@@ -191,12 +194,15 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Detect / status / watch a visible challenge UI. Interstitial titles and origin /cdn-cgi/challenge-platform/ set present; wait (wait_settle / --watch); do not click the wall. Two-try yield still for puzzles. No desk lease; not a solver; idle is not resume. Grid copy in page body is not present; a named widget / recaptcha iframe / recaptcha URL still is
+    /// Detect / status / watch a visible challenge UI. Interstitial titles and origin /cdn-cgi/challenge-platform/ set present; wait (wait_settle / --watch); do not click the wall. Two-try yield still for puzzles on daily Chrome. No desk lease; not a solver on daily Chrome; --solve is research identity only; idle is not resume. Grid copy in page body is not present; a named widget / recaptcha iframe / recaptcha URL still is
     Challenge {
         #[arg(long)]
         status: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "solve")]
         watch: bool,
+        /// Unattended loop; research identity only
+        #[arg(long, conflicts_with = "watch")]
+        solve: bool,
         #[arg(long)]
         observe_path: Option<String>,
         #[arg(long)]
@@ -299,11 +305,15 @@ async fn main() {
             }
             confirm_main(domain, category, mode, revoke, list, session_id)
         }
-        Command::Attach { plan, session_id } => {
+        Command::Attach {
+            plan,
+            identity,
+            session_id,
+        } => {
             if let Err(err) = dpi {
                 fail(err);
             }
-            attach_main(plan, session_id)
+            attach_main(plan, identity, session_id)
         }
         Command::Pick {
             query,
@@ -345,13 +355,14 @@ async fn main() {
         Command::Challenge {
             status,
             watch,
+            solve,
             observe_path,
             session_id,
         } => {
             if let Err(err) = dpi {
                 fail(err);
             }
-            challenge_main(status, watch, observe_path, session_id)
+            challenge_main(status, watch, solve, observe_path, session_id)
         }
         Command::Logs {
             session_id,
@@ -452,8 +463,13 @@ fn ground_main(req: GroundRequest) -> Result<(), HandsError> {
     Ok(())
 }
 
-fn attach_main(plan: bool, session_id: Option<String>) -> Result<(), HandsError> {
-    let envelope = attach::run_attach(session_id.as_deref(), plan)?;
+fn attach_main(
+    plan: bool,
+    identity: Option<String>,
+    session_id: Option<String>,
+) -> Result<(), HandsError> {
+    let identity = attach::parse_identity(identity.as_deref())?;
+    let envelope = attach::run_attach_identity(session_id.as_deref(), plan, identity)?;
     let json = attach::serialize_attach(&envelope)?;
     println!("{json}");
     if !envelope.ok {
@@ -465,15 +481,21 @@ fn attach_main(plan: bool, session_id: Option<String>) -> Result<(), HandsError>
 fn challenge_main(
     status: bool,
     watch: bool,
+    solve: bool,
     observe_path: Option<String>,
     session_id: Option<String>,
 ) -> Result<(), HandsError> {
-    let envelope = challenge::run_challenge(challenge::ChallengeRequest {
+    let req = challenge::ChallengeRequest {
         session_id,
         status,
         watch,
         observe_path,
-    })?;
+    };
+    let envelope = if solve {
+        challenge::run_challenge_solve(req)?
+    } else {
+        challenge::run_challenge(req)?
+    };
     let json = challenge::serialize_challenge(&envelope)?;
     println!("{json}");
     if !envelope.ok {
@@ -773,6 +795,29 @@ mod tests {
         assert!(
             lower.contains("grid copy in page body"),
             "challenge about/long-help should name grid copy in page body:\n{blob}"
+        );
+        assert!(
+            blob.contains("research identity only"),
+            "challenge help should name research identity only:\n{blob}"
+        );
+    }
+
+    #[test]
+    fn attach_long_help_contains_identity_research() {
+        let cmd = Cli::command();
+        let attach = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "attach")
+            .expect("attach subcommand");
+        let about = attach
+            .get_about()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let help = attach.clone().render_long_help().to_string();
+        let blob = format!("{about}\n{help}");
+        assert!(
+            blob.contains("--identity research"),
+            "attach help should name --identity research:\n{blob}"
         );
     }
 

@@ -28,6 +28,7 @@ pub mod pick;
 pub mod preprocess;
 pub mod session;
 pub mod settle;
+pub mod solver;
 pub mod space;
 pub mod target;
 pub mod uia;

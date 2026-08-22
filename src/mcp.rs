@@ -96,6 +96,8 @@ pub struct AttachParams {
     pub session_id: Option<String>,
     #[serde(default)]
     pub plan: Option<bool>,
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -154,6 +156,8 @@ pub struct ChallengeParams {
     pub status: Option<bool>,
     #[serde(default)]
     pub watch: Option<bool>,
+    #[serde(default)]
+    pub solve: Option<bool>,
     #[serde(default)]
     pub observe_path: Option<String>,
 }
@@ -296,7 +300,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Attach to daily Chrome if open; else launch chrome.exe with no automation flags and about:blank. Does not sideload. Does not kill Chrome."
+        description = "Attach to daily Chrome if open; else launch chrome.exe with no automation flags and about:blank. --identity research launches a separate --user-data-dir (never Default); omit identity is daily Chrome with no -- flags. Does not sideload. Does not kill Chrome."
     )]
     fn attach(
         &self,
@@ -346,7 +350,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Detect/status/watch a visible challenge UI. Interstitial titles and origin /cdn-cgi/challenge-platform/ set present; harness waits (wait_settle / --watch); do not click the wall. Two observe-cycles that used actuation then yield (puzzles). Resume when the UI is gone. Not a solver. Idle is not resume. Grid copy in page body is not present; a named widget / recaptcha iframe / recaptcha URL still is."
+        description = "Detect/status/watch a visible challenge UI. Interstitial titles and origin /cdn-cgi/challenge-platform/ set present; harness waits (wait_settle / --watch); do not click the wall. Two observe-cycles that used actuation then yield (puzzles) on daily Chrome. Resume when the UI is gone. Daily Chrome is not a solver; solve is research identity only. Idle is not resume. Grid copy in page body is not present; a named widget / recaptcha iframe / recaptcha URL still is."
     )]
     fn challenge(
         &self,
@@ -356,7 +360,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Optional client of Hands primitives: loop the caller's model (xAI/Grok default) over observe/click/attach/pick/challenge-status. No auto-confirm. Stops on fence or challenge yield. Not a solver."
+        description = "Optional client of Hands primitives: loop the caller's model (xAI/Grok default) over observe/click/attach/pick/challenge-status. No auto-confirm. Stops on fence or challenge yield. Does not auto-solve; challenge --solve is a separate tool, research identity only."
     )]
     fn do_task(
         &self,
@@ -402,7 +406,14 @@ fn run_actuate(result: Result<crate::actuate::ActuateEnvelope, HandsError>) -> C
 }
 
 fn run_attach(params: AttachParams) -> CallToolResult {
-    match attach::run_attach(params.session_id.as_deref(), params.plan.unwrap_or(false))
+    match attach::parse_identity(params.identity.as_deref())
+        .and_then(|identity| {
+            attach::run_attach_identity(
+                params.session_id.as_deref(),
+                params.plan.unwrap_or(false),
+                identity,
+            )
+        })
         .and_then(|env| attach::serialize_attach(&env))
     {
         Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
@@ -475,14 +486,18 @@ fn run_dotask_tool(params: DoTaskParams) -> CallToolResult {
 }
 
 fn run_challenge_tool(params: ChallengeParams) -> CallToolResult {
-    match challenge::run_challenge(ChallengeRequest {
+    let req = ChallengeRequest {
         session_id: params.session_id,
         status: params.status.unwrap_or(false),
         watch: params.watch.unwrap_or(false),
         observe_path: params.observe_path,
-    })
-    .and_then(|env| challenge::serialize_challenge(&env))
-    {
+    };
+    let result = if params.solve.unwrap_or(false) {
+        challenge::run_challenge_solve(req)
+    } else {
+        challenge::run_challenge(req)
+    };
+    match result.and_then(|env| challenge::serialize_challenge(&env)) {
         Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
     }

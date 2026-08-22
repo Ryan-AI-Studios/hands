@@ -878,6 +878,45 @@ mod tests {
     }
 
     #[test]
+    fn sw_js_keeps_native_port_and_reconnects() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extension");
+        let text = fs::read_to_string(root.join("sw.js")).unwrap();
+        assert!(
+            text.contains("hostPort"),
+            "sw.js must keep a global native port so MV3 does not drop connectNative"
+        );
+        assert!(
+            text.contains("scheduleReconnect"),
+            "sw.js must reconnect after onDisconnect"
+        );
+        assert!(
+            text.contains("setTimeout"),
+            "reconnect must use setTimeout (setInterval is forbidden)"
+        );
+        assert!(
+            text.contains("onStartup") && text.contains("onInstalled"),
+            "sw.js must reconnect on Chrome startup and extension reload"
+        );
+        assert!(
+            text.contains("windowType: \"normal\"") || text.contains("windowType:\"normal\""),
+            "no-tab lastFocusedWindow (DevTools) must fall back to a normal window"
+        );
+        assert!(
+            text.contains("getPlatformInfo") && text.contains("keepWorker"),
+            "MV3 must ping getPlatformInfo so the worker does not go Inactive"
+        );
+        let disconnect = text.find("onDisconnect").expect("onDisconnect");
+        let after = &text[disconnect..];
+        let end = after
+            .find("function scheduleReconnect")
+            .unwrap_or(after.len());
+        assert!(
+            after[..end].contains("chrome.runtime.lastError"),
+            "onDisconnect must read lastError or Chrome shows Unchecked Native host has exited"
+        );
+    }
+
+    #[test]
     fn content_js_assigns_chr_from_walk_index() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extension");
         let text = fs::read_to_string(root.join("content.js")).unwrap();

@@ -24,6 +24,7 @@ use crate::session::resolve_session_id_from_os;
 pub const DOTASK_SCHEMA: &str = "hands.dotask/v1";
 pub const DEFAULT_MODEL: &str = "grok-4.6";
 pub const DEFAULT_BASE: &str = "https://api.x.ai/v1";
+pub const KEY_ENV_SIMPLE: &str = "HANDS_KEY";
 pub const KEY_ENV_PRIMARY: &str = "HANDS_XAI_API_KEY";
 pub const KEY_ENV_FALLBACK: &str = "XAI_API_KEY";
 pub const BASE_ENV: &str = "HANDS_XAI_BASE_URL";
@@ -299,7 +300,7 @@ fn run_loop(
             model,
             0,
             None,
-            "missing xAI API key (set HANDS_XAI_API_KEY or XAI_API_KEY)",
+            "missing xAI API key (set HANDS_KEY, HANDS_XAI_API_KEY, or XAI_API_KEY)",
         ));
     };
     let _ = api_key;
@@ -316,7 +317,7 @@ fn run_loop(
             model,
             0,
             None,
-            "missing xAI API key (set HANDS_XAI_API_KEY or XAI_API_KEY)",
+            "missing xAI API key (set HANDS_KEY, HANDS_XAI_API_KEY, or XAI_API_KEY)",
         ));
     };
 
@@ -1125,7 +1126,7 @@ pub fn parse_xai_base(raw: &str) -> Result<String, HandsError> {
 }
 
 pub fn resolve_api_key() -> Option<String> {
-    for key in [KEY_ENV_PRIMARY, KEY_ENV_FALLBACK] {
+    for key in [KEY_ENV_SIMPLE, KEY_ENV_PRIMARY, KEY_ENV_FALLBACK] {
         if let Ok(v) = std::env::var(key) {
             let t = v.trim();
             if !t.is_empty() {
@@ -1623,27 +1624,34 @@ mod tests {
     #[test]
     fn missing_key_is_error_with_zero_primitives() {
         logs::with_test_env(|| {
-            with_env(&[(KEY_ENV_PRIMARY, None), (KEY_ENV_FALLBACK, None)], || {
-                let env = run_dotask(DoTaskRequest {
-                    goal: "find a Camry on cars.com".into(),
-                    session_id: Some("missing-key".into()),
-                    model: None,
-                    max_steps: None,
-                })
-                .unwrap();
-                assert!(!env.ok);
-                assert_eq!(env.stop_reason, StopReason::Error);
-                assert_eq!(env.steps, 0);
-                assert!(env.error.as_deref().unwrap().contains("API key"));
-                assert_eq!(PRIMITIVE_CALLS.load(Ordering::SeqCst), 0);
-                assert_start_ok_no_error("missing-key");
-                let last = last_do_task_jsonl("missing-key");
-                assert_eq!(last.get("ok"), Some(&json!(false)), "{last}");
-                let logged = last.get("error").and_then(Value::as_str).unwrap_or("");
-                assert_eq!(logged, env.error.as_deref().unwrap(), "{last}");
-                assert!(logged.contains("API key"), "{last}");
-                assert_ne!(logged, "error");
-            });
+            with_env(
+                &[
+                    (KEY_ENV_SIMPLE, None),
+                    (KEY_ENV_PRIMARY, None),
+                    (KEY_ENV_FALLBACK, None),
+                ],
+                || {
+                    let env = run_dotask(DoTaskRequest {
+                        goal: "find a Camry on cars.com".into(),
+                        session_id: Some("missing-key".into()),
+                        model: None,
+                        max_steps: None,
+                    })
+                    .unwrap();
+                    assert!(!env.ok);
+                    assert_eq!(env.stop_reason, StopReason::Error);
+                    assert_eq!(env.steps, 0);
+                    assert!(env.error.as_deref().unwrap().contains("API key"));
+                    assert_eq!(PRIMITIVE_CALLS.load(Ordering::SeqCst), 0);
+                    assert_start_ok_no_error("missing-key");
+                    let last = last_do_task_jsonl("missing-key");
+                    assert_eq!(last.get("ok"), Some(&json!(false)), "{last}");
+                    let logged = last.get("error").and_then(Value::as_str).unwrap_or("");
+                    assert_eq!(logged, env.error.as_deref().unwrap(), "{last}");
+                    assert!(logged.contains("API key"), "{last}");
+                    assert_ne!(logged, "error");
+                },
+            );
         });
     }
 
@@ -1651,6 +1659,17 @@ mod tests {
     fn primary_key_wins_over_fallback() {
         with_env(
             &[
+                (KEY_ENV_SIMPLE, Some("simple")),
+                (KEY_ENV_PRIMARY, Some("alpha")),
+                (KEY_ENV_FALLBACK, Some("beta")),
+            ],
+            || {
+                assert_eq!(resolve_api_key().as_deref(), Some("simple"));
+            },
+        );
+        with_env(
+            &[
+                (KEY_ENV_SIMPLE, None),
                 (KEY_ENV_PRIMARY, Some("alpha")),
                 (KEY_ENV_FALLBACK, Some("beta")),
             ],
@@ -1660,6 +1679,7 @@ mod tests {
         );
         with_env(
             &[
+                (KEY_ENV_SIMPLE, Some("  ")),
                 (KEY_ENV_PRIMARY, Some("  ")),
                 (KEY_ENV_FALLBACK, Some("beta")),
             ],

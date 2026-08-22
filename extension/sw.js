@@ -1,16 +1,53 @@
 const HOST_NAME = "com.helpinghands.host";
 
+let hostPort = null;
+let reconnectTimer = null;
+
 function connectHost() {
+  if (hostPort) {
+    return;
+  }
   let port;
   try {
     port = chrome.runtime.connectNative(HOST_NAME);
   } catch (_err) {
+    scheduleReconnect();
     return;
   }
+  hostPort = port;
   port.onMessage.addListener((msg) => {
     forward(port, msg);
   });
-  port.onDisconnect.addListener(() => {});
+  port.onDisconnect.addListener(() => {
+    // Must read lastError or Chrome logs Unchecked runtime.lastError:
+    // "Native host has exited" (host gone / FIRST_PIPE_INSTANCE race).
+    void chrome.runtime.lastError;
+    hostPort = null;
+    scheduleReconnect();
+  });
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer != null) {
+    return;
+  }
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectHost();
+  }, 1000);
+}
+
+function sendToContent(port, tabId, msg) {
+  chrome.tabs.sendMessage(tabId, msg, (reply) => {
+    const last = chrome.runtime.lastError;
+    try {
+      if (last) {
+        port.postMessage({ error: "no-content" });
+      } else {
+        port.postMessage(reply || { error: "empty" });
+      }
+    } catch (_err) {}
+  });
 }
 
 function forward(port, msg) {
@@ -19,24 +56,34 @@ function forward(port, msg) {
     return;
   }
   chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+    void chrome.runtime.lastError;
     const tab = tabs && tabs[0];
-    if (!tab || tab.id == null) {
-      try {
-        port.postMessage({ error: "no-tab" });
-      } catch (_err) {}
+    if (tab && tab.id != null) {
+      sendToContent(port, tab.id, msg);
       return;
     }
-    chrome.tabs.sendMessage(tab.id, msg, (reply) => {
-      const last = chrome.runtime.lastError;
-      try {
-        if (last) {
-          port.postMessage({ error: "no-content" });
-        } else {
-          port.postMessage(reply || { error: "empty" });
-        }
-      } catch (_err) {}
+    chrome.tabs.query({ active: true, windowType: "normal" }, (rest) => {
+      void chrome.runtime.lastError;
+      const fallback = rest && rest[0];
+      if (!fallback || fallback.id == null) {
+        try {
+          port.postMessage({ error: "no-tab" });
+        } catch (_err) {}
+        return;
+      }
+      sendToContent(port, fallback.id, msg);
     });
   });
 }
 
 connectHost();
+chrome.runtime.onStartup.addListener(connectHost);
+chrome.runtime.onInstalled.addListener(connectHost);
+
+function keepWorker() {
+  chrome.runtime.getPlatformInfo(() => {
+    void chrome.runtime.lastError;
+    setTimeout(keepWorker, 20000);
+  });
+}
+keepWorker();

@@ -191,7 +191,7 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Detect / status / watch a visible challenge UI. Interstitial titles and origin /cdn-cgi/challenge-platform/ set present; wait (wait_settle / --watch); do not click the wall. Two-try yield still for puzzles. No desk lease; not a solver; idle is not resume
+    /// Detect / status / watch a visible challenge UI. Interstitial titles and origin /cdn-cgi/challenge-platform/ set present; wait (wait_settle / --watch); do not click the wall. Two-try yield still for puzzles. No desk lease; not a solver; idle is not resume. Grid copy in page body is not present; a named widget / recaptcha iframe / recaptcha URL still is
     Challenge {
         #[arg(long)]
         status: bool,
@@ -769,6 +769,10 @@ mod tests {
         assert!(
             lower.contains("wait"),
             "challenge help should mention wait:\n{blob}"
+        );
+        assert!(
+            lower.contains("grid copy in page body"),
+            "challenge about/long-help should name grid copy in page body:\n{blob}"
         );
     }
 

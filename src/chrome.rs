@@ -905,6 +905,15 @@ mod tests {
             text.contains("getPlatformInfo") && text.contains("keepWorker"),
             "MV3 must ping getPlatformInfo so the worker does not go Inactive"
         );
+        let disconnect = text.find("onDisconnect").expect("onDisconnect");
+        let after = &text[disconnect..];
+        let end = after
+            .find("function scheduleReconnect")
+            .unwrap_or(after.len());
+        assert!(
+            after[..end].contains("chrome.runtime.lastError"),
+            "onDisconnect must read lastError or Chrome shows Unchecked Native host has exited"
+        );
     }
 
     #[test]

@@ -195,7 +195,7 @@ Success: JSON has `"chrome_connected": true` and at least one `"id": "chr:…"`.
 | `chrome_connected: false`, no `hands.exe` with `chrome-extension://` | Reload the extension after a good `REG ADD`. Confirm you sideloaded on **this** profile. |
 | Specified native messaging host not found / not registered | HKCU default must be the **full path to the JSON file**. Restart Chrome. |
 | Access … forbidden | Extension id ≠ `fdnpjnnnmfhlpgaabjflhjoepmejcnha`, or `allowed_origins` typo. |
-| Native host has exited / Error when communicating | Host stderr + Chrome native-messaging log. JSON must be valid (no extra PowerShell). A leftover `hands.exe chrome-extension://…` after **service worker (Inactive)** holds the pipe (`FIRST_PIPE_INSTANCE`); this host now exits when Chrome stdin closes — Reload the Helping Hands card. |
+| Native host has exited / Unchecked `runtime.lastError` | `onDisconnect` must read `chrome.runtime.lastError` (otherwise the Errors chip stays). A leftover `hands.exe chrome-extension://…` after **service worker (Inactive)** holds the pipe (`FIRST_PIPE_INSTANCE`); this host now exits when Chrome stdin closes — Reload the Helping Hands card. |
 | pipe up, snapshot failed within 400 ms, Inspect views **Inactive** | Worker dropped native messaging; doctor still sees the named pipe. Reload the Helping Hands card (not the toolbar). Open an `https://` tab, Chrome FG. |
 | Host-forward still stalls after incremental drain | Remaining stall is a new finding (not the old whole-frame Peek wait). Do not add CDP. |
 

@@ -19,6 +19,9 @@ function connectHost() {
     forward(port, msg);
   });
   port.onDisconnect.addListener(() => {
+    // Must read lastError or Chrome logs Unchecked runtime.lastError:
+    // "Native host has exited" (host gone / FIRST_PIPE_INSTANCE race).
+    void chrome.runtime.lastError;
     hostPort = null;
     scheduleReconnect();
   });
@@ -53,12 +56,14 @@ function forward(port, msg) {
     return;
   }
   chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+    void chrome.runtime.lastError;
     const tab = tabs && tabs[0];
     if (tab && tab.id != null) {
       sendToContent(port, tab.id, msg);
       return;
     }
     chrome.tabs.query({ active: true, windowType: "normal" }, (rest) => {
+      void chrome.runtime.lastError;
       const fallback = rest && rest[0];
       if (!fallback || fallback.id == null) {
         try {
@@ -77,6 +82,7 @@ chrome.runtime.onInstalled.addListener(connectHost);
 
 function keepWorker() {
   chrome.runtime.getPlatformInfo(() => {
+    void chrome.runtime.lastError;
     setTimeout(keepWorker, 20000);
   });
 }

@@ -213,7 +213,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. After click, envelope may include miss (no_change / focus_lost); settle baseline is post-hover ROI pixel-diff; one retry, re-offer on focus_lost. Pixel x/y are virtual-screen (may be negative)."
+        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. After click, envelope may include miss (no_change / focus_lost); settle baseline is post-hover ROI pixel-diff; one retry, re-offer on focus_lost. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default."
     )]
     fn click(
         &self,

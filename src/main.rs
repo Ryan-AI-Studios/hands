@@ -29,7 +29,7 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content. After click, envelope may include `miss` (`no_change` / `focus_lost`); settle baseline is post-hover ROI pixel-diff; one retry, re-offer on `focus_lost`.
+    /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content. After click, envelope may include `miss` (`no_change` / `focus_lost`); settle baseline is post-hover ROI pixel-diff; one retry, re-offer on `focus_lost`. Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default.
     Click {
         #[arg(
             long,

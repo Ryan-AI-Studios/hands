@@ -183,7 +183,7 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Loop the caller's model over shipped primitives (installs the desk lease; no fence bypass)
+    /// Loop the caller's model over shipped primitives (`HANDS_DOTASK_PROVIDER` allowlist; default xAI grok-4.6; installs the desk lease; no fence bypass)
     DoTask {
         #[arg(long)]
         goal: String,

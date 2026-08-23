@@ -1,5 +1,7 @@
 //! Optional `do_task` client of shipped primitives. No fence bypass. Not a solver.
 
+mod adapter;
+
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -20,6 +22,16 @@ use crate::logs;
 use crate::observe::{self, ENVELOPE_MAX_BYTES, ObserveRequest};
 use crate::pick::{self, GroundRequest, PickRequest};
 use crate::session::resolve_session_id_from_os;
+
+use adapter::{
+    FnCall, TurnItem, encode_request, hop_url, key_required, missing_key_message, parse_args,
+    parse_turn, resolve_api_key_for, resolve_base_raw, resolve_model_for,
+};
+
+pub use adapter::{
+    DOTASK_BASE_ENV, DOTASK_MODEL_ENV, PROVIDER_ENV, Provider, auth_headers, parse_base,
+    parse_provider, parse_xai_base, resolve_api_key, resolve_model,
+};
 
 pub const DOTASK_SCHEMA: &str = "hands.dotask/v1";
 pub const DEFAULT_MODEL: &str = "grok-4.6";
@@ -160,11 +172,12 @@ impl ToolExec for LiveExec {
 
 struct UreqTransport {
     agent: ureq::Agent,
-    api_key: String,
+    headers: Vec<(String, String)>,
+    label: String,
 }
 
 impl UreqTransport {
-    fn from_env(api_key: &str) -> Result<Self, HandsError> {
+    fn new(provider: Provider, headers: Vec<(String, String)>) -> Result<Self, HandsError> {
         let timeout_ms = hop_timeout_ms();
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -175,12 +188,14 @@ impl UreqTransport {
             .build();
         Ok(Self {
             agent: ureq::Agent::new_with_config(config),
-            api_key: api_key.to_string(),
+            headers,
+            label: provider.as_str().to_string(),
         })
     }
 
     fn read_response(
         result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+        label: &str,
     ) -> Result<HttpResp, HandsError> {
         match result {
             Ok(mut resp) => {
@@ -188,7 +203,7 @@ impl UreqTransport {
                 let body = resp.body_mut().read_to_string().unwrap_or_default();
                 Ok(HttpResp { status, body })
             }
-            Err(err) => Err(map_ureq_error(err)),
+            Err(err) => Err(HandsError::DoTask(format!("{label} request failed: {err}"))),
         }
     }
 }
@@ -196,27 +211,47 @@ impl UreqTransport {
 impl HttpTransport for UreqTransport {
     fn post_json(&self, url: &str, body: &Value) -> Result<HttpResp, HandsError> {
         let payload = body.to_string();
-        let req = self
+        let mut req = self
             .agent
             .post(url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", self.api_key));
-        Self::read_response(req.send(payload))
+            .header("Content-Type", "application/json");
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        Self::read_response(req.send(payload), &self.label)
     }
 }
 
 pub fn run_dotask(req: DoTaskRequest) -> Result<DoTaskEnvelope, HandsError> {
-    let key = resolve_api_key();
-    let transport = match key.as_deref() {
-        Some(k) => Some(UreqTransport::from_env(k)?),
-        None => None,
-    };
+    let transport = live_transport()?;
     run_dotask_inner(
         req,
         transport.as_ref().map(|t| t as &dyn HttpTransport),
         &LiveExec,
         &RealClock,
     )
+}
+
+fn live_transport() -> Result<Option<UreqTransport>, HandsError> {
+    let Ok(provider) = adapter::resolve_provider() else {
+        return Ok(None);
+    };
+    let key = resolve_api_key_for(provider);
+    let raw = resolve_base_raw(provider);
+    let Ok(base) = parse_base(provider, &raw) else {
+        return Ok(None);
+    };
+    match key.as_deref() {
+        Some(k) => Ok(Some(UreqTransport::new(
+            provider,
+            auth_headers(provider, Some(k)),
+        )?)),
+        None if !key_required(provider, &base) => Ok(Some(UreqTransport::new(
+            provider,
+            auth_headers(provider, None),
+        )?)),
+        None => Ok(None),
+    }
 }
 
 pub fn serialize_dotask(envelope: &DoTaskEnvelope) -> Result<String, HandsError> {
@@ -236,21 +271,29 @@ fn run_dotask_inner(
     logs::remember_session(&session_id);
     let _ = logs::record_actuate(&session_id, "do_task", true, None, None, None, None, None);
 
-    let model = resolve_model(req.model.as_deref());
+    let provider = adapter::resolve_provider();
+    let model = match &provider {
+        Ok(p) => resolve_model_for(*p, req.model.as_deref()),
+        Err(_) => resolve_model(req.model.as_deref()),
+    };
     let max_steps = resolve_max_steps(req.max_steps);
     let wall = Duration::from_millis(wall_timeout_ms());
-    let env = match run_loop(
-        &req.goal,
-        &session_id,
-        &model,
-        max_steps,
-        wall,
-        transport,
-        exec,
-        clock,
-    ) {
-        Ok(env) => env,
+    let env = match provider {
         Err(err) => error_env(&session_id, &model, 0, None, err.tool_message()),
+        Ok(provider) => match run_loop(
+            provider,
+            &req.goal,
+            &session_id,
+            &model,
+            max_steps,
+            wall,
+            transport,
+            exec,
+            clock,
+        ) {
+            Ok(env) => env,
+            Err(err) => error_env(&session_id, &model, 0, None, err.tool_message()),
+        },
     };
     let env = shrink_envelope(env)?;
     let error = if env.stop_reason == StopReason::Error {
@@ -273,6 +316,7 @@ fn run_dotask_inner(
 
 #[allow(clippy::too_many_arguments)]
 fn run_loop(
+    provider: Provider,
     goal: &str,
     session_id: &str,
     model: &str,
@@ -294,41 +338,49 @@ fn run_loop(
             "goal must not be empty",
         ));
     }
-    let Some(api_key) = resolve_api_key() else {
-        return Ok(error_env(
-            session_id,
-            model,
-            0,
-            None,
-            "missing xAI API key (set HANDS_KEY, HANDS_XAI_API_KEY, or XAI_API_KEY)",
-        ));
-    };
-    let _ = api_key;
-    let base = match parse_xai_base(&std::env::var(BASE_ENV).unwrap_or_default()) {
+    let base = match parse_base(provider, &resolve_base_raw(provider)) {
         Ok(b) => b,
         Err(err) => {
             return Ok(error_env(session_id, model, 0, None, err.tool_message()));
         }
     };
-    let endpoint = format!("{base}/responses");
-    let Some(transport) = transport else {
+    let api_key = resolve_api_key_for(provider);
+    if key_required(provider, &base) && api_key.is_none() {
         return Ok(error_env(
             session_id,
             model,
             0,
             None,
-            "missing xAI API key (set HANDS_KEY, HANDS_XAI_API_KEY, or XAI_API_KEY)",
+            missing_key_message(provider),
+        ));
+    }
+    let _ = api_key;
+    let endpoint = hop_url(provider, &base);
+    let Some(transport) = transport else {
+        if key_required(provider, &base) {
+            return Ok(error_env(
+                session_id,
+                model,
+                0,
+                None,
+                missing_key_message(provider),
+            ));
+        }
+        return Ok(error_env(
+            session_id,
+            model,
+            0,
+            None,
+            format!("{} transport is unavailable", provider.as_str()),
         ));
     };
 
     let started = clock.now();
-    let mut input: Vec<Value> = vec![
-        json!({"role": "system", "content": SYSTEM_PROMPT}),
-        json!({"role": "user", "content": goal}),
-    ];
-    let mut latest_image: Option<Value> = None;
+    let mut items: Vec<TurnItem> = Vec::new();
+    let mut latest_image: Option<String> = None;
     let mut steps = 0u32;
     let mut last_tool: Option<String> = None;
+    let tools = offered_tools();
 
     loop {
         if let Some(stop) = lease_stop(session_id, model, steps, last_tool.as_deref()) {
@@ -348,11 +400,14 @@ fn run_loop(
             ));
         }
 
-        let mut hop_input = input.clone();
-        if let Some(img) = &latest_image {
-            hop_input.push(img.clone());
-        }
-        let body = request_body(model, &hop_input);
+        let body = encode_request(
+            provider,
+            model,
+            goal,
+            &items,
+            latest_image.as_deref(),
+            &tools,
+        );
         let resp = match transport.post_json(&endpoint, &body) {
             Ok(r) => r,
             Err(err) => {
@@ -371,7 +426,7 @@ fn run_loop(
                 model,
                 steps,
                 last_tool,
-                format!("xAI HTTP {}", resp.status),
+                format!("{} HTTP {}", provider.as_str(), resp.status),
             ));
         }
         let parsed: Value = match serde_json::from_str(&resp.body) {
@@ -382,14 +437,14 @@ fn run_loop(
                     model,
                     steps,
                     last_tool,
-                    format!("xAI response is not JSON: {err}"),
+                    format!("{} response is not JSON: {err}", provider.as_str()),
                 ));
             }
         };
         if let Some(stop) = lease_stop(session_id, model, steps, last_tool.as_deref()) {
             return Ok(stop);
         }
-        let turn = match parse_turn(&parsed) {
+        let turn = match parse_turn(provider, &parsed) {
             Ok(t) => t,
             Err(err) => {
                 return Ok(error_env(
@@ -415,14 +470,18 @@ fn run_loop(
             ));
         }
 
-        let first = &turn.calls[0];
+        let first = turn.calls[0].clone();
         let extras = &turn.calls[1..];
-        input.push(function_call_item(first));
+        items.push(TurnItem::Call(first.clone()));
 
         if is_forbidden_name(&first.name) || !is_offered(&first.name) {
             let out = json!({"error": "tool not offered"}).to_string();
-            input.push(function_call_output(&first.call_id, &out));
-            push_dropped(&mut input, extras);
+            items.push(TurnItem::Result {
+                call_id: first.call_id.clone(),
+                name: first.name.clone(),
+                output: out,
+            });
+            push_dropped(&mut items, extras);
             last_tool = Some(first.name.clone());
             steps += 1;
             if steps >= max_steps {
@@ -464,8 +523,12 @@ fn run_loop(
             }
             Err(err) => json!({"error": err.tool_message()}).to_string(),
         };
-        input.push(function_call_output(&first.call_id, &result));
-        push_dropped(&mut input, extras);
+        items.push(TurnItem::Result {
+            call_id: first.call_id.clone(),
+            name: first.name.clone(),
+            output: result.clone(),
+        });
+        push_dropped(&mut items, extras);
         last_tool = Some(first.name.clone());
         steps += 1;
 
@@ -752,18 +815,6 @@ fn opt_i32(args: &Value, key: &str) -> Option<i32> {
     })
 }
 
-fn request_body(model: &str, input: &[Value]) -> Value {
-    json!({
-        "model": model,
-        "input": input,
-        "tools": offered_tools(),
-        "stream": false,
-        "parallel_tool_calls": false,
-        "store": false,
-        "max_output_tokens": MAX_OUTPUT_TOKENS,
-    })
-}
-
 fn offered_tools() -> Value {
     json!([
         fn_tool(
@@ -924,7 +975,7 @@ fn is_offered(name: &str) -> bool {
 }
 
 fn is_forbidden_name(name: &str) -> bool {
-    if matches!(name, "confirm" | "stop" | "logs" | "do_task") {
+    if matches!(name, "confirm" | "stop" | "logs" | "listen" | "do_task") {
         return true;
     }
     let compact: String = name
@@ -938,214 +989,30 @@ fn is_forbidden_name(name: &str) -> bool {
     )
 }
 
-struct FnCall {
-    call_id: String,
-    name: String,
-    arguments: Value,
-}
-
-struct ModelTurn {
-    calls: Vec<FnCall>,
-    text: Option<String>,
-}
-
-fn parse_turn(parsed: &Value) -> Result<ModelTurn, HandsError> {
-    let mut calls = Vec::new();
-    let mut texts = Vec::new();
-    if let Some(output) = parsed.get("output").and_then(Value::as_array) {
-        for item in output {
-            let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
-            if kind == "function_call" {
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let call_id = item
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("call")
-                    .to_string();
-                let arguments = item.get("arguments").cloned().unwrap_or(json!({}));
-                calls.push(FnCall {
-                    call_id,
-                    name,
-                    arguments,
-                });
-            } else if kind == "message"
-                && let Some(content) = item.get("content").and_then(Value::as_array)
-            {
-                for part in content {
-                    if let Some(t) = part.get("text").and_then(Value::as_str) {
-                        texts.push(t.to_string());
-                    }
-                }
-            }
-        }
-    }
-    if texts.is_empty()
-        && let Some(t) = parsed.get("output_text").and_then(Value::as_str)
-    {
-        texts.push(t.to_string());
-    }
-    let text = texts.into_iter().find(|s| !s.trim().is_empty());
-    Ok(ModelTurn { calls, text })
-}
-
-fn parse_args(raw: &Value) -> Value {
-    match raw {
-        Value::String(s) => serde_json::from_str(s).unwrap_or(json!({})),
-        Value::Object(_) => raw.clone(),
-        _ => json!({}),
-    }
-}
-
-fn function_call_item(call: &FnCall) -> Value {
-    let arguments = match &call.arguments {
-        Value::String(s) => json!(s),
-        other => json!(other.to_string()),
-    };
-    json!({
-        "type": "function_call",
-        "call_id": call.call_id,
-        "name": call.name,
-        "arguments": arguments
-    })
-}
-
-fn function_call_output(call_id: &str, output: &str) -> Value {
-    json!({
-        "type": "function_call_output",
-        "call_id": call_id,
-        "output": output
-    })
-}
-
-fn push_dropped(input: &mut Vec<Value>, extras: &[FnCall]) {
+fn push_dropped(items: &mut Vec<TurnItem>, extras: &[FnCall]) {
     for extra in extras {
-        input.push(function_call_item(extra));
-        input.push(function_call_output(
-            &extra.call_id,
-            &json!({"error": "dropped: parallel tool calls disabled"}).to_string(),
-        ));
+        items.push(TurnItem::Call(extra.clone()));
+        items.push(TurnItem::Result {
+            call_id: extra.call_id.clone(),
+            name: extra.name.clone(),
+            output: json!({"error": "dropped: parallel tool calls disabled"}).to_string(),
+        });
     }
 }
 
-fn attach_latest_image(observe_json: &str) -> Option<Value> {
+fn attach_latest_image(observe_json: &str) -> Option<String> {
     let value: Value = serde_json::from_str(observe_json).ok()?;
     let path = value.get("screenshot_path").and_then(Value::as_str)?;
-    image_input_from_path(Path::new(path))
+    read_png_b64(Path::new(path))
 }
 
-fn image_input_from_path(path: &Path) -> Option<Value> {
+fn read_png_b64(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > IMAGE_CAP_BYTES {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Some(json!({
-        "role": "user",
-        "content": [{
-            "type": "input_image",
-            "image_url": format!("data:image/png;base64,{b64}"),
-            "detail": "low"
-        }]
-    }))
-}
-
-pub fn parse_xai_base(raw: &str) -> Result<String, HandsError> {
-    let raw = raw.trim();
-    let raw = if raw.is_empty() { DEFAULT_BASE } else { raw };
-    if raw.contains('@') {
-        return Err(HandsError::DoTask(
-            "HANDS_XAI_BASE_URL must not include userinfo".into(),
-        ));
-    }
-    let (scheme, rest) = if let Some(rest) = raw.strip_prefix("https://") {
-        ("https", rest)
-    } else if let Some(rest) = raw.strip_prefix("http://") {
-        ("http", rest)
-    } else {
-        return Err(HandsError::DoTask(
-            "HANDS_XAI_BASE_URL must be http:// or https://".into(),
-        ));
-    };
-    let rest = rest.trim_end_matches('/');
-    let rest = rest
-        .strip_suffix("/responses")
-        .unwrap_or(rest)
-        .trim_end_matches('/');
-    let (hostport, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, ""),
-    };
-    if hostport.is_empty() {
-        return Err(HandsError::DoTask(
-            "HANDS_XAI_BASE_URL host is empty".into(),
-        ));
-    }
-    let host = hostport.split(':').next().unwrap_or(hostport);
-    if host == "0.0.0.0" {
-        return Err(HandsError::DoTask(
-            "HANDS_XAI_BASE_URL host must not be 0.0.0.0".into(),
-        ));
-    }
-    let official = host.eq_ignore_ascii_case("api.x.ai");
-    let loopback = host.eq_ignore_ascii_case("127.0.0.1") || host.eq_ignore_ascii_case("localhost");
-    if official {
-        if scheme != "https" {
-            return Err(HandsError::DoTask(
-                "HANDS_XAI_BASE_URL for api.x.ai must be https".into(),
-            ));
-        }
-        if !path.is_empty() && path != "/v1" {
-            return Err(HandsError::DoTask(format!(
-                "HANDS_XAI_BASE_URL path must be empty or /v1 (got '{path}')"
-            )));
-        }
-        let path = if path.is_empty() { "/v1" } else { path };
-        return Ok(format!("https://{hostport}{path}"));
-    }
-    if loopback {
-        if scheme != "http" {
-            return Err(HandsError::DoTask(
-                "HANDS_XAI_BASE_URL loopback must be http".into(),
-            ));
-        }
-        if !path.is_empty() && path != "/v1" {
-            return Err(HandsError::DoTask(format!(
-                "HANDS_XAI_BASE_URL path must be empty or /v1 (got '{path}')"
-            )));
-        }
-        return Ok(format!("http://{hostport}{path}"));
-    }
-    Err(HandsError::DoTask(format!(
-        "HANDS_XAI_BASE_URL host must be api.x.ai or loopback (got '{host}')"
-    )))
-}
-
-pub fn resolve_api_key() -> Option<String> {
-    for key in [KEY_ENV_SIMPLE, KEY_ENV_PRIMARY, KEY_ENV_FALLBACK] {
-        if let Ok(v) = std::env::var(key) {
-            let t = v.trim();
-            if !t.is_empty() {
-                return Some(t.to_string());
-            }
-        }
-    }
-    None
-}
-
-pub fn resolve_model(explicit: Option<&str>) -> String {
-    if let Some(v) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        return v.to_string();
-    }
-    std::env::var(MODEL_ENV)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 pub fn resolve_max_steps(explicit: Option<u32>) -> u32 {
@@ -1172,10 +1039,6 @@ fn wall_timeout_ms() -> u64 {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(DEFAULT_WALL_TIMEOUT_MS)
         .clamp(MIN_WALL_TIMEOUT_MS, MAX_WALL_TIMEOUT_MS)
-}
-
-fn map_ureq_error(err: ureq::Error) -> HandsError {
-    HandsError::DoTask(format!("xAI request failed: {err}"))
 }
 
 fn error_env(
@@ -1455,12 +1318,23 @@ mod tests {
         }
     }
 
-    fn key_env() -> [(&'static str, Option<&'static str>); 3] {
+    fn key_env() -> [(&'static str, Option<&'static str>); 4] {
         [
+            (KEY_ENV_SIMPLE, None),
             (KEY_ENV_PRIMARY, Some("test-key")),
             (KEY_ENV_FALLBACK, None),
             (BASE_ENV, None),
         ]
+    }
+
+    fn isolated_env() -> Vec<(&'static str, Option<&'static str>)> {
+        let mut v = key_env().to_vec();
+        v.extend([
+            (PROVIDER_ENV, None),
+            (DOTASK_MODEL_ENV, None),
+            (DOTASK_BASE_ENV, None),
+        ]);
+        v
     }
 
     fn http_ok(body: Value) -> Result<HttpResp, HandsError> {
@@ -1578,6 +1452,10 @@ mod tests {
         );
     }
 
+    fn observe_ok() -> String {
+        json!({"ok":true,"screenshot_path":"x"}).to_string()
+    }
+
     #[test]
     fn system_prompt_contains_required_substrings() {
         assert!(SYSTEM_PROMPT.contains("UNTRUSTED"));
@@ -1590,12 +1468,13 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("chrome_connected"));
         assert!(SYSTEM_PROMPT.contains("plan: false"));
         assert!(SYSTEM_PROMPT.contains("chr:"));
+        assert!(!SYSTEM_PROMPT.to_ascii_lowercase().contains("you are grok"));
     }
 
     #[test]
     fn empty_goal_is_error_with_zero_primitives() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
+            with_env(&isolated_env(), || {
                 let env = run_dotask(DoTaskRequest {
                     goal: "   ".into(),
                     session_id: Some("empty-goal".into()),
@@ -1629,6 +1508,9 @@ mod tests {
                     (KEY_ENV_SIMPLE, None),
                     (KEY_ENV_PRIMARY, None),
                     (KEY_ENV_FALLBACK, None),
+                    (PROVIDER_ENV, None),
+                    (DOTASK_BASE_ENV, None),
+                    (BASE_ENV, None),
                 ],
                 || {
                     let env = run_dotask(DoTaskRequest {
@@ -1662,6 +1544,7 @@ mod tests {
                 (KEY_ENV_SIMPLE, Some("simple")),
                 (KEY_ENV_PRIMARY, Some("alpha")),
                 (KEY_ENV_FALLBACK, Some("beta")),
+                (PROVIDER_ENV, None),
             ],
             || {
                 assert_eq!(resolve_api_key().as_deref(), Some("simple"));
@@ -1672,6 +1555,7 @@ mod tests {
                 (KEY_ENV_SIMPLE, None),
                 (KEY_ENV_PRIMARY, Some("alpha")),
                 (KEY_ENV_FALLBACK, Some("beta")),
+                (PROVIDER_ENV, None),
             ],
             || {
                 assert_eq!(resolve_api_key().as_deref(), Some("alpha"));
@@ -1682,6 +1566,7 @@ mod tests {
                 (KEY_ENV_SIMPLE, Some("  ")),
                 (KEY_ENV_PRIMARY, Some("  ")),
                 (KEY_ENV_FALLBACK, Some("beta")),
+                (PROVIDER_ENV, None),
             ],
             || {
                 assert_eq!(resolve_api_key().as_deref(), Some("beta"));
@@ -1690,15 +1575,76 @@ mod tests {
     }
 
     #[test]
+    fn key_env_clears_hands_key() {
+        let pairs = key_env();
+        assert_eq!(pairs.len(), 4);
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| *k == KEY_ENV_SIMPLE && v.is_none())
+        );
+        with_env(&[(KEY_ENV_SIMPLE, Some("outer-hands-key"))], || {
+            with_env(&key_env(), || {
+                with_env(&[(PROVIDER_ENV, None)], || {
+                    assert_eq!(resolve_api_key().as_deref(), Some("test-key"));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn hands_key_wins_over_provider_specific() {
+        with_env(
+            &[
+                (PROVIDER_ENV, Some("openai")),
+                (KEY_ENV_SIMPLE, Some("hands-key")),
+                ("OPENAI_API_KEY", Some("openai-key")),
+            ],
+            || {
+                assert_eq!(resolve_api_key().as_deref(), Some("hands-key"));
+            },
+        );
+    }
+
+    #[test]
     fn explicit_model_wins_over_env() {
-        with_env(&[(MODEL_ENV, Some("env-model"))], || {
-            assert_eq!(resolve_model(Some("cli-model")), "cli-model");
-            assert_eq!(resolve_model(None), "env-model");
-            assert_eq!(resolve_model(Some("  ")), "env-model");
-        });
-        with_env(&[(MODEL_ENV, None)], || {
-            assert_eq!(resolve_model(None), DEFAULT_MODEL);
-        });
+        with_env(
+            &[
+                (MODEL_ENV, Some("env-model")),
+                (DOTASK_MODEL_ENV, None),
+                (PROVIDER_ENV, None),
+            ],
+            || {
+                assert_eq!(resolve_model(Some("cli-model")), "cli-model");
+                assert_eq!(resolve_model(None), "env-model");
+                assert_eq!(resolve_model(Some("  ")), "env-model");
+            },
+        );
+        with_env(
+            &[
+                (MODEL_ENV, None),
+                (DOTASK_MODEL_ENV, None),
+                (PROVIDER_ENV, None),
+            ],
+            || {
+                assert_eq!(resolve_model(None), DEFAULT_MODEL);
+            },
+        );
+    }
+
+    #[test]
+    fn dotask_model_wins_over_xai_model() {
+        with_env(
+            &[
+                (DOTASK_MODEL_ENV, Some("dotask-model")),
+                (MODEL_ENV, Some("xai-model")),
+                (PROVIDER_ENV, None),
+            ],
+            || {
+                assert_eq!(resolve_model(None), "dotask-model");
+                assert_eq!(resolve_model(Some("cli-model")), "cli-model");
+            },
+        );
     }
 
     #[test]
@@ -1732,9 +1678,144 @@ mod tests {
     }
 
     #[test]
+    fn parse_base_allowlist_per_provider() {
+        let providers = [
+            Provider::Xai,
+            Provider::Openai,
+            Provider::Anthropic,
+            Provider::Google,
+            Provider::Ollama,
+            Provider::Deepseek,
+            Provider::Zhipu,
+        ];
+        for p in providers {
+            assert!(
+                parse_base(p, "https://example.com").is_err(),
+                "{:?} example.com",
+                p
+            );
+            assert!(
+                parse_base(p, "https://openrouter.ai").is_err(),
+                "{:?} openrouter",
+                p
+            );
+            assert!(parse_base(p, "http://8.8.8.8").is_err(), "{:?} 8.8.8.8", p);
+            assert!(
+                parse_base(p, "https://user:pass@api.x.ai/v1").is_err(),
+                "{:?} userinfo",
+                p
+            );
+            assert!(parse_base(p, "http://0.0.0.0").is_err(), "{:?} 0.0.0.0", p);
+            assert!(
+                parse_base(p, "https://127.0.0.1").is_err(),
+                "{:?} https loopback",
+                p
+            );
+            assert!(
+                parse_base(p, "http://127.0.0.1:8081").is_err(),
+                "{:?} 8081",
+                p
+            );
+            assert!(
+                parse_base(p, "http://127.0.0.1:8083").is_err(),
+                "{:?} 8083",
+                p
+            );
+            assert!(
+                parse_base(p, "http://localhost:8081").is_err(),
+                "{:?} localhost 8081",
+                p
+            );
+            assert!(
+                parse_base(p, "http://127.0.0.1:9").is_ok(),
+                "{:?} loopback :9",
+                p
+            );
+        }
+        assert_eq!(
+            parse_base(Provider::Openai, "https://api.openai.com").unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            parse_base(Provider::Anthropic, "https://api.anthropic.com").unwrap(),
+            "https://api.anthropic.com/v1"
+        );
+        assert_eq!(
+            parse_base(
+                Provider::Google,
+                "https://generativelanguage.googleapis.com"
+            )
+            .unwrap(),
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(
+            parse_base(Provider::Ollama, "https://ollama.com").unwrap(),
+            "https://ollama.com/api"
+        );
+        assert_eq!(
+            parse_base(Provider::Ollama, "http://127.0.0.1:11434").unwrap(),
+            "http://127.0.0.1:11434"
+        );
+        assert_eq!(
+            parse_base(Provider::Deepseek, "https://api.deepseek.com").unwrap(),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            parse_base(Provider::Zhipu, "https://api.z.ai").unwrap(),
+            "https://api.z.ai/api/paas/v4"
+        );
+        assert_eq!(
+            parse_base(Provider::Zhipu, "https://open.bigmodel.cn").unwrap(),
+            "https://open.bigmodel.cn/api/paas/v4"
+        );
+    }
+
+    #[test]
+    fn provider_aliases_and_unknown() {
+        assert_eq!(parse_provider("").unwrap(), Provider::Xai);
+        assert_eq!(parse_provider("chatgpt").unwrap(), Provider::Openai);
+        assert_eq!(parse_provider("Claude").unwrap(), Provider::Anthropic);
+        assert_eq!(parse_provider("GEMINI").unwrap(), Provider::Google);
+        assert_eq!(parse_provider("glm").unwrap(), Provider::Zhipu);
+        assert!(parse_provider("openrouter").is_err());
+        assert!(parse_provider("azure").is_err());
+    }
+
+    #[test]
+    fn unknown_provider_is_error_zero_http() {
+        logs::with_test_env(|| {
+            with_env(
+                &[
+                    (PROVIDER_ENV, Some("openrouter")),
+                    (KEY_ENV_SIMPLE, Some("test-key")),
+                ],
+                || {
+                    let exec = ScriptedExec::new([]);
+                    let (env, transport) = run_script(
+                        "goal",
+                        vec![http_ok(fn_call("observe", json!({})))],
+                        &exec,
+                        &RealClock,
+                        None,
+                        None,
+                        "unk-prov",
+                    );
+                    assert!(!env.ok);
+                    assert_eq!(env.stop_reason, StopReason::Error);
+                    assert_eq!(env.steps, 0);
+                    assert!(env.error.as_deref().unwrap().contains("unknown provider"));
+                    assert!(transport.posted().is_empty());
+                    assert!(exec.calls().is_empty());
+                    assert_eq!(PRIMITIVE_CALLS.load(Ordering::SeqCst), 0);
+                },
+            );
+        });
+    }
+
+    #[test]
     fn posted_body_store_false_and_omits_forbidden_keys() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
+            with_env(&isolated_env(), || {
                 let exec =
                     ScriptedExec::new([Ok(json!({"screenshot_path":"missing.png"}).to_string())]);
                 let (env, transport) = run_script(
@@ -1774,6 +1855,7 @@ mod tests {
                     assert!(!names.contains(&"confirm"));
                     assert!(!names.contains(&"stop"));
                     assert!(!names.contains(&"logs"));
+                    assert!(!names.contains(&"listen"));
                     assert!(!names.contains(&"do_task"));
                 }
             });
@@ -1783,9 +1865,8 @@ mod tests {
     #[test]
     fn observe_then_text_done() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
-                let exec =
-                    ScriptedExec::new([Ok(json!({"ok":true,"screenshot_path":"x"}).to_string())]);
+            with_env(&isolated_env(), || {
+                let exec = ScriptedExec::new([Ok(observe_ok())]);
                 let (env, _) = run_script(
                     "goal",
                     vec![
@@ -1814,7 +1895,7 @@ mod tests {
     #[test]
     fn fence_stops_without_confirm() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
+            with_env(&isolated_env(), || {
                 let fence = FenceInfo {
                     domain: "linkedin.com".into(),
                     category: "applications".into(),
@@ -1854,7 +1935,7 @@ mod tests {
     #[test]
     fn yield_stops_no_further_actuate() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
+            with_env(&isolated_env(), || {
                 let click = json!({
                     "ok": false,
                     "error": YIELD_ERROR,
@@ -1892,7 +1973,7 @@ mod tests {
     #[test]
     fn forbidden_tools_are_not_executed() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
+            with_env(&isolated_env(), || {
                 let exec = ScriptedExec::new([]);
                 let (env, _) = run_script(
                     "goal",
@@ -1900,6 +1981,7 @@ mod tests {
                         http_ok(fn_call("confirm", json!({"domain":"x"}))),
                         http_ok(fn_call("stop", json!({}))),
                         http_ok(fn_call("logs", json!({}))),
+                        http_ok(fn_call("listen", json!({}))),
                         http_ok(text_done("ok")),
                     ],
                     &exec,
@@ -1910,7 +1992,7 @@ mod tests {
                 );
                 assert_eq!(env.stop_reason, StopReason::Done);
                 assert!(exec.calls().is_empty());
-                assert_eq!(env.steps, 3);
+                assert_eq!(env.steps, 4);
             });
         });
     }
@@ -1918,9 +2000,8 @@ mod tests {
     #[test]
     fn parallel_calls_execute_first_only() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
-                let exec =
-                    ScriptedExec::new([Ok(json!({"ok":true,"screenshot_path":"x"}).to_string())]);
+            with_env(&isolated_env(), || {
+                let exec = ScriptedExec::new([Ok(observe_ok())]);
                 let (env, transport) = run_script(
                     "goal",
                     vec![http_ok(two_calls()), http_ok(text_done("done"))],
@@ -1945,17 +2026,14 @@ mod tests {
     #[test]
     fn pick_down_continues_loop() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
+            with_env(&isolated_env(), || {
                 let pick_err = json!({
                     "schema": "hands.pick/v1",
                     "ok": false,
                     "error": "local Gemma at 127.0.0.1:8081 is down"
                 })
                 .to_string();
-                let exec = ScriptedExec::new([
-                    Ok(pick_err),
-                    Ok(json!({"ok":true,"screenshot_path":"x"}).to_string()),
-                ]);
+                let exec = ScriptedExec::new([Ok(pick_err), Ok(observe_ok())]);
                 let (env, _) = run_script(
                     "goal",
                     vec![
@@ -1980,9 +2058,8 @@ mod tests {
     #[test]
     fn max_steps_one_stops_after_one_primitive() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
-                let exec =
-                    ScriptedExec::new([Ok(json!({"ok":true,"screenshot_path":"x"}).to_string())]);
+            with_env(&isolated_env(), || {
+                let exec = ScriptedExec::new([Ok(observe_ok())]);
                 let (env, _) = run_script(
                     "goal",
                     vec![
@@ -2008,17 +2085,16 @@ mod tests {
         logs::with_test_env(|| {
             with_env(
                 &[
+                    (KEY_ENV_SIMPLE, None),
                     (KEY_ENV_PRIMARY, Some("test-key")),
                     (KEY_ENV_FALLBACK, None),
                     (BASE_ENV, None),
+                    (PROVIDER_ENV, None),
                     (WALL_TIMEOUT_ENV, Some("5000")),
                 ],
                 || {
                     let clock = FakeClock::new();
-                    let exec = ScriptedExec::new([Ok(
-                        json!({"ok":true,"screenshot_path":"x"}).to_string()
-                    )])
-                    .with_clock(clock.clone());
+                    let exec = ScriptedExec::new([Ok(observe_ok())]).with_clock(clock.clone());
                     let (env, _) = run_script(
                         "goal",
                         vec![
@@ -2042,10 +2118,9 @@ mod tests {
     #[test]
     fn pause_mid_loop() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
+            with_env(&isolated_env(), || {
                 let exec =
-                    ScriptedExec::new([Ok(json!({"ok":true,"screenshot_path":"x"}).to_string())])
-                        .with_after([Some(FreezeCause::Pause)]);
+                    ScriptedExec::new([Ok(observe_ok())]).with_after([Some(FreezeCause::Pause)]);
                 let (env, _) = run_script(
                     "goal",
                     vec![
@@ -2067,7 +2142,7 @@ mod tests {
     #[test]
     fn physical_freeze_is_frozen_not_pause() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
+            with_env(&isolated_env(), || {
                 let exec = ScriptedExec::new([Ok(json!({
                     "ok": false,
                     "frozen": true
@@ -2091,7 +2166,7 @@ mod tests {
     #[test]
     fn challenge_watch_forced_false_and_session_injected() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
+            with_env(&isolated_env(), || {
                 let exec = ScriptedExec::new([Ok(json!({
                     "ok": true,
                     "present": false,
@@ -2126,7 +2201,7 @@ mod tests {
     #[test]
     fn image_attached_only_when_file_fits() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
+            with_env(&isolated_env(), || {
                 let dir = std::env::temp_dir().join(format!("hands-dt-{}", uuid::Uuid::new_v4()));
                 std::fs::create_dir_all(&dir).unwrap();
                 let small = dir.join("small.png");
@@ -2225,10 +2300,9 @@ mod tests {
     #[test]
     fn logs_start_and_end_omit_goal_and_key() {
         logs::with_test_env(|| {
-            with_env(&key_env(), || {
+            with_env(&isolated_env(), || {
                 let goal = "find a Camry on cars.com SECRETGOAL";
-                let exec =
-                    ScriptedExec::new([Ok(json!({"ok":true,"screenshot_path":"x"}).to_string())]);
+                let exec = ScriptedExec::new([Ok(observe_ok())]);
                 let (env, _) = run_script(
                     goal,
                     vec![
@@ -2258,7 +2332,7 @@ mod tests {
 
     #[test]
     fn run_dotask_inner_does_not_log_stop_reason_as_error() {
-        let src = include_str!("dotask.rs");
+        let src = include_str!("mod.rs");
         let start = src.find("fn run_dotask_inner").expect("run_dotask_inner");
         let end = src.find("fn run_loop").expect("run_loop");
         assert!(start < end, "run_dotask_inner must precede run_loop");
@@ -2313,9 +2387,9 @@ mod tests {
     #[test]
     fn cargo_and_source_forbid_sdk_solver_confirm() {
         let cargo = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
-        let src = include_str!("dotask.rs");
-        let observe = include_str!("observe.rs");
-        let needles = [
+        let sources = [include_str!("mod.rs"), include_str!("adapter.rs")];
+        let observe = include_str!("../observe.rs");
+        let cargo_needles = [
             ["open", "ai"].concat(),
             ["req", "west"].concat(),
             ["grok", "_api"].concat(),
@@ -2329,17 +2403,382 @@ mod tests {
             ["allows::", "run_confirm"].concat(),
             ["run_confirm", "("].concat(),
         ];
-        for needle in needles {
+        let source_needles = [
+            ["web", "_search"].concat(),
+            ["x", "_search"].concat(),
+            ["code", "_interpreter"].concat(),
+            ["2", "captcha"].concat(),
+            ["on", "nx"].concat(),
+            ["allows::", "run_confirm"].concat(),
+            ["run_confirm", "("].concat(),
+        ];
+        for needle in cargo_needles {
             assert!(
                 !cargo.contains(&needle),
                 "Cargo.toml must not mention {needle}"
             );
-            assert!(
-                !src.contains(&needle),
-                "dotask.rs must not mention {needle}"
-            );
+        }
+        for src in sources {
+            for needle in &source_needles {
+                assert!(
+                    !src.contains(needle.as_str()),
+                    "dotask source must not mention {needle}"
+                );
+            }
         }
         assert!(!observe.contains("dotask::"));
         assert!(!observe.contains("api.x.ai"));
+    }
+
+    #[test]
+    fn auth_headers_table() {
+        let bearer_providers = [
+            Provider::Xai,
+            Provider::Openai,
+            Provider::Ollama,
+            Provider::Deepseek,
+            Provider::Zhipu,
+        ];
+        for p in bearer_providers {
+            let h = auth_headers(p, Some("k"));
+            assert_eq!(
+                h,
+                vec![("Authorization".into(), "Bearer k".into())],
+                "{:?}",
+                p
+            );
+        }
+        let anth = auth_headers(Provider::Anthropic, Some("k"));
+        assert!(anth.contains(&("x-api-key".into(), "k".into())));
+        assert!(anth.contains(&("anthropic-version".into(), "2023-06-01".into())));
+        assert!(!anth.iter().any(|(k, _)| k == "Authorization"));
+        let goog = auth_headers(Provider::Google, Some("k"));
+        assert_eq!(goog, vec![("x-goog-api-key".into(), "k".into())]);
+        assert!(auth_headers(Provider::Ollama, None).is_empty());
+        assert!(auth_headers(Provider::Xai, None).is_empty());
+    }
+
+    fn provider_env(provider: &'static str) -> Vec<(&'static str, Option<&'static str>)> {
+        let mut v = isolated_env();
+        v.push((PROVIDER_ENV, Some(provider)));
+        v.push((KEY_ENV_SIMPLE, Some("test-key")));
+        v
+    }
+
+    #[test]
+    fn openai_responses_store_false() {
+        logs::with_test_env(|| {
+            with_env(&provider_env("openai"), || {
+                let exec = ScriptedExec::new([Ok(observe_ok())]);
+                let (env, transport) = run_script(
+                    "goal",
+                    vec![
+                        http_ok(fn_call("observe", json!({}))),
+                        http_ok(text_done("done")),
+                    ],
+                    &exec,
+                    &RealClock,
+                    None,
+                    None,
+                    "oa-resp",
+                );
+                assert_eq!(env.stop_reason, StopReason::Done);
+                assert_eq!(exec.calls().len(), 1);
+                assert_eq!(exec.calls()[0].0, "observe");
+                let posted = transport.posted();
+                assert!(posted[0].0.contains("api.openai.com/v1/responses"));
+                for (_url, body) in posted {
+                    assert_eq!(body.get("store"), Some(&json!(false)));
+                    assert!(body.get("max_turns").is_none());
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn anthropic_messages_tool_use_observe() {
+        logs::with_test_env(|| {
+            with_env(&provider_env("anthropic"), || {
+                let exec = ScriptedExec::new([Ok(observe_ok())]);
+                let (env, transport) = run_script(
+                    "goal",
+                    vec![
+                        http_ok(json!({
+                            "content": [{
+                                "type": "tool_use",
+                                "id": "call_1",
+                                "name": "observe",
+                                "input": {}
+                            }]
+                        })),
+                        http_ok(json!({"content": [{"type": "text", "text": "done"}]})),
+                    ],
+                    &exec,
+                    &RealClock,
+                    None,
+                    None,
+                    "anth-1",
+                );
+                assert_eq!(env.stop_reason, StopReason::Done);
+                assert_eq!(exec.calls().len(), 1);
+                assert_eq!(exec.calls()[0].0, "observe");
+                let (url, body) = &transport.posted()[0];
+                assert!(url.contains("api.anthropic.com/v1/messages"));
+                assert_eq!(body.get("max_tokens"), Some(&json!(2048)));
+                assert_eq!(body.get("stream"), Some(&json!(false)));
+                assert!(body.get("store").is_none());
+                let tools = body.get("tools").and_then(Value::as_array).unwrap();
+                assert!(tools.iter().all(|t| t.get("input_schema").is_some()));
+                assert!(tools.iter().all(|t| t.get("type").is_none()));
+            });
+        });
+    }
+
+    #[test]
+    fn chat_completions_tool_calls_observe() {
+        logs::with_test_env(|| {
+            with_env(&provider_env("deepseek"), || {
+                let exec = ScriptedExec::new([Ok(observe_ok())]);
+                let hop = json!({
+                    "choices": [{
+                        "message": {
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "observe", "arguments": "{}"}
+                            }]
+                        }
+                    }]
+                });
+                let done = json!({"choices": [{"message": {"content": "done"}}]});
+                let (env, transport) = run_script(
+                    "goal",
+                    vec![http_ok(hop), http_ok(done)],
+                    &exec,
+                    &RealClock,
+                    None,
+                    None,
+                    "ds-chat",
+                );
+                assert_eq!(env.stop_reason, StopReason::Done);
+                assert_eq!(exec.calls()[0].0, "observe");
+                let (url, body) = &transport.posted()[0];
+                assert!(url.contains("api.deepseek.com/chat/completions"));
+                assert_eq!(body.get("stream"), Some(&json!(false)));
+                assert!(body.get("store").is_none());
+                assert_eq!(body.get("parallel_tool_calls"), Some(&json!(false)));
+            });
+        });
+    }
+
+    #[test]
+    fn zhipu_chat_completions_observe() {
+        logs::with_test_env(|| {
+            with_env(&provider_env("zhipu"), || {
+                let exec = ScriptedExec::new([Ok(observe_ok())]);
+                let hop = json!({
+                    "choices": [{
+                        "message": {
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "observe", "arguments": "{}"}
+                            }]
+                        }
+                    }]
+                });
+                let (env, transport) = run_script(
+                    "goal",
+                    vec![
+                        http_ok(hop),
+                        http_ok(json!({"choices": [{"message": {"content": "done"}}]})),
+                    ],
+                    &exec,
+                    &RealClock,
+                    None,
+                    None,
+                    "zp-chat",
+                );
+                assert_eq!(env.stop_reason, StopReason::Done);
+                assert_eq!(exec.calls()[0].0, "observe");
+                assert!(
+                    transport.posted()[0]
+                        .0
+                        .contains("api.z.ai/api/paas/v4/chat/completions")
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn gemini_interactions_function_call() {
+        logs::with_test_env(|| {
+            with_env(&provider_env("google"), || {
+                let exec = ScriptedExec::new([Ok(observe_ok())]);
+                let (env, transport) = run_script(
+                    "goal",
+                    vec![
+                        http_ok(json!({
+                            "steps": [{
+                                "type": "function_call",
+                                "id": "call_1",
+                                "name": "observe",
+                                "arguments": {}
+                            }]
+                        })),
+                        http_ok(json!({"steps": [{"type": "text", "text": "done"}]})),
+                    ],
+                    &exec,
+                    &RealClock,
+                    None,
+                    None,
+                    "gem-1",
+                );
+                assert_eq!(env.stop_reason, StopReason::Done);
+                assert_eq!(exec.calls()[0].0, "observe");
+                let (url, body) = &transport.posted()[0];
+                assert!(url.contains("/interactions"));
+                assert_eq!(body.get("store"), Some(&json!(false)));
+                assert!(body.get("previous_interaction_id").is_none());
+                let dumped = body.to_string();
+                assert!(!dumped.contains("google_search"));
+                assert!(!dumped.contains("mcp_server"));
+                assert_eq!(body.get("stream"), Some(&json!(false)));
+                let input = body.get("input").and_then(Value::as_array).unwrap();
+                assert!(
+                    input.iter().all(|i| i.get("type") != Some(&json!("text"))),
+                    "Interactions input must use user_input/function_* steps, not bare text: {input:?}"
+                );
+                assert!(
+                    input
+                        .iter()
+                        .any(|i| i.get("type") == Some(&json!("user_input")))
+                );
+                let second = &transport.posted()[1].1;
+                let input = second.get("input").and_then(Value::as_array).unwrap();
+                assert!(
+                    input
+                        .iter()
+                        .any(|i| i.get("type") == Some(&json!("function_result")))
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn ollama_api_chat_tool_calls() {
+        logs::with_test_env(|| {
+            with_env(&provider_env("ollama"), || {
+                let exec = ScriptedExec::new([Ok(observe_ok())]);
+                let (env, transport) = run_script(
+                    "goal",
+                    vec![
+                        http_ok(json!({
+                            "message": {
+                                "tool_calls": [{
+                                    "function": {"name": "observe", "arguments": {}}
+                                }]
+                            }
+                        })),
+                        http_ok(json!({"message": {"content": "done"}})),
+                    ],
+                    &exec,
+                    &RealClock,
+                    None,
+                    None,
+                    "ollama-1",
+                );
+                assert_eq!(env.stop_reason, StopReason::Done);
+                assert_eq!(exec.calls()[0].0, "observe");
+                let (url, body) = &transport.posted()[0];
+                assert!(url.ends_with("/api/chat") || url.contains("/api/chat"));
+                assert_eq!(body.get("stream"), Some(&json!(false)));
+                assert!(body.get("keep_alive").is_none());
+                assert!(body.get("store").is_none());
+                let dumped = body.to_string();
+                assert!(!dumped.contains("keep_alive"));
+                let second = &transport.posted()[1].1;
+                let msgs = second.get("messages").and_then(Value::as_array).unwrap();
+                assert!(
+                    msgs.iter().any(|m| m.get("role") == Some(&json!("tool"))
+                        && m.get("tool_name") == Some(&json!("observe"))),
+                    "ollama tool result must name the tool: {msgs:?}"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn ollama_loopback_without_key_completes() {
+        logs::with_test_env(|| {
+            with_env(
+                &[
+                    (PROVIDER_ENV, Some("ollama")),
+                    (DOTASK_BASE_ENV, Some("http://127.0.0.1:11434")),
+                    (KEY_ENV_SIMPLE, None),
+                    (KEY_ENV_PRIMARY, None),
+                    (KEY_ENV_FALLBACK, None),
+                    ("OLLAMA_API_KEY", None),
+                    (BASE_ENV, None),
+                ],
+                || {
+                    assert!(resolve_api_key().is_none());
+                    let exec = ScriptedExec::new([Ok(observe_ok())]);
+                    let (env, transport) = run_script(
+                        "goal",
+                        vec![
+                            http_ok(json!({
+                                "message": {
+                                    "tool_calls": [{
+                                        "function": {"name": "observe", "arguments": {}}
+                                    }]
+                                }
+                            })),
+                            http_ok(json!({"message": {"content": "done"}})),
+                        ],
+                        &exec,
+                        &RealClock,
+                        None,
+                        None,
+                        "ollama-lb",
+                    );
+                    assert_eq!(env.stop_reason, StopReason::Done);
+                    assert_eq!(exec.calls()[0].0, "observe");
+                    assert!(
+                        transport.posted()[0]
+                            .0
+                            .contains("http://127.0.0.1:11434/api/chat")
+                    );
+                    assert!(!env.error.as_deref().unwrap_or("").contains("API key"));
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn http_error_uses_provider_id() {
+        logs::with_test_env(|| {
+            with_env(&provider_env("openai"), || {
+                let exec = ScriptedExec::new([]);
+                let (env, transport) = run_script(
+                    "goal",
+                    vec![Ok(HttpResp {
+                        status: 401,
+                        body: "nope".into(),
+                    })],
+                    &exec,
+                    &RealClock,
+                    None,
+                    None,
+                    "http-id",
+                );
+                assert!(!env.ok);
+                assert_eq!(env.stop_reason, StopReason::Error);
+                assert_eq!(env.error.as_deref(), Some("openai HTTP 401"));
+                assert!(!env.error.as_deref().unwrap().contains("test-key"));
+                assert_eq!(transport.posted().len(), 1);
+                assert!(exec.calls().is_empty());
+            });
+        });
     }
 }

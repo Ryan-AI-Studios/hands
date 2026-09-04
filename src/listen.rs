@@ -256,6 +256,7 @@ pub fn challenge_present(observe_path: Option<&str>) -> Result<bool, HandsError>
             let env = observe::observe(ObserveRequest {
                 session_id: None,
                 detail: Detail::Default,
+                window: None,
             })?;
             Ok(env.challenge.present)
         }
@@ -1056,6 +1057,9 @@ fn write_sidecar(path: &Path, kind: &str, present: bool) {
             yielded: false,
             reason: None,
         },
+        windows: Vec::new(),
+        fg_window: None,
+        target_window: None,
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1215,6 +1219,9 @@ mod tests {
                 chrome_connected: false,
                 chrome_hint: None,
                 challenge: ChallengeInfo::default(),
+                windows: Vec::new(),
+                fg_window: None,
+                target_window: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1273,6 +1280,9 @@ mod tests {
                 chrome_connected: false,
                 chrome_hint: None,
                 challenge: ChallengeInfo::default(),
+                windows: Vec::new(),
+                fg_window: None,
+                target_window: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1325,6 +1335,9 @@ mod tests {
                 chrome_connected: false,
                 chrome_hint: None,
                 challenge: ChallengeInfo::default(),
+                windows: Vec::new(),
+                fg_window: None,
+                target_window: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1369,6 +1382,9 @@ mod tests {
                 chrome_connected: false,
                 chrome_hint: None,
                 challenge: ChallengeInfo::default(),
+                windows: Vec::new(),
+                fg_window: None,
+                target_window: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }

@@ -15,7 +15,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
     VIRTUAL_KEY, VK_A, VK_BACK, VK_C, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
-    VK_L, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP, VK_V, VK_X,
+    VK_L, VK_LEFT, VK_LWIN, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE,
+    VK_TAB, VK_UP, VK_V, VK_X,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, WHEEL_DELTA};
 
@@ -427,6 +428,7 @@ pub fn named_key(name: &str) -> Result<(), HandsError> {
         "ctrl+v" => chord(&[VK_CONTROL, VK_V]),
         "ctrl+x" => chord(&[VK_CONTROL, VK_X]),
         "ctrl+l" => chord(&[VK_CONTROL, VK_L]),
+        "win+shift+s" => chord(&[VK_LWIN, VK_SHIFT, VK_S]),
         other => Err(HandsError::Input(format!("unknown key '{other}'"))),
     }
 }
@@ -551,20 +553,17 @@ mod tests {
         ClearSendHook
     }
 
-    fn assert_mod_letter_chord(
+    fn assert_one_input_sends(
         rec: &[(usize, VIRTUAL_KEY, u16, u32)],
-        modifier: VIRTUAL_KEY,
-        letter: VIRTUAL_KEY,
+        expected: &[(VIRTUAL_KEY, u32)],
     ) {
-        assert_eq!(rec.len(), 4, "four send_inputs of one INPUT each");
-        let expected = [
-            (modifier, 0u32),
-            (letter, 0u32),
-            (letter, KEYEVENTF_KEYUP.0),
-            (modifier, KEYEVENTF_KEYUP.0),
-        ];
+        assert_eq!(
+            rec.len(),
+            expected.len(),
+            "send_inputs count must match chord length"
+        );
         for (i, ((len, w_vk, w_scan, dw_flags), (exp_vk, exp_flags))) in
-            rec.iter().zip(expected).enumerate()
+            rec.iter().zip(expected.iter().copied()).enumerate()
         {
             assert_eq!(*len, 1, "send {i} must be one INPUT");
             assert_eq!(*w_vk, exp_vk, "send {i} wVk");
@@ -576,6 +575,22 @@ mod tests {
                 "send {i} must not set KEYEVENTF_EXTENDEDKEY"
             );
         }
+    }
+
+    fn assert_mod_letter_chord(
+        rec: &[(usize, VIRTUAL_KEY, u16, u32)],
+        modifier: VIRTUAL_KEY,
+        letter: VIRTUAL_KEY,
+    ) {
+        assert_one_input_sends(
+            rec,
+            &[
+                (modifier, 0u32),
+                (letter, 0u32),
+                (letter, KEYEVENTF_KEYUP.0),
+                (modifier, KEYEVENTF_KEYUP.0),
+            ],
+        );
     }
 
     #[test]
@@ -632,6 +647,7 @@ mod tests {
         assert!(!is_enter_key("tab"));
         assert!(!is_enter_key("space"));
         assert!(!is_enter_key("ctrl+l"));
+        assert!(!is_enter_key("win+shift+s"));
     }
 
     #[test]
@@ -681,6 +697,63 @@ mod tests {
     }
 
     #[test]
+    fn win_shift_s_sends_lwin_shift_s_chord() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        let _hook = arm_recorded_keys();
+        named_key("win+shift+s").expect("win+shift+s");
+        assert_one_input_sends(
+            &take_recorded_keys(),
+            &[
+                (VK_LWIN, 0u32),
+                (VK_SHIFT, 0u32),
+                (VK_S, 0u32),
+                (VK_S, KEYEVENTF_KEYUP.0),
+                (VK_SHIFT, KEYEVENTF_KEYUP.0),
+                (VK_LWIN, KEYEVENTF_KEYUP.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn win_shift_s_trims_and_lowercases() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        let _hook = arm_recorded_keys();
+        named_key(" WIN+SHIFT+S ").expect(" WIN+SHIFT+S ");
+        assert_one_input_sends(
+            &take_recorded_keys(),
+            &[
+                (VK_LWIN, 0u32),
+                (VK_SHIFT, 0u32),
+                (VK_S, 0u32),
+                (VK_S, KEYEVENTF_KEYUP.0),
+                (VK_SHIFT, KEYEVENTF_KEYUP.0),
+                (VK_LWIN, KEYEVENTF_KEYUP.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn unknown_snip_aliases_do_not_send() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        let _hook = arm_recorded_keys();
+        for name in ["ctrl+shift+p", "printscreen", "win+d"] {
+            SENT_KEYS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let err = named_key(name).expect_err(name);
+            assert!(
+                err.to_string().contains(&format!("unknown key '{name}'")),
+                "expected unknown key '{name}', got {err}"
+            );
+            assert!(
+                take_recorded_keys().is_empty(),
+                "zero send calls for {name}"
+            );
+        }
+    }
+
+    #[test]
     fn named_key_source_locks_ctrl_l_allowlist_arm() {
         let src = include_str!("input.rs");
         let start = src.find("pub fn named_key(").expect("named_key");
@@ -694,18 +767,26 @@ mod tests {
             "named_key body must stay production-only"
         );
         assert!(body.contains("\"ctrl+l\" => chord(&[VK_CONTROL, VK_L])"));
+        assert!(body.contains("\"win+shift+s\" => chord(&[VK_LWIN, VK_SHIFT, VK_S])"));
         assert!(body.contains("\"ctrl+a\" => chord(&[VK_CONTROL, VK_A])"));
         assert!(body.contains("\"ctrl+c\" => chord(&[VK_CONTROL, VK_C])"));
         assert!(body.contains("\"ctrl+v\" => chord(&[VK_CONTROL, VK_V])"));
         assert!(body.contains("\"ctrl+x\" => chord(&[VK_CONTROL, VK_X])"));
         assert!(!body.contains("starts_with(\"ctrl+\")"));
         assert!(!body.contains("strip_prefix(\"ctrl+\")"));
+        assert!(!body.contains("starts_with(\"win+\")"));
+        assert!(!body.contains("strip_prefix(\"win+\")"));
+        assert!(!body.contains("split('+')"));
     }
 
     #[test]
     fn mcp_and_cli_copy_name_ctrl_l() {
         assert!(include_str!("mcp.rs").contains("ctrl+l"));
         assert!(include_str!("main.rs").contains("ctrl+l"));
+        assert!(include_str!("mcp.rs").contains("win+shift+s"));
+        assert!(include_str!("main.rs").contains("win+shift+s"));
+        assert!(include_str!("mcp.rs").contains("Windows Screen snipping"));
+        assert!(include_str!("main.rs").contains("Windows Screen snipping"));
     }
 
     #[test]

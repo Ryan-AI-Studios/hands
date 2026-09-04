@@ -72,11 +72,11 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Press a named key or combo. ctrl+l is Control+L (Chrome omnibox).
+    /// Press a named key or combo. ctrl+l is Control+L (Chrome omnibox). win+shift+s is Windows Screen snipping.
     Key {
         #[arg(
             long,
-            help = "named key or combo; ctrl+l is Control+L (Chrome omnibox)"
+            help = "named key or combo; ctrl+l is Control+L (Chrome omnibox); win+shift+s is Windows Screen snipping"
         )]
         name: String,
         #[arg(long)]
@@ -749,6 +749,23 @@ mod tests {
             help.contains("ctrl+l"),
             "long-help should mention ctrl+l, got:\n{help}"
         );
+        assert!(
+            help.contains("win+shift+s"),
+            "long-help should mention win+shift+s, got:\n{help}"
+        );
+        assert!(
+            help.contains("Windows Screen snipping"),
+            "long-help should name Windows Screen snipping, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn key_name_win_shift_s_parses() {
+        let cli = Cli::try_parse_from(["hands", "key", "--name", "win+shift+s"]).expect("parse");
+        match cli.command {
+            Command::Key { name, .. } => assert_eq!(name, "win+shift+s"),
+            _ => panic!("expected Key"),
+        }
     }
 
     #[test]

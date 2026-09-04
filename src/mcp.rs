@@ -248,7 +248,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Press a named key (enter, tab, ctrl+a, ctrl+l, …). ctrl+l is Control+L (Chrome omnibox)."
+        description = "Press a named key (enter, tab, ctrl+a, ctrl+l, win+shift+s, …). ctrl+l is Control+L (Chrome omnibox). win+shift+s is Windows Screen snipping."
     )]
     fn key(
         &self,

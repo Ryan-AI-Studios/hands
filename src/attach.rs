@@ -20,7 +20,7 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, STARTUPINFOW, WaitForInputIdle,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -842,7 +842,7 @@ fn enum_candidates() -> Vec<WindowCandidate> {
         let Some(raw) = foreground::hwnd_raw(hwnd) else {
             continue;
         };
-        let class = class_name(hwnd);
+        let class = foreground::class_name(hwnd);
         let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
         let iconic = unsafe { IsIconic(hwnd) }.as_bool();
         let mut pid = 0u32;
@@ -873,16 +873,7 @@ unsafe extern "system" fn collect_hwnds(hwnd: HWND, lparam: LPARAM) -> windows::
     true.into()
 }
 
-fn class_name(hwnd: HWND) -> String {
-    let mut buf = [0u16; 256];
-    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
-    if n <= 0 {
-        return String::new();
-    }
-    String::from_utf16_lossy(&buf[..n as usize])
-}
-
-fn process_image(pid: u32) -> Option<PathBuf> {
+pub(crate) fn process_image(pid: u32) -> Option<PathBuf> {
     if pid == 0 {
         return None;
     }
@@ -956,7 +947,7 @@ unsafe fn query_command_line(handle: HANDLE) -> Option<String> {
     Some(String::from_utf16_lossy(slice))
 }
 
-fn is_chrome_image(path: &Path) -> bool {
+pub(crate) fn is_chrome_image(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.eq_ignore_ascii_case("chrome.exe"))

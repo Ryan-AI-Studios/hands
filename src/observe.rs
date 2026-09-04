@@ -22,6 +22,41 @@ pub const OBSERVE_SCHEMA: &str = "hands.observe/v1";
 pub struct ObserveRequest {
     pub session_id: Option<String>,
     pub detail: Detail,
+    pub window: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowState {
+    Minimized,
+    Normal,
+    Maximized,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DesktopWindow {
+    pub pid: u32,
+    pub title: String,
+    pub state: WindowState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rect: Option<Rect>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FgWindow {
+    pub pid: u32,
+    pub title: String,
+    pub class: String,
+    pub chrome_exe: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TargetWindow {
+    pub pid: u32,
+    pub title: String,
+    pub class: String,
+    pub chrome_exe: bool,
+    pub foreground: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +75,10 @@ pub struct ObserveEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chrome_hint: Option<String>,
     pub challenge: ChallengeInfo,
+    pub windows: Vec<DesktopWindow>,
+    pub fg_window: FgWindow,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_window: Option<TargetWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +99,12 @@ pub struct ObserveSidecar {
     pub chrome_hint: Option<String>,
     #[serde(default)]
     pub challenge: ChallengeInfo,
+    #[serde(default)]
+    pub windows: Vec<DesktopWindow>,
+    #[serde(default)]
+    pub fg_window: Option<FgWindow>,
+    #[serde(default)]
+    pub target_window: Option<TargetWindow>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +113,145 @@ pub struct FuseOpts {
     pub chrome_is_foreground: bool,
     pub virtual_screen: Option<Rect>,
     pub popup_rect: Option<Rect>,
+}
+
+struct ObservePlan {
+    walk_hwnd: Option<isize>,
+    viewport: Option<Rect>,
+    fg_window: FgWindow,
+    target_window: Option<TargetWindow>,
+    chrome_is_foreground: bool,
+}
+
+fn empty_fg_window() -> FgWindow {
+    FgWindow {
+        pid: 0,
+        title: String::new(),
+        class: String::new(),
+        chrome_exe: false,
+    }
+}
+
+fn describe_fg_window(fg: Option<isize>) -> FgWindow {
+    let Some(hwnd) = fg else {
+        return empty_fg_window();
+    };
+    FgWindow {
+        pid: foreground::window_pid(hwnd),
+        title: foreground::title(Some(hwnd)),
+        class: foreground::class_name_of(hwnd),
+        chrome_exe: foreground::is_chrome_hwnd(hwnd),
+    }
+}
+
+fn describe_target(hit: &foreground::TitledWindow, fg: Option<isize>) -> TargetWindow {
+    TargetWindow {
+        pid: hit.pid,
+        title: hit.title.clone(),
+        class: hit.class.clone(),
+        chrome_exe: foreground::is_chrome_hwnd(hit.hwnd),
+        foreground: fg == Some(hit.hwnd),
+    }
+}
+
+fn window_state(hit: &foreground::TitledWindow) -> WindowState {
+    if hit.iconic {
+        WindowState::Minimized
+    } else if hit.zoomed {
+        WindowState::Maximized
+    } else {
+        WindowState::Normal
+    }
+}
+
+fn envelope_windows(inventory: &[foreground::TitledWindow]) -> Vec<DesktopWindow> {
+    inventory
+        .iter()
+        .take(foreground::WINDOW_LIST_CAP)
+        .map(|w| DesktopWindow {
+            pid: w.pid,
+            title: foreground::cap_window_title(&w.title),
+            state: window_state(w),
+            rect: w.rect,
+        })
+        .collect()
+}
+
+fn is_digits_only_pid(query: &str) -> Option<u32> {
+    if query.is_empty() || !query.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    query.parse().ok()
+}
+
+pub(crate) fn resolve_window<'a>(
+    query: &str,
+    windows: &'a [foreground::TitledWindow],
+) -> Result<&'a foreground::TitledWindow, HandsError> {
+    let matches: Vec<&foreground::TitledWindow> = if let Some(pid) = is_digits_only_pid(query) {
+        windows.iter().filter(|w| w.pid == pid).collect()
+    } else {
+        let needle = query.to_lowercase();
+        windows
+            .iter()
+            .filter(|w| w.title.to_lowercase().contains(&needle))
+            .collect()
+    };
+    match matches.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(HandsError::Observe(format!("no window matching {query:?}"))),
+        many => {
+            let list = many
+                .iter()
+                .map(|w| format!("{} {}", w.pid, w.title))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(HandsError::Observe(format!(
+                "multiple windows matching {query:?}: {list}"
+            )))
+        }
+    }
+}
+
+fn plan_observe_target(
+    query: Option<&str>,
+    inventory: &[foreground::TitledWindow],
+    fg: Option<isize>,
+) -> Result<ObservePlan, HandsError> {
+    let fg_window = describe_fg_window(fg);
+    match query {
+        None => Ok(ObservePlan {
+            walk_hwnd: fg,
+            viewport: fg.and_then(foreground::window_rect),
+            fg_window,
+            target_window: None,
+            chrome_is_foreground: fg.is_some_and(foreground::is_chrome_hwnd),
+        }),
+        Some(q) => {
+            let hit = resolve_window(q, inventory)?;
+            let same = fg == Some(hit.hwnd);
+            Ok(ObservePlan {
+                walk_hwnd: Some(hit.hwnd),
+                viewport: foreground::window_rect(hit.hwnd),
+                fg_window,
+                target_window: Some(describe_target(hit, fg)),
+                chrome_is_foreground: same && fg.is_some_and(foreground::is_chrome_hwnd),
+            })
+        }
+    }
+}
+
+/// Resolve `--window` then UIA-walk that HWND. No screenshot and no injection;
+/// perception only (does not raise the target).
+#[cfg(test)]
+fn resolve_and_walk_window(
+    query: &str,
+    inventory: &[foreground::TitledWindow],
+    fg: Option<isize>,
+    detail: Detail,
+) -> Result<uia::UiaSnapshot, HandsError> {
+    let plan = plan_observe_target(Some(query), inventory, fg)?;
+    uia::collect(detail, plan.walk_hwnd)
 }
 
 pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
@@ -79,13 +263,14 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let screenshot_path = display_path(&paths.screenshot_path);
     let observe_path = display_path(&paths.observe_path);
 
-    let viewport = foreground::viewport_rect();
-    let chrome_is_foreground = foreground::is_chrome();
-    let snap = uia::collect(req.detail)?;
+    let fg = foreground::foreground_hwnd();
+    let inventory = foreground::titled_windows();
+    let plan = plan_observe_target(req.window.as_deref(), &inventory, fg)?;
+    let snap = uia::collect(req.detail, plan.walk_hwnd)?;
     let chrome = chrome::try_snapshot(req.detail);
     let opts = FuseOpts {
-        viewport,
-        chrome_is_foreground,
+        viewport: plan.viewport,
+        chrome_is_foreground: plan.chrome_is_foreground,
         virtual_screen: Some(space.as_rect()),
         popup_rect: snap.popup_rect,
     };
@@ -107,7 +292,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         screenshot_path,
         observe_path,
         space,
-        viewport,
+        viewport: plan.viewport,
         extract,
         elements,
         elements_total,
@@ -119,6 +304,9 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
             Some("Chrome host down — run hands native-host-doctor (MCP: native_host_doctor)".into())
         },
         challenge,
+        windows: envelope_windows(&inventory),
+        fg_window: plan.fg_window,
+        target_window: plan.target_window,
     };
     write_sidecar(&paths.observe_path, &full)?;
     let envelope = match req.detail {
@@ -160,6 +348,9 @@ fn write_sidecar(path: &std::path::Path, envelope: &ObserveEnvelope) -> Result<(
         chrome_connected: envelope.chrome_connected,
         chrome_hint: envelope.chrome_hint.clone(),
         challenge: envelope.challenge.clone(),
+        windows: envelope.windows.clone(),
+        fg_window: Some(envelope.fg_window.clone()),
+        target_window: envelope.target_window.clone(),
     };
     let json = serde_json::to_string_pretty(&sidecar)
         .map_err(|err| HandsError::Observe(format!("sidecar serialize: {err}")))?;
@@ -177,10 +368,11 @@ pub fn cap_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
     envelope
 }
 
-/// Default path: 20-element cap, then pop non-dialog elements from the end to
-/// 4 KiB, then shrink `main_text`. Never drops cards, `challenge`,
-/// `chrome_hint`, or `extract.dialogs` first. Last resort: pop extra dialogs
-/// after `main_text` is empty. 16 KiB hard fail stays in `finalize_envelope`.
+/// Default path: 20-element cap, then if still over 4 KiB truncate extra
+/// `windows` rows, then pop non-dialog elements, then shrink `main_text`.
+/// Never drops cards, `challenge`, `chrome_hint`, or `extract.dialogs` first.
+/// Last resort: pop extra dialogs after `main_text` is empty. 16 KiB hard fail
+/// stays in `finalize_envelope`.
 pub fn cap_default_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
     if envelope.elements.len() > VIEWPORT_ENVELOPE_ELEMENT_CAP {
         envelope.elements.truncate(VIEWPORT_ENVELOPE_ELEMENT_CAP);
@@ -190,6 +382,9 @@ pub fn cap_default_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
         return envelope;
     }
     envelope.elements_truncated = true;
+    while !envelope.windows.is_empty() && serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
+        envelope.windows.pop();
+    }
     pop_non_dialog_elements(&mut envelope);
     if serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
         shrink_main_text_to_fit(&mut envelope, DEFAULT_ENVELOPE_MAX_BYTES);
@@ -292,7 +487,7 @@ pub fn fuse_maps(
     opts: FuseOpts,
 ) -> (Extract, Vec<Element>, usize, bool) {
     match detail {
-        Detail::Dom => fuse_maps_dom(uia_title, uia_nodes, chrome),
+        Detail::Dom => fuse_maps_dom(uia_title, uia_nodes, chrome, opts.chrome_is_foreground),
         Detail::Default => fuse_maps_default(uia_title, uia_nodes, chrome, opts),
     }
 }
@@ -301,11 +496,12 @@ fn fuse_maps_dom(
     uia_title: &str,
     uia_nodes: &[crate::extract::RawNode],
     chrome: Option<chrome::ChromeMap>,
+    chrome_is_foreground: bool,
 ) -> (Extract, Vec<Element>, usize, bool) {
     let chrome_connected = chrome.is_some();
     let (uia_els, uia_matched) = filter_nodes(uia_nodes, Detail::Dom);
     let (chrome_els, chrome_n, extract) = match chrome {
-        Some(map) => {
+        Some(map) if chrome_is_foreground => {
             let n = map.elements.len();
             let extract = extract_fused(
                 uia_title,
@@ -318,7 +514,7 @@ fn fuse_maps_dom(
             );
             (map.elements, n, extract)
         }
-        None => (Vec::new(), 0, extract_from_nodes(uia_title, uia_nodes)),
+        _ => (Vec::new(), 0, extract_from_nodes(uia_title, uia_nodes)),
     };
     let mut elements = chrome_els;
     elements.extend(uia_els);
@@ -528,6 +724,9 @@ mod tests {
             chrome_connected: false,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
+            windows: Vec::new(),
+            fg_window: empty_fg_window(),
+            target_window: None,
         }
     }
 
@@ -889,6 +1088,9 @@ mod tests {
             chrome_connected,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
+            windows: Vec::new(),
+            fg_window: empty_fg_window(),
+            target_window: None,
         };
         assert!(raw.viewport.is_some());
         let capped = cap_default_envelope(raw);
@@ -1361,6 +1563,9 @@ mod tests {
             chrome_connected,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
+            windows: Vec::new(),
+            fg_window: empty_fg_window(),
+            target_window: None,
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -1447,6 +1652,9 @@ mod tests {
             chrome_connected: connected,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
+            windows: Vec::new(),
+            fg_window: empty_fg_window(),
+            target_window: None,
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -1799,6 +2007,9 @@ mod tests {
             chrome_connected: false,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
+            windows: Vec::new(),
+            fg_window: empty_fg_window(),
+            target_window: None,
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -1914,6 +2125,19 @@ mod tests {
         assert!(
             sidecar < retain && retain < cap,
             "write_sidecar before retain before cap:\n{slice}"
+        );
+        assert_eq!(
+            slice.matches("foreground_hwnd()").count(),
+            1,
+            "observe must take one FG HWND after screenshot:\n{slice}"
+        );
+        assert!(
+            !slice.contains("viewport_rect()"),
+            "observe must reuse the FG HWND for viewport:\n{slice}"
+        );
+        assert!(
+            !slice.contains("foreground::is_chrome()"),
+            "observe must not call class-only is_chrome():\n{slice}"
         );
         assert!(
             slice.contains("retain_hittable_centers(&mut full.elements, &opts)"),
@@ -2115,5 +2339,267 @@ mod tests {
         );
         assert_eq!(extract.zip.as_deref(), Some("32309"));
         assert_eq!(extract.radius.as_deref(), Some("50 mi"));
+    }
+
+    fn titled_win(hwnd: isize, pid: u32, title: &str) -> crate::foreground::TitledWindow {
+        crate::foreground::TitledWindow {
+            hwnd,
+            pid,
+            title: title.into(),
+            class: "Chrome_WidgetWin_1".into(),
+            iconic: false,
+            zoomed: false,
+            rect: Some(Rect {
+                x: 10,
+                y: 20,
+                w: 800,
+                h: 600,
+            }),
+        }
+    }
+
+    #[test]
+    fn electron_chrome_widget_win_1_does_not_fuse_amazon_title_2026_09_03() {
+        let chrome = chrome::ChromeMap {
+            url: Some("https://www.amazon.com/checkout".into()),
+            title: "Place Your Order - Amazon Checkout".into(),
+            main_text: "order summary".into(),
+            elements: vec![Element {
+                id: "chr:0".into(),
+                role: "Button".into(),
+                text: Some("Place your order".into()),
+                rect: Rect {
+                    x: 200,
+                    y: 200,
+                    w: 40,
+                    h: 20,
+                },
+                grid: None,
+            }],
+            cards: vec![],
+            listing: crate::extract::ListingMeta::default(),
+        };
+        let nodes = vec![uia_node(
+            9,
+            "Cursor",
+            Rect {
+                x: 200,
+                y: 200,
+                w: 40,
+                h: 40,
+            },
+        )];
+        let (extract, els, _total, connected) = fuse_maps(
+            Detail::Default,
+            "Cursor",
+            &nodes,
+            Some(chrome),
+            covering_opts(false),
+        );
+        assert!(
+            connected,
+            "chrome_connected stays an honest host-up bit when Chrome is open"
+        );
+        assert_ne!(extract.title, "Place Your Order - Amazon Checkout");
+        assert_eq!(extract.title, "Cursor");
+        assert!(!els.iter().any(|e| e.id.starts_with("chr:")));
+        assert!(els.iter().any(|e| e.id == "uia:1.9"));
+        let chrome = chrome::ChromeMap {
+            url: Some("https://www.amazon.com/checkout".into()),
+            title: "Place Your Order - Amazon Checkout".into(),
+            main_text: "order summary".into(),
+            elements: vec![Element {
+                id: "chr:0".into(),
+                role: "Button".into(),
+                text: Some("Place your order".into()),
+                rect: Rect {
+                    x: 200,
+                    y: 200,
+                    w: 40,
+                    h: 20,
+                },
+                grid: None,
+            }],
+            cards: vec![],
+            listing: crate::extract::ListingMeta::default(),
+        };
+        let (dom_extract, dom_els, _, _) = fuse_maps(
+            Detail::Dom,
+            "Cursor",
+            &nodes,
+            Some(chrome),
+            covering_opts(false),
+        );
+        assert_ne!(dom_extract.title, "Place Your Order - Amazon Checkout");
+        assert!(!dom_els.iter().any(|e| e.id.starts_with("chr:")));
+    }
+
+    #[test]
+    fn sidecar_missing_windows_fg_window_target_window_deserializes() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [],
+            "elements_total": 0,
+            "elements_truncated": false,
+            "chrome_connected": false
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        assert!(side.windows.is_empty());
+        assert!(side.fg_window.is_none());
+        assert!(side.target_window.is_none());
+    }
+
+    #[test]
+    fn cap_default_truncates_windows_before_elements_keeps_challenge() {
+        let src = include_str!("observe.rs");
+        let start = src
+            .find("pub fn cap_default_envelope(")
+            .expect("cap_default_envelope");
+        let end = src
+            .find("fn pop_non_dialog_elements(")
+            .expect("pop_non_dialog_elements");
+        let slice = &src[start..end];
+        let windows_pop = slice
+            .find("envelope.windows.pop()")
+            .expect("must pop extra windows");
+        let call_pop = slice
+            .find("pop_non_dialog_elements")
+            .expect("then pop non-dialog elements");
+        assert!(
+            windows_pop < call_pop,
+            "windows must shrink before elements:\n{slice}"
+        );
+
+        let mut raw = fat_envelope(20);
+        raw.challenge = ChallengeInfo {
+            present: true,
+            kind: Some("recaptcha".into()),
+            attempts: 1,
+            yielded: false,
+            reason: Some("i'm not a robot".into()),
+        };
+        raw.windows = (0i32..12)
+            .map(|i| DesktopWindow {
+                pid: 1000 + i as u32,
+                title: format!("W{i:02}-{}", "t".repeat(36)),
+                state: WindowState::Normal,
+                rect: Some(Rect {
+                    x: i * 10,
+                    y: 0,
+                    w: 800,
+                    h: 600,
+                }),
+            })
+            .collect();
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        assert!(
+            !capped.elements.is_empty(),
+            "inventory shrink must leave elements"
+        );
+        assert!(capped.challenge.present);
+        assert_eq!(capped.challenge.kind.as_deref(), Some("recaptcha"));
+    }
+
+    #[test]
+    fn resolve_window_pid_and_unique_title_errors() {
+        let inventory = vec![
+            titled_win(1, 42, "Cursor"),
+            titled_win(2, 99, "Google Chrome"),
+            titled_win(3, 99, "Chrome Settings"),
+        ];
+        assert_eq!(resolve_window("42", &inventory).unwrap().hwnd, 1);
+        assert_eq!(resolve_window("cursor", &inventory).unwrap().hwnd, 1);
+        let none = resolve_window("Notepad", &inventory)
+            .unwrap_err()
+            .to_string();
+        assert!(none.contains("Notepad"), "{none}");
+        assert!(none.contains("no window matching"), "{none}");
+        let many = resolve_window("99", &inventory).unwrap_err().to_string();
+        assert!(many.contains("multiple windows matching"), "{many}");
+        assert!(many.contains("99"), "{many}");
+        assert!(many.contains("Google Chrome"), "{many}");
+        let sub = resolve_window("chrome", &inventory)
+            .unwrap_err()
+            .to_string();
+        assert!(sub.contains("multiple windows matching"), "{sub}");
+    }
+
+    #[test]
+    fn window_query_uses_target_hwnd_and_keeps_actual_fg() {
+        let inventory = vec![titled_win(11, 42, "Cursor"), titled_win(22, 7, "Terminal")];
+        let plan = plan_observe_target(Some("cursor"), &inventory, Some(0)).unwrap();
+        assert_eq!(plan.walk_hwnd, Some(11));
+        assert!(!plan.chrome_is_foreground);
+        let target = plan.target_window.expect("target_window");
+        assert!(!target.foreground);
+        assert_eq!(target.pid, 42);
+        let fg_only = plan_observe_target(None, &inventory, Some(0)).unwrap();
+        assert!(fg_only.target_window.is_none());
+        assert_eq!(fg_only.walk_hwnd, Some(0));
+    }
+
+    #[test]
+    fn chrome_chr_only_when_walk_hwnd_is_fg_chrome() {
+        let inventory = vec![titled_win(11, 42, "Cursor")];
+        let targeted = plan_observe_target(Some("cursor"), &inventory, Some(99)).unwrap();
+        assert!(
+            !targeted.chrome_is_foreground,
+            "--window on a non-Chrome HWND must not fuse chr: even if Chrome is open"
+        );
+    }
+
+    #[test]
+    fn observe_window_path_does_not_raise() {
+        let src = include_str!("observe.rs");
+        let start = src.find("fn plan_observe_target(").expect("plan");
+        let end = src.find("pub fn observe(").expect("observe");
+        let slice = &src[start..end];
+        assert!(
+            !slice.contains("ShowWindow") && !slice.contains("SetForegroundWindow"),
+            "targeting must not raise:\n{slice}"
+        );
+        assert!(
+            !slice.contains("send_inputs"),
+            "targeting SendInput:\n{slice}"
+        );
+    }
+
+    #[test]
+    fn window_resolve_and_walk_sends_zero_input() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use windows::Win32::UI::Input::KeyboardAndMouse::INPUT;
+
+        static SENDS: AtomicUsize = AtomicUsize::new(0);
+        fn count_sends(_inputs: &[INPUT]) -> Result<(), HandsError> {
+            SENDS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        crate::lease::reset_for_test();
+        SENDS.store(0, Ordering::SeqCst);
+        crate::input::set_send_inputs_hook(Some(count_sends));
+        let inventory = vec![titled_win(0x1234_5678, 42, "Cursor")];
+        let snap = resolve_and_walk_window("cursor", &inventory, Some(0), Detail::Default)
+            .expect("sparse tree is empty, not a panic");
+        assert!(snap.nodes.is_empty());
+        let none = match resolve_and_walk_window("missing", &inventory, Some(0), Detail::Default) {
+            Ok(_) => panic!("0 matches must be a tool error"),
+            Err(err) => err,
+        };
+        assert!(none.to_string().contains("missing"), "{none}");
+        crate::input::set_send_inputs_hook(None);
+        crate::lease::reset_for_test();
+        assert_eq!(SENDS.load(Ordering::SeqCst), 0);
     }
 }

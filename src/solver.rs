@@ -82,6 +82,7 @@ pub fn run_solve(session_id: String) -> Result<ChallengeEnvelope, HandsError> {
         observe::observe(ObserveRequest {
             session_id: Some(sid.clone()),
             detail: crate::extract::Detail::Default,
+            window: None,
         })
     };
     let click = |x: i32, y: i32| {
@@ -635,6 +636,14 @@ mod tests {
             elements_truncated: false,
             chrome_connected: false,
             chrome_hint: None,
+            windows: Vec::new(),
+            fg_window: crate::observe::FgWindow {
+                pid: 0,
+                title: String::new(),
+                class: String::new(),
+                chrome_exe: false,
+            },
+            target_window: None,
             challenge: ChallengeInfo {
                 present,
                 kind,

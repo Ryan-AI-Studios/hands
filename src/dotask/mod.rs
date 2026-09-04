@@ -720,6 +720,7 @@ fn live_exec(name: &str, args: &Value, session_id: &str) -> Result<String, Hands
             let env = observe::observe(ObserveRequest {
                 session_id: Some(session_id.into()),
                 detail,
+                window: None,
             })?;
             observe::serialize_envelope(&env)
         }

@@ -732,6 +732,7 @@ fn run_watch(session_id: String) -> Result<ChallengeEnvelope, HandsError> {
         let env = crate::observe::observe(crate::observe::ObserveRequest {
             session_id: Some(sid.clone()),
             detail: crate::extract::Detail::Default,
+            window: None,
         })?;
         Ok(env.challenge)
     }) {
@@ -1686,6 +1687,9 @@ mod tests {
             chrome_connected: false,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
+            windows: Vec::new(),
+            fg_window: None,
+            target_window: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         path

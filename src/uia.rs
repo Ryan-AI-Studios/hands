@@ -15,9 +15,7 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
     IUIAutomationValuePattern, UIA_ValuePatternId,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GW_ENABLEDPOPUP, GetForegroundWindow, GetWindow, GetWindowRect,
-};
+use windows::Win32::UI::WindowsAndMessaging::{GW_ENABLEDPOPUP, GetWindow, GetWindowRect};
 
 use crate::error::HandsError;
 use crate::extract::{ControlKind, Detail, MAIN_TEXT_MAX_CHARS, RawNode};
@@ -45,11 +43,11 @@ pub struct HitElement {
     pub value: Option<String>,
 }
 
-pub fn collect(detail: Detail) -> Result<UiaSnapshot, HandsError> {
+pub fn collect(detail: Detail, hwnd: Option<isize>) -> Result<UiaSnapshot, HandsError> {
     let cap = detail.element_cap();
     std::thread::Builder::new()
         .name("hands-uia-sta".into())
-        .spawn(move || sta_collect(detail, cap))
+        .spawn(move || sta_collect(detail, cap, hwnd))
         .map_err(|err| HandsError::Uia(format!("spawn STA thread: {err}")))?
         .join()
         .map_err(|_| HandsError::Uia("UIA STA thread panicked".to_string()))?
@@ -252,10 +250,17 @@ fn native_hwnd(walker: &IUIAutomationTreeWalker, element: &IUIAutomationElement)
     None
 }
 
-fn sta_collect(detail: Detail, cap: usize) -> Result<UiaSnapshot, HandsError> {
+fn sta_collect(detail: Detail, cap: usize, hwnd: Option<isize>) -> Result<UiaSnapshot, HandsError> {
     let _sta = StaGuard::enter()?;
     let automation = create_automation()?;
-    let title = foreground_title(&automation);
+    let hwnd = hwnd.and_then(|raw| {
+        let h = crate::foreground::raw_hwnd(raw);
+        crate::foreground::hwnd_raw(h).map(|_| h)
+    });
+    let title = match hwnd {
+        Some(h) => window_element_name(&automation, h),
+        None => String::new(),
+    };
     let walker = unsafe { automation.ControlViewWalker() }
         .map_err(|err| HandsError::Uia(format!("ControlViewWalker: {err}")))?;
     let (nodes, popup_rect) = match detail {
@@ -264,7 +269,10 @@ fn sta_collect(detail: Detail, cap: usize) -> Result<UiaSnapshot, HandsError> {
                 .map_err(|err| HandsError::Uia(format!("GetRootElement: {err}")))?;
             (walk_control_view(&walker, &root, detail, cap)?, None)
         }
-        Detail::Default => collect_default(&automation, &walker, cap)?,
+        Detail::Default => match hwnd {
+            Some(h) => collect_default(&automation, &walker, cap, h)?,
+            None => (Vec::new(), None),
+        },
     };
     Ok(UiaSnapshot {
         title,
@@ -273,14 +281,14 @@ fn sta_collect(detail: Detail, cap: usize) -> Result<UiaSnapshot, HandsError> {
     })
 }
 
-/// Default walk: `ElementFromHandle(fg)` plus fail-closed owned popup.
-/// Reuses the FG HWND already obtained — no second `GetForegroundWindow`.
+/// Default walk: `ElementFromHandle(hwnd)` plus fail-closed owned popup.
+/// Uses the HWND passed into `collect` — does not call `GetForegroundWindow`.
 fn collect_default(
     automation: &IUIAutomation,
     walker: &IUIAutomationTreeWalker,
     cap: usize,
+    hwnd: HWND,
 ) -> Result<(Vec<RawNode>, Option<Rect>), HandsError> {
-    let hwnd = unsafe { GetForegroundWindow() };
     if hwnd.is_invalid() {
         return Ok((Vec::new(), None));
     }
@@ -292,8 +300,8 @@ fn collect_default(
     Ok((nodes, popup_rect))
 }
 
-/// `GW_ENABLEDPOPUP` on the FG HWND already in hand. If the popup HWND equals
-/// `fg` (Microsoft: none) or the handle fails, skip — never `GetRootElement`.
+/// `GW_ENABLEDPOPUP` on the walk HWND already in hand. If the popup HWND equals
+/// the walk root (Microsoft: none) or the handle fails, skip — never `GetRootElement`.
 fn prepend_owned_popup(
     automation: &IUIAutomation,
     walker: &IUIAutomationTreeWalker,
@@ -339,8 +347,7 @@ fn create_automation() -> Result<IUIAutomation, HandsError> {
         .map_err(|err| HandsError::Uia(format!("CoCreateInstance(CUIAutomation): {err}")))
 }
 
-fn foreground_title(automation: &IUIAutomation) -> String {
-    let hwnd = unsafe { GetForegroundWindow() };
+fn window_element_name(automation: &IUIAutomation, hwnd: HWND) -> String {
     if hwnd.is_invalid() {
         return String::new();
     }
@@ -523,7 +530,8 @@ mod tests {
     #[test]
     #[ignore = "live desktop; not a CI gate. Run: cargo test -- --ignored"]
     fn live_notepad_not_required_in_ci() {
-        let snap = collect(Detail::Default).expect("live UIA");
+        let snap =
+            collect(Detail::Default, crate::foreground::foreground_hwnd()).expect("live UIA");
         let found = snap.nodes.iter().any(|n| {
             let role = n.role.to_ascii_lowercase();
             let name = n.name.to_ascii_lowercase();
@@ -540,7 +548,7 @@ mod tests {
     #[test]
     #[ignore = "live desktop; not a CI gate. Run: cargo test -- --ignored"]
     fn live_resolve_notepad_runtime_id() {
-        let snap = collect(Detail::Dom).expect("live UIA");
+        let snap = collect(Detail::Dom, crate::foreground::foreground_hwnd()).expect("live UIA");
         let node = snap.nodes.iter().find(|n| {
             let role = n.role.to_ascii_lowercase();
             let name = n.name.to_ascii_lowercase();
@@ -561,8 +569,8 @@ mod tests {
     #[test]
     #[ignore = "live desktop; not a CI gate. Run: cargo test -- --ignored"]
     fn live_two_observe_notepad_same_runtime_id() {
-        let first = collect(Detail::Dom).expect("live UIA");
-        let second = collect(Detail::Dom).expect("live UIA");
+        let first = collect(Detail::Dom, crate::foreground::foreground_hwnd()).expect("live UIA");
+        let second = collect(Detail::Dom, crate::foreground::foreground_hwnd()).expect("live UIA");
         let finder = |n: &crate::extract::RawNode| {
             let role = n.role.to_ascii_lowercase();
             let name = n.name.to_ascii_lowercase();
@@ -608,5 +616,26 @@ mod tests {
     fn hwnd_null_is_empty_handle() {
         let hwnd = windows::Win32::Foundation::HWND::default();
         assert!(hwnd.is_invalid());
+    }
+
+    #[test]
+    fn collect_default_and_title_do_not_call_get_foreground_window() {
+        let src = include_str!("uia.rs");
+        let start = src.find("fn collect_default(").expect("collect_default");
+        let end = src.find("fn prepend_owned_popup(").expect("prepend");
+        let def = &src[start..end];
+        assert!(
+            !def.contains("GetForegroundWindow"),
+            "collect_default must use the passed HWND:\n{def}"
+        );
+        let t_start = src
+            .find("fn window_element_name(")
+            .expect("window_element_name");
+        let t_end = src.find("fn walk_control_view(").expect("walk");
+        let title = &src[t_start..t_end];
+        assert!(
+            !title.contains("GetForegroundWindow"),
+            "window_element_name must use the passed HWND:\n{title}"
+        );
     }
 }

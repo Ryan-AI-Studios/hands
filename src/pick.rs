@@ -1379,6 +1379,9 @@ mod tests {
             chrome_connected: false,
             chrome_hint: None,
             challenge: crate::challenge::ChallengeInfo::default(),
+            windows: Vec::new(),
+            fg_window: None,
+            target_window: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
         path

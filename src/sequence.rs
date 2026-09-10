@@ -940,24 +940,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-    static LAST_TOOLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-    fn reset_calls() {
-        CALLS.store(0, Ordering::SeqCst);
-        LAST_TOOLS.lock().unwrap().clear();
-    }
-
-    fn note(tool: &str) {
-        CALLS.fetch_add(1, Ordering::SeqCst);
-        LAST_TOOLS.lock().unwrap().push(tool.into());
-    }
-
-    fn called() -> Vec<String> {
-        LAST_TOOLS.lock().unwrap().clone()
-    }
 
     fn ok_out() -> StepOutcome {
         StepOutcome {
@@ -973,36 +955,14 @@ mod tests {
             yielded: || false,
             frozen: || false,
             cooling: || false,
-            activate: |_, _| {
-                note("activate");
-                Ok(ok_out())
-            },
-            click: |_, _| {
-                note("click");
-                Ok(ok_out())
-            },
-            hover: |_, _| {
-                note("hover");
-                Ok(ok_out())
-            },
-            type_text: |_, _| {
-                note("type");
-                Ok(ok_out())
-            },
-            key: |_, _| {
-                note("key");
-                Ok(ok_out())
-            },
-            scroll: |_, _| {
-                note("scroll");
-                Ok(ok_out())
-            },
-            wait_settle: |_, _| {
-                note("wait_settle");
-                Ok(ok_out())
-            },
+            activate: |_, _| Ok(ok_out()),
+            click: |_, _| Ok(ok_out()),
+            hover: |_, _| Ok(ok_out()),
+            type_text: |_, _| Ok(ok_out()),
+            key: |_, _| Ok(ok_out()),
+            scroll: |_, _| Ok(ok_out()),
+            wait_settle: |_, _| Ok(ok_out()),
             observe: |_| {
-                note("observe");
                 Ok(ObserveSummary {
                     observe_path: "C:\\tmp\\observe.json".into(),
                     elements_total: 3,
@@ -1014,6 +974,10 @@ mod tests {
     }
 
     static LOGS: Mutex<()> = Mutex::new(());
+
+    fn tools(env: &SequenceEnvelope) -> Vec<String> {
+        env.executed_steps.iter().map(|s| s.tool.clone()).collect()
+    }
 
     fn run_hooks(steps: Value, hooks: SequenceHooks) -> SequenceEnvelope {
         let _guard = LOGS.lock().unwrap();
@@ -1038,15 +1002,13 @@ mod tests {
 
     #[test]
     fn empty_and_overflow_are_bad_steps_zero_hooks() {
-        reset_calls();
         let empty = run_hooks(json!([]), test_hooks());
         assert_eq!(empty.stop_reason, StopReason::BadSteps);
         assert!(!empty.ok);
         assert_eq!(empty.steps_executed, 0);
         assert!(empty.failed_step_index.is_none());
-        assert_eq!(called(), Vec::<String>::new());
+        assert!(tools(&empty).is_empty());
 
-        reset_calls();
         let too_many = json!(
             (0..9)
                 .map(|_| json!({"tool":"wait_settle"}))
@@ -1055,46 +1017,40 @@ mod tests {
         let over = run_hooks(too_many, test_hooks());
         assert_eq!(over.stop_reason, StopReason::BadSteps);
         assert_eq!(over.steps_executed, 0);
-        assert!(called().is_empty());
+        assert!(tools(&over).is_empty());
     }
 
     #[test]
     fn forbidden_and_observe_not_last_are_bad_steps() {
-        reset_calls();
         let confirm = run_hooks(json!([{"tool":"confirm","domain":"x"}]), test_hooks());
         assert_eq!(confirm.stop_reason, StopReason::BadSteps);
         assert_eq!(confirm.failed_step_index, Some(0));
-        assert!(called().is_empty());
+        assert!(tools(&confirm).is_empty());
 
-        reset_calls();
         let mid = run_hooks(
             json!([{"tool":"observe"},{"tool":"type","text":"hi"}]),
             test_hooks(),
         );
         assert_eq!(mid.stop_reason, StopReason::BadSteps);
         assert_eq!(mid.failed_step_index, Some(0));
-        assert!(called().is_empty());
+        assert!(tools(&mid).is_empty());
     }
 
     #[test]
     fn missing_required_params_are_bad_steps() {
-        reset_calls();
         let typed = run_hooks(json!([{"tool":"type"}]), test_hooks());
         assert_eq!(typed.stop_reason, StopReason::BadSteps);
-        assert!(called().is_empty());
+        assert!(tools(&typed).is_empty());
 
-        reset_calls();
         let roi = run_hooks(json!([{"tool":"wait_settle","x":1}]), test_hooks());
         assert_eq!(roi.stop_reason, StopReason::BadSteps);
-        assert!(called().is_empty());
+        assert!(tools(&roi).is_empty());
     }
 
     #[test]
     fn activate_not_foregrounded_skips_later_type() {
-        reset_calls();
         let mut hooks = test_hooks();
         hooks.activate = |_, _| {
-            note("activate");
             Ok(StepOutcome {
                 ok: true,
                 foregrounded: Some(false),
@@ -1110,15 +1066,13 @@ mod tests {
         );
         assert_eq!(env.stop_reason, StopReason::FocusLost);
         assert_eq!(env.failed_step_index, Some(0));
-        assert_eq!(called(), vec!["activate"]);
+        assert_eq!(tools(&env), vec!["activate"]);
     }
 
     #[test]
     fn activate_resolve_fail_is_prerequisite() {
-        reset_calls();
         let mut hooks = test_hooks();
         hooks.activate = |_, _| {
-            note("activate");
             Ok(StepOutcome {
                 ok: false,
                 foregrounded: Some(false),
@@ -1134,15 +1088,13 @@ mod tests {
             hooks,
         );
         assert_eq!(env.stop_reason, StopReason::PrerequisiteFailed);
-        assert_eq!(called(), vec!["activate"]);
+        assert_eq!(tools(&env), vec!["activate"]);
     }
 
     #[test]
     fn click_focus_lost_aborts_even_when_ok() {
-        reset_calls();
         let mut hooks = test_hooks();
         hooks.click = |_, _| {
-            note("click");
             Ok(StepOutcome {
                 ok: true,
                 miss: Some("focus_lost".into()),
@@ -1157,15 +1109,13 @@ mod tests {
             hooks,
         );
         assert_eq!(env.stop_reason, StopReason::FocusLost);
-        assert_eq!(called(), vec!["click"]);
+        assert_eq!(tools(&env), vec!["click"]);
     }
 
     #[test]
     fn click_no_change_ok_continues() {
-        reset_calls();
         let mut hooks = test_hooks();
         hooks.click = |_, _| {
-            note("click");
             Ok(StepOutcome {
                 ok: true,
                 miss: Some("no_change".into()),
@@ -1181,16 +1131,14 @@ mod tests {
         );
         assert_eq!(env.stop_reason, StopReason::Completed);
         assert!(env.ok);
-        assert_eq!(called(), vec!["click", "type"]);
+        assert_eq!(tools(&env), vec!["click", "type"]);
         assert_eq!(env.executed_steps[0].miss.as_deref(), Some("no_change"));
     }
 
     #[test]
     fn unknown_key_aborts_later_type() {
-        reset_calls();
         let mut hooks = test_hooks();
         hooks.key = |_, name| {
-            note("key");
             Ok(StepOutcome {
                 ok: false,
                 error: Some(format!("unknown key '{name}'; see key --help")),
@@ -1206,15 +1154,13 @@ mod tests {
             hooks,
         );
         assert_eq!(env.stop_reason, StopReason::UnknownKey);
-        assert_eq!(called(), vec!["key"]);
+        assert_eq!(tools(&env), vec!["key"]);
     }
 
     #[test]
     fn fence_yield_freeze_cooldown_named() {
-        reset_calls();
         let mut hooks = test_hooks();
         hooks.click = |_, _| {
-            note("click");
             Ok(StepOutcome {
                 ok: false,
                 fence: Some(FenceInfo {
@@ -1233,9 +1179,8 @@ mod tests {
         );
         assert_eq!(fence.stop_reason, StopReason::FenceRefused);
         assert!(fence.fence.is_some());
-        assert_eq!(called(), vec!["click"]);
+        assert_eq!(tools(&fence), vec!["click"]);
 
-        reset_calls();
         let mut hooks = test_hooks();
         hooks.yielded = || true;
         let yielded = run_hooks(
@@ -1243,31 +1188,27 @@ mod tests {
             hooks,
         );
         assert_eq!(yielded.stop_reason, StopReason::ChallengeYielded);
-        assert!(called().is_empty());
+        assert!(tools(&yielded).is_empty());
 
-        reset_calls();
         let mut hooks = test_hooks();
         hooks.frozen = || true;
         let frozen = run_hooks(json!([{"tool":"type","text":"x"}]), hooks);
         assert_eq!(frozen.stop_reason, StopReason::LeaseFrozen);
         assert!(frozen.frozen);
-        assert!(called().is_empty());
+        assert!(tools(&frozen).is_empty());
 
-        reset_calls();
         let mut hooks = test_hooks();
         hooks.cooling = || true;
         let cool = run_hooks(json!([{"tool":"type","text":"x"}]), hooks);
         assert_eq!(cool.stop_reason, StopReason::Cooldown);
         assert_eq!(cool.failed_step_index, Some(0));
-        assert!(called().is_empty());
+        assert!(tools(&cool).is_empty());
     }
 
     #[test]
     fn abort_skips_trailing_observe() {
-        reset_calls();
         let mut hooks = test_hooks();
         hooks.key = |_, _| {
-            note("key");
             Ok(StepOutcome {
                 ok: false,
                 error: Some("unknown key 'ctrl+w'; see key --help".into()),
@@ -1283,7 +1224,7 @@ mod tests {
         );
         assert_eq!(env.stop_reason, StopReason::UnknownKey);
         assert!(env.observe_path.is_none());
-        assert_eq!(called(), vec!["key"]);
+        assert_eq!(tools(&env), vec!["key"]);
     }
 
     #[test]
@@ -1293,7 +1234,6 @@ mod tests {
             steps.push(json!({"tool":"wait_settle","x":i,"y":i,"w":10,"h":10}));
         }
         steps.push(json!({"tool":"observe"}));
-        reset_calls();
         let env = run_hooks(Value::Array(steps), test_hooks());
         assert_eq!(env.stop_reason, StopReason::Completed);
         let json = serialize_envelope(&env).unwrap();

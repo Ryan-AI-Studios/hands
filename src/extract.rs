@@ -764,12 +764,14 @@ pub fn infer_card_kind(card: &Card) -> Option<String> {
     if has_recommended_phrase(&card.title.to_ascii_lowercase()) {
         return Some("recommended".into());
     }
-    let delivery_l = card.delivery.as_deref().unwrap_or("").to_ascii_lowercase();
+    let delivery_text = card.delivery.as_deref().unwrap_or("");
+    let delivery_l = delivery_text.to_ascii_lowercase();
     let distance_l = card.distance.as_deref().unwrap_or("").to_ascii_lowercase();
     let title_l = card.title.to_ascii_lowercase();
-    if !delivery_l.is_empty()
-        || distance_l.contains("shipping from")
+    if has_ship_marker(delivery_text, &delivery_l)
         || has_ship_marker(&card.title, &title_l)
+        || distance_l.contains("shipping from")
+        || distance_l.contains("deliver to")
     {
         return Some("ship".into());
     }
@@ -980,7 +982,6 @@ fn is_dealerish_token(tok: &str) -> bool {
     matches!(lower.as_str(), "carmax" | "carvana" | "vroom")
         || lower.contains("auto")
         || lower.contains("motor")
-        || (tok.contains('-') || tok.contains('_')) && tok.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 fn is_paren_mi_span(text: &str, num_start: usize, unit_end: usize, digits: usize) -> bool {
@@ -1081,10 +1082,7 @@ fn has_ship_marker(text: &str, lower: &str) -> bool {
     if lower.contains("shipping from") || lower.contains("deliver to") {
         return true;
     }
-    if delivery_shipping_dollar(text, lower).is_some() {
-        return true;
-    }
-    parse_delivery(text).is_some()
+    delivery_shipping_dollar(text, lower).is_some()
 }
 
 fn is_in_radius_distance(text: &str) -> bool {
@@ -1630,6 +1628,26 @@ mod tests {
             parse_dealer(card, "2024 Toyota Camry", "$19,999").as_deref(),
             Some("Capital Toyota")
         );
+        assert_eq!(
+            parse_dealer(
+                "2024 Camry Capital Toyota Tallahassee, FL (12 mi) $19,999",
+                "2024 Camry",
+                "$19,999"
+            )
+            .as_deref(),
+            Some("Capital Toyota")
+        );
+        assert_eq!(
+            parse_dealer(
+                "2024 Camry Tallahassee, FL (12 mi) $19,999",
+                "2024 Camry",
+                "$19,999"
+            ),
+            None
+        );
+        assert_eq!(sanitize_dealer("American-Made"), None);
+        assert_eq!(sanitize_dealer("Peter"), None);
+        assert_eq!(sanitize_dealer("CarMax").as_deref(), Some("CarMax"));
     }
 
     #[test]
@@ -1720,6 +1738,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(infer_card_kind(&paren).as_deref(), Some("local"));
+        let home_local = Card {
+            title: "2024 Camry".into(),
+            distance: Some("12 mi away".into()),
+            delivery: Some("available for delivery to 32309".into()),
+            ..Default::default()
+        };
+        assert_eq!(infer_card_kind(&home_local).as_deref(), Some("local"));
+        assert_eq!(
+            parse_card_kind("12 mi away available for delivery to 32309").as_deref(),
+            Some("local")
+        );
+        assert_eq!(sanitize_dealer("American-Made"), None);
     }
 
     #[test]
@@ -2103,7 +2133,7 @@ mod tests {
                         h: 2,
                     },
                     miles: Some("JS-MI".into()),
-                    dealer: Some("JS-DEALER".into()),
+                    dealer: Some("JS Dealer".into()),
                     distance: Some("JS-DIST".into()),
                     listing_of: Some("2 of 2".into()),
                     kind: None,
@@ -2140,7 +2170,7 @@ mod tests {
                 .contains("nothing fits those filters")
         );
         assert_eq!(extract.cards[0].miles.as_deref(), Some("JS-MI"));
-        assert_eq!(extract.cards[0].dealer.as_deref(), Some("JS-DEALER"));
+        assert_eq!(extract.cards[0].dealer.as_deref(), Some("JS Dealer"));
         assert_eq!(extract.cards[0].distance.as_deref(), Some("JS-DIST"));
         assert_eq!(extract.cards[0].listing_of.as_deref(), Some("2 of 2"));
         assert_eq!(extract.cards[1].miles.as_deref(), Some("45,000 mi"));

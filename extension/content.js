@@ -470,14 +470,16 @@ function cardDealer(el, text, title, price) {
     rest = rest.split(price).join(" ");
   }
   rest = rest.replace(/(\d{1,3}(?:,\d{3})+|\d{4,})\s*(mi|miles)\b(?!\s*away)/ig, " ");
-  rest = rest.replace(/\d[\d,]*\s*(mi|miles)\s+away\b/ig, " ");
-  rest = rest.replace(/\(\s*\d{1,3}\s*(mi|miles)\)/ig, " ");
-  rest = rest.replace(/[A-Za-z][A-Za-z .'-]*,\s*[A-Za-z]{2}\s*\(\s*\d{1,3}\s*(mi|miles)\)/g, " ");
-  rest = rest.replace(/shipping from\b[^.\n]*/ig, " ");
+  const distance = cardDistance(rest);
+  if (distance) {
+    rest = rest.split(distance).join(" ");
+  }
+  let delivery = cardDelivery(rest);
+  while (delivery) {
+    rest = rest.split(delivery).join(" ");
+    delivery = cardDelivery(rest);
+  }
   rest = rest.replace(/\b\d+\s+of\s+\d+\b/ig, " ");
-  rest = rest.replace(/est\.?\s*shipping\b[^.\n]*/ig, " ");
-  rest = rest.replace(/shipping\s+[$€£][\d,]+(?:\.\d{2})?/ig, " ");
-  rest = rest.replace(/deliver to\s+\d{5}(?:-\d{4})?/ig, " ");
   rest = rest.replace(/\(\s*[\d,]+\s+reviews?\)/ig, " ");
   rest = rest.replace(/[$€£][\d,]+(?:\.\d{2})?/g, " ");
   const junk = [
@@ -646,7 +648,7 @@ function junkHasPhrase(lower, phrase) {
 
 function isDealerishToken(tok) {
   const l = String(tok || "").toLowerCase();
-  return l === "carmax" || l === "carvana" || l === "vroom" || l.indexOf("auto") !== -1 || l.indexOf("motor") !== -1 || ((tok.indexOf("-") !== -1 || tok.indexOf("_") !== -1) && /[A-Za-z]/.test(tok));
+  return l === "carmax" || l === "carvana" || l === "vroom" || l.indexOf("auto") !== -1 || l.indexOf("motor") !== -1;
 }
 
 function cardDistance(text) {
@@ -704,11 +706,13 @@ function cardKind(text, card) {
   const delivery = (card && card.delivery) || "";
   const distance = (card && card.distance) || "";
   if (
-    delivery ||
     /shipping from\b/i.test(distance) ||
+    /shipping from\b/i.test(delivery) ||
     /shipping from\b/i.test(text) ||
     /shipping\s+[$€£]/i.test(text) ||
-    /deliver to\b/i.test(text)
+    /shipping\s+[$€£]/i.test(delivery) ||
+    /deliver to\b/i.test(text) ||
+    /deliver to\b/i.test(delivery)
   ) {
     return cap("ship", CARD_KIND_CAP);
   }

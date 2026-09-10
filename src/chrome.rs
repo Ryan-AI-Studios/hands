@@ -1063,7 +1063,8 @@ mod tests {
         assert!(
             map.cards
                 .iter()
-                .any(|c| c.kind.as_deref() != Some("recommended"))
+                .all(|c| c.kind.as_deref() != Some("recommended")),
+            "pack must drop recommended behind locals+ships"
         );
         assert!(
             fs::read_to_string(mixed_fixture_path())
@@ -1119,7 +1120,9 @@ mod tests {
             .find("function extractPrice")
             .expect("function extractPrice");
         let rest = &src[start..];
-        let end = rest.find("function cardTitle").expect("function cardTitle");
+        let end = rest
+            .find("function prevWholeToken")
+            .expect("function prevWholeToken");
         let slice = &rest[..end];
         assert!(
             slice.contains("/mo"),
@@ -1149,6 +1152,14 @@ mod tests {
         assert!(
             slice.contains("shipping") && slice.contains("deliver to"),
             "cardDealer must junk-strip shipping/deliver to:\n{slice}"
+        );
+        assert!(
+            slice.contains("cardDistance("),
+            "cardDealer must strip cardDistance phrase before leftover:\n{slice}"
+        );
+        assert!(
+            !slice.contains("[A-Za-z .'-]*"),
+            "cardDealer must not greedily swallow City, ST:\n{slice}"
         );
     }
 

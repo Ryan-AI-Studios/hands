@@ -528,6 +528,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
             chrome_ms: Some(chrome_ms),
         },
     );
+    crate::cooldown::note_observe(&envelope.session_id);
     Ok(envelope)
 }
 
@@ -1021,6 +1022,7 @@ fn reshape_from_sidecar(req: &ObserveRequest, from: &str) -> Result<ObserveEnvel
         &envelope.screenshot_path,
         envelope.elements_total,
     );
+    crate::cooldown::note_observe(&envelope.session_id);
     Ok(envelope)
 }
 

@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use crate::actuate::{self, ActuateRequest};
 use crate::attach;
 use crate::challenge::{self, ChallengeInfo, ChallengeRequest};
+use crate::cooldown;
 use crate::error::HandsError;
 use crate::extract::{Detail, take_chars};
 use crate::fence::FenceInfo;
@@ -90,6 +91,7 @@ pub enum StopReason {
     MaxSteps,
     Timeout,
     Error,
+    Cooldown,
 }
 
 impl StopReason {
@@ -103,6 +105,7 @@ impl StopReason {
             Self::MaxSteps => "max_steps",
             Self::Timeout => "timeout",
             Self::Error => "error",
+            Self::Cooldown => "cooldown",
         }
     }
 }
@@ -642,6 +645,24 @@ fn classify_tool_result(
             None,
         ));
     }
+    let loop_suspected = value
+        .get("loop_suspected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cooling = value.get("cooldown_ms").and_then(Value::as_u64).is_some();
+    if loop_suspected || cooling {
+        return Some(stop_env(
+            session_id,
+            model,
+            steps,
+            last_tool.map(str::to_string),
+            None,
+            StopReason::Cooldown,
+            None,
+            None,
+            None,
+        ));
+    }
     let _ = name;
     None
 }
@@ -653,6 +674,19 @@ fn lease_stop(
     last_tool: Option<&str>,
 ) -> Option<DoTaskEnvelope> {
     lease::flush_notify();
+    if cooldown::is_cooling(session_id) {
+        return Some(stop_env(
+            session_id,
+            model,
+            steps,
+            last_tool.map(str::to_string),
+            None,
+            StopReason::Cooldown,
+            None,
+            None,
+            None,
+        ));
+    }
     #[cfg(test)]
     {
         // Parallel lease tests may leave FROZEN set. Only stop on a cause
@@ -2197,6 +2231,61 @@ mod tests {
                 lease::reset_for_test();
             });
         });
+    }
+
+    #[test]
+    fn classify_stops_on_loop_or_cooldown() {
+        logs::with_test_env(|| {
+            with_env(&isolated_env(), || {
+                let exec = ScriptedExec::new([Ok(json!({
+                    "ok": false,
+                    "loop_suspected": true,
+                    "cooldown_ms": 5000
+                })
+                .to_string())]);
+                let (env, _) = run_script(
+                    "goal",
+                    vec![http_ok(fn_call("click", json!({"x":1,"y":1})))],
+                    &exec,
+                    &RealClock,
+                    None,
+                    None,
+                    "cool-class",
+                );
+                assert_eq!(env.stop_reason, StopReason::Cooldown);
+                assert!(env.error.is_none());
+                let last = last_do_task_jsonl("cool-class");
+                assert_ne!(last.get("error").and_then(Value::as_str), Some("cooldown"));
+            });
+        });
+    }
+
+    #[test]
+    fn lease_stop_honors_session_cooling() {
+        let _cool = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        logs::with_test_env(|| {
+            with_env(&isolated_env(), || {
+                crate::cooldown::note_rejection("cool-lease");
+                crate::cooldown::note_rejection("cool-lease");
+                crate::cooldown::note_rejection("cool-lease");
+                let exec = ScriptedExec::new([]);
+                let (env, _) = run_script(
+                    "goal",
+                    vec![http_ok(fn_call("observe", json!({})))],
+                    &exec,
+                    &RealClock,
+                    None,
+                    None,
+                    "cool-lease",
+                );
+                assert_eq!(env.stop_reason, StopReason::Cooldown);
+                assert!(env.error.is_none());
+            });
+        });
+        crate::cooldown::reset_for_test();
     }
 
     #[test]

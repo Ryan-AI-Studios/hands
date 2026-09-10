@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::actuate::{self, ActivateEnvelope, ActuateEnvelope, ActuateRequest};
 use crate::challenge::{self, ChallengeInfo, YIELD_ERROR};
+use crate::cooldown::{self, Snapshot};
 use crate::error::HandsError;
 use crate::fence::FenceInfo;
 use crate::lease;
@@ -140,6 +141,14 @@ pub struct SequenceEnvelope {
     pub elements_total: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observe_challenge_present: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_suspected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -167,7 +176,7 @@ pub struct ObserveSummary {
 pub struct SequenceHooks {
     pub yielded: fn() -> bool,
     pub frozen: fn() -> bool,
-    pub cooling: fn() -> bool,
+    pub cooling: fn(&str) -> bool,
     pub activate: fn(&str, &str) -> Result<StepOutcome, HandsError>,
     pub click: fn(&str, &SequenceStep) -> Result<StepOutcome, HandsError>,
     pub hover: fn(&str, &SequenceStep) -> Result<StepOutcome, HandsError>,
@@ -185,7 +194,7 @@ impl SequenceHooks {
         Self {
             yielded: challenge::yielded,
             frozen: lease::is_frozen,
-            cooling: || false,
+            cooling: cooldown::is_cooling,
             activate: live_activate,
             click: live_click,
             hover: live_hover,
@@ -228,8 +237,9 @@ pub fn sequence_with(
         }
     };
 
-    if (hooks.cooling)() {
-        let env = abort_envelope(
+    if (hooks.cooling)(&session_id) {
+        let snap = cooldown::note_rejection(&session_id);
+        let mut env = abort_envelope(
             &session_id,
             parsed.len(),
             Vec::new(),
@@ -240,6 +250,7 @@ pub fn sequence_with(
             None,
             None,
         );
+        stamp_sequence(&mut env, snap);
         finish_log(&env, None)?;
         return shrink_to_budget(env);
     }
@@ -371,7 +382,8 @@ pub fn sequence_with(
                 if hooks.record_steps {
                     record_step(&session_id, step.tool(), false, Some(&msg), type_len(step))?;
                 }
-                let env = abort_envelope(
+                let snap = cooldown::note_rejection(&session_id);
+                let mut env = abort_envelope(
                     &session_id,
                     parsed.len(),
                     executed,
@@ -382,6 +394,7 @@ pub fn sequence_with(
                     fence,
                     challenge,
                 );
+                stamp_sequence(&mut env, snap);
                 finish_log(&env, None)?;
                 return shrink_to_budget(env);
             }
@@ -408,7 +421,8 @@ pub fn sequence_with(
 
         if let Some(reason) = classify_failure(step, &outcome) {
             let frozen = reason == StopReason::LeaseFrozen || outcome.frozen || (hooks.frozen)();
-            let env = abort_envelope(
+            let snap = sequence_abort_snapshot(&session_id, step, &outcome);
+            let mut env = abort_envelope(
                 &session_id,
                 parsed.len(),
                 executed,
@@ -419,6 +433,9 @@ pub fn sequence_with(
                 fence.clone(),
                 challenge,
             );
+            if let Some(snap) = snap {
+                stamp_sequence(&mut env, snap);
+            }
             finish_log(&env, env.fence.as_ref())?;
             return shrink_to_budget(env);
         }
@@ -440,6 +457,10 @@ pub fn sequence_with(
         observe_path,
         elements_total,
         observe_challenge_present,
+        attempt: None,
+        cooldown_ms: None,
+        loop_suspected: false,
+        guidance: None,
     };
     finish_log(&env, None)?;
     shrink_to_budget(env)
@@ -779,7 +800,46 @@ fn abort_envelope(
         observe_path: None,
         elements_total: None,
         observe_challenge_present: None,
+        attempt: None,
+        cooldown_ms: None,
+        loop_suspected: false,
+        guidance: None,
     }
+}
+
+fn stamp_sequence(env: &mut SequenceEnvelope, snap: Snapshot) {
+    env.attempt = (snap.attempt > 0).then_some(snap.attempt);
+    env.cooldown_ms = snap.cooldown_ms;
+    env.loop_suspected = snap.loop_suspected;
+    env.guidance = cooldown::guidance(env.frozen, snap);
+}
+
+fn sequence_abort_snapshot(
+    session_id: &str,
+    step: &SequenceStep,
+    outcome: &StepOutcome,
+) -> Option<Snapshot> {
+    let needs_note = match step {
+        SequenceStep::Activate { .. } if outcome.ok && outcome.foregrounded != Some(true) => true,
+        SequenceStep::Click { .. }
+            if outcome.ok && outcome.miss.as_deref() == Some("focus_lost") =>
+        {
+            true
+        }
+        _ => false,
+    };
+    if needs_note {
+        return Some(cooldown::note_rejection(session_id));
+    }
+    if !outcome.ok
+        && !matches!(
+            step,
+            SequenceStep::WaitSettle { .. } | SequenceStep::Observe
+        )
+    {
+        return Some(cooldown::snapshot(session_id));
+    }
+    None
 }
 
 fn bad_steps_envelope(session_id: &str, raw_len: usize, fail: ParseFail) -> SequenceEnvelope {
@@ -815,7 +875,7 @@ fn from_actuate(env: ActuateEnvelope) -> StepOutcome {
 fn from_activate(env: ActivateEnvelope) -> StepOutcome {
     StepOutcome {
         ok: env.ok,
-        frozen: false,
+        frozen: env.frozen,
         foregrounded: Some(env.foregrounded),
         settled: None,
         miss: None,
@@ -954,7 +1014,7 @@ mod tests {
         SequenceHooks {
             yielded: || false,
             frozen: || false,
-            cooling: || false,
+            cooling: |_| false,
             activate: |_, _| Ok(ok_out()),
             click: |_, _| Ok(ok_out()),
             hover: |_, _| Ok(ok_out()),
@@ -1198,7 +1258,7 @@ mod tests {
         assert!(tools(&frozen).is_empty());
 
         let mut hooks = test_hooks();
-        hooks.cooling = || true;
+        hooks.cooling = |_| true;
         let cool = run_hooks(json!([{"tool":"type","text":"x"}]), hooks);
         assert_eq!(cool.stop_reason, StopReason::Cooldown);
         assert_eq!(cool.failed_step_index, Some(0));
@@ -1275,6 +1335,10 @@ mod tests {
             observe_path: Some("C:\\tmp\\observe.json".into()),
             elements_total: Some(9),
             observe_challenge_present: Some(false),
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
         };
         let before = env.executed_steps.len();
         let shrunk = shrink_to_budget(env).expect("shrink");
@@ -1282,5 +1346,161 @@ mod tests {
         assert!(shrunk.executed_steps.len() < before);
         let json = serialize_envelope(&shrunk).unwrap();
         assert!(json.len() <= ENVELOPE_MAX_BYTES);
+    }
+
+    #[test]
+    fn live_cooling_and_from_activate_source_lock() {
+        let src = include_str!("sequence.rs");
+        let live = src.find("fn live() -> Self").expect("live");
+        let live_end = src[live..].find("\npub fn run(").expect("run follows live");
+        let live_body = &src[live..live + live_end];
+        assert!(
+            live_body.contains("cooling: cooldown::is_cooling"),
+            "live cooling must call cooldown::is_cooling:\n{live_body}"
+        );
+        let from = src.find("fn from_activate").expect("from_activate");
+        let from_end = src[from..]
+            .find("\nfn live_activate")
+            .expect("live_activate follows");
+        let from_body = &src[from..from + from_end];
+        assert!(
+            from_body.contains("frozen: env.frozen"),
+            "from_activate must read env.frozen:\n{from_body}"
+        );
+        assert!(
+            !from_body.contains("frozen: false"),
+            "from_activate must not hardcode frozen false:\n{from_body}"
+        );
+    }
+
+    #[test]
+    fn focus_lost_ok_true_notes_once() {
+        let _g = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        let mut hooks = test_hooks();
+        hooks.click = |_, _| {
+            Ok(StepOutcome {
+                ok: true,
+                miss: Some("focus_lost".into()),
+                ..StepOutcome::default()
+            })
+        };
+        let env = run_hooks(json!([{"tool":"click","x":1,"y":1}]), hooks);
+        assert_eq!(env.stop_reason, StopReason::FocusLost);
+        assert_eq!(crate::cooldown::snapshot("seq-test").attempt, 1);
+        crate::cooldown::reset_for_test();
+    }
+
+    #[test]
+    fn dispatch_err_notes_once() {
+        let _g = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        let mut hooks = test_hooks();
+        hooks.key = |_, _| {
+            Err(HandsError::Input(
+                "unknown key 'ctrl+w'; see key --help".into(),
+            ))
+        };
+        let env = run_hooks(json!([{"tool":"key","name":"ctrl+w"}]), hooks);
+        assert_eq!(env.stop_reason, StopReason::UnknownKey);
+        assert_eq!(crate::cooldown::snapshot("seq-test").attempt, 1);
+        crate::cooldown::reset_for_test();
+    }
+
+    #[test]
+    fn abort_observe_does_not_reset() {
+        let _g = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        crate::cooldown::note_rejection("seq-test");
+        crate::cooldown::note_rejection("seq-test");
+        crate::cooldown::note_rejection("seq-test");
+        assert!(crate::cooldown::is_cooling("seq-test"));
+        let mut hooks = test_hooks();
+        hooks.key = |_, _| {
+            Ok(StepOutcome {
+                ok: false,
+                error: Some("unknown key 'ctrl+w'; see key --help".into()),
+                ..StepOutcome::default()
+            })
+        };
+        let env = run_hooks(
+            json!([
+                {"tool":"key","name":"ctrl+w"},
+                {"tool":"observe"}
+            ]),
+            hooks,
+        );
+        assert_eq!(env.stop_reason, StopReason::UnknownKey);
+        assert!(env.observe_path.is_none());
+        assert!(crate::cooldown::is_cooling("seq-test"));
+        crate::cooldown::reset_for_test();
+    }
+
+    #[test]
+    fn success_trailing_observe_resets_when_not_frozen() {
+        let _g = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _lease = crate::lease::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        crate::lease::reset_for_test();
+        crate::cooldown::note_rejection("seq-test");
+        crate::cooldown::note_rejection("seq-test");
+        crate::cooldown::note_rejection("seq-test");
+        let mut hooks = test_hooks();
+        hooks.observe = |_| {
+            crate::cooldown::note_observe("seq-test");
+            Ok(ObserveSummary {
+                observe_path: "C:\\tmp\\observe.json".into(),
+                elements_total: 3,
+                challenge_present: false,
+            })
+        };
+        let env = run_hooks(
+            json!([
+                {"tool":"wait_settle","x":1,"y":1,"w":10,"h":10},
+                {"tool":"observe"}
+            ]),
+            hooks,
+        );
+        assert_eq!(env.stop_reason, StopReason::Completed);
+        assert!(!crate::cooldown::is_cooling("seq-test"));
+        crate::cooldown::reset_for_test();
+        crate::lease::reset_for_test();
+    }
+
+    #[test]
+    fn bad_steps_does_not_note() {
+        let _g = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        let env = run_hooks(json!([]), test_hooks());
+        assert_eq!(env.stop_reason, StopReason::BadSteps);
+        assert_eq!(crate::cooldown::snapshot("seq-test").attempt, 0);
+        crate::cooldown::reset_for_test();
+    }
+
+    #[test]
+    fn step_zero_cooling_notes_once() {
+        let _g = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        let mut hooks = test_hooks();
+        hooks.cooling = |_| true;
+        let env = run_hooks(json!([{"tool":"type","text":"x"}]), hooks);
+        assert_eq!(env.stop_reason, StopReason::Cooldown);
+        assert_eq!(env.attempt, Some(1));
+        assert_eq!(crate::cooldown::snapshot("seq-test").attempt, 1);
+        crate::cooldown::reset_for_test();
     }
 }

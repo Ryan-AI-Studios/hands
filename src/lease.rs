@@ -11,11 +11,14 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Power::{
     ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
 };
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CANCEL, VK_PAUSE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED,
@@ -165,7 +168,73 @@ static HID_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 static NOTIFY_LOCK: Mutex<()> = Mutex::new(());
 static CLOCK0: OnceLock<Instant> = OnceLock::new();
 static LISTENERS: Mutex<Vec<FreezeListener>> = Mutex::new(Vec::new());
+static PARENT_CLIENT: Mutex<Option<String>> = Mutex::new(None);
 pub const HID_GRACE_MS: u64 = 50;
+
+pub fn parent_client() -> Option<String> {
+    PARENT_CLIENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn exe_basename(sz: &[u16]) -> Option<String> {
+    let end = sz.iter().position(|&c| c == 0).unwrap_or(sz.len());
+    let raw = String::from_utf16_lossy(&sz[..end]);
+    Path::new(raw.trim())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
+/// Best-effort parent process basename. Never fails the caller.
+fn capture_parent_client() {
+    let snap = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let name = (|| {
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        unsafe { Process32FirstW(snap, &mut entry) }.ok()?;
+        let self_pid = unsafe { GetCurrentProcessId() };
+        let mut parent_pid = None;
+        loop {
+            if entry.th32ProcessID == self_pid {
+                parent_pid = Some(entry.th32ParentProcessID);
+                break;
+            }
+            if unsafe { Process32NextW(snap, &mut entry) }.is_err() {
+                break;
+            }
+        }
+        let parent_pid = parent_pid?;
+        if parent_pid == 0 || parent_pid == 4 {
+            return None;
+        }
+        entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        unsafe { Process32FirstW(snap, &mut entry) }.ok()?;
+        loop {
+            if entry.th32ProcessID == parent_pid {
+                return exe_basename(&entry.szExeFile);
+            }
+            if unsafe { Process32NextW(snap, &mut entry) }.is_err() {
+                break;
+            }
+        }
+        None
+    })();
+    let _ = unsafe { CloseHandle(snap) };
+    if let Some(name) = name {
+        *PARENT_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(name);
+    }
+}
 
 fn now_ms() -> u64 {
     let elapsed = CLOCK0
@@ -539,6 +608,7 @@ impl Drop for LeaseGuard {
 
 /// Install LL hooks + keep-awake on a dedicated message-pump thread.
 pub fn install() -> Result<LeaseGuard, HandsError> {
+    capture_parent_client();
     let (tx, rx) = mpsc::channel();
     let join = std::thread::Builder::new()
         .name("hands-lease".into())
@@ -1130,5 +1200,37 @@ mod tests {
             assert!(seen.lock().unwrap().is_empty());
         });
         reset_for_test();
+    }
+
+    #[test]
+    fn install_captures_parent_on_installing_thread() {
+        let src = include_str!("lease.rs");
+        let start = src.find("pub fn install()").expect("install");
+        let rest = &src[start..];
+        let end = rest
+            .find("\nfn lease_thread")
+            .expect("lease_thread follows");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("#[cfg(test)]"),
+            "install slice must not include tests:\n{body}"
+        );
+        let capture = body.find("capture_parent_client()").expect("capture");
+        let spawn = body.find("std::thread::Builder").expect("spawn");
+        assert!(
+            capture < spawn,
+            "ToolHelp must run on the installing thread before spawn:\n{body}"
+        );
+        let helper = src
+            .find("fn capture_parent_client")
+            .expect("capture_parent_client");
+        let helper_body = src[helper..]
+            .split("\nfn now_ms")
+            .next()
+            .expect("helper slice");
+        assert!(helper_body.contains("dwSize"));
+        assert!(helper_body.contains("CloseHandle"));
+        assert!(helper_body.contains("Process32FirstW"));
+        assert!(helper_body.contains("th32ParentProcessID"));
     }
 }

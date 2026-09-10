@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::bezier::Rng;
 use crate::challenge::{self, ChallengeInfo, YIELD_ERROR};
+use crate::cooldown::{self, Snapshot};
 use crate::error::HandsError;
 use crate::fence::{self, FenceInfo};
 use crate::foreground;
@@ -46,6 +47,14 @@ pub struct ActuateEnvelope {
     pub roi: Option<Rect>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub miss: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_suspected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -77,10 +86,20 @@ pub struct ActivateEnvelope {
     pub foregrounded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<ActivateWindow>,
+    #[serde(default)]
+    pub frozen: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub challenge: Option<ChallengeInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_suspected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
 }
 
 static LAST_TARGET: Mutex<Option<Rect>> = Mutex::new(None);
@@ -135,9 +154,63 @@ impl ActivateHooks {
     }
 }
 
-fn finish_activate(envelope: ActivateEnvelope) -> Result<ActivateEnvelope, HandsError> {
+fn stamp_actuate(env: &mut ActuateEnvelope, snap: Snapshot) {
+    env.attempt = (snap.attempt > 0).then_some(snap.attempt);
+    env.cooldown_ms = snap.cooldown_ms;
+    env.loop_suspected = snap.loop_suspected;
+    env.guidance = cooldown::guidance(env.frozen, snap);
+}
+
+fn stamp_activate(env: &mut ActivateEnvelope, snap: Snapshot) {
+    env.attempt = (snap.attempt > 0).then_some(snap.attempt);
+    env.cooldown_ms = snap.cooldown_ms;
+    env.loop_suspected = snap.loop_suspected;
+    env.guidance = cooldown::guidance(env.frozen, snap);
+}
+
+fn refuse_if_blocked(
+    session_id: &str,
+    target: ActuateTarget,
+) -> Result<Option<ActuateEnvelope>, HandsError> {
+    let frozen = lease::is_frozen();
+    if !frozen && !cooldown::is_cooling(session_id) {
+        return Ok(None);
+    }
+    let error = if frozen {
+        Some("desk lease frozen (physical input or Pause/Break)".into())
+    } else {
+        Some("session cooling — honor cooldown_ms; do not retry yet".into())
+    };
+    finalize_envelope(ActuateEnvelope {
+        session_id: session_id.into(),
+        ok: false,
+        frozen,
+        target,
+        retried: false,
+        settled: false,
+        foregrounded: false,
+        error,
+        fence: None,
+        challenge: None,
+        roi: None,
+        miss: None,
+        attempt: None,
+        cooldown_ms: None,
+        loop_suspected: false,
+        guidance: None,
+    })
+    .map(Some)
+}
+
+fn finish_activate(mut envelope: ActivateEnvelope) -> Result<ActivateEnvelope, HandsError> {
     logs::ensure_installed();
     logs::remember_session(&envelope.session_id);
+    if envelope.ok && envelope.foregrounded {
+        cooldown::note_success(&envelope.session_id);
+    } else if !envelope.ok {
+        let snap = cooldown::note_rejection(&envelope.session_id);
+        stamp_activate(&mut envelope, snap);
+    }
     let _ = logs::record_actuate(
         &envelope.session_id,
         "activate",
@@ -171,8 +244,33 @@ fn activate_with(
             ok: false,
             foregrounded: false,
             window: None,
+            frozen: lease::is_frozen(),
             error: Some(YIELD_ERROR.into()),
             challenge: Some(challenge::snapshot()),
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
+        });
+    }
+    let frozen = lease::is_frozen();
+    if frozen || cooldown::is_cooling(&session_id) {
+        return finish_activate(ActivateEnvelope {
+            session_id,
+            ok: false,
+            foregrounded: false,
+            window: None,
+            frozen,
+            error: Some(if frozen {
+                "desk lease frozen (physical input or Pause/Break)".into()
+            } else {
+                "session cooling — honor cooldown_ms; do not retry yet".into()
+            }),
+            challenge: None,
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
         });
     }
     let inventory = (hooks.inventory)();
@@ -184,8 +282,13 @@ fn activate_with(
                 ok: false,
                 foregrounded: false,
                 window: None,
+                frozen: false,
                 error: Some(err.tool_message()),
                 challenge: None,
+                attempt: None,
+                cooldown_ms: None,
+                loop_suspected: false,
+                guidance: None,
             });
         }
     };
@@ -205,8 +308,13 @@ fn activate_with(
             title: hit.title,
             hwnd: foreground::format_hwnd(hit.hwnd),
         }),
+        frozen: false,
         error: None,
         challenge: None,
+        attempt: None,
+        cooldown_ms: None,
+        loop_suspected: false,
+        guidance: None,
     })
 }
 
@@ -234,6 +342,10 @@ fn base(
         challenge: None,
         roi: None,
         miss: None,
+        attempt: None,
+        cooldown_ms: None,
+        loop_suspected: false,
+        guidance: None,
     })
 }
 
@@ -251,6 +363,10 @@ fn refuse_yield(session_id: String, target: ActuateTarget) -> Result<ActuateEnve
         challenge: Some(challenge::snapshot()),
         roi: None,
         miss: None,
+        attempt: None,
+        cooldown_ms: None,
+        loop_suspected: false,
+        guidance: None,
     })
 }
 
@@ -283,6 +399,10 @@ fn refuse_fence(
         challenge: None,
         roi: None,
         miss: None,
+        attempt: None,
+        cooldown_ms: None,
+        loop_suspected: false,
+        guidance: None,
     })
 }
 
@@ -356,6 +476,10 @@ fn log_fence(fence: &FenceInfo) -> LogFence {
     }
 }
 
+fn counts_rejection(tool: &str) -> bool {
+    matches!(tool, "click" | "hover" | "type" | "key" | "scroll")
+}
+
 fn after_actuate(
     tool: &str,
     result: Result<ActuateEnvelope, HandsError>,
@@ -363,6 +487,20 @@ fn after_actuate(
     key: Option<&str>,
 ) -> Result<ActuateEnvelope, HandsError> {
     logs::ensure_installed();
+    let result = match result {
+        Ok(mut env) => {
+            if counts_rejection(tool) {
+                if env.ok {
+                    cooldown::note_success(&env.session_id);
+                } else {
+                    let snap = cooldown::note_rejection(&env.session_id);
+                    stamp_actuate(&mut env, snap);
+                }
+            }
+            Ok(env)
+        }
+        Err(err) => Err(err),
+    };
     if let Ok(env) = &result {
         logs::remember_session(&env.session_id);
         let _ = logs::record_actuate(
@@ -423,6 +561,9 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         Ok(None) => {}
         Ok(Some(info_fence)) => return refuse_fence(session_id, info, info_fence),
         Err(err) => return fail(session_id, info, err, false, false, false),
+    }
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
     }
     challenge::note_actuation_if_proceeding(false);
     remember_target(resolved.rect);
@@ -515,6 +656,9 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
+    }
     remember_target(resolved.rect);
     let mut rng = Rng::from_time();
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
@@ -570,6 +714,9 @@ fn type_text_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             false,
         );
     }
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
+    }
     if let Err(err) = ensure_dpi() {
         return fail(session_id, info, err, false, false, false);
     }
@@ -612,6 +759,9 @@ fn key_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             Err(err) => return fail(session_id, info, err, false, false, false),
         }
     }
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
+    }
     if let Err(err) = ensure_dpi() {
         return fail(session_id, info, err, false, false, false);
     }
@@ -646,6 +796,9 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let mut foregrounded = false;
     let mut info = none_target();
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
+        return Ok(env);
+    }
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
     if has_target {
@@ -838,6 +991,10 @@ mod tests {
             challenge: None,
             roi: None,
             miss: None,
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
         };
         let err = finalize_envelope(env).expect_err("must not emit oversize");
         assert!(err.to_string().contains("16384"), "{err}");
@@ -872,6 +1029,10 @@ mod tests {
                 h: 600,
             }),
             miss: None,
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"roi\""), "{json}");
@@ -902,6 +1063,10 @@ mod tests {
             challenge: None,
             roi: None,
             miss: None,
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(!json.contains("\"roi\""), "{json}");
@@ -928,6 +1093,10 @@ mod tests {
             challenge: None,
             roi: None,
             miss: Some("no_change".into()),
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"miss\":\"no_change\""), "{json}");
@@ -953,6 +1122,10 @@ mod tests {
             challenge: None,
             roi: None,
             miss: None,
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(!json.contains("\"miss\""), "{json}");
@@ -984,9 +1157,14 @@ mod tests {
             capture > offer && capture > move_to && capture < click,
             "first capture_roi must be after offer and move_to and before first left_click:\n{body}"
         );
+        let blocked = body.find("refuse_if_blocked").expect("refuse_if_blocked");
         assert!(
             refuse < remember && remember < move_to,
             "click_inner must refuse yield before remember_target before move_to:\n{body}"
+        );
+        assert!(
+            blocked < offer,
+            "click_inner must refuse frozen/cooling before offer:\n{body}"
         );
         assert!(
             body.contains("default_roi"),
@@ -1271,11 +1449,17 @@ mod tests {
             "hover_inner slice must not include tests:\n{body}"
         );
         let refuse = body.find("refuse_if_yielded").expect("refuse");
+        let blocked = body.find("refuse_if_blocked").expect("refuse_if_blocked");
         let remember = body.find("remember_target").expect("remember");
         let move_to = body.find("input::move_to").expect("move_to");
+        let offer = body.find("foreground::offer").expect("offer");
         assert!(
             refuse < remember && remember < move_to,
             "hover_inner must refuse yield before remember_target before move_to:\n{body}"
+        );
+        assert!(
+            blocked < offer,
+            "hover_inner must refuse frozen/cooling before offer:\n{body}"
         );
         assert!(
             !body.contains("note_actuation"),
@@ -1563,6 +1747,125 @@ mod tests {
         crate::challenge::reset_for_test();
         assert!(!env.ok, "{env:?}");
         assert_eq!(env.error.as_deref(), Some(YIELD_ERROR));
+        assert_eq!(OFFERS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn activate_with_refuses_frozen_or_cooling_before_offer() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn activate_with").expect("activate_with");
+        let rest = &src[start..];
+        let end = rest.find("\nfn base(").expect("base follows");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("#[cfg(test)]"),
+            "activate_with slice must not include tests:\n{body}"
+        );
+        let cooling = body.find("cooldown::is_cooling").expect("cooling check");
+        let offer = body.find("(hooks.offer)").expect("offer");
+        assert!(
+            cooling < offer,
+            "activate_with must refuse frozen/cooling before offer:\n{body}"
+        );
+        assert!(
+            body.contains("lease::is_frozen"),
+            "activate_with must check lease freeze:\n{body}"
+        );
+    }
+
+    #[test]
+    fn frozen_click_third_has_fields_fourth_skips_offer() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cool = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ch = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::challenge::reset_for_test();
+        with_stop_env(|| {
+            lease::freeze_now_with(lease::FreezeCause::Physical);
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            let req = ActuateRequest {
+                session_id: Some("s-cool-click".into()),
+                x: Some(x),
+                y: Some(y),
+                ..ActuateRequest::default()
+            };
+            let first = click(req.clone()).expect("first");
+            assert!(!first.ok, "{first:?}");
+            assert!(first.frozen);
+            assert_eq!(first.attempt, Some(1));
+            assert!(first.cooldown_ms.is_none());
+            let second = click(req.clone()).expect("second");
+            assert_eq!(second.attempt, Some(2));
+            let third = click(req.clone()).expect("third");
+            assert_eq!(third.attempt, Some(3));
+            assert!(third.loop_suspected);
+            assert!(third.cooldown_ms.is_some(), "{third:?}");
+            assert_eq!(
+                third.guidance.as_deref(),
+                Some(crate::cooldown::GUIDANCE_FROZEN)
+            );
+            let fourth = click(req).expect("fourth");
+            assert!(!fourth.ok, "{fourth:?}");
+            assert!(fourth.frozen);
+            assert!(fourth.loop_suspected);
+            assert!(fourth.cooldown_ms.is_some());
+            assert_eq!(fourth.attempt, Some(4));
+        });
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::challenge::reset_for_test();
+    }
+
+    #[test]
+    fn frozen_activate_does_not_offer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OFFERS: AtomicUsize = AtomicUsize::new(0);
+        fn offer_count(_: Option<isize>, _: (i32, i32)) -> bool {
+            OFFERS.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cool = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ch = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::challenge::reset_for_test();
+        crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
+        OFFERS.store(0, Ordering::SeqCst);
+        lease::freeze_now_with(lease::FreezeCause::Physical);
+        let env = activate_with(
+            Some("s-cool-act".into()),
+            "hwnd:11".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_count,
+                foreground: || Some(0x11),
+            },
+        )
+        .expect("frozen envelope");
+        crate::foreground::set_titled_windows_hook(None);
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::challenge::reset_for_test();
+        assert!(!env.ok, "{env:?}");
+        assert!(env.frozen);
+        assert_eq!(env.attempt, Some(1));
+        assert_eq!(
+            env.guidance.as_deref(),
+            Some(crate::cooldown::GUIDANCE_FROZEN)
+        );
         assert_eq!(OFFERS.load(Ordering::SeqCst), 0);
     }
 }

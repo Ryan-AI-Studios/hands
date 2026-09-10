@@ -249,7 +249,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. After click, envelope may include miss (no_change / focus_lost); settle baseline is post-hover ROI pixel-diff; one retry, re-offer on focus_lost. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default."
+        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. After click, envelope may include miss (no_change / focus_lost); settle baseline is post-hover ROI pixel-diff; one retry, re-offer on focus_lost. Honor loop_suspected / cooldown_ms; frozen means yield the task. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default."
     )]
     fn click(
         &self,
@@ -334,7 +334,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Raise a titled window by the same selector as observe --window (pid, unique title substring, or hwnd:<hex>). Not observe. Not confirm-gated. Reports foregrounded honestly; OS may refuse focus."
+        description = "Raise a titled window by the same selector as observe --window (pid, unique title substring, or hwnd:<hex>). Not observe. Not confirm-gated. Reports foregrounded honestly; OS may refuse focus. Honor loop_suspected / cooldown_ms; frozen means yield the task."
     )]
     fn activate(
         &self,
@@ -344,7 +344,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Fixed script of up to 8 allowlisted steps (activate, click, hover, type, key, scroll, wait_settle, optional trailing observe). Aborts on the first failed prerequisite. Not do_task (no inner LLM). Not confirm-gated as a whole; individual click/enter still gated. No new inter-step dwell (existing hover/scroll 100 ms dwell unchanged). After a fence/yield abort, send a new sequence of the remaining steps — no resume cursor."
+        description = "Fixed script of up to 8 allowlisted steps (activate, click, hover, type, key, scroll, wait_settle, optional trailing observe). Aborts on the first failed prerequisite. Not do_task (no inner LLM). Not confirm-gated as a whole; individual click/enter still gated. No new inter-step dwell (existing hover/scroll 100 ms dwell unchanged). After a fence/yield abort, send a new sequence of the remaining steps — no resume cursor. Honor loop_suspected / cooldown_ms; frozen means yield the task."
     )]
     fn sequence(
         &self,
@@ -437,7 +437,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Optional client of Hands primitives: loop the caller's model (xAI/Grok default) over observe/click/attach/pick/challenge-status. No auto-confirm. Stops on fence or challenge yield. Does not auto-solve; challenge --solve is a separate tool, research identity only. listen is a separate on-demand tool and is never a CAPTCHA solver on any identity."
+        description = "Optional client of Hands primitives: loop the caller's model (xAI/Grok default) over observe/click/attach/pick/challenge-status. No auto-confirm. Stops on fence, challenge yield, or cooldown (loop_suspected / cooldown_ms / session cooling). Does not auto-solve; challenge --solve is a separate tool, research identity only. listen is a separate on-demand tool and is never a CAPTCHA solver on any identity."
     )]
     fn do_task(
         &self,

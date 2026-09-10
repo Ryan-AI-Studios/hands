@@ -28,7 +28,7 @@ static INSTALLED: OnceLock<()> = OnceLock::new();
 static LAST_SESSION: Mutex<Option<String>> = Mutex::new(None);
 static LOG_IO: Mutex<()> = Mutex::new(());
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Event {
     pub schema: String,
     pub ts: String,
@@ -54,6 +54,12 @@ pub struct Event {
     pub key: Option<String>,
     #[serde(default, rename = "yield", skip_serializing_if = "Option::is_none")]
     pub yield_info: Option<LogYield>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -200,6 +206,9 @@ fn pause_event(session_id: &str) -> Event {
         type_meta: None,
         key: None,
         yield_info: None,
+        client: None,
+        cooldown_ms: None,
+        attempt: None,
     }
 }
 
@@ -219,6 +228,9 @@ fn stop_event(session_id: &str, from_tool: bool) -> Event {
         type_meta: None,
         key: None,
         yield_info: None,
+        client: None,
+        cooldown_ms: None,
+        attempt: None,
     }
 }
 
@@ -376,8 +388,20 @@ fn append_event(event: &Event, allow_desk: bool) -> Result<(), HandsError> {
     })
 }
 
-pub fn record(event: Event) -> Result<(), HandsError> {
+pub fn record(mut event: Event) -> Result<(), HandsError> {
     remember_session(&event.session_id);
+    if event.client.is_none() {
+        event.client = lease::parent_client();
+    }
+    if event.ok == Some(false) {
+        let snap = crate::cooldown::snapshot(&event.session_id);
+        if event.attempt.is_none() && snap.attempt > 0 {
+            event.attempt = Some(snap.attempt);
+        }
+        if event.cooldown_ms.is_none() {
+            event.cooldown_ms = snap.cooldown_ms;
+        }
+    }
     append_event(&event, false)
 }
 
@@ -399,6 +423,9 @@ pub fn record_yield(session_id: &str, reason: &str) -> Result<(), HandsError> {
         yield_info: Some(LogYield {
             reason: reason.into(),
         }),
+        client: None,
+        cooldown_ms: None,
+        attempt: None,
     })
 }
 
@@ -439,6 +466,9 @@ pub fn record_observe_row(session_id: &str, observe: LogObserve) -> Result<(), H
         type_meta: None,
         key: None,
         yield_info: None,
+        client: None,
+        cooldown_ms: None,
+        attempt: None,
     })
 }
 
@@ -474,6 +504,9 @@ pub fn record_confirm(
         type_meta: None,
         key: None,
         yield_info: None,
+        client: None,
+        cooldown_ms: None,
+        attempt: None,
     })
 }
 
@@ -512,6 +545,9 @@ pub fn record_actuate(
         type_meta: type_len.map(|len| TypeMeta { len }),
         key: key.map(str::to_string),
         yield_info: None,
+        client: None,
+        cooldown_ms: None,
+        attempt: None,
     })
 }
 
@@ -793,6 +829,9 @@ mod tests {
             type_meta: None,
             key: None,
             yield_info: None,
+            client: None,
+            cooldown_ms: None,
+            attempt: None,
         }
     }
 
@@ -1074,6 +1113,9 @@ mod tests {
                     type_meta: None,
                     key: None,
                     yield_info: None,
+                    client: None,
+                    cooldown_ms: None,
+                    attempt: None,
                 });
             }
             let env = read_tail("s-fat", Some(200)).unwrap();
@@ -1120,6 +1162,9 @@ mod tests {
             type_meta: None,
             key: None,
             yield_info: None,
+            client: None,
+            cooldown_ms: None,
+            attempt: None,
         }
     }
 
@@ -1139,6 +1184,9 @@ mod tests {
             type_meta: None,
             key: None,
             yield_info: None,
+            client: None,
+            cooldown_ms: None,
+            attempt: None,
         }
     }
 
@@ -1417,5 +1465,16 @@ mod tests {
                 assert!(raw.contains("\"list\":true"), "{raw}");
             });
         });
+    }
+
+    #[test]
+    fn old_jsonl_deserializes_without_client_or_cooldown() {
+        let raw = r#"{"schema":"hands.logs/v1","ts":"2026-09-07T12:00:00","session_id":"old","kind":"tool","tool":"click","ok":false}"#;
+        let ev: Event = serde_json::from_str(raw).expect("old row");
+        assert_eq!(ev.session_id, "old");
+        assert_eq!(ev.ok, Some(false));
+        assert!(ev.client.is_none());
+        assert!(ev.cooldown_ms.is_none());
+        assert!(ev.attempt.is_none());
     }
 }

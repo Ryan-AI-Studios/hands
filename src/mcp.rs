@@ -17,6 +17,7 @@ use crate::listen::{self, ListenRequest};
 use crate::logs;
 use crate::observe::{ObserveRequest, ObserveView, observe, serialize_mcp_envelope};
 use crate::pick::{self, GroundRequest, PickRequest};
+use crate::sequence;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ObserveParams {
@@ -106,6 +107,22 @@ pub struct ActivateParams {
     pub window: String,
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+fn steps_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "items": { "type": "object" },
+        "description": "Allowlisted steps: activate, click, hover, type, key, scroll, wait_settle, optional trailing observe. Max 8."
+    })
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SequenceParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[schemars(schema_with = "steps_schema")]
+    pub steps: serde_json::Value,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -325,6 +342,16 @@ impl HandsServer {
     }
 
     #[tool(
+        description = "Fixed script of up to 8 allowlisted steps (activate, click, hover, type, key, scroll, wait_settle, optional trailing observe). Aborts on the first failed prerequisite. Not do_task (no inner LLM). Not confirm-gated as a whole; individual click/enter still gated. No new inter-step dwell (existing hover/scroll 100 ms dwell unchanged). After a fence/yield abort, send a new sequence of the remaining steps — no resume cursor."
+    )]
+    fn sequence(
+        &self,
+        Parameters(params): Parameters<SequenceParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_sequence(params))
+    }
+
+    #[tool(
         description = "Abort injected input and freeze the desk lease (same as Pause/Break). One successful stop writes one desk stop JSONL."
     )]
     fn stop(
@@ -450,6 +477,24 @@ fn run_actuate(result: Result<crate::actuate::ActuateEnvelope, HandsError>) -> C
     match result.and_then(|env| actuate::serialize_envelope(&env).map(|j| (env.ok, j))) {
         Ok((_ok, json)) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
+fn run_sequence(params: SequenceParams) -> CallToolResult {
+    match sequence::run(params.session_id, params.steps)
+        .and_then(|env| sequence::serialize_envelope(&env).map(|json| (env.ok, json)))
+    {
+        Ok((ok, json)) => sequence_tool_result(ok, json),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
+pub fn sequence_tool_result(ok: bool, json: String) -> CallToolResult {
+    let content = vec![ContentBlock::text(json)];
+    if ok {
+        CallToolResult::success(content)
+    } else {
+        CallToolResult::error(content)
     }
 }
 
@@ -621,4 +666,31 @@ pub async fn serve() -> Result<(), HandsError> {
         .await
         .map_err(|err| HandsError::Observe(format!("mcp wait: {err}")))?;
     Ok(())
+}
+
+#[allow(dead_code)]
+fn mcp_production_end() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequence_ok_false_is_tool_error_not_protocol_err() {
+        let err = sequence_tool_result(false, "{\"ok\":false}".into());
+        assert_eq!(err.is_error, Some(true));
+        let ok = sequence_tool_result(true, "{\"ok\":true}".into());
+        assert_eq!(ok.is_error, Some(false));
+    }
+
+    #[test]
+    fn run_actuate_still_transport_success_on_payload_false() {
+        let src = include_str!("mcp.rs");
+        let start = src.find("fn run_actuate").expect("run_actuate");
+        let body = &src[start..start + 280];
+        assert!(
+            body.contains("CallToolResult::success"),
+            "run_actuate must stay success on ok:false:\n{body}"
+        );
+    }
 }

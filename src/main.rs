@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use hands::{
     ActuateRequest, Detail, GroundRequest, HandsError, ObserveRequest, ObserveView, PickRequest,
     actuate, allows, attach, challenge, dotask, ensure_dpi, host_doctor, listen, logs, native_host,
-    observe, pick, serialize_envelope, serialize_pick,
+    observe, pick, sequence, serialize_envelope, serialize_pick,
 };
 
 #[derive(Parser)]
@@ -137,6 +137,14 @@ enum Command {
         /// pid, unique title substring, or hwnd:<hex> (optional 0x)
         #[arg(long)]
         window: String,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Run a fixed script of up to 8 allowlisted steps (activate, click, hover, type, key, scroll, wait_settle, optional trailing observe). Aborts on the first failed prerequisite. Installs the desk lease. Parse tests only — do not live-drive.
+    Sequence {
+        /// JSON array of step objects (`tool` plus per-step fields)
+        #[arg(long)]
+        steps_json: String,
         #[arg(long)]
         session_id: Option<String>,
     },
@@ -680,6 +688,19 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             let json = actuate::serialize_activate(&envelope)?;
             (json, envelope.ok)
         }
+        Command::Sequence {
+            steps_json,
+            session_id,
+        } => {
+            let raw = std::fs::read_to_string(&steps_json).map_err(|err| {
+                HandsError::Input(format!("sequence --steps-json '{steps_json}': {err}"))
+            })?;
+            let steps: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|err| HandsError::Input(format!("sequence --steps-json parse: {err}")))?;
+            let envelope = sequence::run(session_id, steps)?;
+            let json = sequence::serialize_envelope(&envelope)?;
+            (json, envelope.ok)
+        }
         Command::Stop { session_id } => pack(actuate::stop_cli_noop(ActuateRequest {
             session_id,
             ..ActuateRequest::default()
@@ -812,6 +833,31 @@ mod tests {
         match cli.command {
             Command::Key { name, .. } => assert_eq!(name, "ctrl+t"),
             _ => panic!("expected Key"),
+        }
+    }
+
+    #[test]
+    fn sequence_steps_json_parses() {
+        let cli = Cli::try_parse_from(["hands", "sequence", "--steps-json", "C:\\tmp\\steps.json"])
+            .expect("parse");
+        match cli.command {
+            Command::Sequence { steps_json, .. } => {
+                assert_eq!(steps_json, "C:\\tmp\\steps.json")
+            }
+            _ => panic!("expected Sequence"),
+        }
+    }
+
+    #[test]
+    fn sequence_long_help_names_allowlist() {
+        let cmd = Cli::command();
+        let seq = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "sequence")
+            .expect("sequence subcommand");
+        let help = seq.clone().render_long_help().to_string();
+        for needle in ["activate", "click", "observe", "abort"] {
+            assert!(help.to_ascii_lowercase().contains(needle), "{help}");
         }
     }
 

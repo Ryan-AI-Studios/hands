@@ -21,6 +21,7 @@ use crate::lease::{self, FreezeCause};
 use crate::logs;
 use crate::observe::{self, ENVELOPE_MAX_BYTES, ObserveRequest};
 use crate::pick::{self, GroundRequest, PickRequest};
+use crate::sequence;
 use crate::session::resolve_session_id_from_os;
 
 use adapter::{
@@ -762,6 +763,10 @@ fn live_exec(name: &str, args: &Value, session_id: &str) -> Result<String, Hands
                 .ok_or_else(|| HandsError::Input("activate requires window".into()))?;
             actuate::serialize_activate(&actuate::activate(Some(session_id.into()), window)?)
         }
+        "sequence" => {
+            let steps = args.get("steps").cloned().unwrap_or(Value::Null);
+            sequence::serialize_envelope(&sequence::run(Some(session_id.into()), steps)?)
+        }
         "attach" => {
             let plan = args.get("plan").and_then(Value::as_bool).unwrap_or(false);
             attach::serialize_attach(&attach::run_attach(Some(session_id), plan)?)
@@ -901,6 +906,17 @@ fn offered_tools() -> Value {
             })
         ),
         fn_tool(
+            "sequence",
+            "Fixed script of up to 8 allowlisted steps. Aborts on the first failed prerequisite. Not do_task. Not confirm-gated as a whole.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "steps": { "type": "array", "items": { "type": "object" } }
+                },
+                "required": ["steps"]
+            })
+        ),
+        fn_tool(
             "attach",
             "Attach to daily Chrome or launch chrome.exe with no automation flags",
             json!({
@@ -986,6 +1002,7 @@ fn is_offered(name: &str) -> bool {
             | "scroll"
             | "wait_settle"
             | "activate"
+            | "sequence"
             | "attach"
             | "pick"
             | "ground"
@@ -2372,6 +2389,19 @@ mod tests {
             slice.contains("record_actuate"),
             "slice must cover the closing record_actuate:\n{slice}"
         );
+    }
+
+    #[test]
+    fn sequence_is_offered_and_not_forbidden() {
+        assert!(is_offered("sequence"));
+        assert!(!is_forbidden_name("sequence"));
+        let tools = offered_tools();
+        let found = tools
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|t| t.get("name").and_then(Value::as_str) == Some("sequence"));
+        assert!(found, "catalog must offer sequence");
     }
 
     #[test]

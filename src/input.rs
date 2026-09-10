@@ -15,7 +15,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
     VIRTUAL_KEY, VK_A, VK_BACK, VK_C, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
-    VK_L, VK_LEFT, VK_LWIN, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE,
+    VK_L, VK_LEFT, VK_LWIN, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE, VK_T,
     VK_TAB, VK_UP, VK_V, VK_X,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, WHEEL_DELTA};
@@ -428,8 +428,11 @@ pub fn named_key(name: &str) -> Result<(), HandsError> {
         "ctrl+v" => chord(&[VK_CONTROL, VK_V]),
         "ctrl+x" => chord(&[VK_CONTROL, VK_X]),
         "ctrl+l" => chord(&[VK_CONTROL, VK_L]),
+        "ctrl+t" => chord(&[VK_CONTROL, VK_T]),
         "win+shift+s" => chord(&[VK_LWIN, VK_SHIFT, VK_S]),
-        other => Err(HandsError::Input(format!("unknown key '{other}'"))),
+        other => Err(HandsError::Input(format!(
+            "unknown key '{other}'; see key --help"
+        ))),
     }
 }
 
@@ -669,11 +672,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_ctrl_k_t_w_do_not_send() {
+    fn unknown_ctrl_k_w_do_not_send() {
         let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         lease::reset_for_test();
         let _hook = arm_recorded_keys();
-        for name in ["ctrl+k", "ctrl+t", "ctrl+w"] {
+        for name in ["ctrl+k", "ctrl+w"] {
             SENT_KEYS.lock().unwrap_or_else(|e| e.into_inner()).clear();
             let err = named_key(name).expect_err(name);
             assert!(
@@ -681,10 +684,27 @@ mod tests {
                 "expected unknown key '{name}', got {err}"
             );
             assert!(
+                err.to_string().contains("see key --help"),
+                "discoverable hint: {err}"
+            );
+            assert!(
                 take_recorded_keys().is_empty(),
                 "zero send calls for {name}"
             );
         }
+    }
+
+    #[test]
+    fn ctrl_t_sends_control_t_chord() {
+        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        let _hook = arm_recorded_keys();
+        named_key("ctrl+t").expect("ctrl+t");
+        assert_mod_letter_chord(&take_recorded_keys(), VK_CONTROL, VK_T);
+        assert!(!is_enter_key("ctrl+t"));
+        SENT_KEYS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        named_key(" CTRL+T ").expect(" CTRL+T ");
+        assert_mod_letter_chord(&take_recorded_keys(), VK_CONTROL, VK_T);
     }
 
     #[test]
@@ -767,6 +787,7 @@ mod tests {
             "named_key body must stay production-only"
         );
         assert!(body.contains("\"ctrl+l\" => chord(&[VK_CONTROL, VK_L])"));
+        assert!(body.contains("\"ctrl+t\" => chord(&[VK_CONTROL, VK_T])"));
         assert!(body.contains("\"win+shift+s\" => chord(&[VK_LWIN, VK_SHIFT, VK_S])"));
         assert!(body.contains("\"ctrl+a\" => chord(&[VK_CONTROL, VK_A])"));
         assert!(body.contains("\"ctrl+c\" => chord(&[VK_CONTROL, VK_C])"));
@@ -777,12 +798,15 @@ mod tests {
         assert!(!body.contains("starts_with(\"win+\")"));
         assert!(!body.contains("strip_prefix(\"win+\")"));
         assert!(!body.contains("split('+')"));
+        assert!(!body.contains("note_last_url"));
     }
 
     #[test]
     fn mcp_and_cli_copy_name_ctrl_l() {
         assert!(include_str!("mcp.rs").contains("ctrl+l"));
         assert!(include_str!("main.rs").contains("ctrl+l"));
+        assert!(include_str!("mcp.rs").contains("ctrl+t"));
+        assert!(include_str!("main.rs").contains("ctrl+t"));
         assert!(include_str!("mcp.rs").contains("win+shift+s"));
         assert!(include_str!("main.rs").contains("win+shift+s"));
         assert!(include_str!("mcp.rs").contains("Windows Screen snipping"));

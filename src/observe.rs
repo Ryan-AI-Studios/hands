@@ -126,6 +126,8 @@ pub struct DesktopWindow {
     pub pid: u32,
     pub title: String,
     pub state: WindowState,
+    #[serde(default)]
+    pub hwnd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rect: Option<Rect>,
 }
@@ -136,6 +138,8 @@ pub struct FgWindow {
     pub title: String,
     pub class: String,
     pub chrome_exe: bool,
+    #[serde(default)]
+    pub hwnd: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +149,8 @@ pub struct TargetWindow {
     pub class: String,
     pub chrome_exe: bool,
     pub foreground: bool,
+    #[serde(default)]
+    pub hwnd: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -234,6 +240,7 @@ fn empty_fg_window() -> FgWindow {
         title: String::new(),
         class: String::new(),
         chrome_exe: false,
+        hwnd: String::new(),
     }
 }
 
@@ -246,6 +253,7 @@ fn describe_fg_window(fg: Option<isize>) -> FgWindow {
         title: foreground::title(Some(hwnd)),
         class: foreground::class_name_of(hwnd),
         chrome_exe: foreground::is_chrome_hwnd(hwnd),
+        hwnd: foreground::format_hwnd(hwnd),
     }
 }
 
@@ -256,6 +264,7 @@ fn describe_target(hit: &foreground::TitledWindow, fg: Option<isize>) -> TargetW
         class: hit.class.clone(),
         chrome_exe: foreground::is_chrome_hwnd(hit.hwnd),
         foreground: fg == Some(hit.hwnd),
+        hwnd: foreground::format_hwnd(hit.hwnd),
     }
 }
 
@@ -277,6 +286,7 @@ fn envelope_windows(inventory: &[foreground::TitledWindow]) -> Vec<DesktopWindow
             pid: w.pid,
             title: foreground::cap_window_title(&w.title),
             state: window_state(w),
+            hwnd: foreground::format_hwnd(w.hwnd),
             rect: w.rect,
         })
         .collect()
@@ -289,10 +299,31 @@ fn is_digits_only_pid(query: &str) -> Option<u32> {
     query.parse().ok()
 }
 
+fn format_window_candidate(w: &foreground::TitledWindow) -> String {
+    format!("{} {} {}", foreground::format_hwnd(w.hwnd), w.pid, w.title)
+}
+
 pub(crate) fn resolve_window<'a>(
     query: &str,
     windows: &'a [foreground::TitledWindow],
 ) -> Result<&'a foreground::TitledWindow, HandsError> {
+    if let Some(parsed) = foreground::parse_hwnd_selector(query) {
+        let hwnd = parsed?;
+        let hits: Vec<&foreground::TitledWindow> =
+            windows.iter().filter(|w| w.hwnd == hwnd).collect();
+        return match hits.as_slice() {
+            [one] => Ok(*one),
+            [] if !foreground::is_live_hwnd(hwnd) => {
+                Err(HandsError::Observe(format!("stale hwnd {query:?}")))
+            }
+            [] => Err(HandsError::Observe(format!(
+                "window {query} is not in the titled inventory"
+            ))),
+            _ => Err(HandsError::Observe(format!(
+                "multiple windows matching {query:?}"
+            ))),
+        };
+    }
     let matches: Vec<&foreground::TitledWindow> = if let Some(pid) = is_digits_only_pid(query) {
         windows.iter().filter(|w| w.pid == pid).collect()
     } else {
@@ -308,7 +339,7 @@ pub(crate) fn resolve_window<'a>(
         many => {
             let list = many
                 .iter()
-                .map(|w| format!("{} {}", w.pid, w.title))
+                .map(|w| format_window_candidate(w))
                 .collect::<Vec<_>>()
                 .join(", ");
             Err(HandsError::Observe(format!(
@@ -2927,6 +2958,7 @@ mod tests {
                 pid: 1000 + i as u32,
                 title: format!("W{i:02}-{}", "t".repeat(36)),
                 state: WindowState::Normal,
+                hwnd: format!("{i:x}"),
                 rect: Some(Rect {
                     x: i * 10,
                     y: 0,
@@ -2968,10 +3000,27 @@ mod tests {
         assert!(many.contains("multiple windows matching"), "{many}");
         assert!(many.contains("99"), "{many}");
         assert!(many.contains("Google Chrome"), "{many}");
+        assert!(
+            many.contains("2 99") && many.contains("3 99"),
+            "ambiguity must list hwnd pid title: {many}"
+        );
         let sub = resolve_window("chrome", &inventory)
             .unwrap_err()
             .to_string();
         assert!(sub.contains("multiple windows matching"), "{sub}");
+        assert_eq!(
+            resolve_window("hwnd:2", &inventory).unwrap().title,
+            "Google Chrome"
+        );
+        assert_eq!(
+            resolve_window("HWND:0x3", &inventory).unwrap().title,
+            "Chrome Settings"
+        );
+        let stale = resolve_window("hwnd:dead", &inventory)
+            .unwrap_err()
+            .to_string();
+        assert!(stale.contains("stale hwnd"), "{stale}");
+        assert!(stale.contains("hwnd:dead"), "{stale}");
     }
 
     #[test]
@@ -3091,6 +3140,7 @@ mod tests {
                 pid: 4000 + i as u32,
                 title: format!("W{i}-{}", "window".repeat(8)),
                 state: WindowState::Normal,
+                hwnd: format!("{:x}", 0x1000 + i),
                 rect: Some(Rect {
                     x: i * 20,
                     y: 0,

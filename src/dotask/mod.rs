@@ -757,6 +757,11 @@ fn live_exec(name: &str, args: &Value, session_id: &str) -> Result<String, Hands
             h: opt_i32(args, "h"),
             ..ActuateRequest::default()
         })?),
+        "activate" => {
+            let window = opt_string(args, "window")
+                .ok_or_else(|| HandsError::Input("activate requires window".into()))?;
+            actuate::serialize_activate(&actuate::activate(Some(session_id.into()), window)?)
+        }
         "attach" => {
             let plan = args.get("plan").and_then(Value::as_bool).unwrap_or(false);
             attach::serialize_attach(&attach::run_attach(Some(session_id), plan)?)
@@ -887,6 +892,15 @@ fn offered_tools() -> Value {
             })
         ),
         fn_tool(
+            "activate",
+            "Raise a titled window (pid, unique title, or hwnd:<hex>). Not observe. Not confirm-gated.",
+            json!({
+                "type": "object",
+                "properties": { "window": { "type": "string" } },
+                "required": ["window"]
+            })
+        ),
+        fn_tool(
             "attach",
             "Attach to daily Chrome or launch chrome.exe with no automation flags",
             json!({
@@ -971,6 +985,7 @@ fn is_offered(name: &str) -> bool {
             | "key"
             | "scroll"
             | "wait_settle"
+            | "activate"
             | "attach"
             | "pick"
             | "ground"

@@ -87,11 +87,21 @@ pub struct LogConfirm {
     pub list: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LogObserve {
     pub detail: String,
     pub screenshot_path: String,
     pub elements_total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uia_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -398,6 +408,22 @@ pub fn record_observe(
     screenshot_path: &str,
     elements_total: usize,
 ) -> Result<(), HandsError> {
+    record_observe_row(
+        session_id,
+        LogObserve {
+            detail: detail.into(),
+            screenshot_path: screenshot_path.into(),
+            elements_total,
+            duration_ms: None,
+            envelope_bytes: None,
+            screenshot_ms: None,
+            uia_ms: None,
+            chrome_ms: None,
+        },
+    )
+}
+
+pub fn record_observe_row(session_id: &str, observe: LogObserve) -> Result<(), HandsError> {
     record(Event {
         schema: LOGS_SCHEMA.into(),
         ts: now_ts(),
@@ -409,11 +435,7 @@ pub fn record_observe(
         target: None,
         fence: None,
         confirm: None,
-        observe: Some(LogObserve {
-            detail: detail.into(),
-            screenshot_path: screenshot_path.into(),
-            elements_total,
-        }),
+        observe: Some(observe),
         type_meta: None,
         key: None,
         yield_info: None,
@@ -946,6 +968,36 @@ mod tests {
             let obs = env.events[0].observe.as_ref().unwrap();
             assert_eq!(obs.elements_total, 12);
             assert_eq!(obs.detail, "default");
+            assert!(obs.duration_ms.is_none());
+            assert!(obs.envelope_bytes.is_none());
+        });
+    }
+
+    #[test]
+    fn observe_record_row_keeps_duration_and_bytes() {
+        with_test_env(|| {
+            record_observe_row(
+                "s-obs-ms",
+                LogObserve {
+                    detail: "default".into(),
+                    screenshot_path: r"C:\tmp\shot.png".into(),
+                    elements_total: 3,
+                    duration_ms: Some(42),
+                    envelope_bytes: Some(1200),
+                    screenshot_ms: Some(10),
+                    uia_ms: Some(20),
+                    chrome_ms: Some(5),
+                },
+            )
+            .unwrap();
+            let raw = std::fs::read_to_string(jsonl_path("s-obs-ms").unwrap()).unwrap();
+            assert!(raw.contains("\"duration_ms\":42"), "{raw}");
+            assert!(raw.contains("\"envelope_bytes\":1200"), "{raw}");
+            assert!(!raw.contains("main_text"), "{raw}");
+            let env = read_tail("s-obs-ms", None).unwrap();
+            let obs = env.events[0].observe.as_ref().unwrap();
+            assert_eq!(obs.duration_ms, Some(42));
+            assert_eq!(obs.envelope_bytes, Some(1200));
         });
     }
 
@@ -1017,6 +1069,7 @@ mod tests {
                         detail: "default".into(),
                         screenshot_path: format!("C:\\tmp\\{}\\shot.png", "x".repeat(400)),
                         elements_total: i,
+                        ..Default::default()
                     }),
                     type_meta: None,
                     key: None,
@@ -1062,6 +1115,7 @@ mod tests {
                 detail: "default".into(),
                 screenshot_path: format!("C:\\tmp\\{}\\shot.png", "x".repeat(400)),
                 elements_total: i,
+                ..Default::default()
             }),
             type_meta: None,
             key: None,

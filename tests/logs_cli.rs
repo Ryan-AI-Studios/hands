@@ -118,6 +118,7 @@ fn cli_logs_default_tail_fits_4kib_and_keeps_newest_stop() {
                 detail: "default".into(),
                 screenshot_path: format!("C:\\tmp\\{}\\shot.png", "x".repeat(400)),
                 elements_total: i,
+                ..Default::default()
             }),
             type_meta: None,
             key: None,

@@ -40,6 +40,9 @@ enum Command {
         /// Skip this many ingest cards (0..=8); past the end is empty + omitted counts
         #[arg(long, default_value_t = 0)]
         card_offset: usize,
+        /// Write phase timings on the observe sidecar only (or set HANDS_OBSERVE_TIMING=1)
+        #[arg(long)]
+        timing: bool,
     },
     /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content. After click, envelope may include `miss` (`no_change` / `focus_lost`); settle baseline is post-hover ROI pixel-diff; one retry, re-offer on `focus_lost`. Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default.
     Click {
@@ -330,11 +333,12 @@ async fn main() {
             view,
             from,
             card_offset,
+            timing,
         } => {
             if let Err(err) = dpi {
                 fail(err);
             }
-            observe_main(detail, session_id, window, view, from, card_offset)
+            observe_main(detail, session_id, window, view, from, card_offset, timing)
         }
         Command::Confirm {
             domain,
@@ -459,7 +463,11 @@ fn observe_main(
     view: Option<String>,
     from: Option<String>,
     card_offset: usize,
+    timing: bool,
 ) -> Result<(), HandsError> {
+    if timing {
+        unsafe { std::env::set_var("HANDS_OBSERVE_TIMING", "1") };
+    }
     let envelope = observe(ObserveRequest {
         session_id,
         detail: detail.map(Detail::from).unwrap_or(Detail::Default),

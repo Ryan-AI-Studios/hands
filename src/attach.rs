@@ -140,6 +140,7 @@ pub struct AttachEnvelope {
     pub identity: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_data_dir: Option<String>,
+    pub foregrounded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -152,6 +153,7 @@ struct AttachOutcome {
     pid: Option<u32>,
     exe: Option<PathBuf>,
     argv: Option<Vec<OsString>>,
+    foregrounded: bool,
     error: Option<String>,
 }
 
@@ -701,6 +703,7 @@ fn envelope_from(
         }),
         identity: identity.as_str(),
         user_data_dir: user_data_dir.map(|p| p.display().to_string()),
+        foregrounded: outcome.foregrounded,
         error: outcome.error,
     }
 }
@@ -734,7 +737,7 @@ fn ensure_with(
 
     if let Some(win) = found {
         let center = window_center(win.hwnd);
-        let _ = (hooks.offer)(win.hwnd, center);
+        let foregrounded = (hooks.offer)(win.hwnd, center);
         let (exe, argv, error) = match &resolved {
             Ok((exe, argv)) if plan => (Some(exe.clone()), Some(argv.clone()), None),
             Err(err) if plan => (None, None, Some(err.tool_message())),
@@ -747,6 +750,7 @@ fn ensure_with(
             pid: Some(win.pid),
             exe,
             argv,
+            foregrounded,
             error,
         };
     }
@@ -760,6 +764,7 @@ fn ensure_with(
                 pid: None,
                 exe: Some(exe),
                 argv: Some(argv),
+                foregrounded: false,
                 error: None,
             },
             Err(err) => AttachOutcome {
@@ -769,6 +774,7 @@ fn ensure_with(
                 pid: None,
                 exe: None,
                 argv: None,
+                foregrounded: false,
                 error: Some(err.tool_message()),
             },
         };
@@ -784,6 +790,7 @@ fn ensure_with(
                 pid: None,
                 exe: None,
                 argv: None,
+                foregrounded: false,
                 error: Some(err.tool_message()),
             };
         }
@@ -791,6 +798,10 @@ fn ensure_with(
     match (hooks.spawn)(&exe) {
         Ok(_) => {
             let win = poll_hwnd(hooks, HWND_POLL);
+            let foregrounded = match &win {
+                Some(w) => (hooks.offer)(w.hwnd, window_center(w.hwnd)),
+                None => false,
+            };
             AttachOutcome {
                 attached: win.is_some(),
                 launched: true,
@@ -798,6 +809,7 @@ fn ensure_with(
                 pid: win.as_ref().map(|w| w.pid),
                 exe: Some(exe),
                 argv: Some(argv),
+                foregrounded,
                 error: None,
             }
         }
@@ -808,6 +820,7 @@ fn ensure_with(
             pid: None,
             exe: Some(exe),
             argv: Some(argv),
+            foregrounded: false,
             error: Some(err.tool_message()),
         },
     }
@@ -1226,6 +1239,7 @@ mod tests {
         assert_eq!(out.hwnd, Some(99));
         assert_eq!(spawned.load(Ordering::SeqCst), 0);
         assert_eq!(offered.load(Ordering::SeqCst), 99);
+        assert!(out.foregrounded);
         assert!(out.exe.is_some());
         assert_eq!(
             out.argv
@@ -1250,6 +1264,7 @@ mod tests {
         let out = ensure_daily_with(false, &hooks);
         assert!(out.attached);
         assert!(!out.launched);
+        assert!(out.foregrounded);
         assert_eq!(spawned.load(Ordering::SeqCst), 0);
         assert!(out.exe.is_none());
         assert!(out.argv.is_none());
@@ -1278,6 +1293,7 @@ mod tests {
         assert_eq!(spawned.load(Ordering::SeqCst), 1);
         assert!(out.launched);
         assert!(out.attached);
+        assert!(out.foregrounded);
         assert!(out.error.is_none());
         assert!(out.exe.is_some());
         assert_eq!(
@@ -1306,6 +1322,7 @@ mod tests {
         assert_eq!(spawned.load(Ordering::SeqCst), 1);
         assert!(!out.launched);
         assert!(!out.attached);
+        assert!(!out.foregrounded);
         assert!(out.hwnd.is_none());
         assert!(out.pid.is_none());
         assert!(
@@ -1431,6 +1448,7 @@ mod tests {
                 pid: None,
                 exe: Some(dummy_exe()),
                 argv: Some(launch_argv(&dummy_exe()).unwrap()),
+                foregrounded: false,
                 error: None,
             },
         );

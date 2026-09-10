@@ -646,6 +646,7 @@ mod tests {
                 title: String::new(),
                 class: String::new(),
                 chrome_exe: false,
+                hwnd: String::new(),
             },
             target_window: None,
             view: crate::observe::ObserveView::Auto,

@@ -6,8 +6,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOT, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, SW_RESTORE,
-    SetForegroundWindow, ShowWindow, WindowFromPoint,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    SW_RESTORE, SetForegroundWindow, ShowWindow, WindowFromPoint,
 };
 
 use crate::space::Rect;
@@ -90,6 +90,42 @@ pub fn hwnd_raw(hwnd: HWND) -> Option<isize> {
     } else {
         Some(hwnd.0 as isize)
     }
+}
+
+/// Lowercase hex without `0x` (inventory / envelope field).
+pub fn format_hwnd(hwnd: isize) -> String {
+    format!("{:x}", hwnd as usize)
+}
+
+/// Parse `hwnd:` + optional `0x` + hex. `None` if the query is not an hwnd selector.
+pub fn parse_hwnd_selector(query: &str) -> Option<Result<isize, crate::error::HandsError>> {
+    let q = query.trim();
+    let prefix = q.get(..5)?;
+    if !prefix.eq_ignore_ascii_case("hwnd:") {
+        return None;
+    }
+    let rest = q.get(5..)?;
+    let hex = rest
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| rest.trim().strip_prefix("0X"))
+        .unwrap_or_else(|| rest.trim());
+    if hex.is_empty() {
+        return Some(Err(crate::error::HandsError::Observe(format!(
+            "stale hwnd {query:?}"
+        ))));
+    }
+    match usize::from_str_radix(hex, 16) {
+        Ok(raw) => Some(Ok(raw as isize)),
+        Err(_) => Some(Err(crate::error::HandsError::Observe(format!(
+            "stale hwnd {query:?}"
+        )))),
+    }
+}
+
+pub fn is_live_hwnd(raw: isize) -> bool {
+    let h = raw_hwnd(raw);
+    hwnd_raw(h).is_some() && unsafe { IsWindow(Some(h)) }.as_bool()
 }
 
 pub fn same_top_level(a: Option<isize>, b: Option<isize>) -> bool {

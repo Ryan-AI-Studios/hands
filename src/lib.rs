@@ -35,7 +35,7 @@ pub mod space;
 pub mod target;
 pub mod uia;
 
-pub use actuate::{ActuateEnvelope, ActuateRequest};
+pub use actuate::{ActivateEnvelope, ActuateEnvelope, ActuateRequest};
 pub use error::HandsError;
 pub use extract::{Detail, Element, Extract};
 pub use observe::{ObserveEnvelope, ObserveRequest, ObserveView, observe, serialize_envelope};

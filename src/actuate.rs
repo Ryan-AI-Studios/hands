@@ -63,6 +63,26 @@ pub struct ActuateRequest {
     pub dx: Option<i32>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ActivateWindow {
+    pub pid: u32,
+    pub title: String,
+    pub hwnd: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActivateEnvelope {
+    pub session_id: String,
+    pub ok: bool,
+    pub foregrounded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<ActivateWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge: Option<ChallengeInfo>,
+}
+
 static LAST_TARGET: Mutex<Option<Rect>> = Mutex::new(None);
 
 fn remember_target(rect: Rect) {
@@ -92,6 +112,102 @@ pub fn finalize_envelope(envelope: ActuateEnvelope) -> Result<ActuateEnvelope, H
 pub fn serialize_envelope(envelope: &ActuateEnvelope) -> Result<String, HandsError> {
     serde_json::to_string(envelope)
         .map_err(|err| HandsError::Input(format!("envelope serialize: {err}")))
+}
+
+pub fn serialize_activate(envelope: &ActivateEnvelope) -> Result<String, HandsError> {
+    serde_json::to_string(envelope)
+        .map_err(|err| HandsError::Input(format!("activate envelope: {err}")))
+}
+
+struct ActivateHooks {
+    inventory: fn() -> Vec<foreground::TitledWindow>,
+    offer: fn(Option<isize>, (i32, i32)) -> bool,
+    foreground: fn() -> Option<isize>,
+}
+
+impl ActivateHooks {
+    fn live() -> Self {
+        Self {
+            inventory: foreground::titled_windows,
+            offer: foreground::offer,
+            foreground: foreground::foreground_hwnd,
+        }
+    }
+}
+
+fn finish_activate(envelope: ActivateEnvelope) -> Result<ActivateEnvelope, HandsError> {
+    logs::ensure_installed();
+    logs::remember_session(&envelope.session_id);
+    let _ = logs::record_actuate(
+        &envelope.session_id,
+        "activate",
+        envelope.ok,
+        envelope.error.as_deref(),
+        None,
+        None,
+        None,
+        None,
+    );
+    Ok(envelope)
+}
+
+pub fn activate(
+    session_id: Option<String>,
+    window: String,
+) -> Result<ActivateEnvelope, HandsError> {
+    activate_with(session_id, window, ActivateHooks::live())
+}
+
+fn activate_with(
+    session_id: Option<String>,
+    window: String,
+    hooks: ActivateHooks,
+) -> Result<ActivateEnvelope, HandsError> {
+    let session_id = resolve_session_id_from_os(session_id.as_deref());
+    logs::check_write_id(&session_id)?;
+    if challenge::yielded() {
+        return finish_activate(ActivateEnvelope {
+            session_id,
+            ok: false,
+            foregrounded: false,
+            window: None,
+            error: Some(YIELD_ERROR.into()),
+            challenge: Some(challenge::snapshot()),
+        });
+    }
+    let inventory = (hooks.inventory)();
+    let hit = match crate::observe::resolve_window(&window, &inventory) {
+        Ok(w) => w.clone(),
+        Err(err) => {
+            return finish_activate(ActivateEnvelope {
+                session_id,
+                ok: false,
+                foregrounded: false,
+                window: None,
+                error: Some(err.tool_message()),
+                challenge: None,
+            });
+        }
+    };
+    challenge::note_actuation();
+    let center = match hit.rect {
+        Some(r) => (r.x + r.w / 2, r.y + r.h / 2),
+        None => (0, 0),
+    };
+    let offered = (hooks.offer)(Some(hit.hwnd), center);
+    let foregrounded = offered && (hooks.foreground)() == Some(hit.hwnd);
+    finish_activate(ActivateEnvelope {
+        session_id,
+        ok: true,
+        foregrounded,
+        window: Some(ActivateWindow {
+            pid: hit.pid,
+            title: hit.title,
+            hwnd: foreground::format_hwnd(hit.hwnd),
+        }),
+        error: None,
+        challenge: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1313,5 +1429,140 @@ mod tests {
         assert_eq!(crate::challenge::snapshot().attempts, 0);
         assert!(!crate::challenge::snapshot().yielded);
         crate::challenge::reset_for_test();
+    }
+
+    fn sample_titled(hwnd: isize, pid: u32, title: &str) -> crate::foreground::TitledWindow {
+        crate::foreground::TitledWindow {
+            hwnd,
+            pid,
+            title: title.into(),
+            class: "Chrome_WidgetWin_1".into(),
+            iconic: false,
+            zoomed: false,
+            rect: Some(Rect {
+                x: 10,
+                y: 20,
+                w: 800,
+                h: 600,
+            }),
+        }
+    }
+
+    #[test]
+    fn activate_hwnd_offers_and_reports_foregrounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OFFERS: AtomicUsize = AtomicUsize::new(0);
+        fn offer_ok(hwnd: Option<isize>, _: (i32, i32)) -> bool {
+            OFFERS.fetch_add(1, Ordering::SeqCst);
+            hwnd == Some(0x11)
+        }
+        fn fg_ok() -> Option<isize> {
+            Some(0x11)
+        }
+        crate::foreground::set_titled_windows_hook(Some(vec![
+            sample_titled(0x11, 99, "Chrome A"),
+            sample_titled(0x22, 99, "Chrome B"),
+        ]));
+        OFFERS.store(0, Ordering::SeqCst);
+        let env = activate_with(
+            Some("s-act-ok".into()),
+            "hwnd:11".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_ok,
+                foreground: fg_ok,
+            },
+        )
+        .expect("activate");
+        crate::foreground::set_titled_windows_hook(None);
+        assert!(env.ok, "{env:?}");
+        assert!(env.foregrounded);
+        assert_eq!(OFFERS.load(Ordering::SeqCst), 1);
+        assert_eq!(env.window.as_ref().map(|w| w.hwnd.as_str()), Some("11"));
+        assert_eq!(env.window.as_ref().map(|w| w.pid), Some(99));
+    }
+
+    #[test]
+    fn activate_ambiguous_pid_and_stale_hwnd_do_not_offer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OFFERS: AtomicUsize = AtomicUsize::new(0);
+        fn offer_count(_: Option<isize>, _: (i32, i32)) -> bool {
+            OFFERS.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        crate::foreground::set_titled_windows_hook(Some(vec![
+            sample_titled(0x11, 99, "Chrome A"),
+            sample_titled(0x22, 99, "Chrome B"),
+        ]));
+        OFFERS.store(0, Ordering::SeqCst);
+        let many = activate_with(
+            Some("s-act-many".into()),
+            "99".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_count,
+                foreground: || None,
+            },
+        )
+        .expect("ambiguous");
+        assert!(!many.ok, "{many:?}");
+        assert!(
+            many.error
+                .as_deref()
+                .is_some_and(|e| e.contains("multiple windows")),
+            "{many:?}"
+        );
+        let stale = activate_with(
+            Some("s-act-stale".into()),
+            "hwnd:dead".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_count,
+                foreground: || None,
+            },
+        )
+        .expect("stale");
+        crate::foreground::set_titled_windows_hook(None);
+        assert!(!stale.ok, "{stale:?}");
+        assert!(
+            stale
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("stale hwnd")),
+            "{stale:?}"
+        );
+        assert_eq!(OFFERS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn yielded_activate_does_not_offer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OFFERS: AtomicUsize = AtomicUsize::new(0);
+        fn offer_count(_: Option<isize>, _: (i32, i32)) -> bool {
+            OFFERS.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        let _g = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::challenge::reset_for_test();
+        crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
+        OFFERS.store(0, Ordering::SeqCst);
+        yield_machine();
+        let env = activate_with(
+            Some("s-act".into()),
+            "hwnd:11".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_count,
+                foreground: || Some(0x11),
+            },
+        )
+        .expect("yield envelope");
+        crate::foreground::set_titled_windows_hook(None);
+        crate::challenge::reset_for_test();
+        assert!(!env.ok, "{env:?}");
+        assert_eq!(env.error.as_deref(), Some(YIELD_ERROR));
+        assert_eq!(OFFERS.load(Ordering::SeqCst), 0);
     }
 }

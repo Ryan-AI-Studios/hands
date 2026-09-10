@@ -264,11 +264,17 @@ fn sta_collect(detail: Detail, cap: usize, hwnd: Option<isize>) -> Result<UiaSna
     let walker = unsafe { automation.ControlViewWalker() }
         .map_err(|err| HandsError::Uia(format!("ControlViewWalker: {err}")))?;
     let (nodes, popup_rect) = match detail {
-        Detail::Dom => {
-            let root = unsafe { automation.GetRootElement() }
-                .map_err(|err| HandsError::Uia(format!("GetRootElement: {err}")))?;
-            (walk_control_view(&walker, &root, detail, cap)?, None)
-        }
+        Detail::Dom => match hwnd {
+            Some(h) => match unsafe { automation.ElementFromHandle(h) } {
+                Ok(root) => (walk_control_view(&walker, &root, detail, cap)?, None),
+                Err(_) => (Vec::new(), None),
+            },
+            None => {
+                let root = unsafe { automation.GetRootElement() }
+                    .map_err(|err| HandsError::Uia(format!("GetRootElement: {err}")))?;
+                (walk_control_view(&walker, &root, detail, cap)?, None)
+            }
+        },
         Detail::Default => match hwnd {
             Some(h) => collect_default(&automation, &walker, cap, h)?,
             None => (Vec::new(), None),
@@ -636,6 +642,25 @@ mod tests {
         assert!(
             !title.contains("GetForegroundWindow"),
             "window_element_name must use the passed HWND:\n{title}"
+        );
+    }
+
+    #[test]
+    fn detail_dom_with_hwnd_does_not_use_desktop_root() {
+        let src = include_str!("uia.rs");
+        let start = src.find("Detail::Dom =>").expect("Detail::Dom");
+        let slice = &src[start..start + 450];
+        assert!(
+            slice.contains("ElementFromHandle"),
+            "Dom + hwnd must ElementFromHandle:\n{slice}"
+        );
+        assert!(
+            slice.contains("GetRootElement"),
+            "Dom + None still uses GetRootElement:\n{slice}"
+        );
+        assert!(
+            slice.contains("Some(h)"),
+            "Dom must branch on hwnd:\n{slice}"
         );
     }
 }

@@ -1643,6 +1643,8 @@ mod tests {
         fn fg_ok() -> Option<isize> {
             Some(0x11)
         }
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
         crate::foreground::set_titled_windows_hook(Some(vec![
             sample_titled(0x11, 99, "Chrome A"),
             sample_titled(0x22, 99, "Chrome B"),
@@ -1659,6 +1661,7 @@ mod tests {
         )
         .expect("activate");
         crate::foreground::set_titled_windows_hook(None);
+        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(env.foregrounded);
         assert_eq!(OFFERS.load(Ordering::SeqCst), 1);
@@ -1674,6 +1677,8 @@ mod tests {
             OFFERS.fetch_add(1, Ordering::SeqCst);
             true
         }
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
         crate::foreground::set_titled_windows_hook(Some(vec![
             sample_titled(0x11, 99, "Chrome A"),
             sample_titled(0x22, 99, "Chrome B"),
@@ -1707,6 +1712,7 @@ mod tests {
         )
         .expect("stale");
         crate::foreground::set_titled_windows_hook(None);
+        lease::reset_for_test();
         assert!(!stale.ok, "{stale:?}");
         assert!(
             stale
@@ -1726,9 +1732,11 @@ mod tests {
             OFFERS.fetch_add(1, Ordering::SeqCst);
             true
         }
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = crate::challenge::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
         crate::challenge::reset_for_test();
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
         OFFERS.store(0, Ordering::SeqCst);
@@ -1745,6 +1753,7 @@ mod tests {
         .expect("yield envelope");
         crate::foreground::set_titled_windows_hook(None);
         crate::challenge::reset_for_test();
+        lease::reset_for_test();
         assert!(!env.ok, "{env:?}");
         assert_eq!(env.error.as_deref(), Some(YIELD_ERROR));
         assert_eq!(OFFERS.load(Ordering::SeqCst), 0);

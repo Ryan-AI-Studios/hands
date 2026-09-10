@@ -83,6 +83,9 @@ pub fn run_solve(session_id: String) -> Result<ChallengeEnvelope, HandsError> {
             session_id: Some(sid.clone()),
             detail: crate::extract::Detail::Default,
             window: None,
+            view: crate::observe::ObserveView::Auto,
+            from: None,
+            card_offset: 0,
         })
     };
     let click = |x: i32, y: i32| {
@@ -644,6 +647,10 @@ mod tests {
                 chrome_exe: false,
             },
             target_window: None,
+            view: crate::observe::ObserveView::Auto,
+            observe_source: crate::observe::ObserveSource::Live,
+            card_offset: 0,
+            card_counts: crate::observe::ObserveCardCounts::default(),
             challenge: ChallengeInfo {
                 present,
                 kind,

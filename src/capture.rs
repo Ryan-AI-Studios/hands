@@ -148,10 +148,15 @@ fn write_png(path: &Path, width: i32, height: i32, pixels: Vec<u8>) -> Result<()
         .map_err(|err| HandsError::Capture(format!("PNG encode failed: {err}")))
 }
 
-pub fn observe_paths() -> Result<CapturePaths, HandsError> {
+pub(crate) fn observe_dir() -> Result<PathBuf, HandsError> {
     let dir = std::env::temp_dir().join("hands").join("observe");
     std::fs::create_dir_all(&dir)
         .map_err(|err| HandsError::Capture(format!("create observe dir: {err}")))?;
+    Ok(dir)
+}
+
+pub fn observe_paths() -> Result<CapturePaths, HandsError> {
+    let dir = observe_dir()?;
     let stamp = utc_compact();
     let nonce = format!("{:08x}", uuid::Uuid::new_v4().as_fields().0);
     let stem = format!("observe-{stamp}-{nonce}");

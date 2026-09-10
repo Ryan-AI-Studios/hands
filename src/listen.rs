@@ -257,6 +257,9 @@ pub fn challenge_present(observe_path: Option<&str>) -> Result<bool, HandsError>
                 session_id: None,
                 detail: Detail::Default,
                 window: None,
+                view: crate::observe::ObserveView::Auto,
+                from: None,
+                card_offset: 0,
             })?;
             Ok(env.challenge.present)
         }
@@ -1060,6 +1063,11 @@ fn write_sidecar(path: &Path, kind: &str, present: bool) {
         windows: Vec::new(),
         fg_window: None,
         target_window: None,
+        view: crate::observe::ObserveView::Auto,
+        observe_source: crate::observe::ObserveSource::Live,
+        card_offset: 0,
+        card_counts: crate::observe::ObserveCardCounts::default(),
+        popup_rect: None,
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1222,6 +1230,11 @@ mod tests {
                 windows: Vec::new(),
                 fg_window: None,
                 target_window: None,
+                view: crate::observe::ObserveView::Auto,
+                observe_source: crate::observe::ObserveSource::Live,
+                card_offset: 0,
+                card_counts: crate::observe::ObserveCardCounts::default(),
+                popup_rect: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1283,6 +1296,11 @@ mod tests {
                 windows: Vec::new(),
                 fg_window: None,
                 target_window: None,
+                view: crate::observe::ObserveView::Auto,
+                observe_source: crate::observe::ObserveSource::Live,
+                card_offset: 0,
+                card_counts: crate::observe::ObserveCardCounts::default(),
+                popup_rect: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1338,6 +1356,11 @@ mod tests {
                 windows: Vec::new(),
                 fg_window: None,
                 target_window: None,
+                view: crate::observe::ObserveView::Auto,
+                observe_source: crate::observe::ObserveSource::Live,
+                card_offset: 0,
+                card_counts: crate::observe::ObserveCardCounts::default(),
+                popup_rect: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1385,6 +1408,11 @@ mod tests {
                 windows: Vec::new(),
                 fg_window: None,
                 target_window: None,
+                view: crate::observe::ObserveView::Auto,
+                observe_source: crate::observe::ObserveSource::Live,
+                card_offset: 0,
+                card_counts: crate::observe::ObserveCardCounts::default(),
+                popup_rect: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }

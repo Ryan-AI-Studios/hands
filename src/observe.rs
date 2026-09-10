@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::capture::{capture_virtual_screen, display_path};
+use crate::capture::{capture_virtual_screen, display_path, observe_dir};
 use crate::challenge::{self, ChallengeInfo};
 use crate::chrome;
 use crate::error::HandsError;
@@ -18,11 +18,92 @@ pub const ENVELOPE_MAX_BYTES: usize = 16_384;
 pub const DEFAULT_ENVELOPE_MAX_BYTES: usize = 4096;
 pub const OBSERVE_SCHEMA: &str = "hands.observe/v1";
 
+const CONTROL_LEXICON: &[&str] = &[
+    "search", "zip", "radius", "filter", "sort", "mileage", "price", "make", "model", "year", "go",
+    "submit", "distance",
+];
+const PAGINATION_LEXICON: &[&str] = &["next", "previous", "prev", "page"];
+const FILTER_CHIP_LEXICON: &[&str] = &["filter", "sort"];
+const CONTROL_ROLES: &[&str] = &[
+    "Edit",
+    "ComboBox",
+    "Button",
+    "CheckBox",
+    "RadioButton",
+    "TabItem",
+    "SplitButton",
+    "Slider",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ObserveView {
+    #[default]
+    Auto,
+    Controls,
+    Listings,
+}
+
+impl ObserveView {
+    pub fn parse_arg(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(Self::Auto),
+            Some(s) if s.eq_ignore_ascii_case("auto") => Ok(Self::Auto),
+            Some(s) if s.eq_ignore_ascii_case("controls") => Ok(Self::Controls),
+            Some(s) if s.eq_ignore_ascii_case("listings") => Ok(Self::Listings),
+            Some(other) => Err(format!(
+                "unknown view '{other}' (expected auto, controls, or listings)"
+            )),
+        }
+    }
+}
+
+fn skip_auto_view(view: &ObserveView) -> bool {
+    matches!(view, ObserveView::Auto)
+}
+
+fn skip_zero_offset(n: &usize) -> bool {
+    *n == 0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ObserveSource {
+    #[default]
+    Live,
+    Sidecar,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct ObserveCardCounts {
+    #[serde(default)]
+    pub cards_total: usize,
+    #[serde(default)]
+    pub cards_omitted: usize,
+}
+
+impl Serialize for ObserveCardCounts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        if self.cards_total == 0 {
+            serializer.serialize_struct("ObserveCardCounts", 0)?.end()
+        } else {
+            let mut st = serializer.serialize_struct("ObserveCardCounts", 2)?;
+            st.serialize_field("cards_total", &self.cards_total)?;
+            st.serialize_field("cards_omitted", &self.cards_omitted)?;
+            st.end()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ObserveRequest {
     pub session_id: Option<String>,
     pub detail: Detail,
     pub window: Option<String>,
+    pub view: ObserveView,
+    pub from: Option<String>,
+    pub card_offset: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +160,13 @@ pub struct ObserveEnvelope {
     pub fg_window: FgWindow,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_window: Option<TargetWindow>,
+    #[serde(skip_serializing_if = "skip_auto_view")]
+    pub view: ObserveView,
+    pub observe_source: ObserveSource,
+    #[serde(skip_serializing_if = "skip_zero_offset")]
+    pub card_offset: usize,
+    #[serde(flatten)]
+    pub card_counts: ObserveCardCounts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +193,16 @@ pub struct ObserveSidecar {
     pub fg_window: Option<FgWindow>,
     #[serde(default)]
     pub target_window: Option<TargetWindow>,
+    #[serde(default, skip_serializing_if = "skip_auto_view")]
+    pub view: ObserveView,
+    #[serde(default)]
+    pub observe_source: ObserveSource,
+    #[serde(default, skip_serializing_if = "skip_zero_offset")]
+    pub card_offset: usize,
+    #[serde(flatten, default)]
+    pub card_counts: ObserveCardCounts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub popup_rect: Option<Rect>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -255,6 +353,20 @@ fn resolve_and_walk_window(
 }
 
 pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
+    if req.from.is_some() && req.detail != Detail::Default {
+        return Err(HandsError::Observe(
+            "--from cannot be combined with detail=dom".into(),
+        ));
+    }
+    if req.from.is_some() && req.window.is_some() {
+        return Err(HandsError::Observe(
+            "--from cannot be combined with --window".into(),
+        ));
+    }
+    if let Some(from) = req.from.as_deref() {
+        return reshape_from_sidecar(&req, from);
+    }
+
     ensure_dpi()?;
     let session_id = resolve_session_id_from_os(req.session_id.as_deref());
     logs::check_write_id(&session_id)?;
@@ -307,11 +419,16 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         windows: envelope_windows(&inventory),
         fg_window: plan.fg_window,
         target_window: plan.target_window,
+        view: req.view,
+        observe_source: ObserveSource::Live,
+        card_offset: 0,
+        card_counts: ObserveCardCounts::default(),
     };
-    write_sidecar(&paths.observe_path, &full)?;
+    write_sidecar(&paths.observe_path, &full, opts.popup_rect)?;
     let envelope = match req.detail {
         Detail::Default => {
             retain_hittable_centers(&mut full.elements, &opts);
+            apply_card_offset(&mut full, req.card_offset);
             finalize_envelope(cap_default_envelope(full))?
         }
         Detail::Dom => finalize_envelope(full)?,
@@ -333,7 +450,11 @@ fn stamp_grid(space: Space, elements: &mut [Element]) {
     }
 }
 
-fn write_sidecar(path: &std::path::Path, envelope: &ObserveEnvelope) -> Result<(), HandsError> {
+fn write_sidecar(
+    path: &std::path::Path,
+    envelope: &ObserveEnvelope,
+    popup_rect: Option<Rect>,
+) -> Result<(), HandsError> {
     let sidecar = ObserveSidecar {
         schema: OBSERVE_SCHEMA.to_string(),
         session_id: envelope.session_id.clone(),
@@ -351,6 +472,11 @@ fn write_sidecar(path: &std::path::Path, envelope: &ObserveEnvelope) -> Result<(
         windows: envelope.windows.clone(),
         fg_window: Some(envelope.fg_window.clone()),
         target_window: envelope.target_window.clone(),
+        view: envelope.view,
+        observe_source: envelope.observe_source,
+        card_offset: 0,
+        card_counts: ObserveCardCounts::default(),
+        popup_rect,
     };
     let json = serde_json::to_string_pretty(&sidecar)
         .map_err(|err| HandsError::Observe(format!("sidecar serialize: {err}")))?;
@@ -368,16 +494,23 @@ pub fn cap_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
     envelope
 }
 
-/// Default path: 20-element cap, then if still over 4 KiB truncate extra
-/// `windows` rows, then pop non-dialog elements, then shrink `main_text`.
-/// Never drops cards, `challenge`, `chrome_hint`, or `extract.dialogs` first.
+/// Default path: 20-element cap (reserved-first after promote), then if still
+/// over 4 KiB pop extra `windows` rows, shrink `main_text`, pop non-reserved
+/// elements, then trim cards (auto/controls) so reserved controls survive.
+/// `view=listings` prefers cards (trims them only after reserved last-resort).
+/// Never drops `challenge`, `chrome_hint`, or the last dialog first.
 /// Last resort: pop extra dialogs after `main_text` is empty. 16 KiB hard fail
 /// stays in `finalize_envelope`.
 pub fn cap_default_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
+    promote_reserved_behind_dialogs(&mut envelope);
     if envelope.elements.len() > VIEWPORT_ENVELOPE_ELEMENT_CAP {
         envelope.elements.truncate(VIEWPORT_ENVELOPE_ELEMENT_CAP);
     }
     envelope.elements_truncated = envelope.elements.len() < envelope.elements_total;
+    if envelope.view == ObserveView::Controls {
+        envelope.extract.cards.clear();
+        refresh_card_omitted(&mut envelope);
+    }
     if serialized_len(&envelope) <= DEFAULT_ENVELOPE_MAX_BYTES {
         return envelope;
     }
@@ -385,9 +518,16 @@ pub fn cap_default_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
     while !envelope.windows.is_empty() && serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
         envelope.windows.pop();
     }
-    pop_non_dialog_elements(&mut envelope);
     if serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
         shrink_main_text_to_fit(&mut envelope, DEFAULT_ENVELOPE_MAX_BYTES);
+    }
+    pop_non_reserved_elements(&mut envelope);
+    if envelope.view != ObserveView::Listings {
+        trim_cards_from_end(&mut envelope);
+    }
+    pop_reserved_non_dialog_from_end(&mut envelope);
+    if envelope.view == ObserveView::Listings {
+        trim_cards_from_end(&mut envelope);
     }
     if serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES
         && envelope.extract.main_text.is_empty()
@@ -401,26 +541,144 @@ pub fn cap_default_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
             envelope.elements.retain(|el| el.id != dropped.id);
         }
     }
+    refresh_card_omitted(&mut envelope);
     envelope
 }
 
-fn pop_non_dialog_elements(envelope: &mut ObserveEnvelope) {
-    let dialog_ids: std::collections::HashSet<String> = envelope
-        .extract
-        .dialogs
-        .iter()
-        .map(|d| d.id.clone())
-        .collect();
+fn pop_non_reserved_elements(envelope: &mut ObserveEnvelope) {
     while serialized_len(envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
+        let dialog_ids = dialog_id_set(envelope);
+        let viewport = envelope.viewport;
         let Some(idx) = envelope
             .elements
             .iter()
-            .rposition(|el| !dialog_ids.contains(&el.id))
+            .rposition(|el| !is_reserved_control_parts(el, &dialog_ids, viewport))
         else {
             break;
         };
         envelope.elements.remove(idx);
     }
+}
+
+fn pop_reserved_non_dialog_from_end(envelope: &mut ObserveEnvelope) {
+    let dialog_ids = dialog_id_set(envelope);
+    let viewport = envelope.viewport;
+    while serialized_len(envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
+        let Some(idx) = envelope.elements.iter().rposition(|el| {
+            is_reserved_control_parts(el, &dialog_ids, viewport) && !dialog_ids.contains(&el.id)
+        }) else {
+            break;
+        };
+        envelope.elements.remove(idx);
+    }
+}
+
+fn trim_cards_from_end(envelope: &mut ObserveEnvelope) {
+    while serialized_len(envelope) > DEFAULT_ENVELOPE_MAX_BYTES
+        && !envelope.extract.cards.is_empty()
+    {
+        envelope.extract.cards.pop();
+    }
+    refresh_card_omitted(envelope);
+}
+
+fn refresh_card_omitted(envelope: &mut ObserveEnvelope) {
+    envelope.card_counts.cards_omitted = envelope
+        .card_counts
+        .cards_total
+        .saturating_sub(envelope.extract.cards.len());
+}
+
+fn apply_card_offset(envelope: &mut ObserveEnvelope, offset: usize) {
+    let mut cards = std::mem::take(&mut envelope.extract.cards);
+    let total = cards.len();
+    envelope.card_offset = offset;
+    envelope.card_counts.cards_total = total;
+    envelope.extract.cards = if offset >= total {
+        Vec::new()
+    } else {
+        cards.split_off(offset)
+    };
+    refresh_card_omitted(envelope);
+}
+
+fn promote_reserved_behind_dialogs(envelope: &mut ObserveEnvelope) {
+    let dialog_ids = dialog_id_set(envelope);
+    let viewport = envelope.viewport;
+    let mut dialogs = Vec::new();
+    let mut reserved = Vec::new();
+    let mut rest = Vec::new();
+    for el in envelope.elements.drain(..) {
+        if dialog_ids.contains(&el.id) {
+            dialogs.push(el);
+        } else if is_reserved_control_parts(&el, &dialog_ids, viewport) {
+            reserved.push(el);
+        } else {
+            rest.push(el);
+        }
+    }
+    envelope.elements = dialogs;
+    envelope.elements.extend(reserved);
+    envelope.elements.extend(rest);
+}
+
+fn dialog_id_set(envelope: &ObserveEnvelope) -> std::collections::HashSet<String> {
+    envelope
+        .extract
+        .dialogs
+        .iter()
+        .map(|d| d.id.clone())
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn is_reserved_control(el: &Element, envelope: &ObserveEnvelope) -> bool {
+    is_reserved_control_parts(el, &dialog_id_set(envelope), envelope.viewport)
+}
+
+fn is_reserved_control_parts(
+    el: &Element,
+    dialog_ids: &std::collections::HashSet<String>,
+    viewport: Option<Rect>,
+) -> bool {
+    if dialog_ids.contains(&el.id) {
+        return true;
+    }
+    if el.role == "ListItem" {
+        return text_has_any_token(el.text.as_deref(), FILTER_CHIP_LEXICON);
+    }
+    let lexicon = text_has_any_token(el.text.as_deref(), CONTROL_LEXICON);
+    if CONTROL_ROLES.iter().any(|role| el.role == *role) {
+        let in_band = viewport.is_some_and(|vp| in_top_band(el, vp));
+        return in_band || lexicon;
+    }
+    if el.role == "Hyperlink" {
+        return text_has_any_token(el.text.as_deref(), PAGINATION_LEXICON);
+    }
+    false
+}
+
+fn in_top_band(el: &Element, viewport: Rect) -> bool {
+    let (_cx, cy) = el.rect.center();
+    let band_h = (i64::from(viewport.h) * 45) / 100;
+    let band_bottom = viewport.y.saturating_add(band_h as i32);
+    cy >= viewport.y && cy < band_bottom
+}
+
+fn text_has_any_token(text: Option<&str>, words: &[&str]) -> bool {
+    let Some(text) = text else {
+        return false;
+    };
+    if text.trim().is_empty() {
+        return false;
+    }
+    let tokens: Vec<String> = text
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    words.iter().any(|w| tokens.iter().any(|t| t == *w))
 }
 
 fn shrink_main_text_to_fit(envelope: &mut ObserveEnvelope, max_bytes: usize) {
@@ -463,10 +721,13 @@ pub fn serialize_envelope(envelope: &ObserveEnvelope) -> Result<String, HandsErr
         .map_err(|err| HandsError::Observe(format!("envelope serialize: {err}")))
 }
 
-pub fn serialize_mcp_envelope(envelope: &ObserveEnvelope) -> Result<String, HandsError> {
+pub fn serialize_mcp_envelope(
+    envelope: &ObserveEnvelope,
+    include_screenshot_path: bool,
+) -> Result<String, HandsError> {
     let mut value = serde_json::to_value(envelope)
         .map_err(|err| HandsError::Observe(format!("envelope serialize: {err}")))?;
-    if let Some(obj) = value.as_object_mut() {
+    if !include_screenshot_path && let Some(obj) = value.as_object_mut() {
         obj.remove("screenshot_path");
     }
     serde_json::to_string(&value)
@@ -631,6 +892,127 @@ fn retain_hittable_centers(elements: &mut Vec<Element>, opts: &FuseOpts) {
     elements.retain(|el| center_in_client(el.rect, opts));
 }
 
+fn reshape_from_sidecar(req: &ObserveRequest, from: &str) -> Result<ObserveEnvelope, HandsError> {
+    let path = allowlisted_observe_sidecar(from)?;
+    let text = std::fs::read_to_string(&path).map_err(|err| {
+        HandsError::Observe(format!("read observe sidecar {}: {err}", path.display()))
+    })?;
+    let sidecar: ObserveSidecar = serde_json::from_str(&text)
+        .map_err(|err| HandsError::Observe(format!("observe sidecar deserialize: {err}")))?;
+    if sidecar.schema != OBSERVE_SCHEMA {
+        return Err(HandsError::Observe(format!(
+            "observe sidecar schema is '{}' (expected {OBSERVE_SCHEMA})",
+            sidecar.schema
+        )));
+    }
+    logs::check_write_id(&sidecar.session_id)?;
+    let opts = FuseOpts {
+        viewport: sidecar.viewport,
+        chrome_is_foreground: sidecar
+            .target_window
+            .as_ref()
+            .map(|t| t.chrome_exe && t.foreground)
+            .unwrap_or_else(|| sidecar.fg_window.as_ref().is_some_and(|fg| fg.chrome_exe)),
+        virtual_screen: Some(sidecar.space.as_rect()),
+        popup_rect: sidecar.popup_rect,
+    };
+    let mut envelope = envelope_from_sidecar(sidecar, req.view);
+    retain_hittable_centers(&mut envelope.elements, &opts);
+    apply_card_offset(&mut envelope, req.card_offset);
+    let envelope = finalize_envelope(cap_default_envelope(envelope))?;
+    logs::ensure_installed();
+    logs::remember_session(&envelope.session_id);
+    let _ = logs::record_observe(
+        &envelope.session_id,
+        "sidecar",
+        &envelope.screenshot_path,
+        envelope.elements_total,
+    );
+    Ok(envelope)
+}
+
+fn envelope_from_sidecar(sidecar: ObserveSidecar, view: ObserveView) -> ObserveEnvelope {
+    ObserveEnvelope {
+        session_id: sidecar.session_id,
+        screenshot_path: sidecar.screenshot_path,
+        observe_path: sidecar.observe_path,
+        space: sidecar.space,
+        viewport: sidecar.viewport,
+        extract: sidecar.extract,
+        elements: sidecar.elements,
+        elements_total: sidecar.elements_total,
+        elements_truncated: sidecar.elements_truncated,
+        chrome_connected: sidecar.chrome_connected,
+        chrome_hint: sidecar.chrome_hint,
+        challenge: sidecar.challenge,
+        windows: sidecar.windows,
+        fg_window: sidecar.fg_window.unwrap_or_else(empty_fg_window),
+        target_window: sidecar.target_window,
+        view,
+        observe_source: ObserveSource::Sidecar,
+        card_offset: 0,
+        card_counts: ObserveCardCounts::default(),
+    }
+}
+
+fn allowlisted_observe_sidecar(user: &str) -> Result<std::path::PathBuf, HandsError> {
+    let raw = std::path::Path::new(user);
+    if raw
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(HandsError::Observe(
+            "--from path must not contain '..'".into(),
+        ));
+    }
+    let name = raw
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| HandsError::Observe("--from path is missing a file name".into()))?;
+    let raw_name = user
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HandsError::Observe("--from path is missing a file name".into()))?;
+    if name.contains(':') || raw_name.contains(':') {
+        return Err(HandsError::Observe(
+            "--from file name must not contain ':'".into(),
+        ));
+    }
+    if !name.starts_with("observe-") || !name.ends_with(".json") {
+        return Err(HandsError::Observe(
+            "--from file name must match observe-*.json".into(),
+        ));
+    }
+    let dir = observe_dir().map_err(|err| HandsError::Observe(err.to_string()))?;
+    let dir_canon = std::fs::canonicalize(&dir)
+        .map_err(|err| HandsError::Observe(format!("canonicalize observe dir: {err}")))?;
+    let user_canon = std::fs::canonicalize(raw)
+        .map_err(|err| HandsError::Observe(format!("observe sidecar not found: {err}")))?;
+    let dir_cmp = strip_verbatim_prefix(&dir_canon);
+    let parent = user_canon
+        .parent()
+        .ok_or_else(|| HandsError::Observe("--from path has no parent directory".into()))?;
+    let parent_cmp = strip_verbatim_prefix(parent);
+    if parent_cmp != dir_cmp {
+        return Err(HandsError::Observe(
+            "--from path must be under the hands observe directory".into(),
+        ));
+    }
+    Ok(user_canon)
+}
+
+fn strip_verbatim_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        std::path::PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,6 +1109,10 @@ mod tests {
             windows: Vec::new(),
             fg_window: empty_fg_window(),
             target_window: None,
+            view: ObserveView::Auto,
+            observe_source: ObserveSource::Live,
+            card_offset: 0,
+            card_counts: ObserveCardCounts::default(),
         }
     }
 
@@ -1091,6 +1477,10 @@ mod tests {
             windows: Vec::new(),
             fg_window: empty_fg_window(),
             target_window: None,
+            view: ObserveView::Auto,
+            observe_source: ObserveSource::Live,
+            card_offset: 0,
+            card_counts: ObserveCardCounts::default(),
         };
         assert!(raw.viewport.is_some());
         let capped = cap_default_envelope(raw);
@@ -1360,7 +1750,7 @@ mod tests {
     #[test]
     fn serialize_mcp_envelope_omits_screenshot_path_keeps_observe_path() {
         let env = fat_envelope(0);
-        let mcp_json = serialize_mcp_envelope(&env).unwrap();
+        let mcp_json = serialize_mcp_envelope(&env, false).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&mcp_json).unwrap();
         assert!(
             parsed.get("screenshot_path").is_none(),
@@ -1566,6 +1956,10 @@ mod tests {
             windows: Vec::new(),
             fg_window: empty_fg_window(),
             target_window: None,
+            view: ObserveView::Auto,
+            observe_source: ObserveSource::Live,
+            card_offset: 0,
+            card_counts: ObserveCardCounts::default(),
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -1655,6 +2049,10 @@ mod tests {
             windows: Vec::new(),
             fg_window: empty_fg_window(),
             target_window: None,
+            view: ObserveView::Auto,
+            observe_source: ObserveSource::Live,
+            card_offset: 0,
+            card_counts: ObserveCardCounts::default(),
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -2010,6 +2408,10 @@ mod tests {
             windows: Vec::new(),
             fg_window: empty_fg_window(),
             target_window: None,
+            view: ObserveView::Auto,
+            observe_source: ObserveSource::Live,
+            card_offset: 0,
+            card_counts: ObserveCardCounts::default(),
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -2461,18 +2863,25 @@ mod tests {
             .find("pub fn cap_default_envelope(")
             .expect("cap_default_envelope");
         let end = src
-            .find("fn pop_non_dialog_elements(")
-            .expect("pop_non_dialog_elements");
+            .find("fn pop_non_reserved_elements(")
+            .expect("pop_non_reserved_elements");
         let slice = &src[start..end];
         let windows_pop = slice
             .find("envelope.windows.pop()")
             .expect("must pop extra windows");
+        let shrink = slice
+            .find("shrink_main_text_to_fit")
+            .expect("then shrink main_text");
         let call_pop = slice
-            .find("pop_non_dialog_elements")
-            .expect("then pop non-dialog elements");
+            .find("pop_non_reserved_elements")
+            .expect("then pop non-reserved elements");
         assert!(
-            windows_pop < call_pop,
-            "windows must shrink before elements:\n{slice}"
+            windows_pop < shrink && shrink < call_pop,
+            "windows then main_text then non-reserved elements:\n{slice}"
+        );
+        assert!(
+            !slice.contains("pop_non_dialog_elements"),
+            "old pop-all-non-dialog must not remain:\n{slice}"
         );
 
         let mut raw = fat_envelope(20);
@@ -2601,5 +3010,569 @@ mod tests {
         crate::input::set_send_inputs_hook(None);
         crate::lease::reset_for_test();
         assert_eq!(SENDS.load(Ordering::SeqCst), 0);
+    }
+
+    const CONTROL_RESERVE: usize = 8;
+
+    fn shopping_el(id: &str, role: &str, text: &str, y: i32) -> Element {
+        Element {
+            id: id.into(),
+            role: role.into(),
+            text: Some(text.into()),
+            rect: Rect {
+                x: 120,
+                y,
+                w: 80,
+                h: 24,
+            },
+            grid: None,
+        }
+    }
+
+    fn fat_listing_card(i: usize) -> Card {
+        Card {
+            title: format!(
+                "2024 Toyota Camry SE 4D Sedan FWD Convenience Package listing {i} {}",
+                "Camry".repeat(12)
+            ),
+            price: format!("$2{i},9{i}5"),
+            href: format!(
+                "https://www.cars.com/vehicledetail/0100-fat-listing-{i}/{}",
+                "href".repeat(20)
+            ),
+            rect: Rect {
+                x: 110,
+                y: 420 + (i as i32) * 90,
+                w: 640,
+                h: 88,
+            },
+            miles: Some(format!("3{i},145 miles highway driven")),
+            dealer: Some(format!("Capital Toyota of Tallahassee Storefront {i}")),
+            distance: Some(format!("{i}2 mi away from ZIP 32309")),
+            listing_of: None,
+        }
+    }
+
+    fn shopping_windows() -> Vec<DesktopWindow> {
+        (0i32..4)
+            .map(|i| DesktopWindow {
+                pid: 4000 + i as u32,
+                title: format!("W{i}-{}", "window".repeat(8)),
+                state: WindowState::Normal,
+                rect: Some(Rect {
+                    x: i * 20,
+                    y: 0,
+                    w: 800,
+                    h: 600,
+                }),
+            })
+            .collect()
+    }
+
+    fn shopping_fixture() -> ObserveEnvelope {
+        let mut elements = Vec::new();
+        for i in 0..15 {
+            elements.push(shopping_el(
+                &format!("chr:fill:{i}"),
+                "ListItem",
+                &format!("2024 Camry row {i}"),
+                620,
+            ));
+        }
+        elements.push(shopping_el("chr:search", "Edit", "Search", 24));
+        elements.push(shopping_el("chr:zip", "Edit", "ZIP", 24));
+        elements.push(shopping_el("chr:radius", "ComboBox", "Radius", 24));
+        elements.push(shopping_el("chr:filter", "Button", "Filter", 24));
+        elements.push(shopping_el("chr:sort", "ComboBox", "Sort", 24));
+        elements.push(shopping_el("chr:next", "Hyperlink", "Next", 40));
+        elements.push(shopping_el("chr:google", "Button", "Google", 800));
+        elements.push(shopping_el(
+            "chr:avail",
+            "Button",
+            "Check availability",
+            800,
+        ));
+        let n = elements.len();
+        let mut env = fat_envelope(0);
+        env.viewport = covering_opts(true).viewport;
+        env.extract.main_text = "M".repeat(800);
+        env.extract.cards = (0..8).map(fat_listing_card).collect();
+        env.elements = elements;
+        env.elements_total = n;
+        env.windows = shopping_windows();
+        env.view = ObserveView::Auto;
+        env.observe_source = ObserveSource::Live;
+        env
+    }
+
+    #[test]
+    fn reserved_control_table() {
+        let mut env = fat_envelope(0);
+        env.viewport = covering_opts(true).viewport;
+        assert!(is_reserved_control(
+            &shopping_el("chr:search", "Edit", "Search", 24),
+            &env
+        ));
+        assert!(is_reserved_control(
+            &shopping_el("chr:zip", "Edit", "ZIP", 24),
+            &env
+        ));
+        assert!(is_reserved_control(
+            &shopping_el("chr:radius", "ComboBox", "Radius", 24),
+            &env
+        ));
+        assert!(!is_reserved_control(
+            &shopping_el("chr:row", "ListItem", "2024 Camry SE $25,000", 24),
+            &env
+        ));
+        assert!(!is_reserved_control(
+            &shopping_el("chr:price-row", "ListItem", "Price $25,000", 24),
+            &env
+        ));
+        assert!(!is_reserved_control(
+            &shopping_el("chr:make-row", "ListItem", "Make Toyota", 24),
+            &env
+        ));
+        assert!(is_reserved_control(
+            &shopping_el("chr:sort-chip", "ListItem", "Sort: newest", 24),
+            &env
+        ));
+        assert!(!is_reserved_control(
+            &shopping_el("chr:avail", "Button", "Check availability", 800),
+            &env
+        ));
+        assert!(is_reserved_control(
+            &shopping_el("chr:next", "Hyperlink", "Next", 40),
+            &env
+        ));
+        assert!(!is_reserved_control(
+            &shopping_el("chr:google", "Button", "Google", 800),
+            &env
+        ));
+        assert!(is_reserved_control(
+            &shopping_el("uia:split", "SplitButton", "More", 30),
+            &env
+        ));
+        let _ = CONTROL_RESERVE;
+    }
+
+    #[test]
+    fn shopping_auto_keeps_search_zip_radius_and_omits_cards() {
+        let raw = shopping_fixture();
+        assert!(raw.elements.len() >= 21);
+        assert!(raw.extract.main_text.chars().count() <= 800);
+        assert_eq!(raw.windows.len(), 4);
+        assert_eq!(raw.extract.cards.len(), 8);
+        let search_pos = raw
+            .elements
+            .iter()
+            .position(|e| e.id == "chr:search")
+            .expect("search");
+        assert!(search_pos >= 15, "fillers must sit ahead of Search");
+        let mut raw = raw;
+        raw.card_counts.cards_total = 8;
+        raw.card_counts.cards_omitted = 0;
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        assert!(capped.elements.iter().any(|e| e.id == "chr:search"));
+        assert!(capped.elements.iter().any(|e| e.id == "chr:zip"));
+        assert!(capped.elements.iter().any(|e| e.id == "chr:radius"));
+        assert!(capped.elements_truncated);
+        assert_eq!(capped.card_counts.cards_total, 8);
+        assert!(capped.card_counts.cards_omitted >= 1);
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["observe_source"], "live");
+        assert_eq!(parsed["cards_total"], 8);
+        assert!(parsed["cards_omitted"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn shopping_controls_drops_cards_listings_keeps_one() {
+        let mut controls = shopping_fixture();
+        controls.view = ObserveView::Controls;
+        controls.card_counts.cards_total = 8;
+        let capped = cap_default_envelope(controls);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(json.len() <= DEFAULT_ENVELOPE_MAX_BYTES);
+        assert!(capped.extract.cards.is_empty());
+        assert_eq!(capped.card_counts.cards_total, 8);
+        assert_eq!(
+            capped.card_counts.cards_omitted,
+            capped.card_counts.cards_total
+        );
+        assert!(capped.elements.iter().any(|e| e.id == "chr:search"));
+        assert!(capped.elements.iter().any(|e| e.id == "chr:zip"));
+
+        let mut listings = shopping_fixture();
+        listings.view = ObserveView::Listings;
+        listings.card_counts.cards_total = 8;
+        let capped = cap_default_envelope(listings);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(json.len() <= DEFAULT_ENVELOPE_MAX_BYTES);
+        assert!(!capped.extract.cards.is_empty());
+    }
+
+    #[test]
+    fn card_offset_slices_or_empties() {
+        let mut env = shopping_fixture();
+        apply_card_offset(&mut env, 3);
+        assert_eq!(env.extract.cards.len(), 5);
+        assert_eq!(env.card_offset, 3);
+        assert_eq!(env.card_counts.cards_total, 8);
+        assert_eq!(env.card_counts.cards_omitted, 3);
+        assert!(
+            env.extract.cards[0].href.contains("0100-fat-listing-3"),
+            "{}",
+            env.extract.cards[0].href
+        );
+        let mut past = shopping_fixture();
+        apply_card_offset(&mut past, 8);
+        assert!(past.extract.cards.is_empty());
+        assert_eq!(past.card_counts.cards_omitted, 8);
+        assert_eq!(past.card_offset, 8);
+    }
+
+    #[test]
+    fn unknown_view_and_from_plus_window_are_errors() {
+        let err = ObserveView::parse_arg(Some("grid")).unwrap_err();
+        assert!(
+            err.contains("unknown view 'grid' (expected auto, controls, or listings)"),
+            "{err}"
+        );
+        let err = observe(ObserveRequest {
+            session_id: None,
+            detail: Detail::Default,
+            window: Some("Cursor".into()),
+            view: ObserveView::Auto,
+            from: Some(r"C:\tmp\observe-x.json".into()),
+            card_offset: 0,
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--from cannot be combined with --window"),
+            "{err}"
+        );
+        let err = observe(ObserveRequest {
+            session_id: None,
+            detail: Detail::Dom,
+            window: None,
+            view: ObserveView::Auto,
+            from: Some(r"C:\tmp\observe-x.json".into()),
+            card_offset: 0,
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--from cannot be combined with detail=dom"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn from_sidecar_is_hittable_subset_and_echoes_source() {
+        let dir = crate::capture::observe_dir().expect("observe dir");
+        let path = dir.join("observe-0100-from-test.json");
+        let mut raw = shopping_fixture();
+        raw.session_id = "s-0100-from".into();
+        raw.observe_path = path.to_string_lossy().into();
+        raw.elements
+            .push(shopping_el("chr:offscreen", "Button", "Search", 20_000));
+        let sidecar = ObserveSidecar {
+            schema: OBSERVE_SCHEMA.to_string(),
+            session_id: raw.session_id.clone(),
+            screenshot_path: raw.screenshot_path.clone(),
+            observe_path: raw.observe_path.clone(),
+            space: raw.space,
+            viewport: raw.viewport,
+            extract: raw.extract.clone(),
+            elements: raw.elements.clone(),
+            elements_total: raw.elements.len(),
+            elements_truncated: false,
+            chrome_connected: raw.chrome_connected,
+            chrome_hint: raw.chrome_hint.clone(),
+            challenge: raw.challenge.clone(),
+            windows: raw.windows.clone(),
+            fg_window: Some(raw.fg_window.clone()),
+            target_window: raw.target_window.clone(),
+            view: ObserveView::Auto,
+            observe_source: ObserveSource::Live,
+            card_offset: 0,
+            card_counts: ObserveCardCounts::default(),
+            popup_rect: None,
+        };
+        let sidecar_ids: std::collections::HashSet<String> =
+            sidecar.elements.iter().map(|e| e.id.clone()).collect();
+        let sidecar_viewport = sidecar.viewport;
+        let sidecar_space = sidecar.space;
+        std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
+        let env = observe(ObserveRequest {
+            session_id: None,
+            detail: Detail::Default,
+            window: None,
+            view: ObserveView::Auto,
+            from: Some(path.to_string_lossy().into()),
+            card_offset: 3,
+        });
+        let _ = std::fs::remove_file(&path);
+        let env = env.expect("reshape");
+        assert_eq!(env.session_id, "s-0100-from");
+        assert_eq!(env.observe_source, ObserveSource::Sidecar);
+        let json = serialize_envelope(&env).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["observe_source"], "sidecar");
+        assert!(!env.elements.iter().any(|e| e.id == "chr:offscreen"));
+        for el in &env.elements {
+            assert!(sidecar_ids.contains(&el.id), "{}", el.id);
+            assert!(center_in_client(
+                el.rect,
+                &FuseOpts {
+                    viewport: sidecar_viewport,
+                    chrome_is_foreground: false,
+                    virtual_screen: Some(sidecar_space.as_rect()),
+                    popup_rect: None,
+                }
+            ));
+        }
+        assert_eq!(env.card_offset, 3);
+        assert_eq!(
+            env.extract.cards.len(),
+            env.card_counts.cards_total - env.card_counts.cards_omitted
+        );
+        assert!(
+            env.extract.cards[0].href.contains("0100-fat-listing-3"),
+            "{}",
+            env.extract.cards[0].href
+        );
+    }
+
+    #[test]
+    fn from_popup_rect_keeps_popup_only_control() {
+        let dir = crate::capture::observe_dir().expect("observe dir");
+        let path = dir.join("observe-0100-popup-test.json");
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let popup = Rect {
+            x: 900,
+            y: 100,
+            w: 200,
+            h: 80,
+        };
+        let popup_el = Element {
+            id: "uia:popup.1".into(),
+            role: "ListItem".into(),
+            text: Some("Suggestion".into()),
+            rect: Rect {
+                x: 920,
+                y: 120,
+                w: 80,
+                h: 20,
+            },
+            grid: None,
+        };
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let sidecar = ObserveSidecar {
+            schema: OBSERVE_SCHEMA.to_string(),
+            session_id: "s-0100-popup".into(),
+            screenshot_path: r"C:\tmp\observe.png".into(),
+            observe_path: path.to_string_lossy().into(),
+            space,
+            viewport: Some(viewport),
+            extract: Extract::default(),
+            elements: vec![popup_el.clone()],
+            elements_total: 1,
+            elements_truncated: false,
+            chrome_connected: false,
+            chrome_hint: None,
+            challenge: ChallengeInfo::default(),
+            windows: Vec::new(),
+            fg_window: None,
+            target_window: None,
+            view: ObserveView::Auto,
+            observe_source: ObserveSource::Live,
+            card_offset: 0,
+            card_counts: ObserveCardCounts::default(),
+            popup_rect: Some(popup),
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
+        let with_popup = observe(ObserveRequest {
+            session_id: None,
+            detail: Detail::Default,
+            window: None,
+            view: ObserveView::Auto,
+            from: Some(path.to_string_lossy().into()),
+            card_offset: 0,
+        });
+        let _ = std::fs::remove_file(&path);
+        let env = with_popup.expect("reshape popup");
+        assert!(
+            env.elements.iter().any(|e| e.id == "uia:popup.1"),
+            "popup-only control must survive retain when popup_rect is set"
+        );
+        let mut dropped = vec![popup_el];
+        retain_hittable_centers(
+            &mut dropped,
+            &FuseOpts {
+                viewport: Some(viewport),
+                chrome_is_foreground: false,
+                virtual_screen: Some(space.as_rect()),
+                popup_rect: None,
+            },
+        );
+        assert!(
+            dropped.is_empty(),
+            "without popup_rect the control must drop"
+        );
+    }
+
+    #[test]
+    fn serialize_mcp_envelope_opt_in_keeps_screenshot_path() {
+        let env = fat_envelope(0);
+        let json = serialize_mcp_envelope(&env, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.get("screenshot_path").is_some(),
+            "opt-in must keep screenshot_path: {parsed}"
+        );
+        assert_eq!(parsed["observe_source"], "live");
+    }
+
+    #[test]
+    fn mcp_cli_agents_name_opt_in_screenshot_and_views() {
+        let mcp = include_str!("mcp.rs");
+        assert!(mcp.contains("include_screenshot_path"));
+        assert!(mcp.contains("auto-attach") || mcp.to_ascii_lowercase().contains("auto-attach"));
+        assert!(mcp.contains("ingest") || mcp.contains("cap is 8") || mcp.contains("cap 8"));
+        assert!(mcp.contains("hittable"));
+        assert!(!mcp.contains("ImageContent"));
+        assert!(!mcp.contains("resource_link"));
+        let agents = include_str!("../AGENTS.md");
+        assert!(agents.contains("include_screenshot_path"));
+        assert!(agents.contains("cards_total") || agents.contains("cards_omitted"));
+        assert!(agents.contains("--from"));
+        let readme = include_str!("../README.md");
+        assert!(readme.contains("include_screenshot_path"));
+        assert!(readme.contains("--from"));
+        assert!(readme.contains("cards_total") || readme.contains("cards_omitted"));
+        let main = include_str!("main.rs");
+        assert!(main.contains("--view"));
+        assert!(main.contains("--from"));
+        assert!(main.contains("--card-offset") || main.contains("card_offset"));
+        assert_eq!(DEFAULT_ENVELOPE_MAX_BYTES, 4096);
+        assert_eq!(VIEWPORT_ENVELOPE_ELEMENT_CAP, 20);
+        assert_eq!(crate::extract::DEFAULT_ELEMENT_CAP, 250);
+    }
+
+    #[test]
+    fn live_envelope_json_always_has_observe_source() {
+        let env = fat_envelope(0);
+        let json = serialize_envelope(&env).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["observe_source"], "live");
+        assert!(parsed.get("view").is_none());
+        assert!(parsed.get("card_offset").is_none());
+        assert!(parsed.get("cards_total").is_none());
+    }
+
+    #[test]
+    fn cards_omitted_zero_serializes_when_total_positive() {
+        let mut env = fat_envelope(0);
+        env.card_counts.cards_total = 8;
+        env.card_counts.cards_omitted = 0;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialize_envelope(&env).unwrap()).unwrap();
+        assert_eq!(parsed["cards_total"], 8);
+        assert_eq!(parsed["cards_omitted"], 0);
+    }
+
+    #[test]
+    fn from_allowlist_rejects_dotdot_colon_other_dir_and_missing() {
+        let err = allowlisted_observe_sidecar(r"C:\tmp\hands\observe\..\secret.json")
+            .expect_err("dotdot");
+        assert!(err.to_string().contains("must not contain '..'"), "{err}");
+        let err = allowlisted_observe_sidecar(r"C:\tmp\hands\observe\observe-x.json:stream")
+            .expect_err("ads");
+        assert!(err.to_string().contains("must not contain ':'"), "{err}");
+        let other = std::env::temp_dir().join("hands-0100-not-observe.json");
+        std::fs::write(&other, "{}").unwrap();
+        let err = allowlisted_observe_sidecar(&other.to_string_lossy()).expect_err("other name");
+        let _ = std::fs::remove_file(&other);
+        assert!(
+            err.to_string().contains("must match observe-*.json"),
+            "{err}"
+        );
+        let other_dir = std::env::temp_dir().join("hands-0100-other");
+        let _ = std::fs::create_dir_all(&other_dir);
+        let other_ok_name = other_dir.join("observe-0100-other-dir.json");
+        std::fs::write(&other_ok_name, "{}").unwrap();
+        let err =
+            allowlisted_observe_sidecar(&other_ok_name.to_string_lossy()).expect_err("other dir");
+        let _ = std::fs::remove_file(&other_ok_name);
+        assert!(
+            err.to_string()
+                .contains("must be under the hands observe directory"),
+            "{err}"
+        );
+        let missing = crate::capture::observe_dir()
+            .unwrap()
+            .join("observe-0100-missing-nope.json");
+        let err = allowlisted_observe_sidecar(&missing.to_string_lossy()).expect_err("missing");
+        assert!(
+            err.to_string().contains("observe sidecar not found"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reshape_skips_apply_observe_and_dom_skips_view_offset() {
+        let src = include_str!("observe.rs");
+        let reshape = src
+            .split("fn reshape_from_sidecar")
+            .nth(1)
+            .and_then(|s| s.split("fn envelope_from_sidecar").next())
+            .expect("reshape fn");
+        assert!(
+            !reshape.contains("apply_observe"),
+            "reshape must not increment challenge"
+        );
+        assert!(
+            !reshape.contains("note_last_url"),
+            "reshape must not note_last_url"
+        );
+        assert!(
+            !reshape.contains("write_sidecar"),
+            "reshape must not overwrite sidecar"
+        );
+        assert!(
+            !reshape.contains("capture_virtual_screen"),
+            "reshape must not recapture"
+        );
+        let live = src
+            .split("pub fn observe(req: ObserveRequest)")
+            .nth(1)
+            .and_then(|s| s.split("fn stamp_grid").next())
+            .expect("observe fn");
+        assert!(
+            live.contains("Detail::Dom => finalize_envelope(full)?"),
+            "detail=dom must skip view/cap: {live}"
+        );
+        assert!(
+            !live
+                .split("Detail::Dom")
+                .nth(1)
+                .expect("dom arm")
+                .contains("apply_card_offset"),
+            "detail=dom must ignore card_offset"
+        );
     }
 }

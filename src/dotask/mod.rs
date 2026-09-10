@@ -721,6 +721,9 @@ fn live_exec(name: &str, args: &Value, session_id: &str) -> Result<String, Hands
                 session_id: Some(session_id.into()),
                 detail,
                 window: None,
+                view: crate::observe::ObserveView::Auto,
+                from: None,
+                card_offset: 0,
             })?;
             observe::serialize_envelope(&env)
         }

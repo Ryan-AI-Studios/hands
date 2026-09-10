@@ -1382,6 +1382,11 @@ mod tests {
             windows: Vec::new(),
             fg_window: None,
             target_window: None,
+            view: crate::observe::ObserveView::Auto,
+            observe_source: crate::observe::ObserveSource::Live,
+            card_offset: 0,
+            card_counts: crate::observe::ObserveCardCounts::default(),
+            popup_rect: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
         path

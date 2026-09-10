@@ -38,7 +38,7 @@ pub mod uia;
 pub use actuate::{ActuateEnvelope, ActuateRequest};
 pub use error::HandsError;
 pub use extract::{Detail, Element, Extract};
-pub use observe::{ObserveEnvelope, ObserveRequest, observe, serialize_envelope};
+pub use observe::{ObserveEnvelope, ObserveRequest, ObserveView, observe, serialize_envelope};
 pub use pick::{GroundRequest, PickEnvelope, PickRequest, run_ground, run_pick, serialize_pick};
 pub use session::resolve_session_id;
 pub use space::{Space, ensure_dpi, virtual_screen};

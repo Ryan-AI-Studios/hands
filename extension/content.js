@@ -4,10 +4,13 @@ const CARD_TITLE_CAP = 80;
 const CARD_PRICE_CAP = 24;
 const CARD_HREF_CAP = 200;
 const CARD_CAP = 8;
+const CARD_WALK_CAP = 24;
 const CARD_MILES_CAP = 16;
 const CARD_DEALER_CAP = 48;
 const CARD_DISTANCE_CAP = 40;
 const CARD_OF_CAP = 12;
+const CARD_KIND_CAP = 12;
+const CARD_DELIVERY_CAP = 40;
 const RESULT_COUNT_CAP = 24;
 const LOCAL_MATCHES_CAP = 24;
 const EMPTY_STATE_CAP = 120;
@@ -64,14 +67,18 @@ function buildSnapshot(detail) {
       elements.push(payload);
     }
   }
+  const collected = collectCards();
   const snap = {
     url: location.href || "",
     title: document.title || "",
     main_text: mainText(),
     elements: elements,
-    cards: collectCards(),
+    cards: collected.cards,
     metrics: metrics,
   };
+  if (collected.cards_walked > 0) {
+    snap.cards_walked = collected.cards_walked;
+  }
   const listing = collectListingMeta();
   if (listing.result_count) snap.result_count = listing.result_count;
   if (listing.local_matches) snap.local_matches = listing.local_matches;
@@ -343,7 +350,7 @@ function collectCards() {
   const seen = [];
   const out = [];
   const nodes = document.querySelectorAll("article,[role=\"listitem\"],li,a[href]");
-  for (let i = 0; i < nodes.length && out.length < CARD_CAP; i += 1) {
+  for (let i = 0; i < nodes.length && out.length < CARD_WALK_CAP; i += 1) {
     const el = nodes[i];
     if (!includeNode(el) || isPassword(el)) {
       continue;
@@ -390,9 +397,35 @@ function collectCards() {
     if (distance) card.distance = distance;
     const ofText = cardOf(text);
     if (ofText) card.of = ofText;
+    const delivery = cardDelivery(text);
+    if (delivery) card.delivery = delivery;
+    const kind = cardKind(text, card);
+    if (kind) card.kind = kind;
     out.push(card);
   }
-  return out;
+  const cards_walked = out.length;
+  const packed = preferLocalCards(out, CARD_CAP);
+  return { cards: packed, cards_walked: cards_walked };
+}
+
+function preferLocalCards(cards, cap) {
+  const local = [];
+  const unknown = [];
+  const ship = [];
+  const rec = [];
+  for (let i = 0; i < cards.length; i += 1) {
+    const k = cards[i].kind;
+    if (k === "local") {
+      local.push(cards[i]);
+    } else if (k === "ship") {
+      ship.push(cards[i]);
+    } else if (k === "recommended") {
+      rec.push(cards[i]);
+    } else {
+      unknown.push(cards[i]);
+    }
+  }
+  return local.concat(unknown, ship, rec).slice(0, cap);
 }
 
 function itempropText(el, name) {
@@ -423,11 +456,11 @@ function cardMiles(el, text) {
 function cardDealer(el, text, title, price) {
   const item = itempropText(el, "seller");
   if (item) {
-    return cap(item, CARD_DEALER_CAP);
+    return sanitizeDealer(item);
   }
   const data = attr(el, "data-dealer");
   if (data) {
-    return cap(data, CARD_DEALER_CAP);
+    return sanitizeDealer(data);
   }
   let rest = String(text || "");
   if (title) {
@@ -438,21 +471,195 @@ function cardDealer(el, text, title, price) {
   }
   rest = rest.replace(/(\d{1,3}(?:,\d{3})+|\d{4,})\s*(mi|miles)\b(?!\s*away)/ig, " ");
   rest = rest.replace(/\d[\d,]*\s*(mi|miles)\s+away\b/ig, " ");
+  rest = rest.replace(/\(\s*\d{1,3}\s*(mi|miles)\)/ig, " ");
+  rest = rest.replace(/[A-Za-z][A-Za-z .'-]*,\s*[A-Za-z]{2}\s*\(\s*\d{1,3}\s*(mi|miles)\)/g, " ");
   rest = rest.replace(/shipping from\b[^.\n]*/ig, " ");
   rest = rest.replace(/\b\d+\s+of\s+\d+\b/ig, " ");
+  rest = rest.replace(/est\.?\s*shipping\b[^.\n]*/ig, " ");
+  rest = rest.replace(/shipping\s+[$€£][\d,]+(?:\.\d{2})?/ig, " ");
+  rest = rest.replace(/deliver to\s+\d{5}(?:-\d{4})?/ig, " ");
+  rest = rest.replace(/\(\s*[\d,]+\s+reviews?\)/ig, " ");
+  rest = rest.replace(/[$€£][\d,]+(?:\.\d{2})?/g, " ");
+  const junk = [
+    "american-made index",
+    "american made index",
+    "available for delivery",
+    "no price analysis",
+    "get pre-approved",
+    "check availability",
+    "days on cars.com",
+    "you may also like",
+    "contact dealer",
+    "home delivery",
+    "est. shipping",
+    "free carfax",
+    "view details",
+    "get financing",
+    "price drop",
+    "great deal",
+    "good deal",
+    "fair deal",
+    "high price",
+    "deliver to",
+    "shipping to",
+    "per month",
+    "see more",
+    "recommended",
+    "autocheck",
+    "sponsored",
+    "shipping",
+    "reviews",
+    "ratings",
+    "review",
+    "rating",
+    "stars",
+    "star",
+    "est.",
+    "/mo",
+  ];
+  for (let i = 0; i < junk.length; i += 1) {
+    rest = stripJunkPhrase(rest, junk[i]);
+  }
+  rest = rest.replace(/\s+/g, " ").trim();
+  rest = rest.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, "");
+  return sanitizeDealer(rest);
+}
+
+function sanitizeDealer(rest) {
+  rest = String(rest || "");
+  rest = rest.replace(/\(\s*[\d,]+\s+reviews?\)/ig, " ");
+  const junk = [
+    "american-made index",
+    "american made index",
+    "available for delivery",
+    "no price analysis",
+    "get pre-approved",
+    "check availability",
+    "days on cars.com",
+    "you may also like",
+    "contact dealer",
+    "home delivery",
+    "est. shipping",
+    "free carfax",
+    "view details",
+    "get financing",
+    "price drop",
+    "great deal",
+    "good deal",
+    "fair deal",
+    "high price",
+    "deliver to",
+    "shipping to",
+    "per month",
+    "see more",
+    "recommended",
+    "autocheck",
+    "sponsored",
+    "shipping",
+    "reviews",
+    "ratings",
+    "review",
+    "rating",
+    "stars",
+    "star",
+    "est.",
+    "/mo",
+  ];
+  for (let i = 0; i < junk.length; i += 1) {
+    rest = stripJunkPhrase(rest, junk[i]);
+  }
   rest = rest.replace(/[$€£][\d,]+(?:\.\d{2})?/g, " ");
   rest = rest.replace(/\s+/g, " ").trim();
+  rest = rest.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, "");
   if (rest.length < 2 || !/[A-Za-z]/.test(rest)) {
     return "";
   }
-  const junk = /^(used|new|save|view|details|more)$/i;
-  if (junk.test(rest)) {
+  const exact = /^(used|new|save|view|details|more)$/i;
+  if (exact.test(rest)) {
+    return "";
+  }
+  const lower = rest.toLowerCase();
+  for (let i = 0; i < junk.length; i += 1) {
+    if (junkHasPhrase(lower, junk[i])) {
+      return "";
+    }
+  }
+  const tokens = rest.split(/\s+/);
+  if (tokens.length === 1 && !isDealerishToken(tokens[0])) {
     return "";
   }
   return cap(rest, CARD_DEALER_CAP);
 }
 
+function stripJunkPhrase(text, phrase) {
+  const lower = text.toLowerCase();
+  const p = phrase.toLowerCase();
+  let search = 0;
+  let out = "";
+  let last = 0;
+  while (search <= lower.length) {
+    const idx = lower.indexOf(p, search);
+    if (idx === -1) {
+      break;
+    }
+    if (p === "/mo") {
+      out += text.slice(last, idx) + " ";
+      last = idx + p.length;
+      search = idx + p.length;
+      continue;
+    }
+    const before = idx === 0 || !/[A-Za-z0-9]/.test(lower.charAt(idx - 1));
+    const afterCh = lower.charAt(idx + p.length);
+    const after = !afterCh || !/[A-Za-z0-9]/.test(afterCh);
+    if (before && after) {
+      out += text.slice(last, idx) + " ";
+      last = idx + p.length;
+      search = idx + p.length;
+    } else {
+      search = idx + 1;
+    }
+  }
+  return out + text.slice(last);
+}
+
+function junkHasPhrase(lower, phrase) {
+  const p = phrase.toLowerCase();
+  if (p === "/mo") {
+    return lower.indexOf(p) !== -1;
+  }
+  let search = 0;
+  while (search <= lower.length) {
+    const idx = lower.indexOf(p, search);
+    if (idx === -1) {
+      return false;
+    }
+    const before = idx === 0 || !/[A-Za-z0-9]/.test(lower.charAt(idx - 1));
+    const afterCh = lower.charAt(idx + p.length);
+    const after = !afterCh || !/[A-Za-z0-9]/.test(afterCh);
+    if (before && after) {
+      return true;
+    }
+    search = idx + 1;
+  }
+  return false;
+}
+
+function isDealerishToken(tok) {
+  const l = String(tok || "").toLowerCase();
+  return l === "carmax" || l === "carvana" || l === "vroom" || l.indexOf("auto") !== -1 || l.indexOf("motor") !== -1 || ((tok.indexOf("-") !== -1 || tok.indexOf("_") !== -1) && /[A-Za-z]/.test(tok));
+}
+
 function cardDistance(text) {
+  const paren = text.match(/\(\s*\d{1,3}\s*(mi|miles)\)/i);
+  if (paren) {
+    const at = text.indexOf(paren[0]);
+    const before = text.slice(0, at);
+    const city = before.match(/([A-Za-z][A-Za-z0-9]*)\s*,\s*([A-Za-z]{2})\s*$/);
+    if (city) {
+      return cap((city[0] + paren[0]).replace(/\s+/g, " ").trim(), CARD_DISTANCE_CAP);
+    }
+    return cap(paren[0].replace(/\s+/g, " ").trim(), CARD_DISTANCE_CAP);
+  }
   const away = text.match(/\d[\d,]*\s*(mi|miles)\s+away\b/i);
   if (away) {
     return cap(away[0].replace(/\s+/g, " ").trim(), CARD_DISTANCE_CAP);
@@ -460,6 +667,56 @@ function cardDistance(text) {
   const ship = text.match(/shipping from\b[^.\n]*/i);
   if (ship) {
     return cap(ship[0].replace(/\s+/g, " ").trim(), CARD_DISTANCE_CAP);
+  }
+  return "";
+}
+
+function cardDelivery(text) {
+  const avail = text.match(/available for delivery to\b[^.\n]*/i);
+  if (avail) {
+    return cap(avail[0].replace(/\s+/g, " ").trim(), CARD_DELIVERY_CAP);
+  }
+  const est = text.match(/est\.?\s*shipping\b[^.\n]*/i);
+  if (est) {
+    return cap(est[0].replace(/\s+/g, " ").trim(), CARD_DELIVERY_CAP);
+  }
+  const shipFee = text.match(/shipping\s+[$€£][\d,]+(?:\.\d{2})?/i);
+  if (shipFee && !/^shipping from\b/i.test(shipFee[0])) {
+    return cap(shipFee[0].replace(/\s+/g, " ").trim(), CARD_DELIVERY_CAP);
+  }
+  const deliver = text.match(/deliver to\s+\d{5}(?:-\d{4})?/i);
+  if (deliver) {
+    return cap(deliver[0].replace(/\s+/g, " ").trim(), CARD_DELIVERY_CAP);
+  }
+  return "";
+}
+
+function cardKind(text, card) {
+  const lower = String(text || "").toLowerCase();
+  if (
+    lower.indexOf("you may also like") !== -1 ||
+    lower.indexOf("outside your search") !== -1 ||
+    lower.indexOf("outside your area") !== -1 ||
+    junkHasPhrase(lower, "recommended")
+  ) {
+    return cap("recommended", CARD_KIND_CAP);
+  }
+  const delivery = (card && card.delivery) || "";
+  const distance = (card && card.distance) || "";
+  if (
+    delivery ||
+    /shipping from\b/i.test(distance) ||
+    /shipping from\b/i.test(text) ||
+    /shipping\s+[$€£]/i.test(text) ||
+    /deliver to\b/i.test(text)
+  ) {
+    return cap("ship", CARD_KIND_CAP);
+  }
+  if (/\bmi\s+away\b/i.test(text) || /\bmiles\s+away\b/i.test(text) || /\(\s*\d{1,3}\s*(mi|miles)\)/i.test(text)) {
+    return cap("local", CARD_KIND_CAP);
+  }
+  if (/\bmi\s+away\b/i.test(distance) || /\(\s*\d{1,3}\s*(mi|miles)\)/i.test(distance)) {
+    return cap("local", CARD_KIND_CAP);
   }
   return "";
 }
@@ -608,8 +865,85 @@ function cardHref(el) {
 }
 
 function extractPrice(text) {
-  const m = text.match(/\$[\d,]+(?:\.\d{2})?|€[\d,]+(?:\.\d{2})?|£[\d,]+(?:\.\d{2})?|\d[\d,]*\.\d{2}/);
-  return m ? m[0] : "";
+  const skipTok = { est: 1, "est.": 1, drop: 1, save: 1, off: 1, discount: 1 };
+  const hits = [];
+  const re = /[$€£][\d,]+(?:\.\d{2})?/g;
+  let m = re.exec(text);
+  while (m) {
+    const start = m.index;
+    const end = start + m[0].length;
+    const after = text.slice(end).replace(/^\s+/, "");
+    let skip = false;
+    if (after.indexOf("/mo") === 0 || /^\/\s*mo\b/i.test(after) || /^\bmo\b/i.test(after)) {
+      skip = true;
+    }
+    const prev = prevWholeToken(text, start);
+    const next1 = nextWholeToken(text, end);
+    const next2 = next1 ? nextWholeToken(text, next1.end) : null;
+    if (prev && skipTok[prev.toLowerCase()]) {
+      skip = true;
+    }
+    if (next1 && skipTok[next1.tok.toLowerCase()]) {
+      skip = true;
+    }
+    if (next2 && skipTok[next2.tok.toLowerCase()]) {
+      skip = true;
+    }
+    if (!skip) {
+      hits.push({ tok: m[0], grouped: m[0].indexOf(",") !== -1 });
+    }
+    m = re.exec(text);
+  }
+  for (let i = 0; i < hits.length; i += 1) {
+    if (hits[i].grouped) {
+      return hits[i].tok;
+    }
+  }
+  if (hits.length) {
+    return hits[0].tok;
+  }
+  const dec = text.match(/\d[\d,]*\.\d{2}/);
+  return dec ? dec[0] : "";
+}
+
+function prevWholeToken(text, pos) {
+  let i = pos;
+  while (i > 0 && /\s/.test(text.charAt(i - 1))) {
+    i -= 1;
+  }
+  if (i === 0) {
+    return "";
+  }
+  if (text.charAt(i - 1) === ".") {
+    let s = i - 1;
+    while (s > 0 && /[A-Za-z0-9]/.test(text.charAt(s - 1))) {
+      s -= 1;
+    }
+    return text.slice(s, i);
+  }
+  let s = i;
+  while (s > 0 && /[A-Za-z0-9]/.test(text.charAt(s - 1))) {
+    s -= 1;
+  }
+  return text.slice(s, i);
+}
+
+function nextWholeToken(text, pos) {
+  let i = pos;
+  while (i < text.length && /\s/.test(text.charAt(i))) {
+    i += 1;
+  }
+  if (i >= text.length || !/[A-Za-z0-9]/.test(text.charAt(i))) {
+    return null;
+  }
+  let end = i;
+  while (end < text.length && /[A-Za-z0-9]/.test(text.charAt(end))) {
+    end += 1;
+  }
+  if (text.charAt(end) === "." && text.slice(i, end + 1).toLowerCase() === "est.") {
+    return { tok: text.slice(i, end + 1), end: end + 1 };
+  }
+  return { tok: text.slice(i, end), end: end };
 }
 
 function cardTitle(el, text, price) {

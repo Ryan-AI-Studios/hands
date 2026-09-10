@@ -633,6 +633,7 @@ mod tests {
                 empty_state: None,
                 zip: None,
                 radius: None,
+                cards_walked: 0,
             },
             elements,
             elements_total: 0,

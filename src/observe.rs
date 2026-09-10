@@ -80,17 +80,24 @@ pub struct ObserveCardCounts {
     pub cards_total: usize,
     #[serde(default)]
     pub cards_omitted: usize,
+    #[serde(default)]
+    pub cards_walked: usize,
 }
 
 impl Serialize for ObserveCardCounts {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        if self.cards_total == 0 {
+        if self.cards_total == 0 && self.cards_walked == 0 {
             serializer.serialize_struct("ObserveCardCounts", 0)?.end()
+        } else if self.cards_total == 0 {
+            let mut st = serializer.serialize_struct("ObserveCardCounts", 1)?;
+            st.serialize_field("cards_walked", &self.cards_walked)?;
+            st.end()
         } else {
-            let mut st = serializer.serialize_struct("ObserveCardCounts", 2)?;
+            let mut st = serializer.serialize_struct("ObserveCardCounts", 3)?;
             st.serialize_field("cards_total", &self.cards_total)?;
             st.serialize_field("cards_omitted", &self.cards_omitted)?;
+            st.serialize_field("cards_walked", &self.cards_walked)?;
             st.end()
         }
     }
@@ -391,6 +398,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     crate::dialogs::promote(&mut extract, &mut elements);
     stamp_grid(space, &mut elements);
     crate::fence::note_last_url(extract.url.as_deref());
+    let cards_walked = extract.cards_walked;
     let hit = challenge::detect_from_extract(
         &extract.title,
         extract.url.as_deref(),
@@ -422,7 +430,10 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         view: req.view,
         observe_source: ObserveSource::Live,
         card_offset: 0,
-        card_counts: ObserveCardCounts::default(),
+        card_counts: ObserveCardCounts {
+            cards_walked,
+            ..ObserveCardCounts::default()
+        },
     };
     write_sidecar(&paths.observe_path, &full, opts.popup_rect)?;
     let envelope = match req.detail {
@@ -475,7 +486,10 @@ fn write_sidecar(
         view: envelope.view,
         observe_source: envelope.observe_source,
         card_offset: 0,
-        card_counts: ObserveCardCounts::default(),
+        card_counts: ObserveCardCounts {
+            cards_walked: envelope.extract.cards_walked,
+            ..ObserveCardCounts::default()
+        },
         popup_rect,
     };
     let json = serde_json::to_string_pretty(&sidecar)
@@ -917,6 +931,7 @@ fn reshape_from_sidecar(req: &ObserveRequest, from: &str) -> Result<ObserveEnvel
         popup_rect: sidecar.popup_rect,
     };
     let mut envelope = envelope_from_sidecar(sidecar, req.view);
+    envelope.card_counts.cards_walked = envelope.extract.cards_walked;
     retain_hittable_centers(&mut envelope.elements, &opts);
     apply_card_offset(&mut envelope, req.card_offset);
     let envelope = finalize_envelope(cap_default_envelope(envelope))?;
@@ -932,13 +947,18 @@ fn reshape_from_sidecar(req: &ObserveRequest, from: &str) -> Result<ObserveEnvel
 }
 
 fn envelope_from_sidecar(sidecar: ObserveSidecar, view: ObserveView) -> ObserveEnvelope {
+    let mut extract = sidecar.extract;
+    if extract.cards_walked == 0 {
+        extract.cards_walked = sidecar.card_counts.cards_walked;
+    }
+    let cards_walked = extract.cards_walked;
     ObserveEnvelope {
         session_id: sidecar.session_id,
         screenshot_path: sidecar.screenshot_path,
         observe_path: sidecar.observe_path,
         space: sidecar.space,
         viewport: sidecar.viewport,
-        extract: sidecar.extract,
+        extract,
         elements: sidecar.elements,
         elements_total: sidecar.elements_total,
         elements_truncated: sidecar.elements_truncated,
@@ -951,7 +971,10 @@ fn envelope_from_sidecar(sidecar: ObserveSidecar, view: ObserveView) -> ObserveE
         view,
         observe_source: ObserveSource::Sidecar,
         card_offset: 0,
-        card_counts: ObserveCardCounts::default(),
+        card_counts: ObserveCardCounts {
+            cards_walked,
+            ..ObserveCardCounts::default()
+        },
     }
 }
 
@@ -1222,6 +1245,7 @@ mod tests {
                 .collect(),
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
+            cards_walked: 0,
         };
         let nodes: Vec<RawNode> = (0..5).map(uia).collect();
         let (extract, els, total, connected) = fuse_maps(
@@ -2005,6 +2029,7 @@ mod tests {
                 .collect(),
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
+            cards_walked: 0,
         };
         let nodes = vec![uia_node(
             42,
@@ -2135,6 +2160,7 @@ mod tests {
             ],
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
+            cards_walked: 0,
         };
         let (mut extract, mut elements, _total, connected) = fuse_maps(
             Detail::Default,
@@ -2170,6 +2196,8 @@ mod tests {
                 dealer: Some("Capital Toyota".into()),
                 distance: Some("12 mi away".into()),
                 listing_of: None,
+                kind: Some("local".into()),
+                delivery: Some("Ship $399".into()),
             })
             .collect();
         raw.extract.dialogs = vec![
@@ -2780,6 +2808,7 @@ mod tests {
             }],
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
+            cards_walked: 0,
         };
         let nodes = vec![uia_node(
             9,
@@ -2824,6 +2853,7 @@ mod tests {
             }],
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
+            cards_walked: 0,
         };
         let (dom_extract, dom_els, _, _) = fuse_maps(
             Detail::Dom,
@@ -3050,6 +3080,8 @@ mod tests {
             dealer: Some(format!("Capital Toyota of Tallahassee Storefront {i}")),
             distance: Some(format!("{i}2 mi away from ZIP 32309")),
             listing_of: None,
+            kind: Some("local".into()),
+            delivery: Some("Ship $399".into()),
         }
     }
 
@@ -3236,6 +3268,15 @@ mod tests {
         assert!(past.extract.cards.is_empty());
         assert_eq!(past.card_counts.cards_omitted, 8);
         assert_eq!(past.card_offset, 8);
+        let mut walked = shopping_fixture();
+        walked.extract.cards_walked = 13;
+        walked.card_counts.cards_walked = 13;
+        apply_card_offset(&mut walked, 3);
+        assert_eq!(walked.card_counts.cards_walked, 13);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialize_envelope(&walked).unwrap()).unwrap();
+        assert_eq!(parsed["cards_walked"], 13);
+        assert_eq!(parsed["cards_total"], 8);
     }
 
     #[test]
@@ -3450,6 +3491,7 @@ mod tests {
     #[test]
     fn mcp_cli_agents_name_opt_in_screenshot_and_views() {
         let mcp = include_str!("mcp.rs");
+        assert!(mcp.contains("cards_walked"));
         assert!(mcp.contains("include_screenshot_path"));
         assert!(mcp.contains("auto-attach") || mcp.to_ascii_lowercase().contains("auto-attach"));
         assert!(mcp.contains("ingest") || mcp.contains("cap is 8") || mcp.contains("cap 8"));
@@ -3458,11 +3500,13 @@ mod tests {
         assert!(!mcp.contains("resource_link"));
         let agents = include_str!("../AGENTS.md");
         assert!(agents.contains("include_screenshot_path"));
+        assert!(agents.contains("cards_walked"));
         assert!(agents.contains("cards_total") || agents.contains("cards_omitted"));
         assert!(agents.contains("--from"));
         let readme = include_str!("../README.md");
         assert!(readme.contains("include_screenshot_path"));
         assert!(readme.contains("--from"));
+        assert!(readme.contains("cards_walked"));
         assert!(readme.contains("cards_total") || readme.contains("cards_omitted"));
         let main = include_str!("main.rs");
         assert!(main.contains("--view"));
@@ -3493,6 +3537,7 @@ mod tests {
             serde_json::from_str(&serialize_envelope(&env).unwrap()).unwrap();
         assert_eq!(parsed["cards_total"], 8);
         assert_eq!(parsed["cards_omitted"], 0);
+        assert_eq!(parsed["cards_walked"], 0);
     }
 
     #[test]

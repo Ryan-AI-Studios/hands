@@ -13,8 +13,9 @@ use windows::core::PCWSTR;
 
 use crate::error::HandsError;
 use crate::extract::{
-    CARD_DEALER_CAP, CARD_DISTANCE_CAP, CARD_MILES_CAP, CARD_OF_CAP, Card, Detail, EMPTY_STATE_CAP,
-    Element, LOCAL_MATCHES_CAP, ListingMeta, RADIUS_CAP, RESULT_COUNT_CAP, ZIP_CAP, take_chars,
+    CARD_DEALER_CAP, CARD_DELIVERY_CAP, CARD_DISTANCE_CAP, CARD_KIND_CAP, CARD_MILES_CAP,
+    CARD_OF_CAP, Card, Detail, EMPTY_STATE_CAP, Element, LOCAL_MATCHES_CAP, ListingMeta,
+    RADIUS_CAP, RESULT_COUNT_CAP, ZIP_CAP, infer_card_kind, prefer_local_cards, take_chars,
     take_opt_chars,
 };
 use crate::native_host::{CLIENT_TIMEOUT_MS, client_timeout, exchange_pipe_deadline, pipe_name};
@@ -28,6 +29,7 @@ pub const CARD_TITLE_CAP: usize = 80;
 pub const CARD_PRICE_CAP: usize = 24;
 pub const CARD_HREF_CAP: usize = 200;
 pub const CARD_CAP: usize = 8;
+pub const CARD_WALK_CAP: usize = 24;
 
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -40,6 +42,7 @@ pub struct ChromeMap {
     pub elements: Vec<Element>,
     pub cards: Vec<Card>,
     pub listing: ListingMeta,
+    pub cards_walked: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +111,10 @@ struct RawCard {
     distance: Option<String>,
     #[serde(rename = "of", default)]
     listing_of: Option<String>,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    delivery: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +140,8 @@ struct RawSnapshot {
     zip: Option<String>,
     #[serde(default)]
     radius: Option<String>,
+    #[serde(default)]
+    cards_walked: Option<usize>,
 }
 
 pub fn css_rect_to_physical(metrics: &ChromeMetrics, rect: &CssRect) -> Option<Rect> {
@@ -249,7 +258,7 @@ fn map_from_raw(raw: RawSnapshot) -> ChromeMap {
     }
     let mut cards = Vec::new();
     for card in raw.cards {
-        if cards.len() >= CARD_CAP {
+        if cards.len() >= CARD_WALK_CAP {
             break;
         }
         if !href_ok(&card.href) {
@@ -258,7 +267,7 @@ fn map_from_raw(raw: RawSnapshot) -> ChromeMap {
         let Some(rect) = css_rect_to_physical(&raw.metrics, &card.rect_css) else {
             continue;
         };
-        cards.push(Card {
+        let mut mapped = Card {
             title: take_chars(&card.title, CARD_TITLE_CAP),
             price: take_chars(&card.price, CARD_PRICE_CAP),
             href: take_chars(&card.href, CARD_HREF_CAP),
@@ -267,8 +276,34 @@ fn map_from_raw(raw: RawSnapshot) -> ChromeMap {
             dealer: take_opt_chars(card.dealer, CARD_DEALER_CAP),
             distance: take_opt_chars(card.distance, CARD_DISTANCE_CAP),
             listing_of: take_opt_chars(card.listing_of, CARD_OF_CAP),
-        });
+            kind: take_opt_chars(
+                if card.kind.is_empty() {
+                    None
+                } else {
+                    Some(card.kind)
+                },
+                CARD_KIND_CAP,
+            ),
+            delivery: take_opt_chars(
+                if card.delivery.is_empty() {
+                    None
+                } else {
+                    Some(card.delivery)
+                },
+                CARD_DELIVERY_CAP,
+            ),
+        };
+        if mapped.kind.is_none() {
+            mapped.kind = infer_card_kind(&mapped);
+        }
+        cards.push(mapped);
     }
+    let collected_len = cards.len();
+    let cards_walked = raw
+        .cards_walked
+        .filter(|n| *n > collected_len)
+        .unwrap_or(collected_len);
+    let cards = prefer_local_cards(cards, CARD_CAP);
     ChromeMap {
         url: raw.url.filter(|s| !s.trim().is_empty()),
         title: raw.title.unwrap_or_default(),
@@ -281,7 +316,9 @@ fn map_from_raw(raw: RawSnapshot) -> ChromeMap {
             empty_state: take_opt_chars(raw.empty_state, EMPTY_STATE_CAP),
             zip: take_opt_chars(raw.zip, ZIP_CAP),
             radius: take_opt_chars(raw.radius, RADIUS_CAP),
+            cards_walked,
         },
+        cards_walked,
     }
 }
 
@@ -368,6 +405,7 @@ fn pipe_resolve(id: &str) -> Result<ChromeMap, HandsError> {
             empty_state: None,
             zip: None,
             radius: None,
+            cards_walked: None,
         }));
     }
     parse_host_reply(&reply)
@@ -620,6 +658,8 @@ mod tests {
                 .iter()
                 .all(|c| c.miles.is_some() && c.dealer.is_some() && c.distance.is_some())
         );
+        assert_eq!(map.cards_walked, 9);
+        assert_eq!(map.listing.cards_walked, 9);
     }
 
     #[test]
@@ -868,6 +908,10 @@ mod tests {
             "innerHTML =",
             "chrome.scripting",
             "chrome.alarms",
+            "fetch(",
+            "fetch (",
+            "XMLHttpRequest",
+            "CarsWeb.SearchController",
         ];
         for name in ["content.js", "sw.js"] {
             let text = fs::read_to_string(root.join(name)).unwrap();
@@ -935,6 +979,208 @@ mod tests {
         assert!(
             !text.contains("WeakMap"),
             "content.js must not grow WeakMap identity"
+        );
+    }
+
+    fn mixed_fixture_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chrome-srp-mixed.json")
+    }
+
+    #[test]
+    fn mixed_srp_packs_five_locals_and_walked_thirteen() {
+        let bytes = fs::read(mixed_fixture_path()).expect("mixed fixture");
+        let map = parse_snapshot_bytes(&bytes).expect("parse mixed");
+        assert_eq!(map.cards.len(), 8);
+        assert_eq!(map.cards_walked, 13);
+        assert_eq!(map.listing.cards_walked, 13);
+        let locals: Vec<_> = map
+            .cards
+            .iter()
+            .filter(|c| c.kind.as_deref() == Some("local"))
+            .collect();
+        assert_eq!(locals.len(), 5);
+        let expected = [
+            (
+                "2024 Toyota Camry SE",
+                "$19,999",
+                "32,145 mi",
+                "Capital Toyota",
+                "12 mi away",
+                "https://cars.com/vehicledetail/local-se",
+            ),
+            (
+                "2024 Toyota Camry LE",
+                "$18,500",
+                "28,012 mi",
+                "Tallahassee Toyota",
+                "Tallahassee, FL (12 mi)",
+                "https://cars.com/vehicledetail/local-le",
+            ),
+            (
+                "2024 Toyota Camry XLE",
+                "$21,200",
+                "15,432 mi",
+                "Gator Toyota",
+                "(12 mi)",
+                "https://cars.com/vehicledetail/local-xle",
+            ),
+            (
+                "2024 Toyota Camry Nightshade",
+                "$22,400",
+                "41,200 mi",
+                "Crown Toyota",
+                "8 mi away",
+                "https://cars.com/vehicledetail/local-night",
+            ),
+            (
+                "2024 Toyota Camry Hybrid",
+                "$24,800",
+                "19,876 mi",
+                "Capital Toyota",
+                "5 mi away",
+                "https://cars.com/vehicledetail/local-hybrid",
+            ),
+        ];
+        for (title, price, miles, dealer, distance, href) in expected {
+            let card = locals
+                .iter()
+                .find(|c| c.title == title)
+                .unwrap_or_else(|| panic!("missing local {title}"));
+            assert_eq!(card.price, price, "{title}");
+            assert_eq!(card.miles.as_deref(), Some(miles), "{title}");
+            assert_eq!(card.dealer.as_deref(), Some(dealer), "{title}");
+            assert_eq!(card.distance.as_deref(), Some(distance), "{title}");
+            assert_eq!(card.href, href, "{title}");
+        }
+        let ship = map
+            .cards
+            .iter()
+            .find(|c| c.kind.as_deref() == Some("ship") && c.delivery.is_some())
+            .expect("ship with delivery");
+        let fee = ship.delivery.as_deref().unwrap();
+        assert_ne!(ship.distance.as_deref(), Some(fee));
+        assert!(
+            map.cards
+                .iter()
+                .all(|c| c.kind.as_deref() != Some("recommended")),
+            "pack must drop recommended behind locals+ships"
+        );
+        assert!(
+            fs::read_to_string(mixed_fixture_path())
+                .unwrap()
+                .contains("\"kind\": \"recommended\"")
+        );
+        let civic = parse_snapshot_bytes(&fs::read(EnvGuard::fixture_path()).expect("civic"))
+            .expect("civic");
+        assert_eq!(civic.cards.len(), 1);
+        assert_eq!(civic.cards[0].title, "2020 Honda Civic");
+    }
+
+    #[test]
+    fn infer_kind_from_distance_packs_as_local() {
+        let json = r#"{
+            "url":"https://cars.com/search","title":"T","main_text":"x",
+            "metrics":{"screenX":0,"screenY":0,"outerWidth":100,"outerHeight":100,"innerWidth":100,"innerHeight":100,"devicePixelRatio":1},
+            "elements":[],
+            "cards":[
+                {"title":"ship a","price":"$1","href":"https://cars.com/s0","rectCss":{"left":1,"top":1,"width":10,"height":10},"kind":"ship","delivery":"Shipping $399"},
+                {"title":"ship b","price":"$1","href":"https://cars.com/s1","rectCss":{"left":1,"top":1,"width":10,"height":10},"kind":"ship","delivery":"Shipping $399"},
+                {"title":"inferred local","price":"$19,999","href":"https://cars.com/l0","rectCss":{"left":1,"top":1,"width":10,"height":10},"distance":"12 mi away"}
+            ]
+        }"#;
+        let map = parse_snapshot_bytes(json.as_bytes()).expect("parse");
+        assert_eq!(map.cards.len(), 3);
+        assert_eq!(map.cards[0].title, "inferred local");
+        assert_eq!(map.cards[0].kind.as_deref(), Some("local"));
+        assert_eq!(map.cards_walked, 3);
+    }
+
+    #[test]
+    fn old_sidecar_without_kind_delivery_deserializes() {
+        let json = r#"{
+            "url":"https://cars.com/search","title":"T","main_text":"x",
+            "metrics":{"screenX":0,"screenY":0,"outerWidth":100,"outerHeight":100,"innerWidth":100,"innerHeight":100,"devicePixelRatio":1},
+            "elements":[],
+            "cards":[{"title":"civic","price":"$12,345","href":"https://cars.com/c","rectCss":{"left":1,"top":1,"width":10,"height":10}}]
+        }"#;
+        let map = parse_snapshot_bytes(json.as_bytes()).expect("parse");
+        assert_eq!(map.cards.len(), 1);
+        assert!(map.cards[0].kind.is_none());
+        assert!(map.cards[0].delivery.is_none());
+        let v = serde_json::to_value(&map.cards[0]).unwrap();
+        assert!(v.get("kind").is_none());
+        assert!(v.get("delivery").is_none());
+    }
+
+    #[test]
+    fn content_js_extract_price_skips_monthly_and_drop_tokens() {
+        let src = include_str!("../extension/content.js");
+        let start = src
+            .find("function extractPrice")
+            .expect("function extractPrice");
+        let rest = &src[start..];
+        let end = rest
+            .find("function prevWholeToken")
+            .expect("function prevWholeToken");
+        let slice = &rest[..end];
+        assert!(
+            slice.contains("/mo"),
+            "extractPrice must skip /mo:\n{slice}"
+        );
+        assert!(
+            slice.contains("drop") && slice.contains("est"),
+            "extractPrice must whole-token skip drop/est:\n{slice}"
+        );
+        assert!(
+            !slice.contains("substring") || slice.contains("toLowerCase"),
+            "extractPrice slice present"
+        );
+    }
+
+    #[test]
+    fn content_js_card_dealer_junk_strips_shipping_and_deliver_to() {
+        let src = include_str!("../extension/content.js");
+        let start = src
+            .find("function cardDealer")
+            .expect("function cardDealer");
+        let rest = &src[start..];
+        let end = rest
+            .find("function cardDistance")
+            .expect("function cardDistance");
+        let slice = &rest[..end];
+        assert!(
+            slice.contains("shipping") && slice.contains("deliver to"),
+            "cardDealer must junk-strip shipping/deliver to:\n{slice}"
+        );
+        assert!(
+            slice.contains("cardDistance("),
+            "cardDealer must strip cardDistance phrase before leftover:\n{slice}"
+        );
+        assert!(
+            !slice.contains("[A-Za-z .'-]*"),
+            "cardDealer must not greedily swallow City, ST:\n{slice}"
+        );
+    }
+
+    #[test]
+    fn content_js_collect_cards_walks_24_packs_8() {
+        let src = include_str!("../extension/content.js");
+        let start = src
+            .find("function collectCards")
+            .expect("function collectCards");
+        let rest = &src[start..];
+        let end = rest
+            .find("function itempropText")
+            .expect("function itempropText");
+        let slice = &rest[..end];
+        assert!(
+            slice.contains("CARD_WALK_CAP") && slice.contains("cards_walked"),
+            "collectCards must walk/pack and set cards_walked:\n{slice}"
+        );
+        assert!(
+            slice.contains("preferLocalCards") || slice.contains("CARD_CAP"),
+            "collectCards must pack to emit cap:\n{slice}"
         );
     }
 }

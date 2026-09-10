@@ -1,0 +1,160 @@
+{
+  "url": "https://cars.com/search",
+  "title": "Cars.com",
+  "main_text": "Search cars\n2024 Toyota Camry",
+  "metrics": {
+    "screenX": 100,
+    "screenY": 50,
+    "outerWidth": 1280,
+    "outerHeight": 800,
+    "innerWidth": 1280,
+    "innerHeight": 720,
+    "devicePixelRatio": 1.0
+  },
+  "elements": [
+    {
+      "id": "chr:0",
+      "role": "Edit",
+      "text": "Search",
+      "rectCss": { "left": 10, "top": 20, "width": 200, "height": 32 }
+    }
+  ],
+  "cards": [
+    {
+      "title": "2024 Toyota Camry ship 0",
+      "price": "$17,100",
+      "href": "https://cars.com/vehicledetail/ship-0",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "40,000 mi",
+      "dealer": "Jacksonville Toyota",
+      "distance": "Shipping from Jacksonville, FL",
+      "kind": "ship",
+      "delivery": "Shipping $399"
+    },
+    {
+      "title": "2024 Toyota Camry ship 1",
+      "price": "$17,200",
+      "href": "https://cars.com/vehicledetail/ship-1",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "41,000 mi",
+      "dealer": "Orlando Toyota",
+      "distance": "Shipping from Orlando, FL",
+      "kind": "ship",
+      "delivery": "Deliver to 32309"
+    },
+    {
+      "title": "2024 Toyota Camry ship 2",
+      "price": "$17,300",
+      "href": "https://cars.com/vehicledetail/ship-2",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "42,000 mi",
+      "dealer": "Tampa Toyota",
+      "distance": "Shipping from Tampa, FL",
+      "kind": "ship",
+      "delivery": "Shipping $425"
+    },
+    {
+      "title": "2024 Toyota Camry ship 3",
+      "price": "$17,400",
+      "href": "https://cars.com/vehicledetail/ship-3",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "43,000 mi",
+      "dealer": "Miami Toyota",
+      "distance": "Shipping from Miami, FL",
+      "kind": "ship",
+      "delivery": "Est. shipping $399"
+    },
+    {
+      "title": "2024 Toyota Camry ship 4",
+      "price": "$17,500",
+      "href": "https://cars.com/vehicledetail/ship-4",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "44,000 mi",
+      "dealer": "Atlanta Toyota",
+      "distance": "Shipping from Atlanta, GA",
+      "kind": "ship",
+      "delivery": "Shipping $350"
+    },
+    {
+      "title": "2024 Toyota Camry ship 5",
+      "price": "$17,600",
+      "href": "https://cars.com/vehicledetail/ship-5",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "45,000 mi",
+      "dealer": "Savannah Toyota",
+      "distance": "Shipping from Savannah, GA",
+      "kind": "ship",
+      "delivery": "Shipping $410"
+    },
+    {
+      "title": "2024 Toyota Camry ship 6",
+      "price": "$17,700",
+      "href": "https://cars.com/vehicledetail/ship-6",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "46,000 mi",
+      "dealer": "Mobile Toyota",
+      "distance": "Shipping from Mobile, AL",
+      "kind": "ship",
+      "delivery": "Shipping $375"
+    },
+    {
+      "title": "You may also like 2024 Camry rec",
+      "price": "$16,900",
+      "href": "https://cars.com/vehicledetail/rec-0",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "55,000 mi",
+      "dealer": "National Auto",
+      "kind": "recommended"
+    },
+    {
+      "title": "2024 Toyota Camry SE",
+      "price": "$19,999",
+      "href": "https://cars.com/vehicledetail/local-se",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "32,145 mi",
+      "dealer": "Capital Toyota",
+      "distance": "12 mi away",
+      "kind": "local"
+    },
+    {
+      "title": "2024 Toyota Camry LE",
+      "price": "$18,500",
+      "href": "https://cars.com/vehicledetail/local-le",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "28,012 mi",
+      "dealer": "Tallahassee Toyota",
+      "distance": "Tallahassee, FL (12 mi)",
+      "kind": "local"
+    },
+    {
+      "title": "2024 Toyota Camry XLE",
+      "price": "$21,200",
+      "href": "https://cars.com/vehicledetail/local-xle",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "15,432 mi",
+      "dealer": "Gator Toyota",
+      "distance": "(12 mi)",
+      "kind": "local"
+    },
+    {
+      "title": "2024 Toyota Camry Nightshade",
+      "price": "$22,400",
+      "href": "https://cars.com/vehicledetail/local-night",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "41,200 mi",
+      "dealer": "Crown Toyota",
+      "distance": "8 mi away",
+      "kind": "local"
+    },
+    {
+      "title": "2024 Toyota Camry Hybrid",
+      "price": "$24,800",
+      "href": "https://cars.com/vehicledetail/local-hybrid",
+      "rectCss": { "left": 10, "top": 200, "width": 300, "height": 80 },
+      "miles": "19,876 mi",
+      "dealer": "Capital Toyota",
+      "distance": "5 mi away",
+      "kind": "local"
+    }
+  ]
+}

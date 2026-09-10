@@ -11,6 +11,8 @@ pub const CARD_MILES_CAP: usize = 16;
 pub const CARD_DEALER_CAP: usize = 48;
 pub const CARD_DISTANCE_CAP: usize = 40;
 pub const CARD_OF_CAP: usize = 12;
+pub const CARD_KIND_CAP: usize = 12;
+pub const CARD_DELIVERY_CAP: usize = 40;
 pub const RESULT_COUNT_CAP: usize = 24;
 pub const LOCAL_MATCHES_CAP: usize = 24;
 pub const EMPTY_STATE_CAP: usize = 120;
@@ -235,6 +237,10 @@ pub struct Card {
     pub distance: Option<String>,
     #[serde(rename = "of", default, skip_serializing_if = "Option::is_none")]
     pub listing_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
 }
 
 impl Default for Card {
@@ -253,6 +259,8 @@ impl Default for Card {
             dealer: None,
             distance: None,
             listing_of: None,
+            kind: None,
+            delivery: None,
         }
     }
 }
@@ -284,6 +292,8 @@ pub struct Extract {
     pub zip: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radius: Option<String>,
+    #[serde(skip)]
+    pub cards_walked: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -293,6 +303,7 @@ pub struct ListingMeta {
     pub empty_state: Option<String>,
     pub zip: Option<String>,
     pub radius: Option<String>,
+    pub cards_walked: usize,
 }
 
 pub fn filter_nodes(nodes: &[RawNode], detail: Detail) -> (Vec<Element>, usize) {
@@ -386,6 +397,7 @@ pub fn extract_fused(
         empty_state: take_opt_chars(listing.empty_state, EMPTY_STATE_CAP),
         zip: take_opt_chars(listing.zip, ZIP_CAP),
         radius: take_opt_chars(listing.radius, RADIUS_CAP),
+        cards_walked: listing.cards_walked,
     };
     enrich_listing(&mut extract);
     extract
@@ -414,6 +426,10 @@ pub fn parse_miles(text: &str) -> Option<String> {
                 from = num_end;
                 continue;
             }
+            if is_paren_mi_span(text, start, after + unit_len, digits) {
+                from = num_end;
+                continue;
+            }
             if has_comma || digits >= 4 {
                 let phrase = text[start..after + unit_len].trim();
                 if !phrase.is_empty() {
@@ -427,6 +443,9 @@ pub fn parse_miles(text: &str) -> Option<String> {
 }
 
 pub fn parse_distance(text: &str) -> Option<String> {
+    if let Some(paren) = parse_paren_mi_distance(text) {
+        return Some(paren);
+    }
     if let Some(away) = parse_mi_away(text) {
         return Some(away);
     }
@@ -609,11 +628,21 @@ pub fn enrich_listing(extract: &mut Extract) {
         if card.listing_of.is_none() {
             card.listing_of = parse_listing_of(&card.title);
         }
+        if card.kind.is_none() {
+            card.kind = parse_card_kind(&card.title);
+        }
+        if card.delivery.is_none() {
+            card.delivery = parse_delivery(&card.title);
+        }
+        card.dealer = card.dealer.take().and_then(|d| sanitize_dealer(&d));
+        if price_looks_monthly(&card.price, &card.title) {
+            card.price = parse_listing_price(&card.title).unwrap_or_default();
+        }
     }
 }
 
 /// Dealer from a **card-scoped** blob only (already-collected card innerText).
-/// Strip title / price / miles / distance / `of`; leftover is the dealer candidate.
+/// Strip title / price / miles / distance / delivery / `of` / junk; leftover is the dealer.
 /// Never call this on page `main_text` — that would guess from the footer.
 pub fn parse_dealer(card_text: &str, title: &str, price: &str) -> Option<String> {
     let mut rest = card_text.to_string();
@@ -629,11 +658,22 @@ pub fn parse_dealer(card_text: &str, title: &str, price: &str) -> Option<String>
     if let Some(distance) = parse_distance(&rest) {
         rest = rest.replace(&distance, " ");
     }
+    while let Some(delivery) = parse_delivery(&rest) {
+        rest = rest.replace(&delivery, " ");
+    }
     if let Some(of) = parse_listing_of(&rest) {
         rest = rest.replace(&of, " ");
     }
+    sanitize_dealer(&rest)
+}
+
+/// Junk-strip a dealer **string** (JS leftover or itemprop). Production ingest honesty.
+pub fn sanitize_dealer(dealer_string: &str) -> Option<String> {
+    let mut rest = strip_review_parens(dealer_string);
+    rest = strip_junk_phrases(&rest);
     rest = strip_price_tokens(&rest);
-    let rest = collapse_ws(&rest);
+    rest = collapse_ws(&rest);
+    rest = trim_punct(&rest);
     if rest.chars().count() < 2 || !rest.chars().any(|c| c.is_ascii_alphabetic()) {
         return None;
     }
@@ -644,8 +684,166 @@ pub fn parse_dealer(card_text: &str, title: &str, price: &str) -> Option<String>
     ) {
         return None;
     }
+    if leftover_contains_junk(&lower) {
+        return None;
+    }
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    if tokens.len() == 1 && !is_dealerish_token(tokens[0]) {
+        return None;
+    }
     Some(take_chars(&rest, CARD_DEALER_CAP))
 }
+
+pub fn parse_listing_price(text: &str) -> Option<String> {
+    let mut hits: Vec<(usize, usize, bool)> = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let Some(c) = text[i..].chars().next() else {
+            break;
+        };
+        if (c == '$' || c == '€' || c == '£')
+            && let Some((start, end, grouped)) = currency_amount_at(text, i)
+        {
+            if !should_skip_price_hit(text, start, end) {
+                hits.push((start, end, grouped));
+            }
+            i = end;
+            continue;
+        }
+        i += c.len_utf8();
+    }
+    if let Some(&(start, end, _)) = hits.iter().find(|h| h.2) {
+        return Some(take_chars(&text[start..end], CARD_PRICE_FALLBACK_CAP));
+    }
+    if let Some(&(start, end, _)) = hits.first() {
+        return Some(take_chars(&text[start..end], CARD_PRICE_FALLBACK_CAP));
+    }
+    parse_plain_decimal_price(text)
+}
+
+const CARD_PRICE_FALLBACK_CAP: usize = 24;
+
+pub fn parse_delivery(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let candidates = [
+        delivery_span(text, &lower, "available for delivery to"),
+        delivery_span(text, &lower, "est. shipping"),
+        delivery_shipping_dollar(text, &lower),
+        delivery_deliver_to(text, &lower),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .min_by_key(|(start, _)| *start)
+        .map(|(_, phrase)| take_chars(&phrase, CARD_DELIVERY_CAP))
+}
+
+pub fn parse_card_kind(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    if has_recommended_phrase(&lower) {
+        return Some("recommended".into());
+    }
+    if has_ship_marker(text, &lower) {
+        return Some("ship".into());
+    }
+    if is_in_radius_distance(text) {
+        return Some("local".into());
+    }
+    None
+}
+
+pub fn infer_card_kind(card: &Card) -> Option<String> {
+    if let Some(kind) = card
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
+        return Some(take_chars(kind, CARD_KIND_CAP));
+    }
+    if has_recommended_phrase(&card.title.to_ascii_lowercase()) {
+        return Some("recommended".into());
+    }
+    let delivery_text = card.delivery.as_deref().unwrap_or("");
+    let delivery_l = delivery_text.to_ascii_lowercase();
+    let distance_l = card.distance.as_deref().unwrap_or("").to_ascii_lowercase();
+    let title_l = card.title.to_ascii_lowercase();
+    if has_ship_marker(delivery_text, &delivery_l)
+        || has_ship_marker(&card.title, &title_l)
+        || distance_l.contains("shipping from")
+        || distance_l.contains("deliver to")
+    {
+        return Some("ship".into());
+    }
+    if card.distance.as_deref().is_some_and(is_in_radius_distance)
+        || is_in_radius_distance(&card.title)
+    {
+        return Some("local".into());
+    }
+    None
+}
+
+pub fn prefer_local_cards(cards: Vec<Card>, cap: usize) -> Vec<Card> {
+    let mut local = Vec::new();
+    let mut unknown = Vec::new();
+    let mut ship = Vec::new();
+    let mut rec = Vec::new();
+    for card in cards {
+        match card.kind.as_deref() {
+            Some("local") => local.push(card),
+            Some("ship") => ship.push(card),
+            Some("recommended") => rec.push(card),
+            _ => unknown.push(card),
+        }
+    }
+    let mut out = Vec::with_capacity(cap.min(local.len() + unknown.len() + ship.len() + rec.len()));
+    out.extend(local);
+    out.extend(unknown);
+    out.extend(ship);
+    out.extend(rec);
+    out.truncate(cap);
+    out
+}
+
+const DEALER_JUNK_PHRASES: &[&str] = &[
+    "american-made index",
+    "american made index",
+    "available for delivery",
+    "no price analysis",
+    "get pre-approved",
+    "check availability",
+    "days on cars.com",
+    "you may also like",
+    "contact dealer",
+    "home delivery",
+    "est. shipping",
+    "free carfax",
+    "view details",
+    "get financing",
+    "price drop",
+    "great deal",
+    "good deal",
+    "fair deal",
+    "high price",
+    "deliver to",
+    "shipping to",
+    "per month",
+    "see more",
+    "recommended",
+    "autocheck",
+    "sponsored",
+    "shipping",
+    "reviews",
+    "ratings",
+    "review",
+    "rating",
+    "stars",
+    "star",
+    "est.",
+    "/mo",
+];
+
+const PRICE_SKIP_TOKENS: &[&str] = &["est", "est.", "drop", "save", "off", "discount"];
 
 fn collapse_ws(text: &str) -> String {
     let mut out = String::new();
@@ -685,6 +883,440 @@ fn strip_price_tokens(text: &str) -> String {
         out.push(c);
     }
     out
+}
+
+fn strip_junk_phrases(text: &str) -> String {
+    let mut rest = text.to_string();
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let mut found: Option<(usize, usize)> = None;
+        for phrase in DEALER_JUNK_PHRASES {
+            if let Some(idx) = find_bounded_phrase(&lower, phrase) {
+                let end = idx + phrase.len();
+                match found {
+                    Some((s, _)) if idx >= s => {}
+                    _ => found = Some((idx, end)),
+                }
+            }
+        }
+        let Some((start, end)) = found else {
+            break;
+        };
+        rest.replace_range(start..end, " ");
+    }
+    rest
+}
+
+fn leftover_contains_junk(lower: &str) -> bool {
+    DEALER_JUNK_PHRASES
+        .iter()
+        .any(|phrase| find_bounded_phrase(lower, phrase).is_some())
+}
+
+fn find_bounded_phrase(lower: &str, phrase: &str) -> Option<usize> {
+    let bytes = lower.as_bytes();
+    let mut search = 0;
+    while search <= lower.len().saturating_sub(phrase.len()) {
+        let rel = lower[search..].find(phrase)?;
+        let idx = search + rel;
+        let after = idx + phrase.len();
+        if phrase == "/mo" {
+            return Some(idx);
+        }
+        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return Some(idx);
+        }
+        search = idx + 1;
+    }
+    None
+}
+
+fn strip_review_parens(text: &str) -> String {
+    let mut rest = text.to_string();
+    while let Some((start, end)) = find_review_paren(&rest) {
+        rest.replace_range(start..end, " ");
+    }
+    rest
+}
+
+fn find_review_paren(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            let after_open = skip_ws_bytes(text, i + 1);
+            if let Some((n_start, n_end, digits, _)) = next_number(text, after_open)
+                && n_start == after_open
+                && digits > 0
+            {
+                let after_num = skip_ws_bytes(text, n_end);
+                let (is_reviews, word_len) = if is_word_at(&text[after_num..], "reviews") {
+                    (true, 7usize)
+                } else if is_word_at(&text[after_num..], "review") {
+                    (true, 6usize)
+                } else {
+                    (false, 0usize)
+                };
+                if is_reviews {
+                    let after_word = skip_ws_bytes(text, after_num + word_len);
+                    if after_word < bytes.len() && bytes[after_word] == b')' {
+                        return Some((i, after_word + 1));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn trim_punct(s: &str) -> String {
+    s.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_string()
+}
+
+fn is_dealerish_token(tok: &str) -> bool {
+    let lower = tok.to_ascii_lowercase();
+    matches!(lower.as_str(), "carmax" | "carvana" | "vroom")
+        || lower.contains("auto")
+        || lower.contains("motor")
+}
+
+fn is_paren_mi_span(text: &str, num_start: usize, unit_end: usize, digits: usize) -> bool {
+    if !(1..=3).contains(&digits) {
+        return false;
+    }
+    let before = skip_ws_back(text, num_start);
+    if before == 0 || text.as_bytes()[before - 1] != b'(' {
+        return false;
+    }
+    let after = skip_ws_bytes(text, unit_end);
+    after < text.len() && text.as_bytes()[after] == b')'
+}
+
+fn skip_ws_back(text: &str, mut i: usize) -> usize {
+    while i > 0 {
+        let Some(c) = text[..i].chars().next_back() else {
+            break;
+        };
+        if !c.is_whitespace() {
+            break;
+        }
+        i -= c.len_utf8();
+    }
+    i
+}
+
+fn parse_paren_mi_distance(text: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some((start, num_end, digits, _)) = next_number(text, from) {
+        if (1..=3).contains(&digits) {
+            let after = skip_ws_bytes(text, num_end);
+            if let Some(unit_len) = match_mi_unit(&text[after..]) {
+                let unit_end = after + unit_len;
+                let close_at = skip_ws_bytes(text, unit_end);
+                if close_at < text.len() && text.as_bytes()[close_at] == b')' {
+                    let open_at = skip_ws_back(text, start);
+                    if open_at > 0 && text.as_bytes()[open_at - 1] == b'(' {
+                        let paren_start = open_at - 1;
+                        let paren_end = close_at + 1;
+                        if let Some(extended) = extend_city_st(text, paren_start, paren_end) {
+                            return Some(take_chars(&extended, CARD_DISTANCE_CAP));
+                        }
+                        let phrase = text[paren_start..paren_end].trim();
+                        if !phrase.is_empty() {
+                            return Some(take_chars(phrase, CARD_DISTANCE_CAP));
+                        }
+                    }
+                }
+            }
+        }
+        from = num_end;
+    }
+    None
+}
+
+fn extend_city_st(text: &str, paren_start: usize, paren_end: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    let i = skip_ws_back(text, paren_start);
+    if i < 2 {
+        return None;
+    }
+    if !bytes[i - 1].is_ascii_alphabetic() || !bytes[i - 2].is_ascii_alphabetic() {
+        return None;
+    }
+    if i >= 3 && bytes[i - 3].is_ascii_alphabetic() {
+        return None;
+    }
+    let st_start = i - 2;
+    let mut j = skip_ws_back(text, st_start);
+    if j == 0 || bytes[j - 1] != b',' {
+        return None;
+    }
+    j = skip_ws_back(text, j - 1);
+    let city_end = j;
+    while j > 0 && bytes[j - 1].is_ascii_alphanumeric() {
+        j -= 1;
+    }
+    if city_end <= j {
+        return None;
+    }
+    let phrase = text[j..paren_end].trim();
+    if phrase.is_empty() {
+        None
+    } else {
+        Some(phrase.to_string())
+    }
+}
+
+fn has_recommended_phrase(lower: &str) -> bool {
+    lower.contains("you may also like")
+        || lower.contains("outside your search")
+        || lower.contains("outside your area")
+        || find_bounded_phrase(lower, "recommended").is_some()
+}
+
+fn has_ship_marker(text: &str, lower: &str) -> bool {
+    if lower.contains("shipping from") || lower.contains("deliver to") {
+        return true;
+    }
+    delivery_shipping_dollar(text, lower).is_some()
+}
+
+fn is_in_radius_distance(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains(" mi away") || lower.contains(" miles away") {
+        return true;
+    }
+    parse_paren_mi_distance(text).is_some()
+}
+
+fn delivery_span(text: &str, lower: &str, needle: &str) -> Option<(usize, String)> {
+    let idx = lower.find(needle)?;
+    let line = text[idx..]
+        .split(['\n', '\r'])
+        .next()
+        .unwrap_or(&text[idx..]);
+    let phrase = line.trim();
+    if phrase.is_empty() {
+        None
+    } else {
+        Some((idx, phrase.to_string()))
+    }
+}
+
+fn delivery_shipping_dollar(text: &str, lower: &str) -> Option<(usize, String)> {
+    let mut search = 0;
+    while let Some(rel) = lower[search..].find("shipping") {
+        let idx = search + rel;
+        let after_word = idx + "shipping".len();
+        let after = skip_ws_bytes(text, after_word);
+        if is_word_at(&text[after..], "from") {
+            search = idx + 1;
+            continue;
+        }
+        if text
+            .get(after..)
+            .is_some_and(|s| s.starts_with('$') || s.starts_with('€') || s.starts_with('£'))
+            && let Some((_, amt_end, _)) = currency_amount_at(text, after)
+        {
+            let phrase = text[idx..amt_end].trim();
+            if !phrase.is_empty() {
+                return Some((idx, phrase.to_string()));
+            }
+        }
+        search = idx + 1;
+    }
+    None
+}
+
+fn delivery_deliver_to(text: &str, lower: &str) -> Option<(usize, String)> {
+    let idx = lower.find("deliver to")?;
+    let after = skip_ws_bytes(text, idx + "deliver to".len());
+    let zip = take_zip_at(text, after)?;
+    let end = after + zip.len();
+    let phrase = text[idx..end].trim();
+    if phrase.is_empty() {
+        None
+    } else {
+        Some((idx, phrase.to_string()))
+    }
+}
+
+fn price_looks_monthly(price: &str, title: &str) -> bool {
+    if price.trim().is_empty() {
+        return false;
+    }
+    let p = price.to_ascii_lowercase();
+    if p.contains("/mo") || p.contains("est.") {
+        return true;
+    }
+    if let Some(idx) = title.find(price) {
+        let after = skip_ws_bytes(title, idx + price.len());
+        let rest = &title[after..];
+        if rest.starts_with("/mo") {
+            return true;
+        }
+        if let Some(stripped) = rest.strip_prefix('/') {
+            let t = stripped.trim_start();
+            if is_word_at(t, "mo") {
+                return true;
+            }
+        }
+        if is_word_at(rest, "mo") {
+            return true;
+        }
+    }
+    false
+}
+
+fn currency_amount_at(text: &str, byte_i: usize) -> Option<(usize, usize, bool)> {
+    let rest = text.get(byte_i..)?;
+    let mut chars = rest.chars();
+    let sign = chars.next()?;
+    if sign != '$' && sign != '€' && sign != '£' {
+        return None;
+    }
+    let mut end = byte_i + sign.len_utf8();
+    let mut grouped = false;
+    let mut saw_digit = false;
+    for ch in text[end..].chars() {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            end += 1;
+        } else if ch == ',' {
+            grouped = true;
+            end += 1;
+        } else if ch == '.' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    if !saw_digit {
+        return None;
+    }
+    Some((byte_i, end, grouped))
+}
+
+fn should_skip_price_hit(text: &str, start: usize, end: usize) -> bool {
+    let after = skip_ws_bytes(text, end);
+    let rest = &text[after..];
+    if rest.starts_with("/mo") {
+        return true;
+    }
+    if let Some(stripped) = rest.strip_prefix('/') {
+        let t = stripped.trim_start();
+        if is_word_at(t, "mo") {
+            return true;
+        }
+    }
+    if is_word_at(rest, "mo") {
+        return true;
+    }
+    if prev_whole_token(text, start).is_some_and(is_price_skip_token) {
+        return true;
+    }
+    let Some((after1, tok1)) = next_whole_token(text, end) else {
+        return false;
+    };
+    if is_price_skip_token(tok1) {
+        return true;
+    }
+    if let Some((_, tok2)) = next_whole_token(text, after1)
+        && is_price_skip_token(tok2)
+    {
+        return true;
+    }
+    false
+}
+
+fn is_price_skip_token(tok: &str) -> bool {
+    let lower = tok.to_ascii_lowercase();
+    PRICE_SKIP_TOKENS.iter().any(|s| lower == *s)
+}
+
+fn prev_whole_token(text: &str, pos: usize) -> Option<&str> {
+    let i = skip_ws_back(text, pos);
+    if i == 0 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut start = i;
+    if bytes[i - 1] == b'.' {
+        start -= 1;
+        while start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+            start -= 1;
+        }
+        if start < i {
+            return Some(&text[start..i]);
+        }
+        return None;
+    }
+    while start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+        start -= 1;
+    }
+    if start < i {
+        Some(&text[start..i])
+    } else {
+        None
+    }
+}
+
+fn next_whole_token(text: &str, pos: usize) -> Option<(usize, &str)> {
+    let start = skip_ws_bytes(text, pos);
+    if start >= text.len() {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut end = start;
+    if bytes[start] == b'.' {
+        return None;
+    }
+    while end < bytes.len() && bytes[end].is_ascii_alphanumeric() {
+        end += 1;
+    }
+    let mut tok_end = end;
+    if tok_end < bytes.len() && bytes[tok_end] == b'.' {
+        let candidate = &text[start..=tok_end];
+        if candidate.eq_ignore_ascii_case("est.") {
+            tok_end += 1;
+            return Some((tok_end, &text[start..tok_end]));
+        }
+    }
+    if end > start {
+        Some((end, &text[start..end]))
+    } else {
+        None
+    }
+}
+
+fn parse_plain_decimal_price(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b',') {
+                i += 1;
+            }
+            if i + 2 < bytes.len()
+                && bytes[i] == b'.'
+                && bytes[i + 1].is_ascii_digit()
+                && bytes[i + 2].is_ascii_digit()
+            {
+                let dec_end = i + 3;
+                let after_ok = dec_end >= bytes.len() || !bytes[dec_end].is_ascii_digit();
+                if after_ok && i > start {
+                    return Some(take_chars(&text[start..dec_end], CARD_PRICE_FALLBACK_CAP));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn find_empty_phrase(lower: &str, phrase: &str) -> Option<usize> {
@@ -976,6 +1608,216 @@ mod tests {
         assert_eq!(extract.main_text, "hello\nworld");
         assert_eq!(extract.url, None);
         assert!(extract.cards.is_empty());
+    }
+
+    #[test]
+    fn parse_dealer_strips_live_junk_and_keeps_capital_toyota() {
+        assert_eq!(parse_dealer("Peter", "", ""), None);
+        assert_eq!(
+            parse_dealer(". Est. /mo Great Deal American-Made Index Peter", "", ""),
+            None
+        );
+        let ship = "2024 Camry Capital Toyota Est. shipping $399 Deliver to 32309";
+        let dealer = parse_dealer(ship, "2024 Camry", "");
+        assert_eq!(dealer.as_deref(), Some("Capital Toyota"));
+        assert_ne!(dealer.as_deref(), Some("Deliver to 32309"));
+        assert_ne!(dealer.as_deref(), Some("Est. shipping"));
+        assert_eq!(parse_dealer("Deliver to 32309", "", ""), None);
+        let card = "2024 Toyota Camry 32,145 mi 12 mi away Capital Toyota $19,999 1 of 6";
+        assert_eq!(
+            parse_dealer(card, "2024 Toyota Camry", "$19,999").as_deref(),
+            Some("Capital Toyota")
+        );
+        assert_eq!(
+            parse_dealer(
+                "2024 Camry Capital Toyota Tallahassee, FL (12 mi) $19,999",
+                "2024 Camry",
+                "$19,999"
+            )
+            .as_deref(),
+            Some("Capital Toyota")
+        );
+        assert_eq!(
+            parse_dealer(
+                "2024 Camry Tallahassee, FL (12 mi) $19,999",
+                "2024 Camry",
+                "$19,999"
+            ),
+            None
+        );
+        assert_eq!(sanitize_dealer("American-Made"), None);
+        assert_eq!(sanitize_dealer("Peter"), None);
+        assert_eq!(sanitize_dealer("CarMax").as_deref(), Some("CarMax"));
+    }
+
+    #[test]
+    fn parse_listing_price_skips_monthly_and_keeps_crest_office() {
+        assert_eq!(
+            parse_listing_price("2024 Camry Est. $312/mo Great Deal $19,999").as_deref(),
+            Some("$19,999")
+        );
+        assert_eq!(
+            parse_listing_price("Crest Motors $9,995").as_deref(),
+            Some("$9,995")
+        );
+        assert_eq!(
+            parse_listing_price("Office Square Motors $19,999").as_deref(),
+            Some("$19,999")
+        );
+        assert_eq!(parse_listing_price("$1,000 price drop"), None);
+        assert_eq!(parse_listing_price("$500 off"), None);
+        assert_eq!(
+            parse_listing_price("Est. $312/mo Great Deal $19,999").as_deref(),
+            Some("$19,999")
+        );
+    }
+
+    #[test]
+    fn parse_distance_paren_and_not_shipping_fee() {
+        assert_eq!(parse_distance("(12 mi)").as_deref(), Some("(12 mi)"));
+        assert_eq!(
+            parse_distance("Tallahassee, FL (12 mi)").as_deref(),
+            Some("Tallahassee, FL (12 mi)")
+        );
+        let greedy = parse_distance("Capital Toyota Tallahassee, FL (12 mi)").unwrap();
+        assert_ne!(greedy, "Capital Toyota Tallahassee, FL (12 mi)");
+        assert!(
+            greedy == "(12 mi)" || greedy == "Tallahassee, FL (12 mi)",
+            "got {greedy}"
+        );
+        assert!(!greedy.contains("Capital Toyota"));
+        assert_eq!(parse_distance("Shipping $399 to 32309"), None);
+        assert_eq!(parse_miles("Shipping $399 to 32309"), None);
+        assert_eq!(parse_miles("(12 mi)"), None);
+        assert_eq!(parse_miles("(5 mi)"), None);
+    }
+
+    #[test]
+    fn parse_delivery_and_kind_home_delivery_stays_local() {
+        assert_eq!(
+            parse_delivery("Est. shipping $399").as_deref(),
+            Some("Est. shipping $399")
+        );
+        assert_eq!(
+            parse_delivery("Shipping $399").as_deref(),
+            Some("Shipping $399")
+        );
+        assert_eq!(
+            parse_delivery("Deliver to 32309").as_deref(),
+            Some("Deliver to 32309")
+        );
+        assert_eq!(parse_delivery("home delivery"), None);
+        assert_eq!(
+            parse_card_kind("12 mi away home delivery").as_deref(),
+            Some("local")
+        );
+        assert_eq!(
+            parse_card_kind("You may also like Shipping $399").as_deref(),
+            Some("recommended")
+        );
+        assert_eq!(
+            parse_card_kind("Shipping from Jacksonville, FL").as_deref(),
+            Some("ship")
+        );
+        assert_eq!(parse_card_kind("2024 Camry SE"), None);
+        let local = Card {
+            title: "2024 Camry".into(),
+            distance: Some("12 mi away".into()),
+            ..Default::default()
+        };
+        assert_eq!(infer_card_kind(&local).as_deref(), Some("local"));
+        let ship = Card {
+            title: "2024 Camry".into(),
+            delivery: Some("Shipping $399".into()),
+            ..Default::default()
+        };
+        assert_eq!(infer_card_kind(&ship).as_deref(), Some("ship"));
+        let paren = Card {
+            title: "2024 Camry".into(),
+            distance: Some("(12 mi)".into()),
+            ..Default::default()
+        };
+        assert_eq!(infer_card_kind(&paren).as_deref(), Some("local"));
+        let home_local = Card {
+            title: "2024 Camry".into(),
+            distance: Some("12 mi away".into()),
+            delivery: Some("available for delivery to 32309".into()),
+            ..Default::default()
+        };
+        assert_eq!(infer_card_kind(&home_local).as_deref(), Some("local"));
+        assert_eq!(
+            parse_card_kind("12 mi away available for delivery to 32309").as_deref(),
+            Some("local")
+        );
+        assert_eq!(sanitize_dealer("American-Made"), None);
+    }
+
+    #[test]
+    fn prefer_local_cards_packs_locals_first() {
+        fn c(title: &str, kind: Option<&str>) -> Card {
+            Card {
+                title: title.into(),
+                kind: kind.map(str::to_string),
+                ..Default::default()
+            }
+        }
+        let mut cards = Vec::new();
+        for i in 0..8 {
+            cards.push(c(&format!("ship {i}"), Some("ship")));
+        }
+        for i in 0..5 {
+            cards.push(c(&format!("local {i}"), Some("local")));
+        }
+        let packed = prefer_local_cards(cards, 8);
+        assert_eq!(packed.len(), 8);
+        assert!(
+            packed
+                .iter()
+                .take(5)
+                .all(|x| x.kind.as_deref() == Some("local"))
+        );
+        assert!(
+            packed
+                .iter()
+                .skip(5)
+                .all(|x| x.kind.as_deref() == Some("ship"))
+        );
+        assert_eq!(packed[0].title, "local 0");
+        assert_eq!(packed[5].title, "ship 0");
+        let mut nine = Vec::new();
+        for i in 0..9 {
+            nine.push(c(&format!("car {i}"), Some("local")));
+        }
+        let eight = prefer_local_cards(nine, 8);
+        assert_eq!(eight.len(), 8);
+        assert_eq!(eight[0].title, "car 0");
+        assert_eq!(eight[7].title, "car 7");
+    }
+
+    #[test]
+    fn enrich_clears_js_junk_dealer() {
+        let mut extract = Extract {
+            title: "Results".into(),
+            url: None,
+            main_text: "footer Capital Toyota".into(),
+            cards: vec![Card {
+                title: "2024 Camry".into(),
+                price: "$312/mo".into(),
+                href: "https://cars.com/1".into(),
+                rect: Rect {
+                    x: 1,
+                    y: 1,
+                    w: 2,
+                    h: 2,
+                },
+                dealer: Some(". Est. /mo Great Deal Peter".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        enrich_listing(&mut extract);
+        assert!(extract.cards[0].dealer.is_none());
+        assert_ne!(extract.cards[0].price, "$312/mo");
     }
 
     #[test]
@@ -1291,9 +2133,11 @@ mod tests {
                         h: 2,
                     },
                     miles: Some("JS-MI".into()),
-                    dealer: Some("JS-DEALER".into()),
+                    dealer: Some("JS Dealer".into()),
                     distance: Some("JS-DIST".into()),
                     listing_of: Some("2 of 2".into()),
+                    kind: None,
+                    delivery: None,
                 },
                 Card {
                     title: "45,000 mi 8 mi away 1 of 6 sedan".into(),
@@ -1326,7 +2170,7 @@ mod tests {
                 .contains("nothing fits those filters")
         );
         assert_eq!(extract.cards[0].miles.as_deref(), Some("JS-MI"));
-        assert_eq!(extract.cards[0].dealer.as_deref(), Some("JS-DEALER"));
+        assert_eq!(extract.cards[0].dealer.as_deref(), Some("JS Dealer"));
         assert_eq!(extract.cards[0].distance.as_deref(), Some("JS-DIST"));
         assert_eq!(extract.cards[0].listing_of.as_deref(), Some("2 of 2"));
         assert_eq!(extract.cards[1].miles.as_deref(), Some("45,000 mi"));
@@ -1408,9 +2252,13 @@ mod tests {
             assert!(v.get(key).is_none(), "{key} should be omitted");
         }
         let card = &v["cards"][0];
-        for key in ["miles", "dealer", "distance", "of"] {
+        for key in ["miles", "dealer", "distance", "of", "kind", "delivery"] {
             assert!(card.get(key).is_none(), "card.{key} should be omitted");
         }
+        assert!(
+            v.get("cards_walked").is_none(),
+            "Extract.cards_walked must not appear in extract JSON"
+        );
     }
 
     #[test]

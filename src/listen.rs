@@ -1068,6 +1068,7 @@ fn write_sidecar(path: &Path, kind: &str, present: bool) {
         card_offset: 0,
         card_counts: crate::observe::ObserveCardCounts::default(),
         popup_rect: None,
+        timing: None,
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1235,6 +1236,7 @@ mod tests {
                 card_offset: 0,
                 card_counts: crate::observe::ObserveCardCounts::default(),
                 popup_rect: None,
+                timing: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1301,6 +1303,7 @@ mod tests {
                 card_offset: 0,
                 card_counts: crate::observe::ObserveCardCounts::default(),
                 popup_rect: None,
+                timing: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1361,6 +1364,7 @@ mod tests {
                 card_offset: 0,
                 card_counts: crate::observe::ObserveCardCounts::default(),
                 popup_rect: None,
+                timing: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1413,6 +1417,7 @@ mod tests {
                 card_offset: 0,
                 card_counts: crate::observe::ObserveCardCounts::default(),
                 popup_rect: None,
+                timing: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }

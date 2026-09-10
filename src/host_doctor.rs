@@ -289,7 +289,7 @@ pub fn run() -> Report {
     let snapshot_ok = if snapshot_env_set {
         false
     } else {
-        chrome::try_snapshot(Detail::Default).is_some()
+        chrome::try_snapshot(Detail::Default).has_map()
     };
     diagnose(Inputs {
         json_text,

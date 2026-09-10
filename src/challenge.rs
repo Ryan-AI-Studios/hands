@@ -1698,6 +1698,7 @@ mod tests {
             card_offset: 0,
             card_counts: crate::observe::ObserveCardCounts::default(),
             popup_rect: None,
+            timing: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         path

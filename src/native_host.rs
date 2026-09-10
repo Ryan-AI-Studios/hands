@@ -113,7 +113,14 @@ pub fn write_frame_limited<W: Write>(
         .write_all(&len.to_le_bytes())
         .and_then(|()| writer.write_all(&bytes))
         .and_then(|()| writer.flush())
-        .map_err(|err| HandsError::Chrome(format!("native-host frame write: {err}")))
+        .map_err(|err| {
+            let tag = if max == MAX_CHROME_TO_HOST {
+                "native-host client pipe write"
+            } else {
+                "native-host frame write"
+            };
+            HandsError::Chrome(format!("{tag}: {err}"))
+        })
 }
 
 pub fn read_frame<R: Read>(reader: &mut R) -> Result<Value, HandsError> {
@@ -253,6 +260,9 @@ fn chrome_stdin_gone(handle: HANDLE) -> bool {
 
 fn chrome_peer_gone(err: &HandsError) -> bool {
     let s = err.to_string().to_ascii_lowercase();
+    if s.contains("client pipe write") {
+        return false;
+    }
     s.contains("stdin closed")
         || s.contains("broken pipe")
         || s.contains("pipe is being closed")
@@ -748,7 +758,34 @@ mod tests {
         assert!(chrome_peer_gone(&HandsError::Chrome(
             "native-host frame write: The pipe is being closed. (os error 232)".into()
         )));
+        assert!(!chrome_peer_gone(&HandsError::Chrome(
+            "native-host client pipe write: The pipe is being closed. (os error 232)".into()
+        )));
         assert!(!chrome_peer_gone(&host_forward_timeout()));
+    }
+
+    #[test]
+    fn write_pipe_frame_error_tag_is_not_chrome_peer_gone() {
+        let src = include_str!("native_host.rs");
+        let start = src
+            .find("fn write_frame_limited(")
+            .expect("fn write_frame_limited(");
+        let slice = src[start..].split("\nfn ").next().unwrap_or(&src[start..]);
+        assert!(
+            slice.contains("native-host client pipe write"),
+            "client named-pipe writes must use a distinct tag"
+        );
+        assert!(
+            slice.contains("native-host frame write"),
+            "Chrome stdio writes keep the frame-write tag"
+        );
+        let serve = src
+            .find("if chrome_peer_gone(&err)")
+            .expect("serve_pipe exits only on chrome_peer_gone");
+        assert!(
+            src[serve..].contains("return Ok(())"),
+            "chrome_peer_gone still ends serve_pipe"
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 use crate::capture::{capture_virtual_screen, display_path, observe_dir};
 use crate::challenge::{self, ChallengeInfo};
@@ -216,6 +217,27 @@ pub struct ObserveSidecar {
     pub card_counts: ObserveCardCounts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub popup_rect: Option<Rect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<ObserveTiming>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserveTiming {
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uia_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_ms: Option<u64>,
+}
+
+fn observe_timing_requested() -> bool {
+    std::env::var("HANDS_OBSERVE_TIMING")
+        .ok()
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -406,25 +428,35 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     }
 
     ensure_dpi()?;
+    let started = Instant::now();
     let session_id = resolve_session_id_from_os(req.session_id.as_deref());
     logs::check_write_id(&session_id)?;
     let space = virtual_screen()?;
+    let shot_t = Instant::now();
     let paths = capture_virtual_screen(space)?;
+    let screenshot_ms = shot_t.elapsed().as_millis() as u64;
     let screenshot_path = display_path(&paths.screenshot_path);
     let observe_path = display_path(&paths.observe_path);
 
     let fg = foreground::foreground_hwnd();
     let inventory = foreground::titled_windows();
     let plan = plan_observe_target(req.window.as_deref(), &inventory, fg)?;
+    let uia_t = Instant::now();
     let snap = uia::collect(req.detail, plan.walk_hwnd)?;
-    let chrome = chrome::try_snapshot(req.detail);
+    let uia_ms = uia_t.elapsed().as_millis() as u64;
+    let chrome_t = Instant::now();
+    let chrome_outcome = chrome::try_snapshot(req.detail);
+    let chrome_ms = chrome_t.elapsed().as_millis() as u64;
+    let chrome_connected = chrome_outcome.host_up();
+    let chrome_hint = chrome_outcome.chrome_hint();
+    let chrome = chrome_outcome.into_map();
     let opts = FuseOpts {
         viewport: plan.viewport,
         chrome_is_foreground: plan.chrome_is_foreground,
         virtual_screen: Some(space.as_rect()),
         popup_rect: snap.popup_rect,
     };
-    let (mut extract, mut elements, elements_total, chrome_connected) =
+    let (mut extract, mut elements, elements_total, _) =
         fuse_maps(req.detail, &snap.title, &snap.nodes, chrome, opts);
     crate::dialogs::promote(&mut extract, &mut elements);
     stamp_grid(space, &mut elements);
@@ -449,11 +481,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         elements_total,
         elements_truncated: false,
         chrome_connected,
-        chrome_hint: if chrome_connected {
-            None
-        } else {
-            Some("Chrome host down — run hands native-host-doctor (MCP: native_host_doctor)".into())
-        },
+        chrome_hint,
         challenge,
         windows: envelope_windows(&inventory),
         fg_window: plan.fg_window,
@@ -466,7 +494,15 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
             ..ObserveCardCounts::default()
         },
     };
-    write_sidecar(&paths.observe_path, &full, opts.popup_rect)?;
+    let pre_ms = started.elapsed().as_millis() as u64;
+    let sidecar_timing = observe_timing_requested().then(|| ObserveTiming {
+        duration_ms: pre_ms,
+        envelope_bytes: Some(serialized_len(&full) as u64),
+        screenshot_ms: Some(screenshot_ms),
+        uia_ms: Some(uia_ms),
+        chrome_ms: Some(chrome_ms),
+    });
+    write_sidecar(&paths.observe_path, &full, opts.popup_rect, sidecar_timing)?;
     let envelope = match req.detail {
         Detail::Default => {
             retain_hittable_centers(&mut full.elements, &opts);
@@ -475,13 +511,22 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         }
         Detail::Dom => finalize_envelope(full)?,
     };
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let envelope_bytes = serialized_len(&envelope) as u64;
     logs::ensure_installed();
     logs::remember_session(&envelope.session_id);
-    let _ = logs::record_observe(
+    let _ = logs::record_observe_row(
         &envelope.session_id,
-        req.detail.as_str(),
-        &envelope.screenshot_path,
-        envelope.elements_total,
+        logs::LogObserve {
+            detail: req.detail.as_str().into(),
+            screenshot_path: envelope.screenshot_path.clone(),
+            elements_total: envelope.elements_total,
+            duration_ms: Some(duration_ms),
+            envelope_bytes: Some(envelope_bytes),
+            screenshot_ms: Some(screenshot_ms),
+            uia_ms: Some(uia_ms),
+            chrome_ms: Some(chrome_ms),
+        },
     );
     Ok(envelope)
 }
@@ -496,6 +541,7 @@ fn write_sidecar(
     path: &std::path::Path,
     envelope: &ObserveEnvelope,
     popup_rect: Option<Rect>,
+    timing: Option<ObserveTiming>,
 ) -> Result<(), HandsError> {
     let sidecar = ObserveSidecar {
         schema: OBSERVE_SCHEMA.to_string(),
@@ -522,6 +568,7 @@ fn write_sidecar(
             ..ObserveCardCounts::default()
         },
         popup_rect,
+        timing,
     };
     let json = serde_json::to_string_pretty(&sidecar)
         .map_err(|err| HandsError::Observe(format!("sidecar serialize: {err}")))?;
@@ -1304,7 +1351,9 @@ mod tests {
         crate::fence::clear_last_url_for_test();
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("fixture");
         let (extract, els, _total, connected) = fuse_maps(
             Detail::Default,
             "UIA",
@@ -1466,7 +1515,9 @@ mod tests {
     fn default_fuse_drops_desktop_noise_keeps_fixture_chr() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("fixture");
         let mut nodes = viewport_buttons(5);
         nodes.extend(desktop_noise());
         let (extract, els, total, connected) = fuse_maps(
@@ -1499,7 +1550,9 @@ mod tests {
     fn default_envelope_fits_4kib_and_caps_20() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("fixture");
         let mut nodes = viewport_buttons(40);
         nodes.extend(desktop_noise());
         let (extract, mut elements, elements_total, chrome_connected) = fuse_maps(
@@ -1558,7 +1611,9 @@ mod tests {
     fn dom_fuse_can_include_noise_and_more_than_20() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("fixture");
         let mut nodes = viewport_buttons(25);
         nodes.extend(desktop_noise());
         let (_extract, els, total, connected) =
@@ -1575,7 +1630,9 @@ mod tests {
     fn chrome_connected_but_not_foreground_has_no_chr() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("fixture");
         let nodes = vec![uia_node(
             7,
             "Document",
@@ -1610,7 +1667,9 @@ mod tests {
         crate::fence::note_last_url(Some("https://cars.com/search"));
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("fixture");
         let nodes = vec![uia_node(
             7,
             "Document",
@@ -1646,7 +1705,9 @@ mod tests {
     fn no_foreground_viewport_empties_default_elements() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("fixture");
         let mut nodes = viewport_buttons(8);
         nodes.extend(desktop_noise());
         let (extract, els, total, connected) = fuse_maps(
@@ -1758,6 +1819,10 @@ mod tests {
         assert!(
             mcp.contains("native-host-doctor") || mcp.contains("native_host_doctor"),
             "mcp observe description points at native-host-doctor"
+        );
+        assert!(
+            mcp.contains("wait_settle") && mcp.contains("400"),
+            "mcp observe description names loading/timeout vs host-down"
         );
         assert!(
             mcp.contains("miles") && mcp.contains("dealer") && mcp.contains("empty_state"),
@@ -1919,6 +1984,44 @@ mod tests {
         }"#;
         let side: ObserveSidecar = serde_json::from_str(json).unwrap();
         assert_eq!(side.chrome_hint, None);
+        assert!(side.timing.is_none());
+    }
+
+    #[test]
+    fn default_envelope_omits_timing_object() {
+        let env = fat_envelope(0);
+        let json = serialize_envelope(&env).unwrap();
+        assert!(
+            !json.contains("\"timing\""),
+            "default envelope must not carry phase timings"
+        );
+        assert!(json.len() <= DEFAULT_ENVELOPE_MAX_BYTES || env.elements.len() > 20);
+    }
+
+    #[test]
+    fn chrome_readiness_hints_match_locked_copy() {
+        use crate::chrome::{
+            CHROME_HINT_HOST_DOWN, CHROME_HINT_LOADING, CHROME_HINT_TIMEOUT, SnapshotOutcome,
+        };
+        assert_eq!(
+            SnapshotOutcome::HostDown.chrome_hint().as_deref(),
+            Some(CHROME_HINT_HOST_DOWN)
+        );
+        assert_eq!(
+            SnapshotOutcome::Loading.chrome_hint().as_deref(),
+            Some(CHROME_HINT_LOADING)
+        );
+        assert_eq!(
+            SnapshotOutcome::Timeout.chrome_hint().as_deref(),
+            Some(CHROME_HINT_TIMEOUT)
+        );
+        let mut env = fat_envelope(0);
+        env.chrome_connected = true;
+        env.chrome_hint = Some(CHROME_HINT_LOADING.into());
+        let json = serialize_envelope(&env).unwrap();
+        assert!(json.contains("Page loading"));
+        assert!(!json.contains("native-host-doctor"));
+        assert!(env.chrome_connected);
     }
 
     #[test]
@@ -1970,7 +2073,9 @@ mod tests {
     fn fixture_plus_continue_as_leads_envelope() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("fixture");
         let mut nodes = viewport_buttons(8);
         nodes.push(uia_node(
             42,
@@ -2308,7 +2413,9 @@ mod tests {
     fn stamp_grid_fixture_chr0_is_g21() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default).expect("fixture");
+        let map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("fixture");
         let (_extract, mut elements, _total, _connected) =
             fuse_maps(Detail::Default, "UIA", &[], Some(map), fixture_opts(true));
         let space = Space::new(0, 0, 1920, 1080).unwrap();
@@ -3397,6 +3504,7 @@ mod tests {
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             popup_rect: None,
+            timing: None,
         };
         let sidecar_ids: std::collections::HashSet<String> =
             sidecar.elements.iter().map(|e| e.id.clone()).collect();
@@ -3494,6 +3602,7 @@ mod tests {
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             popup_rect: Some(popup),
+            timing: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
         let with_popup = observe(ObserveRequest {

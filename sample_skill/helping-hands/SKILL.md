@@ -30,9 +30,10 @@ They must be the **same built exe**. Live: `HANDS_CHROME_SNAPSHOT` **unset**.
 Pipe: `\\.\pipe\hands-chrome` (`HANDS_CHROME_PIPE`). Extension id
 `fdnpjnnnmfhlpgaabjflhjoepmejcnha`. Host name `com.helpinghands.host`.
 
-`chrome_connected` is **snapshot-ok** (pipe + service worker + a tab the content
-script can answer), not merely “named pipe exists”. Doctor splits those: **pipe**
-vs **snapshot**. `chr:<u32>` appears only when **Chrome is the foreground window**
+`chrome_connected` is **host-up** (named pipe or fixture), not snapshot success.
+Loading/`no-content` or a 400 ms timeout keep it true with a retry/`wait_settle`
+hint. Doctor hint only when the host is down. Doctor still splits **pipe** vs
+**snapshot**. `chr:<u32>` appears only when **Chrome is the foreground window**
 and the page is a normal `https://` tab. Content scripts do **not** run on
 `chrome://` (including `chrome://extensions`). Prefer `chr:` for page content;
 Chrome UIA churns.

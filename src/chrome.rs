@@ -25,6 +25,45 @@ static LAST_PIPE_DETAIL: Mutex<Detail> = Mutex::new(Detail::Default);
 
 pub const SNAPSHOT_ENV: &str = "HANDS_CHROME_SNAPSHOT";
 pub const PIPE_ENV: &str = "HANDS_CHROME_PIPE";
+pub const CHROME_HINT_HOST_DOWN: &str =
+    "Chrome host down — run hands native-host-doctor (MCP: native_host_doctor)";
+pub const CHROME_HINT_LOADING: &str = "Page loading — retry observe or wait_settle";
+pub const CHROME_HINT_TIMEOUT: &str =
+    "Chrome snapshot timed out (400 ms) — retry observe or wait_settle";
+
+#[derive(Debug, Clone)]
+pub enum SnapshotOutcome {
+    Map(Box<ChromeMap>),
+    Loading,
+    Timeout,
+    HostDown,
+}
+
+impl SnapshotOutcome {
+    pub fn into_map(self) -> Option<ChromeMap> {
+        match self {
+            Self::Map(map) => Some(*map),
+            _ => None,
+        }
+    }
+
+    pub fn has_map(&self) -> bool {
+        matches!(self, Self::Map(_))
+    }
+
+    pub fn host_up(&self) -> bool {
+        !matches!(self, Self::HostDown)
+    }
+
+    pub fn chrome_hint(&self) -> Option<String> {
+        match self {
+            Self::Map(_) => None,
+            Self::Loading => Some(CHROME_HINT_LOADING.into()),
+            Self::Timeout => Some(CHROME_HINT_TIMEOUT.into()),
+            Self::HostDown => Some(CHROME_HINT_HOST_DOWN.into()),
+        }
+    }
+}
 pub const CARD_TITLE_CAP: usize = 80;
 pub const CARD_PRICE_CAP: usize = 24;
 pub const CARD_HREF_CAP: usize = 200;
@@ -186,11 +225,32 @@ fn round_i32(v: f64) -> Option<i32> {
     Some(r as i32)
 }
 
-pub fn try_snapshot(detail: Detail) -> Option<ChromeMap> {
+pub fn try_snapshot(detail: Detail) -> SnapshotOutcome {
     match snapshot_env() {
-        Some(path) => load_fixture(&path).ok(),
-        None => pipe_snapshot(detail).ok(),
+        Some(path) => match load_fixture(&path) {
+            Ok(map) => SnapshotOutcome::Map(Box::new(map)),
+            Err(_) => SnapshotOutcome::HostDown,
+        },
+        None => match pipe_snapshot(detail) {
+            Ok(map) => SnapshotOutcome::Map(Box::new(map)),
+            Err(err) => classify_snapshot_err(&err),
+        },
     }
+}
+
+pub fn classify_snapshot_err(err: &HandsError) -> SnapshotOutcome {
+    let s = err.to_string();
+    if s.contains("client timed out after") {
+        return SnapshotOutcome::Timeout;
+    }
+    if let Some(rest) = s.strip_prefix("Chrome host error: ") {
+        let token = rest.trim().trim_matches('"');
+        if matches!(token, "no-content" | "no-tab" | "empty") {
+            return SnapshotOutcome::Loading;
+        }
+        return SnapshotOutcome::Loading;
+    }
+    SnapshotOutcome::HostDown
 }
 
 pub fn try_resolve(id: &str) -> Result<ChromeHit, HandsError> {
@@ -588,7 +648,7 @@ mod tests {
         let g = EnvGuard::lock();
         g.set_snapshot(Some(&EnvGuard::fixture_path()));
         g.set_pipe(None);
-        let map = try_snapshot(Detail::Default).expect("fixture");
+        let map = try_snapshot(Detail::Default).into_map().expect("fixture");
         assert_eq!(map.url.as_deref(), Some("https://cars.com/search"));
         assert_eq!(map.title, "Cars.com");
         assert_eq!(map.elements[0].id, "chr:0");
@@ -619,11 +679,17 @@ mod tests {
         g.set_snapshot(Some(std::path::Path::new(
             r"C:\dev\Helping-Hands\hands\tests\fixtures\missing-chrome.json",
         )));
-        assert!(try_snapshot(Detail::Default).is_none());
+        assert!(matches!(
+            try_snapshot(Detail::Default),
+            SnapshotOutcome::HostDown
+        ));
         let bad = std::env::temp_dir().join("hands-chrome-bad.json");
         fs::write(&bad, "{not json").unwrap();
         g.set_snapshot(Some(&bad));
-        assert!(try_snapshot(Detail::Default).is_none());
+        assert!(matches!(
+            try_snapshot(Detail::Default),
+            SnapshotOutcome::HostDown
+        ));
         let _ = fs::remove_file(bad);
     }
 
@@ -1182,5 +1248,63 @@ mod tests {
             slice.contains("preferLocalCards") || slice.contains("CARD_CAP"),
             "collectCards must pack to emit cap:\n{slice}"
         );
+    }
+
+    #[test]
+    fn classify_snapshot_err_table() {
+        assert!(matches!(
+            classify_snapshot_err(&HandsError::Chrome(
+                "Chrome host client timed out after 400 ms; chr: unavailable".into()
+            )),
+            SnapshotOutcome::Timeout
+        ));
+        assert!(matches!(
+            classify_snapshot_err(&HandsError::Chrome("Chrome host error: no-content".into())),
+            SnapshotOutcome::Loading
+        ));
+        assert!(matches!(
+            classify_snapshot_err(&HandsError::Chrome("Chrome host error: \"no-tab\"".into())),
+            SnapshotOutcome::Loading
+        ));
+        assert!(matches!(
+            classify_snapshot_err(&HandsError::Chrome("Chrome host error: empty".into())),
+            SnapshotOutcome::Loading
+        ));
+        assert!(matches!(
+            classify_snapshot_err(&HandsError::Chrome(
+                "Chrome host is not connected (no pipe \\\\.\\pipe\\hands-chrome within 400 ms); chr: unavailable"
+                    .into()
+            )),
+            SnapshotOutcome::HostDown
+        ));
+        assert_eq!(
+            SnapshotOutcome::Map(Box::new(ChromeMap {
+                url: None,
+                title: String::new(),
+                main_text: String::new(),
+                elements: Vec::new(),
+                cards: Vec::new(),
+                listing: ListingMeta::default(),
+                cards_walked: 0,
+            }))
+            .chrome_hint(),
+            None
+        );
+        assert_eq!(
+            SnapshotOutcome::Loading.chrome_hint().as_deref(),
+            Some(CHROME_HINT_LOADING)
+        );
+        assert_eq!(
+            SnapshotOutcome::Timeout.chrome_hint().as_deref(),
+            Some(CHROME_HINT_TIMEOUT)
+        );
+        assert_eq!(
+            SnapshotOutcome::HostDown.chrome_hint().as_deref(),
+            Some(CHROME_HINT_HOST_DOWN)
+        );
+        assert!(SnapshotOutcome::Loading.host_up());
+        assert!(SnapshotOutcome::Timeout.host_up());
+        assert!(!SnapshotOutcome::HostDown.host_up());
+        assert_eq!(CLIENT_TIMEOUT_MS, 400);
     }
 }

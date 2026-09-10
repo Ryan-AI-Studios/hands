@@ -192,3 +192,45 @@ fn cli_logs_default_tail_fits_4kib_and_keeps_newest_stop() {
         "{line}"
     );
 }
+
+#[test]
+fn sequence_summary_row_uses_stop_reason_in_error() {
+    let _guard = LOGS_DIR_LOCK.lock().unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "hands-logs-seq-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prev = std::env::var_os("HANDS_LOGS_DIR");
+    unsafe { std::env::set_var("HANDS_LOGS_DIR", &dir) };
+
+    let env = hands::sequence::run(Some("seq-cli".into()), serde_json::json!([]))
+        .expect("sequence bad_steps");
+
+    let exe = env!("CARGO_BIN_EXE_hands");
+    let listed = Command::new(exe)
+        .env("HANDS_LOGS_DIR", &dir)
+        .args(["logs", "--session-id", "seq-cli"])
+        .output();
+
+    match prev {
+        Some(v) => unsafe { std::env::set_var("HANDS_LOGS_DIR", v) },
+        None => unsafe { std::env::remove_var("HANDS_LOGS_DIR") },
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!env.ok);
+    assert_eq!(env.stop_reason.as_str(), "bad_steps");
+    let listed = listed.expect("spawn hands logs");
+    assert!(
+        listed.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("\"tool\":\"sequence\""), "{stdout}");
+    assert!(stdout.contains("bad_steps"), "{stdout}");
+}

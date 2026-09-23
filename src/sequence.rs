@@ -1039,7 +1039,7 @@ mod tests {
         env.executed_steps.iter().map(|s| s.tool.clone()).collect()
     }
 
-    fn run_hooks(steps: Value, hooks: SequenceHooks) -> SequenceEnvelope {
+    fn run_hooks(session_id: &str, steps: Value, hooks: SequenceHooks) -> SequenceEnvelope {
         let _guard = LOGS.lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "hands-seq-{}",
@@ -1051,7 +1051,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let prev = std::env::var_os("HANDS_LOGS_DIR");
         unsafe { std::env::set_var("HANDS_LOGS_DIR", &dir) };
-        let env = sequence_with(Some("seq-test".into()), steps, hooks).expect("sequence");
+        let env = sequence_with(Some(session_id.into()), steps, hooks).expect("sequence");
         match prev {
             Some(v) => unsafe { std::env::set_var("HANDS_LOGS_DIR", v) },
             None => unsafe { std::env::remove_var("HANDS_LOGS_DIR") },
@@ -1062,7 +1062,7 @@ mod tests {
 
     #[test]
     fn empty_and_overflow_are_bad_steps_zero_hooks() {
-        let empty = run_hooks(json!([]), test_hooks());
+        let empty = run_hooks("seq-empty-overflow", json!([]), test_hooks());
         assert_eq!(empty.stop_reason, StopReason::BadSteps);
         assert!(!empty.ok);
         assert_eq!(empty.steps_executed, 0);
@@ -1074,7 +1074,7 @@ mod tests {
                 .map(|_| json!({"tool":"wait_settle"}))
                 .collect::<Vec<_>>()
         );
-        let over = run_hooks(too_many, test_hooks());
+        let over = run_hooks("seq-empty-overflow", too_many, test_hooks());
         assert_eq!(over.stop_reason, StopReason::BadSteps);
         assert_eq!(over.steps_executed, 0);
         assert!(tools(&over).is_empty());
@@ -1082,12 +1082,17 @@ mod tests {
 
     #[test]
     fn forbidden_and_observe_not_last_are_bad_steps() {
-        let confirm = run_hooks(json!([{"tool":"confirm","domain":"x"}]), test_hooks());
+        let confirm = run_hooks(
+            "seq-forbidden-observe",
+            json!([{"tool":"confirm","domain":"x"}]),
+            test_hooks(),
+        );
         assert_eq!(confirm.stop_reason, StopReason::BadSteps);
         assert_eq!(confirm.failed_step_index, Some(0));
         assert!(tools(&confirm).is_empty());
 
         let mid = run_hooks(
+            "seq-forbidden-observe",
             json!([{"tool":"observe"},{"tool":"type","text":"hi"}]),
             test_hooks(),
         );
@@ -1098,11 +1103,15 @@ mod tests {
 
     #[test]
     fn missing_required_params_are_bad_steps() {
-        let typed = run_hooks(json!([{"tool":"type"}]), test_hooks());
+        let typed = run_hooks("seq-missing-params", json!([{"tool":"type"}]), test_hooks());
         assert_eq!(typed.stop_reason, StopReason::BadSteps);
         assert!(tools(&typed).is_empty());
 
-        let roi = run_hooks(json!([{"tool":"wait_settle","x":1}]), test_hooks());
+        let roi = run_hooks(
+            "seq-missing-params",
+            json!([{"tool":"wait_settle","x":1}]),
+            test_hooks(),
+        );
         assert_eq!(roi.stop_reason, StopReason::BadSteps);
         assert!(tools(&roi).is_empty());
     }
@@ -1118,6 +1127,7 @@ mod tests {
             })
         };
         let env = run_hooks(
+            "seq-activate-not-fg",
             json!([
                 {"tool":"activate","window":"hwnd:1"},
                 {"tool":"type","text":"bleed"}
@@ -1141,6 +1151,7 @@ mod tests {
             })
         };
         let env = run_hooks(
+            "seq-activate-stale",
             json!([
                 {"tool":"activate","window":"hwnd:dead"},
                 {"tool":"key","name":"enter"}
@@ -1162,6 +1173,7 @@ mod tests {
             })
         };
         let env = run_hooks(
+            "seq-click-focus-lost",
             json!([
                 {"tool":"click","x":1,"y":1},
                 {"tool":"type","text":"nope"}
@@ -1183,6 +1195,7 @@ mod tests {
             })
         };
         let env = run_hooks(
+            "seq-click-no-change",
             json!([
                 {"tool":"click","x":1,"y":1},
                 {"tool":"type","text":"ok"}
@@ -1207,6 +1220,7 @@ mod tests {
             })
         };
         let env = run_hooks(
+            "seq-unknown-key",
             json!([
                 {"tool":"key","name":"ctrl+w"},
                 {"tool":"type","text":"bleed"}
@@ -1234,6 +1248,7 @@ mod tests {
             })
         };
         let fence = run_hooks(
+            "seq-fence-named",
             json!([{"tool":"click","x":1,"y":1},{"tool":"type","text":"x"}]),
             hooks,
         );
@@ -1244,6 +1259,7 @@ mod tests {
         let mut hooks = test_hooks();
         hooks.yielded = || true;
         let yielded = run_hooks(
+            "seq-fence-named",
             json!([{"tool":"type","text":"x"},{"tool":"key","name":"enter"}]),
             hooks,
         );
@@ -1252,14 +1268,22 @@ mod tests {
 
         let mut hooks = test_hooks();
         hooks.frozen = || true;
-        let frozen = run_hooks(json!([{"tool":"type","text":"x"}]), hooks);
+        let frozen = run_hooks(
+            "seq-fence-named",
+            json!([{"tool":"type","text":"x"}]),
+            hooks,
+        );
         assert_eq!(frozen.stop_reason, StopReason::LeaseFrozen);
         assert!(frozen.frozen);
         assert!(tools(&frozen).is_empty());
 
         let mut hooks = test_hooks();
         hooks.cooling = |_| true;
-        let cool = run_hooks(json!([{"tool":"type","text":"x"}]), hooks);
+        let cool = run_hooks(
+            "seq-fence-named",
+            json!([{"tool":"type","text":"x"}]),
+            hooks,
+        );
         assert_eq!(cool.stop_reason, StopReason::Cooldown);
         assert_eq!(cool.failed_step_index, Some(0));
         assert!(tools(&cool).is_empty());
@@ -1276,6 +1300,7 @@ mod tests {
             })
         };
         let env = run_hooks(
+            "seq-abort-skip-observe",
             json!([
                 {"tool":"key","name":"ctrl+w"},
                 {"tool":"observe"}
@@ -1294,7 +1319,7 @@ mod tests {
             steps.push(json!({"tool":"wait_settle","x":i,"y":i,"w":10,"h":10}));
         }
         steps.push(json!({"tool":"observe"}));
-        let env = run_hooks(Value::Array(steps), test_hooks());
+        let env = run_hooks("seq-eight-compact", Value::Array(steps), test_hooks());
         assert_eq!(env.stop_reason, StopReason::Completed);
         let json = serialize_envelope(&env).unwrap();
         assert!(
@@ -1375,10 +1400,10 @@ mod tests {
 
     #[test]
     fn focus_lost_ok_true_notes_once() {
+        const KEY: &str = "seq-focus-lost-notes";
         let _g = crate::cooldown::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::cooldown::reset_for_test();
         let mut hooks = test_hooks();
         hooks.click = |_, _| {
             Ok(StepOutcome {
@@ -1387,40 +1412,40 @@ mod tests {
                 ..StepOutcome::default()
             })
         };
-        let env = run_hooks(json!([{"tool":"click","x":1,"y":1}]), hooks);
+        let env = run_hooks(KEY, json!([{"tool":"click","x":1,"y":1}]), hooks);
         assert_eq!(env.stop_reason, StopReason::FocusLost);
-        assert_eq!(crate::cooldown::snapshot("seq-test").attempt, 1);
-        crate::cooldown::reset_for_test();
+        assert_eq!(crate::cooldown::snapshot(KEY).attempt, 1);
+        crate::cooldown::note_success(KEY);
     }
 
     #[test]
     fn dispatch_err_notes_once() {
+        const KEY: &str = "seq-dispatch-err-notes";
         let _g = crate::cooldown::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::cooldown::reset_for_test();
         let mut hooks = test_hooks();
         hooks.key = |_, _| {
             Err(HandsError::Input(
                 "unknown key 'ctrl+w'; see key --help".into(),
             ))
         };
-        let env = run_hooks(json!([{"tool":"key","name":"ctrl+w"}]), hooks);
+        let env = run_hooks(KEY, json!([{"tool":"key","name":"ctrl+w"}]), hooks);
         assert_eq!(env.stop_reason, StopReason::UnknownKey);
-        assert_eq!(crate::cooldown::snapshot("seq-test").attempt, 1);
-        crate::cooldown::reset_for_test();
+        assert_eq!(crate::cooldown::snapshot(KEY).attempt, 1);
+        crate::cooldown::note_success(KEY);
     }
 
     #[test]
     fn abort_observe_does_not_reset() {
+        const KEY: &str = "seq-abort-observe";
         let _g = crate::cooldown::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::cooldown::reset_for_test();
-        crate::cooldown::note_rejection("seq-test");
-        crate::cooldown::note_rejection("seq-test");
-        crate::cooldown::note_rejection("seq-test");
-        assert!(crate::cooldown::is_cooling("seq-test"));
+        crate::cooldown::note_rejection(KEY);
+        crate::cooldown::note_rejection(KEY);
+        crate::cooldown::note_rejection(KEY);
+        assert!(crate::cooldown::is_cooling(KEY));
         let mut hooks = test_hooks();
         hooks.key = |_, _| {
             Ok(StepOutcome {
@@ -1430,6 +1455,7 @@ mod tests {
             })
         };
         let env = run_hooks(
+            KEY,
             json!([
                 {"tool":"key","name":"ctrl+w"},
                 {"tool":"observe"}
@@ -1438,26 +1464,26 @@ mod tests {
         );
         assert_eq!(env.stop_reason, StopReason::UnknownKey);
         assert!(env.observe_path.is_none());
-        assert!(crate::cooldown::is_cooling("seq-test"));
-        crate::cooldown::reset_for_test();
+        assert!(crate::cooldown::is_cooling(KEY));
+        crate::cooldown::note_success(KEY);
     }
 
     #[test]
     fn success_trailing_observe_resets_when_not_frozen() {
+        const KEY: &str = "seq-trailing-observe";
         let _g = crate::cooldown::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _lease = crate::lease::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::cooldown::reset_for_test();
         crate::lease::reset_for_test();
-        crate::cooldown::note_rejection("seq-test");
-        crate::cooldown::note_rejection("seq-test");
-        crate::cooldown::note_rejection("seq-test");
+        crate::cooldown::note_rejection(KEY);
+        crate::cooldown::note_rejection(KEY);
+        crate::cooldown::note_rejection(KEY);
         let mut hooks = test_hooks();
         hooks.observe = |_| {
-            crate::cooldown::note_observe("seq-test");
+            crate::cooldown::note_observe(KEY);
             Ok(ObserveSummary {
                 observe_path: "C:\\tmp\\observe.json".into(),
                 elements_total: 3,
@@ -1465,6 +1491,7 @@ mod tests {
             })
         };
         let env = run_hooks(
+            KEY,
             json!([
                 {"tool":"wait_settle","x":1,"y":1,"w":10,"h":10},
                 {"tool":"observe"}
@@ -1472,35 +1499,79 @@ mod tests {
             hooks,
         );
         assert_eq!(env.stop_reason, StopReason::Completed);
-        assert!(!crate::cooldown::is_cooling("seq-test"));
-        crate::cooldown::reset_for_test();
+        assert!(!crate::cooldown::is_cooling(KEY));
+        crate::cooldown::note_success(KEY);
         crate::lease::reset_for_test();
     }
 
     #[test]
     fn bad_steps_does_not_note() {
+        const KEY: &str = "seq-bad-steps-notes";
         let _g = crate::cooldown::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::cooldown::reset_for_test();
-        let env = run_hooks(json!([]), test_hooks());
+        let env = run_hooks(KEY, json!([]), test_hooks());
         assert_eq!(env.stop_reason, StopReason::BadSteps);
-        assert_eq!(crate::cooldown::snapshot("seq-test").attempt, 0);
-        crate::cooldown::reset_for_test();
+        assert_eq!(crate::cooldown::snapshot(KEY).attempt, 0);
+        crate::cooldown::note_success(KEY);
     }
 
     #[test]
     fn step_zero_cooling_notes_once() {
+        const KEY: &str = "seq-step-zero-cooling";
         let _g = crate::cooldown::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::cooldown::reset_for_test();
         let mut hooks = test_hooks();
         hooks.cooling = |_| true;
-        let env = run_hooks(json!([{"tool":"type","text":"x"}]), hooks);
+        let env = run_hooks(KEY, json!([{"tool":"type","text":"x"}]), hooks);
         assert_eq!(env.stop_reason, StopReason::Cooldown);
         assert_eq!(env.attempt, Some(1));
-        assert_eq!(crate::cooldown::snapshot("seq-test").attempt, 1);
-        crate::cooldown::reset_for_test();
+        assert_eq!(crate::cooldown::snapshot(KEY).attempt, 1);
+        crate::cooldown::note_success(KEY);
+    }
+
+    #[test]
+    fn run_hooks_takes_session_id_and_does_not_lock_or_reset() {
+        let src = include_str!("sequence.rs");
+        let start = src.find("fn run_hooks(").expect("run_hooks");
+        let end = src
+            .find("fn empty_and_overflow_are_bad_steps_zero_hooks")
+            .expect("first run_hooks caller");
+        let helper = &src[start..end];
+        assert!(
+            helper.contains("session_id: &str") && helper.contains("Some(session_id.into())"),
+            "run_hooks must take a caller session id:\n{helper}"
+        );
+        assert!(
+            !helper.contains("TEST_LOCK") && !helper.contains("seq-test"),
+            "run_hooks must not lock TEST_LOCK or hardcode seq-test:\n{helper}"
+        );
+        assert!(
+            !helper.contains("thread::current") && !helper.contains(".name()"),
+            "run_hooks must not derive keys from the thread name:\n{helper}"
+        );
+        let tests = src.split("mod tests").nth(1).expect("sequence tests");
+        assert!(
+            !tests.contains("crate::cooldown::reset_for_test"),
+            "sequence tests must not process-clear cooldown state"
+        );
+        for name in [
+            "fn focus_lost_ok_true_notes_once",
+            "fn dispatch_err_notes_once",
+            "fn abort_observe_does_not_reset",
+            "fn success_trailing_observe_resets_when_not_frozen",
+            "fn bad_steps_does_not_note",
+            "fn step_zero_cooling_notes_once",
+        ] {
+            let start = tests.find(name).unwrap_or_else(|| panic!("{name}"));
+            let body = &tests[start..start + 1200.min(tests.len() - start)];
+            let lock = body.find("cooldown::TEST_LOCK").expect("TEST_LOCK");
+            let run = body.find("run_hooks(").expect("run_hooks");
+            assert!(
+                lock < run,
+                "{name} must hold TEST_LOCK outside run_hooks so reset_for_test callers cannot wipe its key"
+            );
+        }
     }
 }

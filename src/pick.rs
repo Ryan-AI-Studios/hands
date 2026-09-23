@@ -1247,6 +1247,7 @@ mod tests {
             text: Some("Search".into()),
             rect: Rect { x, y, w: 40, h: 16 },
             grid: None,
+            unnamed: None,
         }
     }
 
@@ -1380,6 +1381,9 @@ mod tests {
             chrome_hint: None,
             challenge: crate::challenge::ChallengeInfo::default(),
             windows: Vec::new(),
+            windows_total: 0,
+            windows_truncated: false,
+            windows_inventory: Vec::new(),
             fg_window: None,
             target_window: None,
             view: crate::observe::ObserveView::Auto,
@@ -1387,6 +1391,7 @@ mod tests {
             card_offset: 0,
             card_counts: crate::observe::ObserveCardCounts::default(),
             popup_rect: None,
+            client: None,
             timing: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
@@ -1786,6 +1791,7 @@ mod tests {
                 h: 1,
             },
             grid: None,
+            unnamed: None,
         };
         let (_, user) = build_pick_prompt("q", std::slice::from_ref(&long));
         assert!(!user.contains(&"x".repeat(81)));
@@ -1802,6 +1808,7 @@ mod tests {
                 h: 1,
             },
             grid: None,
+            unnamed: None,
         };
         let (sys, user) = build_pick_prompt("q", std::slice::from_ref(&spoof));
         assert!(sys.contains("UNTRUSTED"), "{sys}");
@@ -1825,6 +1832,7 @@ mod tests {
                 h: 1,
             },
             grid: None,
+            unnamed: None,
         };
         let (_, user) = build_pick_prompt("q", std::slice::from_ref(&keep));
         assert!(

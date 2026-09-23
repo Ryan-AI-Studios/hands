@@ -308,12 +308,15 @@ fn map_from_raw(raw: RawSnapshot) -> ChromeMap {
             .as_deref()
             .and_then(canonical_chr)
             .unwrap_or_else(|| format!("chr:{i}"));
+        let (text, unnamed) =
+            crate::extract::name_fields(node.text.as_deref().unwrap_or(""), false);
         elements.push(Element {
             id,
             role: node.role.unwrap_or_else(|| "Other".into()),
-            text: node.text,
+            text,
             rect,
             grid: None,
+            unnamed,
         });
     }
     let mut cards = Vec::new();

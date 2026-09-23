@@ -15,7 +15,7 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
     IUIAutomationValuePattern, UIA_ValuePatternId,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GW_ENABLEDPOPUP, GetWindow, GetWindowRect};
+use windows::Win32::UI::WindowsAndMessaging::{GW_ENABLEDPOPUP, GetWindow};
 
 use crate::error::HandsError;
 use crate::extract::{ControlKind, Detail, MAIN_TEXT_MAX_CHARS, RawNode};
@@ -323,29 +323,11 @@ fn prepend_owned_popup(
         Ok(root) => walk_control_view(walker, &root, Detail::Default, cap).ok()?,
         Err(_) => return None,
     };
-    let rect = hwnd_outer_rect(popup)?;
+    let rect = crate::foreground::hwnd_raw(popup).and_then(crate::foreground::client_rect)?;
     let mut combined = extra;
     combined.append(nodes);
     *nodes = combined;
     Some(rect)
-}
-
-fn hwnd_outer_rect(hwnd: HWND) -> Option<Rect> {
-    let mut rect = RECT::default();
-    if unsafe { GetWindowRect(hwnd, &raw mut rect) }.is_err() {
-        return None;
-    }
-    let w = rect.right.saturating_sub(rect.left);
-    let h = rect.bottom.saturating_sub(rect.top);
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    Some(Rect {
-        x: rect.left,
-        y: rect.top,
-        w,
-        h,
-    })
 }
 
 fn create_automation() -> Result<IUIAutomation, HandsError> {
@@ -622,6 +604,26 @@ mod tests {
     fn hwnd_null_is_empty_handle() {
         let hwnd = windows::Win32::Foundation::HWND::default();
         assert!(hwnd.is_invalid());
+    }
+
+    #[test]
+    fn prepend_owned_popup_uses_true_client() {
+        let src = include_str!("uia.rs");
+        let start = src
+            .find("fn prepend_owned_popup(")
+            .expect("prepend_owned_popup");
+        let end = src
+            .find("fn create_automation(")
+            .expect("create_automation");
+        let slice = &src[start..end];
+        assert!(
+            slice.contains("client_rect"),
+            "owned popup membership must use the true client:\n{slice}"
+        );
+        assert!(
+            !slice.contains("GetWindowRect") && !slice.contains("hwnd_outer_rect"),
+            "owned popup membership must not use the outer rect:\n{slice}"
+        );
     }
 
     #[test]

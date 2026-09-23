@@ -407,16 +407,16 @@ mod tests {
             h: 56,
         };
         assert_eq!(rect.center(), (497, 648));
-        assert_eq!(space.cell_id_of_center(rect), "g:4:6");
+        assert_eq!(space.cell_id_of_center(rect), "g:49:64");
 
-        let hit = Target::Grid { col: 4, row: 6 }.resolve(space).unwrap();
-        assert_eq!((hit.x, hit.y), (450, 650));
+        let hit = Target::Grid { col: 49, row: 64 }.resolve(space).unwrap();
+        assert_eq!((hit.x, hit.y), (495, 645));
         assert!(hit.x >= rect.x && hit.x < rect.x + rect.w);
         assert!(hit.y >= rect.y && hit.y < rect.y + rect.h);
-        assert_eq!((hit.x, hit.y), space.cell_rect(4, 6).center());
+        assert_eq!((hit.x, hit.y), space.cell_rect(49, 64).center());
 
-        let miss = Target::Grid { col: 2, row: 5 }.resolve(space).unwrap();
-        assert_eq!((miss.x, miss.y), (250, 550));
+        let miss = Target::Grid { col: 49, row: 61 }.resolve(space).unwrap();
+        assert_eq!((miss.x, miss.y), (495, 615));
         let inside = miss.x >= rect.x
             && miss.x < rect.x + rect.w
             && miss.y >= rect.y

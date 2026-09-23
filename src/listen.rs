@@ -1030,6 +1030,7 @@ fn write_sidecar(path: &Path, kind: &str, present: bool) {
                     h: 10,
                 },
                 grid: None,
+                unnamed: None,
             }],
         ),
     };
@@ -1061,6 +1062,9 @@ fn write_sidecar(path: &Path, kind: &str, present: bool) {
             reason: None,
         },
         windows: Vec::new(),
+        windows_total: 0,
+        windows_truncated: false,
+        windows_inventory: Vec::new(),
         fg_window: None,
         target_window: None,
         view: crate::observe::ObserveView::Auto,
@@ -1068,6 +1072,7 @@ fn write_sidecar(path: &Path, kind: &str, present: bool) {
         card_offset: 0,
         card_counts: crate::observe::ObserveCardCounts::default(),
         popup_rect: None,
+        client: None,
         timing: None,
     };
     if let Some(parent) = path.parent() {
@@ -1229,6 +1234,9 @@ mod tests {
                 chrome_hint: None,
                 challenge: ChallengeInfo::default(),
                 windows: Vec::new(),
+                windows_total: 0,
+                windows_truncated: false,
+                windows_inventory: Vec::new(),
                 fg_window: None,
                 target_window: None,
                 view: crate::observe::ObserveView::Auto,
@@ -1236,6 +1244,7 @@ mod tests {
                 card_offset: 0,
                 card_counts: crate::observe::ObserveCardCounts::default(),
                 popup_rect: None,
+                client: None,
                 timing: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
@@ -1296,6 +1305,9 @@ mod tests {
                 chrome_hint: None,
                 challenge: ChallengeInfo::default(),
                 windows: Vec::new(),
+                windows_total: 0,
+                windows_truncated: false,
+                windows_inventory: Vec::new(),
                 fg_window: None,
                 target_window: None,
                 view: crate::observe::ObserveView::Auto,
@@ -1303,6 +1315,7 @@ mod tests {
                 card_offset: 0,
                 card_counts: crate::observe::ObserveCardCounts::default(),
                 popup_rect: None,
+                client: None,
                 timing: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
@@ -1357,6 +1370,9 @@ mod tests {
                 chrome_hint: None,
                 challenge: ChallengeInfo::default(),
                 windows: Vec::new(),
+                windows_total: 0,
+                windows_truncated: false,
+                windows_inventory: Vec::new(),
                 fg_window: None,
                 target_window: None,
                 view: crate::observe::ObserveView::Auto,
@@ -1364,6 +1380,7 @@ mod tests {
                 card_offset: 0,
                 card_counts: crate::observe::ObserveCardCounts::default(),
                 popup_rect: None,
+                client: None,
                 timing: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
@@ -1410,6 +1427,9 @@ mod tests {
                 chrome_hint: None,
                 challenge: ChallengeInfo::default(),
                 windows: Vec::new(),
+                windows_total: 0,
+                windows_truncated: false,
+                windows_inventory: Vec::new(),
                 fg_window: None,
                 target_window: None,
                 view: crate::observe::ObserveView::Auto,
@@ -1417,6 +1437,7 @@ mod tests {
                 card_offset: 0,
                 card_counts: crate::observe::ObserveCardCounts::default(),
                 popup_rect: None,
+                client: None,
                 timing: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();

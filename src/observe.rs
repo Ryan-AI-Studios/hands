@@ -171,6 +171,9 @@ pub struct ObserveEnvelope {
     pub chrome_hint: Option<String>,
     pub challenge: ChallengeInfo,
     pub windows: Vec<DesktopWindow>,
+    pub windows_total: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub windows_truncated: bool,
     pub fg_window: FgWindow,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_window: Option<TargetWindow>,
@@ -204,6 +207,12 @@ pub struct ObserveSidecar {
     #[serde(default)]
     pub windows: Vec<DesktopWindow>,
     #[serde(default)]
+    pub windows_total: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub windows_truncated: bool,
+    #[serde(default)]
+    pub windows_inventory: Vec<DesktopWindow>,
+    #[serde(default)]
     pub fg_window: Option<FgWindow>,
     #[serde(default)]
     pub target_window: Option<TargetWindow>,
@@ -217,6 +226,8 @@ pub struct ObserveSidecar {
     pub card_counts: ObserveCardCounts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub popup_rect: Option<Rect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<Rect>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<ObserveTiming>,
 }
@@ -243,6 +254,7 @@ fn observe_timing_requested() -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct FuseOpts {
     pub viewport: Option<Rect>,
+    pub client: Option<Rect>,
     pub chrome_is_foreground: bool,
     pub virtual_screen: Option<Rect>,
     pub popup_rect: Option<Rect>,
@@ -300,18 +312,30 @@ fn window_state(hit: &foreground::TitledWindow) -> WindowState {
     }
 }
 
+fn desktop_window(w: &foreground::TitledWindow, cap_title: bool) -> DesktopWindow {
+    DesktopWindow {
+        pid: w.pid,
+        title: if cap_title {
+            foreground::cap_window_title(&w.title)
+        } else {
+            w.title.clone()
+        },
+        state: window_state(w),
+        hwnd: foreground::format_hwnd(w.hwnd),
+        rect: w.rect,
+    }
+}
+
 fn envelope_windows(inventory: &[foreground::TitledWindow]) -> Vec<DesktopWindow> {
     inventory
         .iter()
         .take(foreground::WINDOW_LIST_CAP)
-        .map(|w| DesktopWindow {
-            pid: w.pid,
-            title: foreground::cap_window_title(&w.title),
-            state: window_state(w),
-            hwnd: foreground::format_hwnd(w.hwnd),
-            rect: w.rect,
-        })
+        .map(|w| desktop_window(w, true))
         .collect()
+}
+
+fn inventory_windows(inventory: &[foreground::TitledWindow]) -> Vec<DesktopWindow> {
+    inventory.iter().map(|w| desktop_window(w, false)).collect()
 }
 
 fn is_digits_only_pid(query: &str) -> Option<u32> {
@@ -452,6 +476,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let chrome = chrome_outcome.into_map();
     let opts = FuseOpts {
         viewport: plan.viewport,
+        client: plan.walk_hwnd.and_then(foreground::client_rect),
         chrome_is_foreground: plan.chrome_is_foreground,
         virtual_screen: Some(space.as_rect()),
         popup_rect: snap.popup_rect,
@@ -484,6 +509,8 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         chrome_hint,
         challenge,
         windows: envelope_windows(&inventory),
+        windows_total: inventory.len(),
+        windows_truncated: inventory.len() > foreground::WINDOW_LIST_CAP,
         fg_window: plan.fg_window,
         target_window: plan.target_window,
         view: req.view,
@@ -502,7 +529,14 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         uia_ms: Some(uia_ms),
         chrome_ms: Some(chrome_ms),
     });
-    write_sidecar(&paths.observe_path, &full, opts.popup_rect, sidecar_timing)?;
+    write_sidecar(
+        &paths.observe_path,
+        &full,
+        opts.popup_rect,
+        opts.client,
+        sidecar_timing,
+        &inventory,
+    )?;
     let envelope = match req.detail {
         Detail::Default => {
             retain_hittable_centers(&mut full.elements, &opts);
@@ -542,7 +576,9 @@ fn write_sidecar(
     path: &std::path::Path,
     envelope: &ObserveEnvelope,
     popup_rect: Option<Rect>,
+    client: Option<Rect>,
     timing: Option<ObserveTiming>,
+    inventory: &[foreground::TitledWindow],
 ) -> Result<(), HandsError> {
     let sidecar = ObserveSidecar {
         schema: OBSERVE_SCHEMA.to_string(),
@@ -559,6 +595,9 @@ fn write_sidecar(
         chrome_hint: envelope.chrome_hint.clone(),
         challenge: envelope.challenge.clone(),
         windows: envelope.windows.clone(),
+        windows_total: envelope.windows_total,
+        windows_truncated: envelope.windows_truncated,
+        windows_inventory: inventory_windows(inventory),
         fg_window: Some(envelope.fg_window.clone()),
         target_window: envelope.target_window.clone(),
         view: envelope.view,
@@ -569,6 +608,7 @@ fn write_sidecar(
             ..ObserveCardCounts::default()
         },
         popup_rect,
+        client,
         timing,
     };
     let json = serde_json::to_string_pretty(&sidecar)
@@ -940,17 +980,18 @@ fn in_viewport(rect: Rect, opts: &FuseOpts) -> bool {
 }
 
 fn center_in_client(rect: Rect, opts: &FuseOpts) -> bool {
-    match (opts.viewport, opts.virtual_screen) {
-        (Some(viewport), Some(screen)) => {
-            let (cx, cy) = rect.center();
-            screen.contains_point(cx, cy)
-                && (viewport.contains_point(cx, cy)
-                    || opts
-                        .popup_rect
-                        .is_some_and(|popup| popup.contains_point(cx, cy)))
-        }
-        _ => false,
+    let Some(screen) = opts.virtual_screen else {
+        return false;
+    };
+    let (cx, cy) = rect.center();
+    if !screen.contains_point(cx, cy) {
+        return false;
     }
+    opts.client
+        .is_some_and(|client| client.contains_point(cx, cy))
+        || opts
+            .popup_rect
+            .is_some_and(|popup| popup.contains_point(cx, cy))
 }
 
 fn filter_viewport_nodes(
@@ -1001,6 +1042,7 @@ fn reshape_from_sidecar(req: &ObserveRequest, from: &str) -> Result<ObserveEnvel
     logs::check_write_id(&sidecar.session_id)?;
     let opts = FuseOpts {
         viewport: sidecar.viewport,
+        client: sidecar.client,
         chrome_is_foreground: sidecar
             .target_window
             .as_ref()
@@ -1045,6 +1087,11 @@ fn envelope_from_sidecar(sidecar: ObserveSidecar, view: ObserveView) -> ObserveE
         chrome_connected: sidecar.chrome_connected,
         chrome_hint: sidecar.chrome_hint,
         challenge: sidecar.challenge,
+        windows_total: sidecar
+            .windows_total
+            .max(sidecar.windows_inventory.len())
+            .max(sidecar.windows.len()),
+        windows_truncated: sidecar.windows_truncated,
         windows: sidecar.windows,
         fg_window: sidecar.fg_window.unwrap_or_else(empty_fg_window),
         target_window: sidecar.target_window,
@@ -1130,6 +1177,12 @@ mod tests {
                 w: 1920,
                 h: 1080,
             }),
+            client: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            }),
             chrome_is_foreground,
             virtual_screen: Some(Rect {
                 x: 0,
@@ -1144,6 +1197,12 @@ mod tests {
     fn fixture_opts(chrome_is_foreground: bool) -> FuseOpts {
         FuseOpts {
             viewport: Some(Rect {
+                x: 100,
+                y: 50,
+                w: 1280,
+                h: 800,
+            }),
+            client: Some(Rect {
                 x: 100,
                 y: 50,
                 w: 1280,
@@ -1202,6 +1261,7 @@ mod tests {
                         h: 12,
                     },
                     grid: None,
+                    unnamed: None,
                 })
                 .collect(),
             elements_total: n,
@@ -1210,6 +1270,8 @@ mod tests {
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
+            windows_total: 0,
+            windows_truncated: false,
             fg_window: empty_fg_window(),
             target_window: None,
             view: ObserveView::Auto,
@@ -1247,7 +1309,7 @@ mod tests {
             "session_id": "s",
             "screenshot_path": "C:\\tmp\\a.png",
             "observe_path": "C:\\tmp\\a.json",
-            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
             "extract": {"title":"T","url":null,"main_text":"","cards":[]},
             "elements": [],
             "elements_total": 0,
@@ -1270,7 +1332,7 @@ mod tests {
         assert_eq!(capped.elements_total, 400);
         assert!(!capped.elements.is_empty());
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["space"]["cell_px"], 100);
+        assert_eq!(parsed["space"]["cell_px"], crate::space::CELL_PX);
         assert!(parsed["url"].is_null() || parsed["extract"]["url"].is_null());
     }
 
@@ -1321,6 +1383,7 @@ mod tests {
                         h: 8,
                     },
                     grid: None,
+                    unnamed: None,
                 })
                 .collect(),
             cards: vec![],
@@ -1363,6 +1426,12 @@ mod tests {
             Some(map),
             FuseOpts {
                 viewport: Some(Rect {
+                    x: 100,
+                    y: 50,
+                    w: 1280,
+                    h: 800,
+                }),
+                client: Some(Rect {
                     x: 100,
                     y: 50,
                     w: 1280,
@@ -1422,6 +1491,7 @@ mod tests {
                     h: 32,
                 },
                 grid: None,
+                unnamed: None,
             },
         );
         raw.elements_total = 401;
@@ -1585,6 +1655,8 @@ mod tests {
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
+            windows_total: 0,
+            windows_truncated: false,
             fg_window: empty_fg_window(),
             target_window: None,
             view: ObserveView::Auto,
@@ -1719,6 +1791,7 @@ mod tests {
             Some(map),
             FuseOpts {
                 viewport: None,
+                client: None,
                 chrome_is_foreground: true,
                 virtual_screen: Some(Rect {
                     x: 0,
@@ -1786,7 +1859,7 @@ mod tests {
             "session_id": "s",
             "screenshot_path": "C:\\tmp\\a.png",
             "observe_path": "C:\\tmp\\a.json",
-            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
             "extract": {"title":"T","url":null,"main_text":"","cards":[]},
             "elements": [],
             "elements_total": 0,
@@ -1977,7 +2050,7 @@ mod tests {
             "session_id": "s",
             "screenshot_path": "C:\\tmp\\a.png",
             "observe_path": "C:\\tmp\\a.json",
-            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
             "extract": {"title":"T","url":null,"main_text":"","cards":[]},
             "elements": [],
             "elements_total": 0,
@@ -2053,6 +2126,7 @@ mod tests {
             text: Some(text.into()),
             rect,
             grid: None,
+            unnamed: None,
         }
     }
 
@@ -2116,6 +2190,8 @@ mod tests {
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
+            windows_total: 0,
+            windows_truncated: false,
             fg_window: empty_fg_window(),
             target_window: None,
             view: ObserveView::Auto,
@@ -2163,6 +2239,7 @@ mod tests {
                         h: 24,
                     },
                     grid: None,
+                    unnamed: None,
                 })
                 .collect(),
             cards: vec![],
@@ -2210,6 +2287,8 @@ mod tests {
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
+            windows_total: 0,
+            windows_truncated: false,
             fg_window: empty_fg_window(),
             target_window: None,
             view: ObserveView::Auto,
@@ -2352,6 +2431,7 @@ mod tests {
                 text: Some(d.text.clone()),
                 rect: d.rect,
                 grid: None,
+                unnamed: None,
             }),
         );
         raw.challenge = ChallengeInfo {
@@ -2399,7 +2479,7 @@ mod tests {
             "session_id": "s",
             "screenshot_path": "C:\\tmp\\a.png",
             "observe_path": "C:\\tmp\\a.json",
-            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
             "extract": {"title":"T","url":null,"main_text":"","cards":[]},
             "elements": [],
             "elements_total": 0,
@@ -2433,7 +2513,7 @@ mod tests {
             }
         );
         assert_eq!(chr0.rect.center(), (210, 166));
-        assert_eq!(chr0.grid.as_deref(), Some("g:2:1"));
+        assert_eq!(chr0.grid.as_deref(), Some("g:21:16"));
         assert_eq!(chr0.grid.as_ref().unwrap(), &space.cell_id(210, 166));
     }
 
@@ -2451,10 +2531,11 @@ mod tests {
                 h: 2,
             },
             grid: None,
+            unnamed: None,
         }];
         stamp_grid(space, &mut elements);
         assert_eq!(elements[0].rect.center(), (0, 0));
-        assert_eq!(elements[0].grid.as_deref(), Some("g:19:0"));
+        assert_eq!(elements[0].grid.as_deref(), Some("g:192:0"));
         assert_ne!(elements[0].grid.as_deref(), Some("g:0:0"));
     }
 
@@ -2465,7 +2546,7 @@ mod tests {
             "session_id": "s",
             "screenshot_path": "C:\\tmp\\a.png",
             "observe_path": "C:\\tmp\\a.json",
-            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
             "extract": {"title":"T","url":null,"main_text":"","cards":[]},
             "elements": [{"id":"chr:0","role":"Edit","text":"Search","rect":{"x":110,"y":150,"w":200,"h":32}}],
             "elements_total": 1,
@@ -2491,13 +2572,60 @@ mod tests {
                 h: 32,
             },
             grid: None,
+            unnamed: None,
         };
         let raw = serde_json::to_value(&el).unwrap();
         assert!(raw.get("grid").is_none());
         let mut elements = vec![el];
         stamp_grid(Space::new(0, 0, 1920, 1080).unwrap(), &mut elements);
         let stamped = serde_json::to_value(&elements[0]).unwrap();
-        assert_eq!(stamped["grid"], "g:2:1");
+        assert_eq!(stamped["grid"], "g:21:16");
+    }
+
+    #[test]
+    fn unnamed_omitted_unless_true_and_cell_px_is_const() {
+        let named = Element {
+            id: "uia:1".into(),
+            role: "Button".into(),
+            text: Some("Search".into()),
+            rect: Rect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2,
+            },
+            grid: None,
+            unnamed: None,
+        };
+        let raw = serde_json::to_value(&named).unwrap();
+        assert!(raw.get("unnamed").is_none(), "{raw}");
+        let blank = Element {
+            id: "uia:2".into(),
+            role: "CheckBox".into(),
+            text: None,
+            rect: named.rect,
+            grid: None,
+            unnamed: Some(true),
+        };
+        let raw = serde_json::to_value(&blank).unwrap();
+        assert_eq!(raw["unnamed"], true);
+        assert!(raw.get("text").is_none() || raw["text"].is_null(), "{raw}");
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        assert_eq!(space.cell_px, crate::space::CELL_PX);
+        assert_eq!(crate::space::CELL_PX, 10);
+    }
+
+    #[test]
+    fn windows_total_and_truncated_serialize() {
+        let mut env = fat_envelope(0);
+        env.windows_total = 15;
+        env.windows_truncated = true;
+        let raw = serde_json::to_value(&env).unwrap();
+        assert_eq!(raw["windows_total"], 15);
+        assert_eq!(raw["windows_truncated"], true);
+        env.windows_truncated = false;
+        let raw = serde_json::to_value(&env).unwrap();
+        assert!(raw.get("windows_truncated").is_none(), "{raw}");
     }
 
     #[test]
@@ -2574,6 +2702,8 @@ mod tests {
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
+            windows_total: 0,
+            windows_truncated: false,
             fg_window: empty_fg_window(),
             target_window: None,
             view: ObserveView::Auto,
@@ -2713,6 +2843,10 @@ mod tests {
             slice.contains("retain_hittable_centers(&mut full.elements, &opts)"),
             "Default arm must retain:\n{slice}"
         );
+        assert!(
+            slice.contains("opts.client"),
+            "observe must persist the true client on the sidecar:\n{slice}"
+        );
         let dom = slice.find("Detail::Dom").expect("Dom arm");
         let after_dom = &slice[dom..];
         assert!(
@@ -2766,6 +2900,69 @@ mod tests {
             slice.contains("rect.center()"),
             "center_in_client must call rect.center():\n{slice}"
         );
+        assert!(
+            slice.contains("opts.client") && !slice.contains("or(opts.viewport)"),
+            "center_in_client must use the true client, not the outer viewport:\n{slice}"
+        );
+    }
+
+    #[test]
+    fn center_in_client_does_not_use_outer_viewport() {
+        let outer = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        let client = Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        let taskbar = Rect {
+            x: 10,
+            y: 1030,
+            w: 40,
+            h: 20,
+        };
+        let opts = FuseOpts {
+            viewport: Some(outer),
+            client: Some(client),
+            chrome_is_foreground: true,
+            virtual_screen: Some(screen),
+            popup_rect: None,
+        };
+        assert!(!center_in_client(taskbar, &opts));
+        let no_client = FuseOpts {
+            client: None,
+            ..opts
+        };
+        assert!(!center_in_client(taskbar, &no_client));
+        let popup = Rect {
+            x: 900,
+            y: 100,
+            w: 200,
+            h: 80,
+        };
+        let suggestion = Rect {
+            x: 920,
+            y: 120,
+            w: 80,
+            h: 20,
+        };
+        let popup_only = FuseOpts {
+            client: None,
+            popup_rect: Some(popup),
+            ..opts
+        };
+        assert!(center_in_client(suggestion, &popup_only));
     }
 
     #[test]
@@ -2803,7 +3000,7 @@ mod tests {
             "session_id": "s",
             "screenshot_path": "C:\\tmp\\a.png",
             "observe_path": "C:\\tmp\\a.json",
-            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
             "extract": {"title":"T","url":null,"main_text":"","cards":[{"title":"c","price":"$1","href":"https://example.com","rect":{"x":1,"y":1,"w":2,"h":2}}]},
             "elements": [],
             "elements_total": 0,
@@ -2945,6 +3142,7 @@ mod tests {
                     h: 20,
                 },
                 grid: None,
+                unnamed: None,
             }],
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
@@ -2990,6 +3188,7 @@ mod tests {
                     h: 20,
                 },
                 grid: None,
+                unnamed: None,
             }],
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
@@ -3013,7 +3212,7 @@ mod tests {
             "session_id": "s",
             "screenshot_path": "C:\\tmp\\a.png",
             "observe_path": "C:\\tmp\\a.json",
-            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
             "extract": {"title":"T","url":null,"main_text":"","cards":[]},
             "elements": [],
             "elements_total": 0,
@@ -3214,6 +3413,7 @@ mod tests {
                 h: 24,
             },
             grid: None,
+            unnamed: None,
         }
     }
 
@@ -3499,6 +3699,9 @@ mod tests {
             chrome_hint: raw.chrome_hint.clone(),
             challenge: raw.challenge.clone(),
             windows: raw.windows.clone(),
+            windows_total: raw.windows.len(),
+            windows_truncated: false,
+            windows_inventory: raw.windows.clone(),
             fg_window: Some(raw.fg_window.clone()),
             target_window: raw.target_window.clone(),
             view: ObserveView::Auto,
@@ -3506,6 +3709,7 @@ mod tests {
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             popup_rect: None,
+            client: raw.viewport,
             timing: None,
         };
         let sidecar_ids: std::collections::HashSet<String> =
@@ -3535,6 +3739,7 @@ mod tests {
                 el.rect,
                 &FuseOpts {
                     viewport: sidecar_viewport,
+                    client: sidecar_viewport,
                     chrome_is_foreground: false,
                     virtual_screen: Some(sidecar_space.as_rect()),
                     popup_rect: None,
@@ -3580,6 +3785,7 @@ mod tests {
                 h: 20,
             },
             grid: None,
+            unnamed: None,
         };
         let space = Space::new(0, 0, 1920, 1080).unwrap();
         let sidecar = ObserveSidecar {
@@ -3597,6 +3803,9 @@ mod tests {
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
+            windows_total: 0,
+            windows_truncated: false,
+            windows_inventory: Vec::new(),
             fg_window: None,
             target_window: None,
             view: ObserveView::Auto,
@@ -3604,6 +3813,7 @@ mod tests {
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             popup_rect: Some(popup),
+            client: None,
             timing: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
@@ -3626,6 +3836,7 @@ mod tests {
             &mut dropped,
             &FuseOpts {
                 viewport: Some(viewport),
+                client: Some(viewport),
                 chrome_is_foreground: false,
                 virtual_screen: Some(space.as_rect()),
                 popup_rect: None,
@@ -3762,6 +3973,10 @@ mod tests {
         assert!(
             !reshape.contains("capture_virtual_screen"),
             "reshape must not recapture"
+        );
+        assert!(
+            reshape.contains("client: sidecar.client"),
+            "reshape must reuse the persisted true client"
         );
         let live = src
             .split("pub fn observe(req: ObserveRequest)")

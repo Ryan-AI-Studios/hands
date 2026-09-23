@@ -179,16 +179,14 @@ impl RawNode {
     }
 
     pub fn to_element(&self) -> Option<Element> {
+        let (text, unnamed) = name_fields(&self.name, self.is_password);
         Some(Element {
             id: self.element_id()?,
             role: self.role.clone(),
-            text: if self.is_password {
-                None
-            } else {
-                Some(self.name.clone())
-            },
+            text,
             rect: self.rect,
             grid: None,
+            unnamed,
         })
     }
 
@@ -213,6 +211,18 @@ impl RawNode {
     }
 }
 
+/// Accessible name → envelope `text` / `unnamed`. Password is `text: None` without `unnamed`.
+pub fn name_fields(name: &str, is_password: bool) -> (Option<String>, Option<bool>) {
+    if is_password {
+        return (None, None);
+    }
+    if name.trim().is_empty() {
+        (None, Some(true))
+    } else {
+        (Some(name.to_string()), None)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Element {
     pub id: String,
@@ -221,6 +231,8 @@ pub struct Element {
     pub rect: Rect,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unnamed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1597,7 +1609,16 @@ mod tests {
         password.is_password = true;
         let el = password.to_element().expect("valid runtime id");
         assert_eq!(el.text, None);
+        assert_eq!(el.unnamed, None);
         assert_eq!(el.id, "uia:42.1");
+    }
+
+    #[test]
+    fn empty_name_is_unnamed_and_text_null() {
+        let blank = node(ControlKind::CheckBox, "   ");
+        let el = blank.to_element().expect("valid runtime id");
+        assert_eq!(el.text, None);
+        assert_eq!(el.unnamed, Some(true));
     }
 
     #[test]

@@ -614,7 +614,7 @@ mod tests {
                 origin_y: 0,
                 width: 1000,
                 height: 1000,
-                cell_px: 100,
+                cell_px: crate::space::CELL_PX,
             },
             viewport: Some(Rect {
                 x: 10,
@@ -641,6 +641,8 @@ mod tests {
             chrome_connected: false,
             chrome_hint: None,
             windows: Vec::new(),
+            windows_total: 0,
+            windows_truncated: false,
             fg_window: crate::observe::FgWindow {
                 pid: 0,
                 title: String::new(),
@@ -679,6 +681,7 @@ mod tests {
                 h: 20,
             },
             grid: None,
+            unnamed: None,
         }
     }
 

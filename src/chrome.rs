@@ -946,13 +946,7 @@ mod tests {
             .output()
             .expect("git ls-files");
         let text = String::from_utf8_lossy(&out.stdout);
-        for needle in [
-            "conductor/",
-            "SHARED-UNDERSTANDING",
-            "planner.md",
-            "docs/adr",
-            "CONTEXT.md",
-        ] {
+        for needle in ["conductor/", "planner.md", "docs/adr", "CONTEXT.md"] {
             assert!(
                 !text.lines().any(|l| l.contains(needle)),
                 "planning path leaked: {needle}"

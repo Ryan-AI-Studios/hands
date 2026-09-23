@@ -431,4 +431,4 @@ Bare `wait-settle` watches the foreground window (`GetWindowRect`, same as obser
 
 ## What this is
 
-Product intent lives in the planning tree: `C:\dev\Helping-Hands\SHARED-UNDERSTANDING.md`.
+Product intent lives in the planning tree: `C:\dev\Helping-Hands\docs\adr\` and `CONTEXT.md`.

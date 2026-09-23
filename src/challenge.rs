@@ -1691,6 +1691,9 @@ mod tests {
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
+            windows_total: 0,
+            windows_truncated: false,
+            windows_inventory: Vec::new(),
             fg_window: None,
             target_window: None,
             view: crate::observe::ObserveView::Auto,
@@ -1698,6 +1701,7 @@ mod tests {
             card_offset: 0,
             card_counts: crate::observe::ObserveCardCounts::default(),
             popup_rect: None,
+            client: None,
             timing: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
@@ -1711,7 +1715,7 @@ mod tests {
             "session_id": "s",
             "screenshot_path": "C:\\tmp\\a.png",
             "observe_path": "C:\\tmp\\a.json",
-            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":100},
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
             "extract": {"title":"T","url":null,"main_text":"","cards":[]},
             "elements": [],
             "elements_total": 0,

@@ -381,6 +381,51 @@ fn refuse_if_yielded(
     }
 }
 
+fn refuse_if_outside_client(
+    session_id: &str,
+    info: &ActuateTarget,
+    resolved: &crate::target::ResolvedTarget,
+) -> Result<Option<ActuateEnvelope>, HandsError> {
+    let fg = foreground::foreground_hwnd();
+    let Some(intended) = resolved.hwnd.and_then(foreground::root_hwnd).or(fg) else {
+        return fail(
+            session_id.to_string(),
+            info.clone(),
+            HandsError::Target(
+                "no foreground window to validate the point against; activate a window first"
+                    .into(),
+            ),
+            false,
+            false,
+            false,
+        )
+        .map(Some);
+    };
+    if foreground::point_in_allowed_client(resolved.x, resolved.y, intended, resolved.hwnd, None) {
+        return Ok(None);
+    }
+    let client = foreground::client_rect(intended).unwrap_or(Rect {
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+    });
+    let title = foreground::title(Some(intended));
+    let hwnd = foreground::format_hwnd(intended);
+    fail(
+        session_id.to_string(),
+        info.clone(),
+        HandsError::Target(format!(
+            "point ({},{}) is outside the client rect of window {title:?} hwnd:{hwnd} client=({},{},{},{}); pick a target whose click center is inside that client or an owned popup, or activate the intended window first",
+            resolved.x, resolved.y, client.x, client.y, client.w, client.h
+        )),
+        false,
+        false,
+        false,
+    )
+    .map(Some)
+}
+
 fn refuse_fence(
     session_id: String,
     target: ActuateTarget,
@@ -565,6 +610,9 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_if_outside_client(&session_id, &info, &resolved)? {
+        return Ok(env);
+    }
     challenge::note_actuation_if_proceeding(false);
     remember_target(resolved.rect);
     let mut rng = Rng::from_time();
@@ -657,6 +705,9 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         return Ok(env);
     }
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
+    }
+    if let Some(env) = refuse_if_outside_client(&session_id, &info, &resolved)? {
         return Ok(env);
     }
     remember_target(resolved.rect);
@@ -793,7 +844,7 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     };
     let has_target =
         req.element_id.is_some() || req.grid.is_some() || req.x.is_some() || req.y.is_some();
-    let mut foregrounded = false;
+    let foregrounded;
     let mut info = none_target();
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
@@ -818,6 +869,43 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
                 info = env.target;
             }
             Err(err) => return fail(session_id, info, err, false, false, false),
+        }
+    } else {
+        let space = match ensure_dpi().and_then(|_| virtual_screen()) {
+            Ok(s) => s,
+            Err(err) => return fail(session_id, info, err, false, false, false),
+        };
+        let Some(fg) = foreground::foreground_hwnd() else {
+            return fail(
+                session_id,
+                info,
+                HandsError::Target(
+                    "scroll has no foreground window; activate a window first".into(),
+                ),
+                false,
+                false,
+                false,
+            );
+        };
+        let Some(client) = foreground::client_rect(fg) else {
+            return fail(
+                session_id,
+                info,
+                HandsError::Target(
+                    "scroll has no foreground client rect; activate a window first".into(),
+                ),
+                false,
+                false,
+                false,
+            );
+        };
+        let (cx, cy) = client.center();
+        info = resolved_info("pixel", None, cx, cy);
+        remember_target(client);
+        let mut rng = Rng::from_time();
+        foregrounded = foreground::offer(Some(fg), (cx, cy));
+        if let Err(err) = input::move_to(space, cx, cy, &mut rng) {
+            return fail(session_id, info, err, foregrounded, false, false);
         }
     }
     challenge::note_actuation();
@@ -1140,6 +1228,86 @@ mod tests {
         assert_eq!(click_miss(true, true), Some("focus_lost"));
     }
 
+    fn pixel_resolved(x: i32, y: i32) -> crate::target::ResolvedTarget {
+        crate::target::ResolvedTarget {
+            target: Target::Pixel { x, y },
+            kind: "pixel",
+            id: None,
+            x,
+            y,
+            rect: Rect { x, y, w: 1, h: 1 },
+            hwnd: None,
+            name: String::new(),
+            role: String::new(),
+        }
+    }
+
+    fn hook_client_800x600(_: isize) -> Option<Rect> {
+        Some(Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        })
+    }
+
+    #[test]
+    fn refuse_if_outside_client_ok_false_does_not_offer() {
+        crate::foreground::set_client_rect_hook(Some(hook_client_800x600));
+        let _ = crate::foreground::take_offer_calls();
+        let resolved = pixel_resolved(10, 1037);
+        let info = resolved_info("pixel", None, 10, 1037);
+        let env = refuse_if_outside_client("s-0105", &info, &resolved)
+            .expect("guard result")
+            .expect("named refusal");
+        crate::foreground::set_client_rect_hook(None);
+        assert!(!env.ok, "{env:?}");
+        assert!(
+            env.error.as_deref().is_some_and(
+                |e| e.contains("outside the client rect") || e.contains("no foreground window")
+            ),
+            "{:?}",
+            env.error
+        );
+        assert!(
+            crate::foreground::take_offer_calls().is_empty(),
+            "offer must not run on an out-of-client refuse"
+        );
+    }
+
+    #[test]
+    fn refuse_if_outside_client_allows_inside() {
+        crate::foreground::set_client_rect_hook(Some(hook_client_800x600));
+        let resolved = pixel_resolved(10, 10);
+        let info = resolved_info("pixel", None, 10, 10);
+        let out = refuse_if_outside_client("s-0105-in", &info, &resolved).expect("guard result");
+        crate::foreground::set_client_rect_hook(None);
+        if crate::foreground::foreground_hwnd().is_some() {
+            assert!(out.is_none(), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn outside_client_refuse_counts_rejection_not_success() {
+        let _g = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        crate::foreground::set_client_rect_hook(Some(hook_client_800x600));
+        let resolved = pixel_resolved(10, 1037);
+        let info = resolved_info("pixel", None, 10, 1037);
+        let env = refuse_if_outside_client("s-0105-rej", &info, &resolved)
+            .expect("guard result")
+            .expect("named refusal");
+        crate::foreground::set_client_rect_hook(None);
+        assert!(!env.ok, "{env:?}");
+        let out = after_actuate("click", Ok(env), None, None).expect("after");
+        assert!(!out.ok, "{out:?}");
+        let snap = crate::cooldown::snapshot("s-0105-rej");
+        assert_eq!(snap.attempt, 1, "{snap:?}");
+        crate::cooldown::reset_for_test();
+    }
+
     #[test]
     fn click_inner_snapshots_after_offer_and_move() {
         let src = include_str!("actuate.rs");
@@ -1158,13 +1326,16 @@ mod tests {
             "first capture_roi must be after offer and move_to and before first left_click:\n{body}"
         );
         let blocked = body.find("refuse_if_blocked").expect("refuse_if_blocked");
+        let client = body
+            .find("refuse_if_outside_client")
+            .expect("refuse_if_outside_client");
         assert!(
             refuse < remember && remember < move_to,
             "click_inner must refuse yield before remember_target before move_to:\n{body}"
         );
         assert!(
-            blocked < offer,
-            "click_inner must refuse frozen/cooling before offer:\n{body}"
+            blocked < offer && client < offer && client < remember,
+            "click_inner must refuse frozen/cooling and out-of-client before offer/remember:\n{body}"
         );
         assert!(
             body.contains("default_roi"),
@@ -1453,17 +1624,43 @@ mod tests {
         let remember = body.find("remember_target").expect("remember");
         let move_to = body.find("input::move_to").expect("move_to");
         let offer = body.find("foreground::offer").expect("offer");
+        let client = body
+            .find("refuse_if_outside_client")
+            .expect("refuse_if_outside_client");
         assert!(
             refuse < remember && remember < move_to,
             "hover_inner must refuse yield before remember_target before move_to:\n{body}"
         );
         assert!(
-            blocked < offer,
-            "hover_inner must refuse frozen/cooling before offer:\n{body}"
+            blocked < offer && client < offer && client < remember,
+            "hover_inner must refuse frozen/cooling and out-of-client before offer/remember:\n{body}"
         );
         assert!(
             !body.contains("note_actuation"),
             "hover must not count as an actuation attempt:\n{body}"
+        );
+    }
+
+    #[test]
+    fn scroll_inner_untargeted_moves_to_fg_client() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn scroll_inner").expect("scroll_inner");
+        let rest = &src[start..];
+        let end = rest
+            .find("pub fn wait_settle")
+            .expect("wait_settle follows");
+        let body = &rest[..end];
+        assert!(
+            body.contains("client_rect") && body.contains("move_to") && body.contains("center()"),
+            "untargeted scroll must move to the FG client centre:\n{body}"
+        );
+        assert!(
+            body.contains("no foreground window") || body.contains("no foreground client"),
+            "untargeted scroll must name a missing-window refusal:\n{body}"
+        );
+        assert!(
+            body.contains("hover_inner") && body.contains("req.x") && body.contains("req.y"),
+            "targeted scroll must keep --x/--y hover-first:\n{body}"
         );
     }
 

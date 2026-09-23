@@ -12,7 +12,7 @@ use windows::core::BOOL;
 
 use crate::error::HandsError;
 
-pub const CELL_PX: i32 = 100;
+pub const CELL_PX: i32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
@@ -298,11 +298,11 @@ mod tests {
     fn grid_negative_origin_cell_id() {
         let space = Space::new(-1920, 0, 3840, 1080).unwrap();
         assert_eq!(space.cell_id(-1920, 0), "g:0:0");
-        assert_eq!(space.cell_id(-1821, 0), "g:0:0");
-        assert_eq!(space.cell_id(-1820, 0), "g:1:0");
-        assert_eq!(space.cell_id(-1, 99), "g:19:0");
-        assert_eq!(space.cell_id(0, 0), "g:19:0");
-        assert_eq!(space.cell_id(0, 100), "g:19:1");
+        assert_eq!(space.cell_id(-1911, 0), "g:0:0");
+        assert_eq!(space.cell_id(-1910, 0), "g:1:0");
+        assert_eq!(space.cell_id(-1, 9), "g:191:0");
+        assert_eq!(space.cell_id(0, 0), "g:192:0");
+        assert_eq!(space.cell_id(0, 10), "g:192:1");
     }
 
     #[test]
@@ -315,7 +315,7 @@ mod tests {
             h: 56,
         };
         assert_eq!(rect.center(), (497, 648));
-        assert_eq!(space.cell_id_of_center(rect), "g:4:6");
+        assert_eq!(space.cell_id_of_center(rect), "g:49:64");
     }
 
     #[test]
@@ -328,7 +328,7 @@ mod tests {
             h: 2,
         };
         assert_eq!(rect.center(), (0, 0));
-        assert_eq!(space.cell_id_of_center(rect), "g:19:0");
+        assert_eq!(space.cell_id_of_center(rect), "g:192:0");
     }
 
     #[test]
@@ -339,44 +339,57 @@ mod tests {
             Rect {
                 x: -1920,
                 y: -200,
-                w: 100,
-                h: 100
+                w: 10,
+                h: 10
             }
         );
     }
 
     #[test]
     fn grid_last_partial_cell() {
-        let space = Space::new(0, 0, 250, 180).unwrap();
+        let space = Space::new(0, 0, 255, 185).unwrap();
         assert_eq!(
-            space.cell_rect(2, 0),
+            space.cell_rect(25, 0),
             Rect {
-                x: 200,
+                x: 250,
                 y: 0,
-                w: 50,
-                h: 100
+                w: 5,
+                h: 10
             }
         );
         assert_eq!(
-            space.cell_rect(0, 1),
+            space.cell_rect(0, 18),
             Rect {
                 x: 0,
-                y: 100,
-                w: 100,
-                h: 80
+                y: 180,
+                w: 10,
+                h: 5
             }
         );
         assert_eq!(
-            space.cell_rect(2, 1),
+            space.cell_rect(25, 18),
             Rect {
-                x: 200,
-                y: 100,
-                w: 50,
-                h: 80
+                x: 250,
+                y: 180,
+                w: 5,
+                h: 5
             }
         );
-        assert_eq!(space.cell_id(249, 179), "g:2:1");
-        assert_eq!(space.cell_rect(2, 1).center(), (225, 140));
+        assert_eq!(space.cell_id(254, 184), "g:25:18");
+        assert_eq!(space.cell_rect(25, 18).center(), (252, 182));
+    }
+
+    #[test]
+    fn large_screen_arithmetic_no_panic() {
+        for (width, height) in [(3840, 2160), (5120, 1440)] {
+            let space = Space::new(0, 0, width, height).unwrap();
+            assert_eq!(space.cell_px, CELL_PX);
+            let last = space.cell_rect((width - 1) / CELL_PX, (height - 1) / CELL_PX);
+            assert!(last.area() > 0, "{width}x{height} last={last:?}");
+            assert!(space.contains(last), "{width}x{height} last={last:?}");
+            let id = space.cell_id(width - 1, height - 1);
+            assert!(id.starts_with("g:"), "{id}");
+        }
     }
 
     #[test]
@@ -399,7 +412,7 @@ mod tests {
         assert!(!space.contains_point(1920, 1079));
         assert!(!space.contains_point(1919, 1080));
         assert!(!space.contains_point(-1921, 0));
-        let last = space.cell_rect(38, 10);
+        let last = space.cell_rect(383, 107);
         assert!(last.area() > 0);
         assert!(space.contains(last));
     }

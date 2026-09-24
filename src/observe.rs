@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-use crate::capture::{capture_virtual_screen, display_path, observe_dir};
+use crate::capture::{capture_virtual_screen_timed, display_path, observe_dir};
 use crate::challenge::{self, ChallengeInfo};
 use crate::chrome;
 use crate::error::HandsError;
@@ -241,9 +241,19 @@ pub struct ObserveTiming {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screenshot_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blit_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preprocess_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uia_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serialize_ms: Option<u64>,
 }
 
 fn observe_timing_requested() -> bool {
@@ -457,9 +467,8 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let session_id = resolve_session_id_from_os(req.session_id.as_deref());
     logs::check_write_id(&session_id)?;
     let space = virtual_screen()?;
-    let shot_t = Instant::now();
-    let paths = capture_virtual_screen(space)?;
-    let screenshot_ms = shot_t.elapsed().as_millis() as u64;
+    let (paths, cap_t) = capture_virtual_screen_timed(space)?;
+    let screenshot_ms = cap_t.screenshot_ms();
     let screenshot_path = display_path(&paths.screenshot_path);
     let observe_path = display_path(&paths.observe_path);
 
@@ -467,11 +476,19 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let inventory = foreground::titled_windows();
     let plan = plan_observe_target(req.window.as_deref(), &inventory, fg)?;
     let uia_t = Instant::now();
-    let snap = uia::collect(req.detail, plan.walk_hwnd)?;
-    let uia_ms = uia_t.elapsed().as_millis() as u64;
+    let detail = req.detail;
+    let walk_hwnd = plan.walk_hwnd;
+    let uia_h = std::thread::Builder::new()
+        .name("hands-uia-overlap".into())
+        .spawn(move || uia::collect(detail, walk_hwnd))
+        .map_err(|err| HandsError::Uia(format!("spawn UIA overlap: {err}")))?;
     let chrome_t = Instant::now();
     let chrome_outcome = chrome::try_snapshot(req.detail);
     let chrome_ms = chrome_t.elapsed().as_millis() as u64;
+    let snap = uia_h
+        .join()
+        .map_err(|_| HandsError::Uia("UIA overlap thread panicked".to_string()))??;
+    let uia_ms = uia_t.elapsed().as_millis() as u64;
     let chrome_connected = chrome_outcome.host_up();
     let chrome_hint = chrome_outcome.chrome_hint();
     let chrome = chrome_outcome.into_map();
@@ -482,10 +499,12 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         virtual_screen: Some(space.as_rect()),
         popup_rect: snap.popup_rect,
     };
+    let fusion_t = Instant::now();
     let (mut extract, mut elements, elements_total, _) =
         fuse_maps(req.detail, &snap.title, &snap.nodes, chrome, opts);
     crate::dialogs::promote(&mut extract, &mut elements);
     stamp_grid(space, &mut elements);
+    let fusion_ms = fusion_t.elapsed().as_millis() as u64;
     crate::fence::note_last_url(extract.url.as_deref());
     let cards_walked = extract.cards_walked;
     let hit = challenge::detect_from_extract(
@@ -522,22 +541,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
             ..ObserveCardCounts::default()
         },
     };
-    let pre_ms = started.elapsed().as_millis() as u64;
-    let sidecar_timing = observe_timing_requested().then(|| ObserveTiming {
-        duration_ms: pre_ms,
-        envelope_bytes: Some(serialized_len(&full) as u64),
-        screenshot_ms: Some(screenshot_ms),
-        uia_ms: Some(uia_ms),
-        chrome_ms: Some(chrome_ms),
-    });
-    write_sidecar(
-        &paths.observe_path,
-        &full,
-        opts.popup_rect,
-        opts.client,
-        sidecar_timing,
-        &inventory,
-    )?;
+    let sidecar_full = full.clone();
     let envelope = match req.detail {
         Detail::Default => {
             retain_hittable_centers(&mut full.elements, &opts);
@@ -546,8 +550,30 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         }
         Detail::Dom => finalize_envelope(full)?,
     };
-    let duration_ms = started.elapsed().as_millis() as u64;
+    let serialize_t = Instant::now();
     let envelope_bytes = serialized_len(&envelope) as u64;
+    let serialize_ms = serialize_t.elapsed().as_millis() as u64;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let sidecar_timing = observe_timing_requested().then_some(ObserveTiming {
+        duration_ms,
+        envelope_bytes: Some(envelope_bytes),
+        screenshot_ms: Some(screenshot_ms),
+        blit_ms: Some(cap_t.blit_ms),
+        preprocess_ms: Some(cap_t.preprocess_ms),
+        encode_ms: Some(cap_t.encode_ms),
+        uia_ms: Some(uia_ms),
+        chrome_ms: Some(chrome_ms),
+        fusion_ms: Some(fusion_ms),
+        serialize_ms: Some(serialize_ms),
+    });
+    write_sidecar(
+        &paths.observe_path,
+        &sidecar_full,
+        opts.popup_rect,
+        opts.client,
+        sidecar_timing,
+        &inventory,
+    )?;
     logs::ensure_installed();
     logs::remember_session(&envelope.session_id);
     let _ = logs::record_observe_row(
@@ -559,8 +585,13 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
             duration_ms: Some(duration_ms),
             envelope_bytes: Some(envelope_bytes),
             screenshot_ms: Some(screenshot_ms),
+            blit_ms: Some(cap_t.blit_ms),
+            preprocess_ms: Some(cap_t.preprocess_ms),
+            encode_ms: Some(cap_t.encode_ms),
             uia_ms: Some(uia_ms),
             chrome_ms: Some(chrome_ms),
+            fusion_ms: Some(fusion_ms),
+            serialize_ms: Some(serialize_ms),
         },
     );
     crate::cooldown::note_observe(&envelope.session_id);
@@ -2827,7 +2858,7 @@ mod tests {
     }
 
     #[test]
-    fn observe_writes_sidecar_before_retain_before_cap() {
+    fn observe_sidecar_is_pre_cap_clone_written_after_finalize() {
         let src = include_str!("observe.rs");
         let start = src.find("pub fn observe(").expect("observe");
         let end = src.find("fn stamp_grid(").expect("stamp_grid");
@@ -2837,16 +2868,21 @@ mod tests {
             !slice.contains("#[cfg(test)]") && !slice.contains("mod tests"),
             "slice must not include tests:\n{slice}"
         );
-        let sidecar = slice.find("write_sidecar").expect("write_sidecar");
+        let clone = slice.find("sidecar_full").expect("sidecar_full clone");
         let retain = slice
             .find("retain_hittable_centers")
             .expect("retain_hittable_centers");
         let cap = slice
             .find("cap_default_envelope")
             .expect("cap_default_envelope");
+        let sidecar = slice.find("write_sidecar(").expect("write_sidecar call");
         assert!(
-            sidecar < retain && retain < cap,
-            "write_sidecar before retain before cap:\n{slice}"
+            clone < retain && retain < cap && cap < sidecar,
+            "clone pre-cap sidecar before retain; write after cap:\n{slice}"
+        );
+        assert!(
+            slice.contains("&sidecar_full"),
+            "sidecar write must use the pre-retain clone"
         );
         assert_eq!(
             slice.matches("foreground_hwnd()").count(),
@@ -4018,11 +4054,13 @@ mod tests {
         assert!(!mcp.contains("resource_link"));
         let agents = include_str!("../AGENTS.md");
         assert!(agents.contains("include_screenshot_path"));
+        assert!(agents.contains("blit/preprocess/encode") || agents.contains("blit_ms"));
         assert!(agents.contains("cards_walked"));
         assert!(agents.contains("cards_total") || agents.contains("cards_omitted"));
         assert!(agents.contains("--from"));
         let readme = include_str!("../README.md");
         assert!(readme.contains("include_screenshot_path"));
+        assert!(readme.contains("blit/preprocess/encode") || readme.contains("full pipeline"));
         assert!(readme.contains("--from"));
         assert!(readme.contains("cards_walked"));
         assert!(readme.contains("cards_total") || readme.contains("cards_omitted"));
@@ -4141,5 +4179,200 @@ mod tests {
                 .contains("apply_card_offset"),
             "detail=dom must ignore card_offset"
         );
+    }
+
+    #[test]
+    fn observe_overlaps_uia_collect_with_chrome_snapshot() {
+        let src = include_str!("observe.rs");
+        let live = src
+            .split("pub fn observe(req: ObserveRequest)")
+            .nth(1)
+            .and_then(|s| s.split("fn stamp_grid").next())
+            .expect("observe fn");
+        let spawn = live.find("hands-uia-overlap").expect("overlap thread name");
+        let collect = live.find("uia::collect").expect("uia::collect");
+        let snapshot = live
+            .find("chrome::try_snapshot")
+            .expect("chrome::try_snapshot");
+        let join = live.find(".join()").expect("join UIA thread");
+        assert!(
+            spawn < collect && collect < snapshot && snapshot < join,
+            "UIA collect must run overlapped with try_snapshot:\n{live}"
+        );
+        assert!(
+            live.contains("popup_rect: snap.popup_rect"),
+            "overlap must still feed UIA popup_rect"
+        );
+        assert!(
+            !live.contains("capture_roi"),
+            "observe PNG stays virtual-screen"
+        );
+    }
+
+    #[test]
+    fn observe_does_not_inner_retry_chrome_snapshot() {
+        let src = include_str!("observe.rs");
+        let live = src
+            .split("pub fn observe(req: ObserveRequest)")
+            .nth(1)
+            .and_then(|s| s.split("fn stamp_grid").next())
+            .expect("observe fn");
+        let after = live
+            .split("chrome::try_snapshot")
+            .nth(1)
+            .expect("after try_snapshot");
+        assert!(
+            !after.contains("try_snapshot"),
+            "observe must not retry try_snapshot:\n{after}"
+        );
+        assert!(
+            !after.contains("sleep(") && !after.contains("thread::sleep"),
+            "observe must not sleep after try_snapshot:\n{after}"
+        );
+        let chrome_src = include_str!("chrome.rs");
+        assert!(
+            chrome_src.contains("CLIENT_TIMEOUT_MS") && chrome_src.contains("400"),
+            "CLIENT_TIMEOUT_MS stays 400"
+        );
+        assert_eq!(crate::native_host::CLIENT_TIMEOUT_MS, 400);
+    }
+
+    #[test]
+    fn sidecar_timing_duration_is_written_after_finalize() {
+        let src = include_str!("observe.rs");
+        let live = src
+            .split("pub fn observe(req: ObserveRequest)")
+            .nth(1)
+            .and_then(|s| s.split("fn stamp_grid").next())
+            .expect("observe fn");
+        let finalize = live.find("finalize_envelope").expect("finalize");
+        let sidecar = live.find("write_sidecar(").expect("write_sidecar call");
+        assert!(
+            finalize < sidecar,
+            "sidecar timing.duration_ms must be the full pipeline:\n{live}"
+        );
+        assert!(
+            live.contains("sidecar_full"),
+            "sidecar must keep the pre-cap record"
+        );
+    }
+
+    #[test]
+    fn observe_timing_omits_split_when_none() {
+        let bare = ObserveTiming {
+            duration_ms: 100,
+            envelope_bytes: Some(50),
+            screenshot_ms: Some(10),
+            blit_ms: None,
+            preprocess_ms: None,
+            encode_ms: None,
+            uia_ms: Some(20),
+            chrome_ms: Some(5),
+            fusion_ms: None,
+            serialize_ms: None,
+        };
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(v.get("blit_ms").is_none(), "{v}");
+        assert!(v.get("fusion_ms").is_none(), "{v}");
+        let split = ObserveTiming {
+            blit_ms: Some(3),
+            preprocess_ms: Some(4),
+            encode_ms: Some(3),
+            fusion_ms: Some(1),
+            serialize_ms: Some(2),
+            ..bare
+        };
+        let v = serde_json::to_value(&split).unwrap();
+        assert_eq!(v["blit_ms"], 3);
+        assert_eq!(v["preprocess_ms"], 4);
+        assert_eq!(v["encode_ms"], 3);
+        assert_eq!(v["fusion_ms"], 1);
+        assert_eq!(v["serialize_ms"], 2);
+    }
+
+    #[test]
+    fn mcp_default_keeps_windows_and_observe_path_load_bearing() {
+        let mut env = fat_envelope(4);
+        env.windows = (0..12)
+            .map(|i| DesktopWindow {
+                pid: 1000 + i as u32,
+                title: format!("Window {i} title padded xx"),
+                state: WindowState::Normal,
+                hwnd: format!("{i:x}"),
+                rect: Some(Rect {
+                    x: 0,
+                    y: 0,
+                    w: 100,
+                    h: 40,
+                }),
+            })
+            .collect();
+        env.windows_total = 12;
+        let mcp = serialize_mcp_envelope(&env, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&mcp).unwrap();
+        assert!(
+            parsed.get("screenshot_path").is_none(),
+            "MCP default omits screenshot_path"
+        );
+        assert!(
+            parsed.get("observe_path").is_some(),
+            "observe_path is load-bearing for --from"
+        );
+        let windows = parsed["windows"]
+            .as_array()
+            .expect("windows stay on MCP default");
+        assert_eq!(windows.len(), 12, "hwnd inventory is load-bearing");
+        let mut stripped = env.clone();
+        stripped.windows.clear();
+        let without = serialize_mcp_envelope(&stripped, false).unwrap().len();
+        assert!(
+            mcp.len() > without,
+            "windows cost {} vs {} without",
+            mcp.len(),
+            without
+        );
+        eprintln!(
+            "0110 MCP bytes with windows={} without={} delta={}",
+            mcp.len(),
+            without,
+            mcp.len() - without
+        );
+    }
+
+    #[test]
+    fn phase0_fixture_chrome_stage_samples() {
+        let g = chrome::EnvGuard::lock();
+        let fixtures = [
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/chrome-spa-autocomplete.json"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/chrome-srp-mixed.json"),
+        ];
+        for path in &fixtures {
+            g.set_snapshot(Some(path));
+            let mut samples = Vec::new();
+            for _ in 0..8 {
+                let t = Instant::now();
+                let outcome = chrome::try_snapshot(Detail::Default);
+                assert!(
+                    outcome.into_map().is_some(),
+                    "fixture must parse {}",
+                    path.display()
+                );
+                samples.push(t.elapsed().as_millis() as u64);
+            }
+            samples.sort_unstable();
+            let median = samples[samples.len() / 2];
+            eprintln!(
+                "0110 chrome fixture {} n={} min={} median={} max={} ms {:?}",
+                path.file_name().unwrap().to_string_lossy(),
+                samples.len(),
+                samples[0],
+                median,
+                samples[samples.len() - 1],
+                samples
+            );
+            assert_eq!(samples.len(), 8);
+        }
     }
 }

@@ -105,9 +105,19 @@ pub struct LogObserve {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screenshot_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blit_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preprocess_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uia_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serialize_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -444,8 +454,13 @@ pub fn record_observe(
             duration_ms: None,
             envelope_bytes: None,
             screenshot_ms: None,
+            blit_ms: None,
+            preprocess_ms: None,
+            encode_ms: None,
             uia_ms: None,
             chrome_ms: None,
+            fusion_ms: None,
+            serialize_ms: None,
         },
     )
 }
@@ -1024,8 +1039,13 @@ mod tests {
                     duration_ms: Some(42),
                     envelope_bytes: Some(1200),
                     screenshot_ms: Some(10),
+                    blit_ms: Some(3),
+                    preprocess_ms: Some(4),
+                    encode_ms: Some(3),
                     uia_ms: Some(20),
                     chrome_ms: Some(5),
+                    fusion_ms: Some(1),
+                    serialize_ms: Some(1),
                 },
             )
             .unwrap();

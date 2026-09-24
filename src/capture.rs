@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use image::RgbaImage;
 
@@ -23,14 +23,45 @@ pub struct CapturePaths {
     pub observe_path: PathBuf,
 }
 
+/// BitBlt vs `for_vlm` vs PNG encode+disk. `screenshot_ms` is their sum.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureTiming {
+    pub blit_ms: u64,
+    pub preprocess_ms: u64,
+    pub encode_ms: u64,
+}
+
+impl CaptureTiming {
+    pub fn screenshot_ms(self) -> u64 {
+        self.blit_ms
+            .saturating_add(self.preprocess_ms)
+            .saturating_add(self.encode_ms)
+    }
+}
+
 /// Capture the virtual-screen union via GDI BitBlt and write an unlabeled PNG.
 pub fn capture_virtual_screen(space: Space) -> Result<CapturePaths, HandsError> {
+    Ok(capture_virtual_screen_timed(space)?.0)
+}
+
+pub fn capture_virtual_screen_timed(
+    space: Space,
+) -> Result<(CapturePaths, CaptureTiming), HandsError> {
     ensure_dpi()?;
     let (width, height) = dims(space)?;
+    let blit_t = Instant::now();
     let pixels = blit_rect(space.origin_x, space.origin_y, width, height)?;
+    let blit_ms = blit_t.elapsed().as_millis() as u64;
     let paths = observe_paths()?;
-    write_png(&paths.screenshot_path, width, height, pixels)?;
-    Ok(paths)
+    let (preprocess_ms, encode_ms) = write_png(&paths.screenshot_path, width, height, pixels)?;
+    Ok((
+        paths,
+        CaptureTiming {
+            blit_ms,
+            preprocess_ms,
+            encode_ms,
+        },
+    ))
 }
 
 /// In-memory RGBA ROI. No file. Clip to `virtual_screen`. Reject zero area.
@@ -139,13 +170,23 @@ fn read_bgra(hdc: HDC, bitmap: HBITMAP, width: i32, height: i32) -> Result<Vec<u
     Ok(buf)
 }
 
-fn write_png(path: &Path, width: i32, height: i32, pixels: Vec<u8>) -> Result<(), HandsError> {
+fn write_png(
+    path: &Path,
+    width: i32,
+    height: i32,
+    pixels: Vec<u8>,
+) -> Result<(u64, u64), HandsError> {
+    let prep_t = Instant::now();
     let img = RgbaImage::from_raw(width as u32, height as u32, pixels).ok_or_else(|| {
         HandsError::Capture("pixel buffer size does not match virtual-screen size".to_string())
     })?;
     let img = crate::preprocess::for_vlm(img);
+    let preprocess_ms = prep_t.elapsed().as_millis() as u64;
+    let enc_t = Instant::now();
     img.save(path)
-        .map_err(|err| HandsError::Capture(format!("PNG encode failed: {err}")))
+        .map_err(|err| HandsError::Capture(format!("PNG encode failed: {err}")))?;
+    let encode_ms = enc_t.elapsed().as_millis() as u64;
+    Ok((preprocess_ms, encode_ms))
 }
 
 pub(crate) fn observe_dir() -> Result<PathBuf, HandsError> {
@@ -254,6 +295,16 @@ impl Drop for RestoreSelect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_timing_screenshot_ms_is_sum() {
+        let t = CaptureTiming {
+            blit_ms: 10,
+            preprocess_ms: 20,
+            encode_ms: 5,
+        };
+        assert_eq!(t.screenshot_ms(), 35);
+    }
 
     #[test]
     fn utc_epoch() {

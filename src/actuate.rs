@@ -94,6 +94,8 @@ pub struct ActivateEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub challenge: Option<ChallengeInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
@@ -145,6 +147,7 @@ struct ActivateHooks {
     inventory: fn() -> Vec<foreground::TitledWindow>,
     offer: fn(Option<isize>, (i32, i32)) -> bool,
     foreground: fn() -> Option<isize>,
+    is_live: fn(isize) -> bool,
 }
 
 impl ActivateHooks {
@@ -153,7 +156,22 @@ impl ActivateHooks {
             inventory: foreground::titled_windows,
             offer: foreground::offer,
             foreground: foreground::foreground_hwnd,
+            is_live: foreground::is_live_hwnd,
         }
+    }
+}
+
+fn classify_activate_reason(
+    hwnd: isize,
+    fg: Option<isize>,
+    is_live: fn(isize) -> bool,
+) -> &'static str {
+    if !is_live(hwnd) {
+        "stale_hwnd"
+    } else if fg.is_none() {
+        "no_foreground_window"
+    } else {
+        "os_refused"
     }
 }
 
@@ -250,6 +268,7 @@ fn activate_with(
             window: None,
             frozen: lease::is_frozen(),
             error: Some(YIELD_ERROR.into()),
+            reason: None,
             challenge: Some(challenge::snapshot()),
             attempt: None,
             cooldown_ms: None,
@@ -270,6 +289,7 @@ fn activate_with(
             } else {
                 "session cooling — honor cooldown_ms; do not retry yet".into()
             }),
+            reason: None,
             challenge: None,
             attempt: None,
             cooldown_ms: None,
@@ -288,6 +308,7 @@ fn activate_with(
                 window: None,
                 frozen: false,
                 error: Some(err.tool_message()),
+                reason: None,
                 challenge: None,
                 attempt: None,
                 cooldown_ms: None,
@@ -301,8 +322,14 @@ fn activate_with(
         Some(r) => (r.x + r.w / 2, r.y + r.h / 2),
         None => (0, 0),
     };
-    let offered = (hooks.offer)(Some(hit.hwnd), center);
-    let foregrounded = offered && (hooks.foreground)() == Some(hit.hwnd);
+    let _ = (hooks.offer)(Some(hit.hwnd), center);
+    let fg = (hooks.foreground)();
+    let foregrounded = fg == Some(hit.hwnd);
+    let reason = if foregrounded {
+        None
+    } else {
+        Some(classify_activate_reason(hit.hwnd, fg, hooks.is_live).into())
+    };
     finish_activate(ActivateEnvelope {
         session_id,
         ok: true,
@@ -314,6 +341,7 @@ fn activate_with(
         }),
         frozen: false,
         error: None,
+        reason,
         challenge: None,
         attempt: None,
         cooldown_ms: None,
@@ -2160,6 +2188,7 @@ mod tests {
                 inventory: crate::foreground::titled_windows,
                 offer: offer_ok,
                 foreground: fg_ok,
+                is_live: |_| true,
             },
         )
         .expect("activate");
@@ -2167,6 +2196,7 @@ mod tests {
         lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(env.foregrounded);
+        assert_eq!(env.reason, None);
         assert_eq!(OFFERS.load(Ordering::SeqCst), 1);
         assert_eq!(env.window.as_ref().map(|w| w.hwnd.as_str()), Some("11"));
         assert_eq!(env.window.as_ref().map(|w| w.pid), Some(99));
@@ -2194,6 +2224,7 @@ mod tests {
                 inventory: crate::foreground::titled_windows,
                 offer: offer_count,
                 foreground: || None,
+                is_live: |_| true,
             },
         )
         .expect("ambiguous");
@@ -2211,6 +2242,7 @@ mod tests {
                 inventory: crate::foreground::titled_windows,
                 offer: offer_count,
                 foreground: || None,
+                is_live: |_| true,
             },
         )
         .expect("stale");
@@ -2251,6 +2283,7 @@ mod tests {
                 inventory: crate::foreground::titled_windows,
                 offer: offer_count,
                 foreground: || Some(0x11),
+                is_live: |_| true,
             },
         )
         .expect("yield envelope");
@@ -2364,6 +2397,7 @@ mod tests {
                 inventory: crate::foreground::titled_windows,
                 offer: offer_count,
                 foreground: || Some(0x11),
+                is_live: |_| true,
             },
         )
         .expect("frozen envelope");
@@ -2379,5 +2413,171 @@ mod tests {
             Some(crate::cooldown::GUIDANCE_FROZEN)
         );
         assert_eq!(OFFERS.load(Ordering::SeqCst), 0);
+    }
+
+    fn live_always(_: isize) -> bool {
+        true
+    }
+
+    fn live_never(_: isize) -> bool {
+        false
+    }
+
+    fn offer_false(_: Option<isize>, _: (i32, i32)) -> bool {
+        false
+    }
+
+    #[test]
+    fn classify_activate_reason_table() {
+        assert_eq!(
+            classify_activate_reason(0x11, None, live_never),
+            "stale_hwnd"
+        );
+        assert_eq!(
+            classify_activate_reason(0x11, None, live_always),
+            "no_foreground_window"
+        );
+        assert_eq!(
+            classify_activate_reason(0x11, Some(0x22), live_always),
+            "os_refused"
+        );
+    }
+
+    #[test]
+    fn activate_already_fg_is_foregrounded_even_when_offer_fails() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
+        let env = activate_with(
+            Some("s-act-already-fg".into()),
+            "hwnd:11".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_false,
+                foreground: || Some(0x11),
+                is_live: live_always,
+            },
+        )
+        .expect("activate");
+        crate::foreground::set_titled_windows_hook(None);
+        lease::reset_for_test();
+        assert!(env.ok, "{env:?}");
+        assert!(env.foregrounded, "{env:?}");
+        assert_eq!(env.reason, None);
+        assert_eq!(env.error, None);
+    }
+
+    #[test]
+    fn activate_offer_fail_no_fg_is_no_foreground_window() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
+        let env = activate_with(
+            Some("s-act-no-fg".into()),
+            "hwnd:11".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_false,
+                foreground: || None,
+                is_live: live_always,
+            },
+        )
+        .expect("activate");
+        crate::foreground::set_titled_windows_hook(None);
+        lease::reset_for_test();
+        assert!(env.ok, "{env:?}");
+        assert!(!env.foregrounded, "{env:?}");
+        assert_eq!(env.reason.as_deref(), Some("no_foreground_window"));
+        assert_eq!(env.error, None);
+    }
+
+    #[test]
+    fn activate_offer_fail_other_fg_is_os_refused() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
+        let env = activate_with(
+            Some("s-act-os-refused".into()),
+            "hwnd:11".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_false,
+                foreground: || Some(0x22),
+                is_live: live_always,
+            },
+        )
+        .expect("activate");
+        crate::foreground::set_titled_windows_hook(None);
+        lease::reset_for_test();
+        assert!(env.ok, "{env:?}");
+        assert!(!env.foregrounded, "{env:?}");
+        assert_eq!(env.reason.as_deref(), Some("os_refused"));
+        assert_eq!(env.error, None);
+    }
+
+    #[test]
+    fn activate_dead_hwnd_after_resolve_is_stale_hwnd() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
+        let env = activate_with(
+            Some("s-act-dead".into()),
+            "hwnd:11".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_false,
+                foreground: || Some(0x22),
+                is_live: live_never,
+            },
+        )
+        .expect("activate");
+        crate::foreground::set_titled_windows_hook(None);
+        lease::reset_for_test();
+        assert!(env.ok, "{env:?}");
+        assert!(!env.foregrounded, "{env:?}");
+        assert_eq!(env.reason.as_deref(), Some("stale_hwnd"));
+        assert_eq!(env.error, None);
+    }
+
+    #[test]
+    fn activate_envelope_omits_reason_when_none() {
+        let env = ActivateEnvelope {
+            session_id: "s".into(),
+            ok: true,
+            foregrounded: true,
+            window: None,
+            frozen: false,
+            error: None,
+            reason: None,
+            challenge: None,
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
+        };
+        let json = serialize_activate(&env).expect("json");
+        assert!(!json.contains("\"reason\""), "{json}");
+        assert!(!json.contains("\"error\""), "{json}");
+    }
+
+    #[test]
+    fn activate_envelope_includes_reason() {
+        let env = ActivateEnvelope {
+            session_id: "s".into(),
+            ok: true,
+            foregrounded: false,
+            window: None,
+            frozen: false,
+            error: None,
+            reason: Some("os_refused".into()),
+            challenge: None,
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
+        };
+        let json = serialize_activate(&env).expect("json");
+        assert!(json.contains("\"reason\":\"os_refused\""), "{json}");
+        assert!(!json.contains("\"error\""), "{json}");
     }
 }

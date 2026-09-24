@@ -6,10 +6,10 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOT, GW_ENABLEDPOPUP, GW_OWNER, GetAncestor, GetClassNameW, GetClientRect,
-    GetForegroundWindow, GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_RESTORE, SetForegroundWindow, ShowWindow,
-    WindowFromPoint,
+    BringWindowToTop, EnumWindows, GA_ROOT, GW_ENABLEDPOPUP, GW_OWNER, GetAncestor, GetClassNameW,
+    GetClientRect, GetForegroundWindow, GetWindow, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_RESTORE,
+    SetForegroundWindow, ShowWindow, WindowFromPoint,
 };
 
 use crate::space::Rect;
@@ -92,11 +92,15 @@ fn attach_retry(hwnd: HWND) -> bool {
         return false;
     }
     let fg_tid = unsafe { GetWindowThreadProcessId(fg, None) };
+    let target_tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
     let cur = unsafe { GetCurrentThreadId() };
-    if fg_tid == 0 || fg_tid == cur {
-        return unsafe { SetForegroundWindow(hwnd) }.as_bool();
+    let _fg = (fg_tid != 0 && fg_tid != cur).then(|| AttachGuard::connect(fg_tid, cur));
+    let _target = (target_tid != 0 && target_tid != cur && target_tid != fg_tid)
+        .then(|| AttachGuard::connect(target_tid, cur));
+    if unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+        return true;
     }
-    let _attach = AttachGuard::connect(fg_tid, cur);
+    let _ = unsafe { BringWindowToTop(hwnd) };
     unsafe { SetForegroundWindow(hwnd) }.as_bool()
 }
 
@@ -535,6 +539,32 @@ unsafe extern "system" fn collect_top_level(hwnd: HWND, lparam: LPARAM) -> windo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_retry_dual_attach_and_no_forbidden_apis() {
+        let src = include_str!("foreground.rs");
+        let start = src.find("fn attach_retry").expect("attach_retry");
+        let rest = &src[start..];
+        let end = rest
+            .find("struct AttachGuard")
+            .expect("AttachGuard follows");
+        let body = &rest[..end];
+        assert!(
+            body.contains("target_tid") && body.matches("AttachGuard::connect").count() >= 2,
+            "attach_retry must attach FG and target threads:\n{body}"
+        );
+        assert!(
+            body.contains("BringWindowToTop"),
+            "attach_retry may BringWindowToTop after dual-attach fails:\n{body}"
+        );
+        assert!(
+            !body.contains("SwitchToThisWindow")
+                && !body.contains("SendInput")
+                && !body.contains("SPI_SETFOREGROUNDLOCKTIMEOUT")
+                && !body.contains("AllowSetForegroundWindow"),
+            "attach_retry must not use declined raise APIs:\n{body}"
+        );
+    }
 
     #[test]
     fn chrome_class_is_widget_win_1_not_zero() {

@@ -118,6 +118,8 @@ pub struct ExecutedStep {
     pub navigated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -167,6 +169,7 @@ pub struct StepOutcome {
     pub id: Option<String>,
     pub name: Option<String>,
     pub window: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +316,7 @@ pub fn sequence_with(
                         miss: None,
                         navigated: false,
                         settled: None,
+                        reason: None,
                     });
                     if hooks.record_steps {
                         record_step(&session_id, "observe", true, None, None)?;
@@ -329,6 +333,7 @@ pub fn sequence_with(
                         miss: None,
                         navigated: false,
                         settled: None,
+                        reason: None,
                     });
                     if hooks.record_steps {
                         record_step(
@@ -384,6 +389,7 @@ pub fn sequence_with(
                     miss: None,
                     navigated: false,
                     settled: None,
+                    reason: None,
                 });
                 if hooks.record_steps {
                     record_step(&session_id, step.tool(), false, Some(&msg), type_len(step))?;
@@ -740,6 +746,7 @@ fn compact_row(step: &SequenceStep, outcome: &StepOutcome) -> ExecutedStep {
             SequenceStep::WaitSettle { .. } => outcome.settled,
             _ => None,
         },
+        reason: outcome.reason.clone(),
     }
 }
 
@@ -871,6 +878,7 @@ fn from_actuate(env: ActuateEnvelope) -> StepOutcome {
         settled: Some(env.settled),
         miss: env.miss,
         navigated: env.navigated,
+        reason: None,
         error: env.error,
         fence: env.fence,
         challenge: env.challenge,
@@ -894,6 +902,7 @@ fn from_activate(env: ActivateEnvelope) -> StepOutcome {
         id: None,
         name: None,
         window: env.window.map(|w| format!("hwnd:{}", w.hwnd)),
+        reason: env.reason,
     }
 }
 
@@ -1149,6 +1158,30 @@ mod tests {
     }
 
     #[test]
+    fn activate_os_refused_reason_still_aborts_and_is_surfaced() {
+        let mut hooks = test_hooks();
+        hooks.activate = |_, _| {
+            Ok(StepOutcome {
+                ok: true,
+                foregrounded: Some(false),
+                reason: Some("os_refused".into()),
+                ..StepOutcome::default()
+            })
+        };
+        let env = run_hooks(
+            "seq-activate-reason",
+            json!([
+                {"tool":"activate","window":"hwnd:1"},
+                {"tool":"type","text":"bleed"}
+            ]),
+            hooks,
+        );
+        assert_eq!(env.stop_reason, StopReason::FocusLost);
+        assert_eq!(env.executed_steps[0].reason.as_deref(), Some("os_refused"));
+        assert_eq!(tools(&env), vec!["activate"]);
+    }
+
+    #[test]
     fn activate_resolve_fail_is_prerequisite() {
         let mut hooks = test_hooks();
         hooks.activate = |_, _| {
@@ -1388,6 +1421,7 @@ mod tests {
                     miss: None,
                     navigated: false,
                     settled: Some(true),
+                    reason: None,
                 })
                 .collect(),
             fence: None,

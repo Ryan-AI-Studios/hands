@@ -135,7 +135,7 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Raise a titled window by the same selector as observe --window (pid, unique title, or hwnd:<hex>). Not observe. Not confirm-gated. Installs the desk lease.
+    /// Raise a titled window by the same selector as observe --window (pid, unique title, or hwnd:<hex>). Not observe. Not confirm-gated. Installs the desk lease. `ok:true` is delivery; `foregrounded` is honest. When `foregrounded:false` after a resolved window, `reason` is `stale_hwnd` / `no_foreground_window` / `os_refused` (not `error`).
     Activate {
         /// pid, unique title substring, or hwnd:<hex> (optional 0x)
         #[arg(long)]
@@ -884,6 +884,10 @@ mod tests {
             .expect("activate subcommand");
         let help = activate.clone().render_long_help().to_string();
         assert!(help.contains("hwnd:"), "activate help names hwnd:\n{help}");
+        assert!(
+            help.contains("reason"),
+            "activate help should mention reason:\n{help}"
+        );
     }
 
     #[test]

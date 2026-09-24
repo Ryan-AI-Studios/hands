@@ -25,6 +25,7 @@ const CONTROL_LEXICON: &[&str] = &[
 ];
 const PAGINATION_LEXICON: &[&str] = &["next", "previous", "prev", "page"];
 const FILTER_CHIP_LEXICON: &[&str] = &["filter", "sort"];
+const SUGGESTION_RESERVE_CAP: usize = 8;
 const CONTROL_ROLES: &[&str] = &[
     "Edit",
     "ComboBox",
@@ -740,17 +741,24 @@ fn promote_reserved_behind_dialogs(envelope: &mut ObserveEnvelope) {
     let viewport = envelope.viewport;
     let mut dialogs = Vec::new();
     let mut reserved = Vec::new();
+    let mut suggestions = Vec::new();
     let mut rest = Vec::new();
     for el in envelope.elements.drain(..) {
         if dialog_ids.contains(&el.id) {
             dialogs.push(el);
+        } else if is_suggestion_row(&el) {
+            suggestions.push(el);
         } else if is_reserved_control_parts(&el, &dialog_ids, viewport) {
             reserved.push(el);
         } else {
             rest.push(el);
         }
     }
+    if suggestions.len() > SUGGESTION_RESERVE_CAP {
+        rest.splice(0..0, suggestions.drain(SUGGESTION_RESERVE_CAP..));
+    }
     envelope.elements = dialogs;
+    envelope.elements.extend(suggestions);
     envelope.elements.extend(reserved);
     envelope.elements.extend(rest);
 }
@@ -769,12 +777,26 @@ pub(crate) fn is_reserved_control(el: &Element, envelope: &ObserveEnvelope) -> b
     is_reserved_control_parts(el, &dialog_id_set(envelope), envelope.viewport)
 }
 
+fn is_suggestion_row(el: &Element) -> bool {
+    if !el.id.starts_with("chr:") {
+        return false;
+    }
+    match el.role.as_str() {
+        "ListItem" => !text_has_any_token(el.text.as_deref(), FILTER_CHIP_LEXICON),
+        "TreeItem" => true,
+        _ => false,
+    }
+}
+
 fn is_reserved_control_parts(
     el: &Element,
     dialog_ids: &std::collections::HashSet<String>,
     viewport: Option<Rect>,
 ) -> bool {
     if dialog_ids.contains(&el.id) {
+        return true;
+    }
+    if is_suggestion_row(el) {
         return true;
     }
     if el.role == "ListItem" {
@@ -3512,16 +3534,24 @@ mod tests {
             &shopping_el("chr:radius", "ComboBox", "Radius", 24),
             &env
         ));
-        assert!(!is_reserved_control(
+        assert!(is_reserved_control(
             &shopping_el("chr:row", "ListItem", "2024 Camry SE $25,000", 24),
             &env
         ));
-        assert!(!is_reserved_control(
+        assert!(is_reserved_control(
             &shopping_el("chr:price-row", "ListItem", "Price $25,000", 24),
             &env
         ));
-        assert!(!is_reserved_control(
+        assert!(is_reserved_control(
             &shopping_el("chr:make-row", "ListItem", "Make Toyota", 24),
+            &env
+        ));
+        assert!(!is_reserved_control(
+            &shopping_el("uia:1.9", "ListItem", "MSFT — Microsoft Corp", 24),
+            &env
+        ));
+        assert!(is_reserved_control(
+            &shopping_el("chr:tree", "TreeItem", "MSFT", 24),
             &env
         ));
         assert!(is_reserved_control(
@@ -3545,6 +3575,122 @@ mod tests {
             &env
         ));
         let _ = CONTROL_RESERVE;
+        let _ = SUGGESTION_RESERVE_CAP;
+    }
+
+    fn spa_autocomplete_fixture_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chrome-spa-autocomplete.json")
+    }
+
+    fn envelope_from_chrome_map(map: chrome::ChromeMap) -> ObserveEnvelope {
+        let (extract, elements, elements_total, chrome_connected) = fuse_maps(
+            Detail::Default,
+            "Barchart",
+            &[],
+            Some(map),
+            fixture_opts(true),
+        );
+        ObserveEnvelope {
+            session_id: "sess".into(),
+            screenshot_path: "C:\\tmp\\observe.png".into(),
+            observe_path: "C:\\tmp\\observe.json".into(),
+            space: Space::new(0, 0, 1920, 1080).unwrap(),
+            viewport: fixture_opts(true).viewport,
+            extract,
+            elements,
+            elements_total,
+            elements_truncated: false,
+            chrome_connected,
+            chrome_hint: None,
+            challenge: ChallengeInfo::default(),
+            windows: Vec::new(),
+            windows_total: 0,
+            windows_truncated: false,
+            fg_window: empty_fg_window(),
+            target_window: None,
+            view: ObserveView::Auto,
+            observe_source: ObserveSource::Live,
+            card_offset: 0,
+            card_counts: ObserveCardCounts::default(),
+        }
+    }
+
+    #[test]
+    fn spa_autocomplete_options_survive_20_cap() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&spa_autocomplete_fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("spa fixture");
+        assert!(map.elements.len() > VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        let raw = envelope_from_chrome_map(map);
+        let before = raw.elements.len();
+        assert!(before > VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        let capped = cap_default_envelope(raw);
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert!(capped.elements_truncated);
+        for id in ["chr:17", "chr:18", "chr:19", "chr:20", "chr:21", "chr:22"] {
+            assert!(
+                capped.elements.iter().any(|e| e.id == id),
+                "option {id} must survive the 20-cap"
+            );
+        }
+        assert!(
+            capped
+                .elements
+                .iter()
+                .any(|e| e.text.as_deref() == Some("MSFT — Microsoft Corp — NASDAQ"))
+        );
+        assert!(
+            capped
+                .elements
+                .iter()
+                .filter(|e| e.role == "ListItem")
+                .count()
+                <= SUGGESTION_RESERVE_CAP
+        );
+    }
+
+    #[test]
+    fn spa_closed_menu_omits_option_rows() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&spa_autocomplete_fixture_path()));
+        let mut map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("spa fixture");
+        map.elements
+            .retain(|el| el.role != "ListItem" && el.role != "TreeItem");
+        let raw = envelope_from_chrome_map(map);
+        let capped = cap_default_envelope(raw);
+        assert!(capped.elements.iter().all(|e| e.role != "ListItem"));
+        assert!(
+            !capped
+                .elements
+                .iter()
+                .any(|e| e.text.as_deref().is_some_and(|t| t.contains("MSFT")))
+        );
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+    }
+
+    #[test]
+    fn non_menu_baseline_fixture_envelope_stays_capped() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default)
+            .into_map()
+            .expect("baseline fixture");
+        let raw = envelope_from_chrome_map(map);
+        let capped = cap_default_envelope(raw);
+        assert_eq!(capped.elements.len(), 3);
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert!(capped.elements.iter().any(|e| e.id == "chr:0"));
+        assert!(
+            !capped
+                .elements
+                .iter()
+                .any(|e| e.text.as_deref().is_some_and(|t| t.contains("MSFT")))
+        );
     }
 
     #[test]

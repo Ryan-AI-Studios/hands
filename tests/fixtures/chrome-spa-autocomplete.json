@@ -1,0 +1,155 @@
+{
+  "url": "https://www.barchart.com/stocks",
+  "title": "Barchart — Stocks",
+  "main_text": "Symbol search MSFT",
+  "metrics": {
+    "screenX": 100,
+    "screenY": 50,
+    "outerWidth": 1280,
+    "outerHeight": 800,
+    "innerWidth": 1280,
+    "innerHeight": 720,
+    "devicePixelRatio": 1.0
+  },
+  "elements": [
+    {
+      "id": "chr:0",
+      "role": "ComboBox",
+      "text": "Symbol search",
+      "rectCss": { "left": 20, "top": 16, "width": 220, "height": 28 }
+    },
+    {
+      "id": "chr:1",
+      "role": "Button",
+      "text": "Stocks",
+      "rectCss": { "left": 260, "top": 16, "width": 64, "height": 24 }
+    },
+    {
+      "id": "chr:2",
+      "role": "Button",
+      "text": "Futures",
+      "rectCss": { "left": 330, "top": 16, "width": 64, "height": 24 }
+    },
+    {
+      "id": "chr:3",
+      "role": "Button",
+      "text": "Options",
+      "rectCss": { "left": 400, "top": 16, "width": 64, "height": 24 }
+    },
+    {
+      "id": "chr:4",
+      "role": "Button",
+      "text": "Watchlist",
+      "rectCss": { "left": 470, "top": 16, "width": 80, "height": 24 }
+    },
+    {
+      "id": "chr:5",
+      "role": "Button",
+      "text": "Alerts",
+      "rectCss": { "left": 560, "top": 16, "width": 64, "height": 24 }
+    },
+    {
+      "id": "chr:6",
+      "role": "Button",
+      "text": "Login",
+      "rectCss": { "left": 630, "top": 16, "width": 56, "height": 24 }
+    },
+    {
+      "id": "chr:7",
+      "role": "Button",
+      "text": "News",
+      "rectCss": { "left": 700, "top": 16, "width": 48, "height": 24 }
+    },
+    {
+      "id": "chr:8",
+      "role": "Button",
+      "text": "Screeners",
+      "rectCss": { "left": 760, "top": 16, "width": 80, "height": 24 }
+    },
+    {
+      "id": "chr:9",
+      "role": "Button",
+      "text": "Menu",
+      "rectCss": { "left": 850, "top": 16, "width": 48, "height": 24 }
+    },
+    {
+      "id": "chr:10",
+      "role": "Button",
+      "text": "Markets",
+      "rectCss": { "left": 910, "top": 16, "width": 64, "height": 24 }
+    },
+    {
+      "id": "chr:11",
+      "role": "Button",
+      "text": "ETFs",
+      "rectCss": { "left": 980, "top": 16, "width": 48, "height": 24 }
+    },
+    {
+      "id": "chr:12",
+      "role": "Button",
+      "text": "Help",
+      "rectCss": { "left": 1040, "top": 16, "width": 48, "height": 24 }
+    },
+    {
+      "id": "chr:13",
+      "role": "Button",
+      "text": "Pricing",
+      "rectCss": { "left": 1100, "top": 16, "width": 64, "height": 24 }
+    },
+    {
+      "id": "chr:14",
+      "role": "Button",
+      "text": "More",
+      "rectCss": { "left": 1170, "top": 16, "width": 48, "height": 24 }
+    },
+    {
+      "id": "chr:15",
+      "role": "Button",
+      "text": "Home",
+      "rectCss": { "left": 20, "top": 48, "width": 48, "height": 20 }
+    },
+    {
+      "id": "chr:16",
+      "role": "Button",
+      "text": "Filter",
+      "rectCss": { "left": 80, "top": 48, "width": 56, "height": 20 }
+    },
+    {
+      "id": "chr:17",
+      "role": "ListItem",
+      "text": "MSFT — Microsoft Corp — NASDAQ",
+      "rectCss": { "left": 20, "top": 200, "width": 360, "height": 28 }
+    },
+    {
+      "id": "chr:18",
+      "role": "ListItem",
+      "text": "MSFT34.SA — Microsoft B3",
+      "rectCss": { "left": 20, "top": 230, "width": 360, "height": 28 }
+    },
+    {
+      "id": "chr:19",
+      "role": "ListItem",
+      "text": "2X MSFT — GraniteShares 2x Long",
+      "rectCss": { "left": 20, "top": 260, "width": 360, "height": 28 }
+    },
+    {
+      "id": "chr:20",
+      "role": "ListItem",
+      "text": "MSFT.IV — Microsoft IV",
+      "rectCss": { "left": 20, "top": 290, "width": 360, "height": 28 }
+    },
+    {
+      "id": "chr:21",
+      "role": "ListItem",
+      "text": "MSFTY — Microsoft Yield",
+      "rectCss": { "left": 20, "top": 320, "width": 360, "height": 28 }
+    },
+    {
+      "id": "chr:22",
+      "role": "ListItem",
+      "text": "MSFT shadow option",
+      "rectCss": { "left": 20, "top": 350, "width": 360, "height": 28 }
+    }
+  ],
+  "cards": []
+}

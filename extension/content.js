@@ -28,6 +28,10 @@ const DEFAULT_SELECTOR = [
   '[role="link"]',
   '[role="tab"]',
   '[role="menuitem"]',
+  '[role="option"]',
+  '[role="menuitemcheckbox"]',
+  '[role="menuitemradio"]',
+  '[role="treeitem"]',
   '[role="checkbox"]',
   '[role="radio"]',
   '[role="textbox"]',
@@ -132,15 +136,32 @@ function parseChrId(id) {
 
 function walk(detail) {
   const selector = detail === "dom" ? DOM_SELECTOR : DEFAULT_SELECTOR;
-  const list = document.querySelectorAll(selector);
   const out = [];
-  for (let i = 0; i < list.length; i += 1) {
-    const el = list[i];
-    if (includeNode(el)) {
-      out.push(el);
-    }
+  const root = document.documentElement;
+  if (root) {
+    collect(root, selector, out);
   }
   return out;
+}
+
+function collect(node, selector, out) {
+  if (!node || node.nodeType !== 1) {
+    return;
+  }
+  if (node.matches(selector) && includeNode(node) && openRowGate(node)) {
+    out.push(node);
+  }
+  const shadow = node.shadowRoot;
+  if (shadow) {
+    const shadowKids = shadow.children;
+    for (let i = 0; i < shadowKids.length; i += 1) {
+      collect(shadowKids[i], selector, out);
+    }
+  }
+  const kids = node.children;
+  for (let i = 0; i < kids.length; i += 1) {
+    collect(kids[i], selector, out);
+  }
 }
 
 function includeNode(el) {
@@ -156,6 +177,9 @@ function includeNode(el) {
   if (el.getAttribute("aria-hidden") === "true") {
     return false;
   }
+  if (el.closest('[aria-hidden="true"], [hidden]')) {
+    return false;
+  }
   const rect = el.getBoundingClientRect();
   if (!rect || rect.width <= 0 || rect.height <= 0) {
     return false;
@@ -168,6 +192,56 @@ function includeNode(el) {
     return false;
   }
   return true;
+}
+
+function openRowGate(el) {
+  const role = (el.getAttribute("role") || "").toLowerCase();
+  if (
+    role !== "option" &&
+    role !== "menuitemcheckbox" &&
+    role !== "menuitemradio" &&
+    role !== "treeitem"
+  ) {
+    return true;
+  }
+  try {
+    const popover = el.closest("[popover]");
+    if (popover && !popover.matches(":popover-open")) {
+      return false;
+    }
+  } catch (_err) {
+    // :popover-open unsupported — do not exclude a visible row
+  }
+  const box = el.closest("[role=listbox],[role=menu],[role=tree]");
+  if (box && box.id) {
+    const controller = findPopupController(box.id);
+    if (controller) {
+      const expanded = controller.getAttribute("aria-expanded");
+      if (expanded === "false") {
+        return false;
+      }
+      if (expanded === "true") {
+        return true;
+      }
+    }
+  }
+  return true;
+}
+
+function findPopupController(id) {
+  let escaped = id;
+  if (typeof CSS !== "undefined" && CSS.escape) {
+    escaped = CSS.escape(id);
+  }
+  try {
+    return document.querySelector(
+      '[aria-controls="' + escaped + '"], [aria-owns~="' + escaped + '"]'
+    );
+  } catch (_err) {
+    return document.querySelector(
+      '[aria-controls="' + id + '"], [aria-owns~="' + id + '"]'
+    );
+  }
 }
 
 function nodePayload(el, index) {
@@ -304,6 +378,8 @@ function roleName(role) {
     case "tab":
       return "TabItem";
     case "menuitem":
+    case "menuitemcheckbox":
+    case "menuitemradio":
       return "MenuItem";
     case "checkbox":
       return "CheckBox";

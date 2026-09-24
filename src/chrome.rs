@@ -1029,11 +1029,23 @@ mod tests {
         let text = fs::read_to_string(root.join("content.js")).unwrap();
         assert!(
             text.contains(r#""chr:" + String(index)"#),
-            "content.js must assign chr: from the querySelectorAll walk index"
+            "content.js must assign chr: from the shared walk emit index"
         );
         assert!(
-            text.contains("querySelectorAll"),
-            "content.js must walk with querySelectorAll"
+            text.contains("function walk(") && text.contains("function collect("),
+            "content.js snapshot and resolve must share walk/collect"
+        );
+        let resolve = text.find("function buildResolve(").expect("buildResolve");
+        let resolve_end = text[resolve..]
+            .find("function parseChrId(")
+            .expect("parseChrId after buildResolve");
+        assert!(
+            text[resolve..resolve + resolve_end].contains("walk("),
+            "buildResolve must re-run the shared walk"
+        );
+        assert!(
+            text.contains("node.shadowRoot"),
+            "composed walk must pierce open shadow roots only"
         );
         assert!(
             !text.contains("data-hands"),
@@ -1042,6 +1054,79 @@ mod tests {
         assert!(
             !text.contains("WeakMap"),
             "content.js must not grow WeakMap identity"
+        );
+    }
+
+    #[test]
+    fn content_js_spa_option_walk_and_gate() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extension");
+        let text = fs::read_to_string(root.join("content.js")).unwrap();
+        let default_end = text.find("const DOM_SELECTOR").expect("DOM_SELECTOR");
+        let default = &text[..default_end];
+        assert!(
+            default.contains(r#"'[role="option"]'"#),
+            "DEFAULT_SELECTOR must include role=option"
+        );
+        assert!(
+            default.contains(r#"'[role="menuitemcheckbox"]'"#),
+            "DEFAULT_SELECTOR must include role=menuitemcheckbox"
+        );
+        assert!(
+            default.contains(r#"'[role="menuitemradio"]'"#),
+            "DEFAULT_SELECTOR must include role=menuitemradio"
+        );
+        assert!(
+            default.contains(r#"'[role="treeitem"]'"#),
+            "DEFAULT_SELECTOR must include role=treeitem"
+        );
+        assert!(
+            !default.contains(r#"'[role="listbox"]'"#)
+                && !default.contains(r#"'[role="menu"]'"#)
+                && !default.contains("[popover]")
+                && !default.contains(r#"'[role="popover"]'"#),
+            "DEFAULT_SELECTOR must not walk listbox/menu/popover containers"
+        );
+        assert!(
+            text.contains(r#"'[aria-hidden="true"], [hidden]'"#),
+            "includeNode must exclude ancestor aria-hidden/hidden"
+        );
+        assert!(
+            text.contains("function openRowGate(")
+                && text.contains("aria-expanded")
+                && text.contains("aria-controls")
+                && text.contains(":popover-open"),
+            "open-row gate must resolve controller aria-expanded / popover-open"
+        );
+        assert!(
+            !text.contains("querySelectorAll('*')"),
+            "composed walk must not scan querySelectorAll('*')"
+        );
+    }
+
+    #[test]
+    fn spa_autocomplete_fixture_parses_option_rows() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chrome-spa-autocomplete.json");
+        let bytes = fs::read(&path).expect("spa autocomplete fixture");
+        let map = parse_snapshot_bytes(&bytes).expect("parse spa autocomplete");
+        let options: Vec<_> = map
+            .elements
+            .iter()
+            .filter(|el| el.role == "ListItem" || el.role == "TreeItem")
+            .collect();
+        assert!(
+            options.len() >= 3,
+            "fixture must carry open-list option rows"
+        );
+        assert!(
+            options
+                .iter()
+                .any(|el| el.text.as_deref().is_some_and(|t| t.contains("MSFT"))),
+            "option text must be usable (MSFT-class)"
+        );
+        assert!(
+            options.iter().any(|el| el.id == "chr:22"),
+            "chr:22 is the open-shadow option in emit order (source-lock story)"
         );
     }
 

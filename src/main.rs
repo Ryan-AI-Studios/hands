@@ -44,7 +44,7 @@ enum Command {
         #[arg(long)]
         timing: bool,
     },
-    /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content. Point must be inside the intended window's true client or an owned popup (no `--window` on click; activate first). Out-of-client is `ok:false` (named refusal, cooldown), not SendInput. `ok:true` means delivered; `miss` (`no_change` / `focus_lost`) is the effect signal. Settle baseline is post-hover ROI pixel-diff; one retry, re-offer on `focus_lost`. Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default.
+    /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content. Point must be inside the intended window's true client or an owned popup (no `--window` on click; activate first). Out-of-client is `ok:false` (named refusal, cooldown), not SendInput. `ok:true` means delivered; `miss` (`no_change` / `focus_lost`) is the effect signal. `navigated:true` is a Chrome caption change or loading interstitial — `miss` omitted, no retry; `chr:` ids died, re-observe. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on `focus_lost`. Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default.
     Click {
         #[arg(
             long,
@@ -143,7 +143,7 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Run a fixed script of up to 8 allowlisted steps (activate, click, hover, type, key, scroll, wait_settle, optional trailing observe). Aborts on the first failed prerequisite. `executed_steps[i].miss` is informational (`no_change` does not abort). `ok:true` is delivery-only. Installs the desk lease. Parse tests only — do not live-drive.
+    /// Run a fixed script of up to 8 allowlisted steps (activate, click, hover, type, key, scroll, wait_settle, optional trailing observe). Aborts on the first failed prerequisite. `executed_steps[i].miss` is informational (`no_change` does not abort). `navigated:true` does not abort; `chr:` ids died — re-observe. `ok:true` is delivery-only. Installs the desk lease. Parse tests only — do not live-drive.
     Sequence {
         /// JSON array of step objects (`tool` plus per-step fields)
         #[arg(long)]
@@ -1107,6 +1107,10 @@ mod tests {
         assert!(
             blob.contains("miss") || blob.contains("no_change"),
             "click help should mention miss or no_change:\n{blob}"
+        );
+        assert!(
+            blob.contains("navigated"),
+            "click help should mention navigated:\n{blob}"
         );
     }
 

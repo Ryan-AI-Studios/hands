@@ -7,9 +7,9 @@ How to drive Helping Hands without believing a delivered click is a completed in
 1. **Observe** the intended window (default is the foreground).
 2. **Verify** the envelope: challenge, window inventory, element ids, `unnamed`, `miss` from the last act.
 3. **Act** with the most stable handle you have.
-4. **Verify** again. `ok: true` means the input was **delivered**, not that the UI did what you wanted. Read `miss`.
+4. **Verify** again. `ok: true` means the input was **delivered**, not that the UI did what you wanted. Read `miss` and `navigated`.
 
-Re-observe after navigation. `chr:` ids are a page-local walk index (`chr:0`, `chr:42`) and die on navigation (an insert-before can shift later indexes).
+Re-observe after navigation. `chr:` ids are a page-local walk index (`chr:0`, `chr:42`) and die on navigation (an insert-before can shift later indexes). When `navigated: true`, those ids are already dead — observe again before the next click.
 
 ## Targeting ladder
 
@@ -27,9 +27,11 @@ Do not prefer the grid over `chr:` / `uia:` / rect.
 - **Confirm fence.** Gated `click` / `key enter` still need `confirm` then retry. This contract does not bypass the fence.
 - **Desk lease / Pause / cooldown.** Physical input freezes injection (yield the task — not a 2 s wait). Pause/Break and `stop` halt injection. Repeated `ok: false` actuations grow session backoff.
 
-## `miss`
+## `miss` and `navigated`
 
-`miss` is the effect signal: `no_change` or `focus_lost`. `sequence` already surfaces `executed_steps[i].miss`. A `no_change` miss does **not** flip `ok` or abort the sequence. One retry with re-offer on `focus_lost` (0013) is unchanged.
+`miss` is the effect signal: `no_change` or `focus_lost` only. `sequence` already surfaces `executed_steps[i].miss`. A `no_change` miss does **not** flip `ok` or abort the sequence. One retry with re-offer on `focus_lost` (0013) is unchanged.
+
+`navigated` is additive (omitted when false). On daily Chrome, a caption change or a loading interstitial (`title_blocks_settled`) reports `navigated: true`, `miss` omitted, and **no** second click. `sequence` does **not** abort on `navigated`. After `navigated: true`, `chr:` ids died — re-observe. Soft-routes that keep the same caption still look like `no_change`. Non-Chrome title edits (`Untitled` → `*Untitled`) are not `navigated`.
 
 ## Windows
 

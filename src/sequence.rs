@@ -114,6 +114,8 @@ pub struct ExecutedStep {
     pub foregrounded: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub miss: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub navigated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settled: Option<bool>,
 }
@@ -158,6 +160,7 @@ pub struct StepOutcome {
     pub foregrounded: Option<bool>,
     pub settled: Option<bool>,
     pub miss: Option<String>,
+    pub navigated: bool,
     pub error: Option<String>,
     pub fence: Option<FenceInfo>,
     pub challenge: Option<ChallengeInfo>,
@@ -308,6 +311,7 @@ pub fn sequence_with(
                         window: None,
                         foregrounded: None,
                         miss: None,
+                        navigated: false,
                         settled: None,
                     });
                     if hooks.record_steps {
@@ -323,6 +327,7 @@ pub fn sequence_with(
                         window: None,
                         foregrounded: None,
                         miss: None,
+                        navigated: false,
                         settled: None,
                     });
                     if hooks.record_steps {
@@ -377,6 +382,7 @@ pub fn sequence_with(
                     },
                     foregrounded: None,
                     miss: None,
+                    navigated: false,
                     settled: None,
                 });
                 if hooks.record_steps {
@@ -729,6 +735,7 @@ fn compact_row(step: &SequenceStep, outcome: &StepOutcome) -> ExecutedStep {
         }),
         foregrounded: outcome.foregrounded,
         miss: outcome.miss.clone(),
+        navigated: outcome.navigated,
         settled: match step {
             SequenceStep::WaitSettle { .. } => outcome.settled,
             _ => None,
@@ -863,6 +870,7 @@ fn from_actuate(env: ActuateEnvelope) -> StepOutcome {
         foregrounded: Some(env.foregrounded),
         settled: Some(env.settled),
         miss: env.miss,
+        navigated: env.navigated,
         error: env.error,
         fence: env.fence,
         challenge: env.challenge,
@@ -879,6 +887,7 @@ fn from_activate(env: ActivateEnvelope) -> StepOutcome {
         foregrounded: Some(env.foregrounded),
         settled: None,
         miss: None,
+        navigated: false,
         error: env.error,
         fence: None,
         challenge: env.challenge,
@@ -1209,6 +1218,31 @@ mod tests {
     }
 
     #[test]
+    fn click_navigated_ok_continues() {
+        let mut hooks = test_hooks();
+        hooks.click = |_, _| {
+            Ok(StepOutcome {
+                ok: true,
+                navigated: true,
+                ..StepOutcome::default()
+            })
+        };
+        let env = run_hooks(
+            "seq-click-navigated",
+            json!([
+                {"tool":"click","x":1,"y":1},
+                {"tool":"type","text":"ok"}
+            ]),
+            hooks,
+        );
+        assert_eq!(env.stop_reason, StopReason::Completed);
+        assert!(env.ok);
+        assert_eq!(tools(&env), vec!["click", "type"]);
+        assert!(env.executed_steps[0].navigated);
+        assert_eq!(env.executed_steps[0].miss, None);
+    }
+
+    #[test]
     fn unknown_key_aborts_later_type() {
         let mut hooks = test_hooks();
         hooks.key = |_, name| {
@@ -1352,6 +1386,7 @@ mod tests {
                     window: Some("w".repeat(2000)),
                     foregrounded: Some(true),
                     miss: None,
+                    navigated: false,
                     settled: Some(true),
                 })
                 .collect(),

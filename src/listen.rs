@@ -260,6 +260,7 @@ pub fn challenge_present(observe_path: Option<&str>) -> Result<bool, HandsError>
                 view: crate::observe::ObserveView::Auto,
                 from: None,
                 card_offset: 0,
+                scope: crate::observe::ObserveScope::Fg,
             })?;
             Ok(env.challenge.present)
         }

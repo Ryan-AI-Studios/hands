@@ -70,6 +70,29 @@ fn skip_zero_offset(n: &usize) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+pub enum ObserveScope {
+    #[default]
+    Fg,
+    Desktop,
+}
+
+impl ObserveScope {
+    pub fn parse_arg(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(Self::Fg),
+            Some(s) if s.eq_ignore_ascii_case("fg") => Ok(Self::Fg),
+            Some(s) if s.eq_ignore_ascii_case("desktop") => Ok(Self::Desktop),
+            Some(other) => Err(format!("unknown scope '{other}' (expected fg or desktop)")),
+        }
+    }
+}
+
+fn skip_empty_class(class: &Option<String>) -> bool {
+    class.as_deref().is_none_or(str::is_empty)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum ObserveSource {
     #[default]
     Live,
@@ -113,6 +136,21 @@ pub struct ObserveRequest {
     pub view: ObserveView,
     pub from: Option<String>,
     pub card_offset: usize,
+    pub scope: ObserveScope,
+}
+
+impl Default for ObserveRequest {
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            detail: Detail::Default,
+            window: None,
+            view: ObserveView::Auto,
+            from: None,
+            card_offset: 0,
+            scope: ObserveScope::Fg,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +170,8 @@ pub struct DesktopWindow {
     pub hwnd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rect: Option<Rect>,
+    #[serde(default, skip_serializing_if = "skip_empty_class")]
+    pub class: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -323,7 +363,11 @@ fn window_state(hit: &foreground::TitledWindow) -> WindowState {
     }
 }
 
-fn desktop_window(w: &foreground::TitledWindow, cap_title: bool) -> DesktopWindow {
+fn desktop_window(
+    w: &foreground::TitledWindow,
+    cap_title: bool,
+    include_class: bool,
+) -> DesktopWindow {
     DesktopWindow {
         pid: w.pid,
         title: if cap_title {
@@ -334,19 +378,33 @@ fn desktop_window(w: &foreground::TitledWindow, cap_title: bool) -> DesktopWindo
         state: window_state(w),
         hwnd: foreground::format_hwnd(w.hwnd),
         rect: w.rect,
+        class: if include_class && !w.class.is_empty() {
+            Some(w.class.clone())
+        } else {
+            None
+        },
     }
 }
 
-fn envelope_windows(inventory: &[foreground::TitledWindow]) -> Vec<DesktopWindow> {
+fn envelope_windows(
+    inventory: &[foreground::TitledWindow],
+    include_class: bool,
+) -> Vec<DesktopWindow> {
     inventory
         .iter()
         .take(foreground::WINDOW_LIST_CAP)
-        .map(|w| desktop_window(w, true))
+        .map(|w| desktop_window(w, true, include_class))
         .collect()
 }
 
-fn inventory_windows(inventory: &[foreground::TitledWindow]) -> Vec<DesktopWindow> {
-    inventory.iter().map(|w| desktop_window(w, false)).collect()
+fn inventory_windows(
+    inventory: &[foreground::TitledWindow],
+    include_class: bool,
+) -> Vec<DesktopWindow> {
+    inventory
+        .iter()
+        .map(|w| desktop_window(w, false, include_class))
+        .collect()
 }
 
 fn is_digits_only_pid(query: &str) -> Option<u32> {
@@ -357,25 +415,31 @@ fn is_digits_only_pid(query: &str) -> Option<u32> {
 }
 
 fn format_window_candidate(w: &foreground::TitledWindow) -> String {
-    format!("{} {} {}", foreground::format_hwnd(w.hwnd), w.pid, w.title)
+    format!(
+        "hwnd:{} {} {}",
+        foreground::format_hwnd(w.hwnd),
+        w.pid,
+        w.title
+    )
 }
 
-pub(crate) fn resolve_window<'a>(
+pub(crate) fn resolve_window(
     query: &str,
-    windows: &'a [foreground::TitledWindow],
-) -> Result<&'a foreground::TitledWindow, HandsError> {
+    windows: &[foreground::TitledWindow],
+) -> Result<foreground::TitledWindow, HandsError> {
     if let Some(parsed) = foreground::parse_hwnd_selector(query) {
         let hwnd = parsed?;
         let hits: Vec<&foreground::TitledWindow> =
             windows.iter().filter(|w| w.hwnd == hwnd).collect();
         return match hits.as_slice() {
-            [one] => Ok(*one),
+            [one] => Ok((*one).clone()),
             [] if !foreground::is_live_hwnd(hwnd) => {
                 Err(HandsError::Observe(format!("stale hwnd {query:?}")))
             }
-            [] => Err(HandsError::Observe(format!(
-                "window {query} is not in the titled inventory"
-            ))),
+            [] => match foreground::describe_hwnd(hwnd) {
+                Some(hit) => Ok(hit),
+                None => Err(HandsError::Observe(format!("stale hwnd {query:?}"))),
+            },
             _ => Err(HandsError::Observe(format!(
                 "multiple windows matching {query:?}"
             ))),
@@ -391,7 +455,7 @@ pub(crate) fn resolve_window<'a>(
             .collect()
     };
     match matches.as_slice() {
-        [one] => Ok(*one),
+        [one] => Ok((*one).clone()),
         [] => Err(HandsError::Observe(format!("no window matching {query:?}"))),
         many => {
             let list = many
@@ -406,28 +470,49 @@ pub(crate) fn resolve_window<'a>(
     }
 }
 
+fn walk_viewport(hit: &foreground::TitledWindow) -> Option<Rect> {
+    foreground::inventory_rect(
+        hit.iconic,
+        hit.rect.or_else(|| foreground::window_rect(hit.hwnd)),
+    )
+}
+
+fn fg_viewport(fg: Option<isize>) -> Option<Rect> {
+    let hwnd = fg?;
+    foreground::inventory_rect(foreground::is_iconic(hwnd), foreground::window_rect(hwnd))
+}
+
 fn plan_observe_target(
     query: Option<&str>,
     inventory: &[foreground::TitledWindow],
     fg: Option<isize>,
+    scope: ObserveScope,
+    space: Option<Rect>,
 ) -> Result<ObservePlan, HandsError> {
     let fg_window = describe_fg_window(fg);
-    match query {
-        None => Ok(ObservePlan {
+    match (scope, query) {
+        (ObserveScope::Desktop, None) => Ok(ObservePlan {
+            walk_hwnd: None,
+            viewport: space,
+            fg_window,
+            target_window: None,
+            chrome_is_foreground: false,
+        }),
+        (ObserveScope::Fg, None) => Ok(ObservePlan {
             walk_hwnd: fg,
-            viewport: fg.and_then(foreground::window_rect),
+            viewport: fg_viewport(fg),
             fg_window,
             target_window: None,
             chrome_is_foreground: fg.is_some_and(foreground::is_chrome_hwnd),
         }),
-        Some(q) => {
+        (_, Some(q)) => {
             let hit = resolve_window(q, inventory)?;
             let same = fg == Some(hit.hwnd);
             Ok(ObservePlan {
                 walk_hwnd: Some(hit.hwnd),
-                viewport: foreground::window_rect(hit.hwnd),
+                viewport: walk_viewport(&hit),
                 fg_window,
-                target_window: Some(describe_target(hit, fg)),
+                target_window: Some(describe_target(&hit, fg)),
                 chrome_is_foreground: same && fg.is_some_and(foreground::is_chrome_hwnd),
             })
         }
@@ -443,7 +528,7 @@ fn resolve_and_walk_window(
     fg: Option<isize>,
     detail: Detail,
 ) -> Result<uia::UiaSnapshot, HandsError> {
-    let plan = plan_observe_target(Some(query), inventory, fg)?;
+    let plan = plan_observe_target(Some(query), inventory, fg, ObserveScope::Fg, None)?;
     uia::collect(detail, plan.walk_hwnd)
 }
 
@@ -456,6 +541,12 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     if req.from.is_some() && req.window.is_some() {
         return Err(HandsError::Observe(
             "--from cannot be combined with --window".into(),
+        ));
+    }
+    if req.scope == ObserveScope::Desktop && req.detail == Detail::Dom && req.window.is_none() {
+        return Err(HandsError::Observe(
+            "--scope desktop with detail=dom requires --window (desktop is not a UIA subject)"
+                .into(),
         ));
     }
     if let Some(from) = req.from.as_deref() {
@@ -473,25 +564,57 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let observe_path = display_path(&paths.observe_path);
 
     let fg = foreground::foreground_hwnd();
-    let inventory = foreground::titled_windows();
-    let plan = plan_observe_target(req.window.as_deref(), &inventory, fg)?;
+    let include_class = matches!(req.scope, ObserveScope::Desktop);
+    let inventory = match req.scope {
+        ObserveScope::Fg => foreground::titled_windows(),
+        ObserveScope::Desktop => foreground::selectable_windows(),
+    };
+    let plan = plan_observe_target(
+        req.window.as_deref(),
+        &inventory,
+        fg,
+        req.scope,
+        Some(space.as_rect()),
+    )?;
+    let skip_walk = matches!(req.scope, ObserveScope::Desktop) && req.window.is_none();
     let uia_t = Instant::now();
     let detail = req.detail;
     let walk_hwnd = plan.walk_hwnd;
-    let uia_h = std::thread::Builder::new()
-        .name("hands-uia-overlap".into())
-        .spawn(move || uia::collect(detail, walk_hwnd))
-        .map_err(|err| HandsError::Uia(format!("spawn UIA overlap: {err}")))?;
+    let uia_h = if skip_walk {
+        None
+    } else {
+        Some(
+            std::thread::Builder::new()
+                .name("hands-uia-overlap".into())
+                .spawn(move || uia::collect(detail, walk_hwnd))
+                .map_err(|err| HandsError::Uia(format!("spawn UIA overlap: {err}")))?,
+        )
+    };
     let chrome_t = Instant::now();
     let chrome_outcome = chrome::try_snapshot(req.detail);
     let chrome_ms = chrome_t.elapsed().as_millis() as u64;
-    let snap = uia_h
-        .join()
-        .map_err(|_| HandsError::Uia("UIA overlap thread panicked".to_string()))??;
-    let uia_ms = uia_t.elapsed().as_millis() as u64;
+    let snap = match uia_h {
+        None => uia::UiaSnapshot {
+            title: String::new(),
+            nodes: Vec::new(),
+            popup_rect: None,
+        },
+        Some(h) => h
+            .join()
+            .map_err(|_| HandsError::Uia("UIA overlap thread panicked".to_string()))??,
+    };
+    let uia_ms = if skip_walk {
+        0
+    } else {
+        uia_t.elapsed().as_millis() as u64
+    };
     let chrome_connected = chrome_outcome.host_up();
     let chrome_hint = chrome_outcome.chrome_hint();
-    let chrome = chrome_outcome.into_map();
+    let chrome = if skip_walk {
+        None
+    } else {
+        chrome_outcome.into_map()
+    };
     let opts = FuseOpts {
         viewport: plan.viewport,
         client: plan.walk_hwnd.and_then(foreground::client_rect),
@@ -528,7 +651,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         chrome_connected,
         chrome_hint,
         challenge,
-        windows: envelope_windows(&inventory),
+        windows: envelope_windows(&inventory, include_class),
         windows_total: inventory.len(),
         windows_truncated: inventory.len() > foreground::WINDOW_LIST_CAP,
         fg_window: plan.fg_window,
@@ -573,6 +696,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         opts.client,
         sidecar_timing,
         &inventory,
+        include_class,
     )?;
     logs::ensure_installed();
     logs::remember_session(&envelope.session_id);
@@ -611,6 +735,7 @@ fn write_sidecar(
     client: Option<Rect>,
     timing: Option<ObserveTiming>,
     inventory: &[foreground::TitledWindow],
+    include_class: bool,
 ) -> Result<(), HandsError> {
     let sidecar = ObserveSidecar {
         schema: OBSERVE_SCHEMA.to_string(),
@@ -629,7 +754,7 @@ fn write_sidecar(
         windows: envelope.windows.clone(),
         windows_total: envelope.windows_total,
         windows_truncated: envelope.windows_truncated,
-        windows_inventory: inventory_windows(inventory),
+        windows_inventory: inventory_windows(inventory, include_class),
         fg_window: Some(envelope.fg_window.clone()),
         target_window: envelope.target_window.clone(),
         view: envelope.view,
@@ -2905,7 +3030,7 @@ mod tests {
             slice.contains("opts.client"),
             "observe must persist the true client on the sidecar:\n{slice}"
         );
-        let dom = slice.find("Detail::Dom").expect("Dom arm");
+        let dom = slice.find("Detail::Dom =>").expect("Dom arm");
         let after_dom = &slice[dom..];
         assert!(
             after_dom.contains("finalize_envelope(full)"),
@@ -3039,15 +3164,25 @@ mod tests {
     }
 
     #[test]
-    fn cargo_forbids_dwm() {
+    fn cargo_dwm_is_cloak_only() {
         let cargo = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
         assert!(
-            !cargo.contains("Win32_Graphics_Dwm"),
-            "Cargo.toml must not enable DWM"
+            cargo.contains("Win32_Graphics_Dwm"),
+            "0111 cloak gate needs Win32_Graphics_Dwm"
         );
+        let fg = include_str!("foreground.rs");
         assert!(
-            !cargo.to_ascii_lowercase().contains("dwmget"),
-            "Cargo.toml must not mention DwmGet"
+            fg.contains("DWMWA_CLOAKED") && fg.contains("DwmGetWindowAttribute"),
+            "expanded inventory must drop DWM-cloaked windows"
+        );
+        let observe = include_str!("observe.rs");
+        let prod = observe
+            .split("mod tests")
+            .next()
+            .expect("observe production");
+        assert!(
+            !prod.contains("DwmGetWindowAttribute") && !prod.contains("DWMWA_"),
+            "observe must not call DWM"
         );
     }
 
@@ -3331,6 +3466,7 @@ mod tests {
                     w: 800,
                     h: 600,
                 }),
+                class: None,
             })
             .collect();
         let capped = cap_default_envelope(raw);
@@ -3392,13 +3528,15 @@ mod tests {
     #[test]
     fn window_query_uses_target_hwnd_and_keeps_actual_fg() {
         let inventory = vec![titled_win(11, 42, "Cursor"), titled_win(22, 7, "Terminal")];
-        let plan = plan_observe_target(Some("cursor"), &inventory, Some(0)).unwrap();
+        let plan = plan_observe_target(Some("cursor"), &inventory, Some(0), ObserveScope::Fg, None)
+            .unwrap();
         assert_eq!(plan.walk_hwnd, Some(11));
         assert!(!plan.chrome_is_foreground);
         let target = plan.target_window.expect("target_window");
         assert!(!target.foreground);
         assert_eq!(target.pid, 42);
-        let fg_only = plan_observe_target(None, &inventory, Some(0)).unwrap();
+        let fg_only =
+            plan_observe_target(None, &inventory, Some(0), ObserveScope::Fg, None).unwrap();
         assert!(fg_only.target_window.is_none());
         assert_eq!(fg_only.walk_hwnd, Some(0));
     }
@@ -3406,11 +3544,138 @@ mod tests {
     #[test]
     fn chrome_chr_only_when_walk_hwnd_is_fg_chrome() {
         let inventory = vec![titled_win(11, 42, "Cursor")];
-        let targeted = plan_observe_target(Some("cursor"), &inventory, Some(99)).unwrap();
+        let targeted =
+            plan_observe_target(Some("cursor"), &inventory, Some(99), ObserveScope::Fg, None)
+                .unwrap();
         assert!(
             !targeted.chrome_is_foreground,
             "--window on a non-Chrome HWND must not fuse chr: even if Chrome is open"
         );
+    }
+
+    #[test]
+    fn scope_parse_and_desktop_plan_skips_walk() {
+        assert_eq!(ObserveScope::parse_arg(None).unwrap(), ObserveScope::Fg);
+        assert_eq!(
+            ObserveScope::parse_arg(Some("desktop")).unwrap(),
+            ObserveScope::Desktop
+        );
+        let err = ObserveScope::parse_arg(Some("all")).unwrap_err();
+        assert!(err.contains("unknown scope 'all'"), "{err}");
+        let space = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        let inventory = vec![titled_win(11, 42, "Cursor")];
+        let desktop = plan_observe_target(
+            None,
+            &inventory,
+            Some(11),
+            ObserveScope::Desktop,
+            Some(space),
+        )
+        .unwrap();
+        assert!(desktop.walk_hwnd.is_none());
+        assert_eq!(desktop.viewport, Some(space));
+        assert!(desktop.target_window.is_none());
+        assert!(!desktop.chrome_is_foreground);
+        let err = observe(ObserveRequest {
+            session_id: None,
+            detail: Detail::Dom,
+            window: None,
+            view: ObserveView::Auto,
+            from: None,
+            card_offset: 0,
+            scope: ObserveScope::Desktop,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("detail=dom requires --window"), "{err}");
+    }
+
+    #[test]
+    fn live_hwnd_outside_titled_inventory_and_minimized_viewport() {
+        fn untitled(hwnd: isize) -> Option<crate::foreground::TitledWindow> {
+            if hwnd == 0xabc {
+                Some(crate::foreground::TitledWindow {
+                    hwnd,
+                    pid: 7,
+                    title: String::new(),
+                    class: "Notepad".into(),
+                    iconic: false,
+                    zoomed: false,
+                    rect: Some(Rect {
+                        x: 40,
+                        y: 50,
+                        w: 200,
+                        h: 100,
+                    }),
+                })
+            } else {
+                None
+            }
+        }
+        crate::foreground::set_describe_hwnd_hook(Some(untitled));
+        let hit = resolve_window("hwnd:abc", &[]).expect("live untitled hwnd");
+        assert_eq!(hit.hwnd, 0xabc);
+        assert!(hit.title.is_empty());
+        assert_eq!(hit.class, "Notepad");
+        let plan =
+            plan_observe_target(Some("hwnd:abc"), &[], Some(1), ObserveScope::Fg, None).unwrap();
+        crate::foreground::set_describe_hwnd_hook(None);
+        assert_eq!(plan.walk_hwnd, Some(0xabc));
+        assert_eq!(
+            plan.viewport,
+            Some(Rect {
+                x: 40,
+                y: 50,
+                w: 200,
+                h: 100
+            })
+        );
+        assert_eq!(plan.target_window.expect("target").title, "");
+        let mut buried = titled_win(11, 42, "");
+        buried.class = "CabinetWClass".into();
+        buried.iconic = true;
+        buried.rect = None;
+        let minimized =
+            plan_observe_target(Some("hwnd:b"), &[buried], Some(0), ObserveScope::Fg, None)
+                .unwrap();
+        assert_eq!(minimized.walk_hwnd, Some(11));
+        assert!(minimized.viewport.is_none());
+        assert_eq!(
+            minimized.target_window.expect("target").class,
+            "CabinetWClass"
+        );
+    }
+
+    #[test]
+    fn desktop_multi_match_lists_hwnd_tokens_and_follow_up_resolves() {
+        let inventory = vec![
+            {
+                let mut w = titled_win(0x10, 99, "");
+                w.class = "Notepad".into();
+                w
+            },
+            {
+                let mut w = titled_win(0x11, 99, "");
+                w.class = "Notepad".into();
+                w
+            },
+        ];
+        let many = resolve_window("99", &inventory).unwrap_err().to_string();
+        assert!(many.contains("multiple windows matching"), "{many}");
+        assert!(many.contains("hwnd:10 99"), "{many}");
+        assert!(many.contains("hwnd:11 99"), "{many}");
+        assert_eq!(resolve_window("hwnd:10", &inventory).unwrap().hwnd, 0x10);
+        let expanded = envelope_windows(&inventory, true);
+        assert_eq!(expanded[0].class.as_deref(), Some("Notepad"));
+        let fg_rows = envelope_windows(&inventory, false);
+        assert!(fg_rows[0].class.is_none());
+        let json = serde_json::to_string(&fg_rows[0]).unwrap();
+        assert!(!json.contains("class"), "{json}");
     }
 
     #[test]
@@ -3426,6 +3691,19 @@ mod tests {
         assert!(
             !slice.contains("send_inputs"),
             "targeting SendInput:\n{slice}"
+        );
+        let live = include_str!("observe.rs");
+        let obs = live.find("pub fn observe(").expect("observe");
+        let stamp = live.find("fn stamp_grid(").expect("stamp_grid");
+        let body = &live[obs..stamp];
+        assert!(body.contains("skip_walk"), "{body}");
+        assert!(
+            body.contains("ObserveScope::Desktop") && body.contains("try_snapshot"),
+            "desktop still probes chrome host-up:\n{body}"
+        );
+        assert!(
+            !body.contains("GetRootElement"),
+            "desktop must not walk the UIA root:\n{body}"
         );
     }
 
@@ -3514,6 +3792,7 @@ mod tests {
                     w: 800,
                     h: 600,
                 }),
+                class: None,
             })
             .collect()
     }
@@ -3834,6 +4113,7 @@ mod tests {
             view: ObserveView::Auto,
             from: Some(r"C:\tmp\observe-x.json".into()),
             card_offset: 0,
+            scope: ObserveScope::Fg,
         })
         .unwrap_err();
         assert!(
@@ -3848,6 +4128,7 @@ mod tests {
             view: ObserveView::Auto,
             from: Some(r"C:\tmp\observe-x.json".into()),
             card_offset: 0,
+            scope: ObserveScope::Fg,
         })
         .unwrap_err();
         assert!(
@@ -3906,6 +4187,7 @@ mod tests {
             view: ObserveView::Auto,
             from: Some(path.to_string_lossy().into()),
             card_offset: 3,
+            scope: ObserveScope::Fg,
         });
         let _ = std::fs::remove_file(&path);
         let env = env.expect("reshape");
@@ -4006,6 +4288,7 @@ mod tests {
             view: ObserveView::Auto,
             from: Some(path.to_string_lossy().into()),
             card_offset: 0,
+            scope: ObserveScope::Fg,
         });
         let _ = std::fs::remove_file(&path);
         let env = with_popup.expect("reshape popup");
@@ -4173,7 +4456,7 @@ mod tests {
         );
         assert!(
             !live
-                .split("Detail::Dom")
+                .split("Detail::Dom =>")
                 .nth(1)
                 .expect("dom arm")
                 .contains("apply_card_offset"),
@@ -4305,6 +4588,7 @@ mod tests {
                     w: 100,
                     h: 40,
                 }),
+                class: None,
             })
             .collect();
         env.windows_total = 12;

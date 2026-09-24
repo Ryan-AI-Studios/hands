@@ -299,7 +299,7 @@ fn activate_with(
     }
     let inventory = (hooks.inventory)();
     let hit = match crate::observe::resolve_window(&window, &inventory) {
-        Ok(w) => w.clone(),
+        Ok(w) => w,
         Err(err) => {
             return finish_activate(ActivateEnvelope {
                 session_id,

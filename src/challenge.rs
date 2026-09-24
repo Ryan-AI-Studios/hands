@@ -736,6 +736,7 @@ fn run_watch(session_id: String) -> Result<ChallengeEnvelope, HandsError> {
             view: crate::observe::ObserveView::Auto,
             from: None,
             card_offset: 0,
+            scope: crate::observe::ObserveScope::Fg,
         })?;
         Ok(env.challenge)
     }) {

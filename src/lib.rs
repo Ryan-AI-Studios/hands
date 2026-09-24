@@ -40,7 +40,9 @@ pub mod uia;
 pub use actuate::{ActivateEnvelope, ActuateEnvelope, ActuateRequest};
 pub use error::HandsError;
 pub use extract::{Detail, Element, Extract};
-pub use observe::{ObserveEnvelope, ObserveRequest, ObserveView, observe, serialize_envelope};
+pub use observe::{
+    ObserveEnvelope, ObserveRequest, ObserveScope, ObserveView, observe, serialize_envelope,
+};
 pub use pick::{GroundRequest, PickEnvelope, PickRequest, run_ground, run_pick, serialize_pick};
 pub use sequence::SequenceEnvelope;
 pub use session::resolve_session_id;

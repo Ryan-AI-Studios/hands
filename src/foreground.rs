@@ -3,13 +3,14 @@
 use std::path::Path;
 
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GA_ROOT, GW_ENABLEDPOPUP, GW_OWNER, GetAncestor, GetClassNameW,
-    GetClientRect, GetForegroundWindow, GetWindow, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_RESTORE,
-    SetForegroundWindow, ShowWindow, WindowFromPoint,
+    BringWindowToTop, EnumWindows, GA_ROOT, GW_ENABLEDPOPUP, GW_OWNER, GWL_EXSTYLE, GetAncestor,
+    GetClassNameW, GetClientRect, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    SW_RESTORE, SetForegroundWindow, ShowWindow, WS_EX_TOOLWINDOW, WindowFromPoint,
 };
 
 use crate::space::Rect;
@@ -22,6 +23,8 @@ type ClientRectHook = fn(isize) -> Option<Rect>;
 type WindowTitleHook = fn(Option<isize>) -> String;
 #[cfg(test)]
 type ChromeTargetHook = fn(Option<isize>) -> bool;
+#[cfg(test)]
+type DescribeHwndHook = fn(isize) -> Option<TitledWindow>;
 
 #[cfg(test)]
 thread_local! {
@@ -175,8 +178,70 @@ pub fn parse_hwnd_selector(query: &str) -> Option<Result<isize, crate::error::Ha
 }
 
 pub fn is_live_hwnd(raw: isize) -> bool {
+    #[cfg(test)]
+    {
+        if let Some(hook) = DESCRIBE_HWND_HOOK.with(|c| *c.borrow()) {
+            return hook(raw).is_some();
+        }
+    }
     let h = raw_hwnd(raw);
     hwnd_raw(h).is_some() && unsafe { IsWindow(Some(h)) }.as_bool()
+}
+
+pub fn is_iconic(hwnd: isize) -> bool {
+    unsafe { IsIconic(raw_hwnd(hwnd)) }.as_bool()
+}
+
+const HELPER_CLASS_DENYLIST: &[&str] =
+    &["IME", "MSCTFIME UI", "Default IME", "OleMainThreadWndName"];
+
+fn is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked: u32 = 0;
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            std::ptr::addr_of_mut!(cloaked).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    ok.is_ok() && cloaked != 0
+}
+
+fn is_untitled_toolwindow(hwnd: HWND, title: &str) -> bool {
+    if !title.is_empty() {
+        return false;
+    }
+    let ex = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    ex & WS_EX_TOOLWINDOW.0 != 0
+}
+
+fn is_helper_class(class: &str) -> bool {
+    HELPER_CLASS_DENYLIST.contains(&class)
+}
+
+/// Live pid/class/title/rect for a hwnd. `None` if the handle is not a window.
+pub(crate) fn describe_hwnd(raw: isize) -> Option<TitledWindow> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = DESCRIBE_HWND_HOOK.with(|c| *c.borrow()) {
+            return hook(raw);
+        }
+    }
+    if !is_live_hwnd(raw) {
+        return None;
+    }
+    let hwnd = raw_hwnd(raw);
+    let iconic = unsafe { IsIconic(hwnd) }.as_bool();
+    Some(TitledWindow {
+        hwnd: raw,
+        pid: window_pid(raw),
+        title: title(Some(raw)),
+        class: class_name(hwnd),
+        iconic,
+        zoomed: unsafe { IsZoomed(hwnd) }.as_bool(),
+        rect: inventory_rect(iconic, window_rect(raw)),
+    })
 }
 
 pub fn same_top_level(a: Option<isize>, b: Option<isize>) -> bool {
@@ -458,6 +523,17 @@ pub(crate) struct TitledWindow {
     pub rect: Option<crate::space::Rect>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static DESCRIBE_HWND_HOOK: std::cell::RefCell<Option<DescribeHwndHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_describe_hwnd_hook(hook: Option<DescribeHwndHook>) {
+    DESCRIBE_HWND_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
 pub(crate) fn inventory_rect(
     iconic: bool,
     rect: Option<crate::space::Rect>,
@@ -524,6 +600,68 @@ fn titled_windows_live() -> Vec<TitledWindow> {
             iconic,
             zoomed,
             rect: inventory_rect(iconic, window_rect(raw)),
+        });
+    }
+    sort_titled_windows(&mut out);
+    out
+}
+
+#[cfg(test)]
+thread_local! {
+    static SELECTABLE_HOOK: std::cell::RefCell<Option<Vec<TitledWindow>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_selectable_windows_hook(windows: Option<Vec<TitledWindow>>) {
+    SELECTABLE_HOOK.with(|c| *c.borrow_mut() = windows);
+}
+
+pub(crate) fn selectable_windows() -> Vec<TitledWindow> {
+    #[cfg(test)]
+    {
+        if let Some(list) = SELECTABLE_HOOK.with(|c| c.borrow().clone()) {
+            return list;
+        }
+    }
+    selectable_windows_live()
+}
+
+fn selectable_windows_live() -> Vec<TitledWindow> {
+    let mut hwnds: Vec<HWND> = Vec::new();
+    let _ = unsafe { EnumWindows(Some(collect_top_level), LPARAM(&raw mut hwnds as isize)) };
+    let mut out = Vec::new();
+    for hwnd in hwnds {
+        let iconic = unsafe { IsIconic(hwnd) }.as_bool();
+        if !unsafe { IsWindowVisible(hwnd) }.as_bool() && !iconic {
+            continue;
+        }
+        let Some(raw) = hwnd_raw(hwnd) else {
+            continue;
+        };
+        if is_cloaked(hwnd) {
+            continue;
+        }
+        let class = class_name(hwnd);
+        if is_helper_class(&class) {
+            continue;
+        }
+        let title = title(Some(raw));
+        if is_untitled_toolwindow(hwnd, &title) {
+            continue;
+        }
+        let rect = inventory_rect(iconic, window_rect(raw));
+        if !iconic && rect.is_none() {
+            continue;
+        }
+        out.push(TitledWindow {
+            hwnd: raw,
+            pid: window_pid(raw),
+            title,
+            class,
+            iconic,
+            zoomed: unsafe { IsZoomed(hwnd) }.as_bool(),
+            rect,
         });
     }
     sort_titled_windows(&mut out);
@@ -790,5 +928,56 @@ mod tests {
             !slice.contains("ShowWindow") && !slice.contains("SetForegroundWindow"),
             "inventory must not raise:\n{slice}"
         );
+    }
+
+    #[test]
+    fn helper_class_denylist_is_exact() {
+        assert!(is_helper_class("IME"));
+        assert!(is_helper_class("MSCTFIME UI"));
+        assert!(is_helper_class("Default IME"));
+        assert!(is_helper_class("OleMainThreadWndName"));
+        assert!(!is_helper_class("Notepad"));
+        assert!(!is_helper_class("ime"));
+        assert!(!is_helper_class("Chrome_WidgetWin_1"));
+    }
+
+    #[test]
+    fn selectable_windows_hook_and_no_raise() {
+        set_selectable_windows_hook(Some(vec![TitledWindow {
+            hwnd: 0xabc,
+            pid: 7,
+            title: String::new(),
+            class: "Notepad".into(),
+            iconic: true,
+            zoomed: false,
+            rect: None,
+        }]));
+        let list = selectable_windows();
+        set_selectable_windows_hook(None);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].title.is_empty());
+        assert!(list[0].iconic);
+        assert_eq!(list[0].class, "Notepad");
+        let src = include_str!("foreground.rs");
+        let start = src
+            .find("fn selectable_windows_live(")
+            .expect("selectable_windows_live");
+        let end = src
+            .find("unsafe extern \"system\" fn collect_top_level(")
+            .expect("collect_top_level");
+        let slice = &src[start..end];
+        assert!(
+            !slice.contains("ShowWindow") && !slice.contains("SetForegroundWindow"),
+            "expanded inventory must not raise:\n{slice}"
+        );
+        assert!(
+            slice.contains("DWMWA_CLOAKED") || slice.contains("is_cloaked"),
+            "{slice}"
+        );
+        assert!(
+            slice.contains("WS_EX_TOOLWINDOW") || slice.contains("is_untitled_toolwindow"),
+            "{slice}"
+        );
+        assert!(slice.contains("is_helper_class"), "{slice}");
     }
 }

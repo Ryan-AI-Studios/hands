@@ -249,7 +249,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. Point must be inside the intended window's true client or an owned popup (no --window on click; activate first). Out-of-client is ok:false (named refusal, cooldown), not SendInput. ok:true means delivered; miss (no_change / focus_lost) is the effect signal. Settle baseline is post-hover ROI pixel-diff; one retry, re-offer on focus_lost. Honor loop_suspected / cooldown_ms; frozen means yield the task. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default."
+        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. Point must be inside the intended window's true client or an owned popup (no --window on click; activate first). Out-of-client is ok:false (named refusal, cooldown), not SendInput. ok:true means delivered; miss (no_change / focus_lost) is the effect signal. navigated:true is a Chrome caption change or loading interstitial — miss is omitted, no retry; chr: ids died, re-observe. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on focus_lost. Honor loop_suspected / cooldown_ms; frozen means yield the task. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default."
     )]
     fn click(
         &self,
@@ -344,7 +344,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Fixed script of up to 8 allowlisted steps (activate, click, hover, type, key, scroll, wait_settle, optional trailing observe). Aborts on the first failed prerequisite. Not do_task (no inner LLM). Not confirm-gated as a whole; individual click/enter still gated. No new inter-step dwell (existing hover/scroll 100 ms dwell unchanged). executed_steps[i].miss is informational (no_change does not abort). ok:true on a step is delivery-only. After a fence/yield abort, send a new sequence of the remaining steps — no resume cursor. Honor loop_suspected / cooldown_ms; frozen means yield the task."
+        description = "Fixed script of up to 8 allowlisted steps (activate, click, hover, type, key, scroll, wait_settle, optional trailing observe). Aborts on the first failed prerequisite. Not do_task (no inner LLM). Not confirm-gated as a whole; individual click/enter still gated. No new inter-step dwell (existing hover/scroll 100 ms dwell unchanged). executed_steps[i].miss is informational (no_change does not abort). navigated:true does not abort; chr: ids died — re-observe. ok:true on a step is delivery-only. After a fence/yield abort, send a new sequence of the remaining steps — no resume cursor. Honor loop_suspected / cooldown_ms; frozen means yield the task."
     )]
     fn sequence(
         &self,

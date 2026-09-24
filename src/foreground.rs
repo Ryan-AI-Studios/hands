@@ -18,12 +18,20 @@ use crate::space::Rect;
 type OfferCall = (Option<isize>, (i32, i32));
 #[cfg(test)]
 type ClientRectHook = fn(isize) -> Option<Rect>;
+#[cfg(test)]
+type WindowTitleHook = fn(Option<isize>) -> String;
+#[cfg(test)]
+type ChromeTargetHook = fn(Option<isize>) -> bool;
 
 #[cfg(test)]
 thread_local! {
     static OFFER_CALLS: std::cell::RefCell<Vec<OfferCall>> =
         const { std::cell::RefCell::new(Vec::new()) };
     static CLIENT_RECT_HOOK: std::cell::RefCell<Option<ClientRectHook>> =
+        const { std::cell::RefCell::new(None) };
+    static TITLE_HOOK: std::cell::RefCell<Option<WindowTitleHook>> =
+        const { std::cell::RefCell::new(None) };
+    static CHROME_HOOK: std::cell::RefCell<Option<ChromeTargetHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -35,6 +43,16 @@ pub(crate) fn take_offer_calls() -> Vec<(Option<isize>, (i32, i32))> {
 #[cfg(test)]
 pub(crate) fn set_client_rect_hook(hook: Option<fn(isize) -> Option<Rect>>) {
     CLIENT_RECT_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+pub(crate) fn set_window_title_hook(hook: Option<fn(Option<isize>) -> String>) {
+    TITLE_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+pub(crate) fn set_chrome_target_hook(hook: Option<fn(Option<isize>) -> bool>) {
+    CHROME_HOOK.with(|c| *c.borrow_mut() = hook);
 }
 
 pub fn offer(hwnd: Option<isize>, point: (i32, i32)) -> bool {
@@ -320,6 +338,16 @@ pub fn viewport_rect() -> Option<Rect> {
 /// Caption via `GetWindowTextW` (256 wchar, same as `class_name`). `None` = current FG.
 /// Invalid HWND / empty caption → empty string (title gate does not fire).
 pub fn title(hwnd: Option<isize>) -> String {
+    #[cfg(test)]
+    {
+        if let Some(hook) = TITLE_HOOK.with(|c| *c.borrow()) {
+            return hook(hwnd);
+        }
+    }
+    title_live(hwnd)
+}
+
+fn title_live(hwnd: Option<isize>) -> String {
     let hwnd = match hwnd {
         Some(raw) => {
             let h = raw_hwnd(raw);
@@ -351,6 +379,20 @@ pub fn is_chrome() -> bool {
     match foreground_hwnd() {
         Some(hwnd) => is_chrome_hwnd(hwnd),
         None => false,
+    }
+}
+
+/// Chrome-ness of a click target: `is_chrome_hwnd` when known, else the FG bit.
+pub fn target_is_chrome(hwnd: Option<isize>) -> bool {
+    #[cfg(test)]
+    {
+        if let Some(hook) = CHROME_HOOK.with(|c| *c.borrow()) {
+            return hook(hwnd);
+        }
+    }
+    match hwnd {
+        Some(h) => is_chrome_hwnd(h),
+        None => is_chrome(),
     }
 }
 

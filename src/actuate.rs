@@ -1,6 +1,7 @@
 //! High-level click / hover / type / key / scroll / wait_settle / stop.
 
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -47,6 +48,8 @@ pub struct ActuateEnvelope {
     pub roi: Option<Rect>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub miss: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub navigated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -194,6 +197,7 @@ fn refuse_if_blocked(
         challenge: None,
         roi: None,
         miss: None,
+        navigated: false,
         attempt: None,
         cooldown_ms: None,
         loop_suspected: false,
@@ -342,6 +346,7 @@ fn base(
         challenge: None,
         roi: None,
         miss: None,
+        navigated: false,
         attempt: None,
         cooldown_ms: None,
         loop_suspected: false,
@@ -363,6 +368,7 @@ fn refuse_yield(session_id: String, target: ActuateTarget) -> Result<ActuateEnve
         challenge: Some(challenge::snapshot()),
         roi: None,
         miss: None,
+        navigated: false,
         attempt: None,
         cooldown_ms: None,
         loop_suspected: false,
@@ -444,6 +450,7 @@ fn refuse_fence(
         challenge: None,
         roi: None,
         miss: None,
+        navigated: false,
         attempt: None,
         cooldown_ms: None,
         loop_suspected: false,
@@ -584,6 +591,69 @@ fn click_miss(same: bool, focus_lost: bool) -> Option<&'static str> {
     }
 }
 
+const CAPTION_POLL_BUDGET: Duration = Duration::from_millis(300);
+
+#[derive(Debug)]
+struct ClickEffect {
+    navigated: bool,
+    miss: Option<&'static str>,
+}
+
+/// Chrome caption change or interstitial title. Empty→empty is not navigation.
+fn caption_nav(chrome: bool, before: &str, after: &str) -> bool {
+    if !chrome {
+        return false;
+    }
+    if settle::title_blocks_settled(after) {
+        return true;
+    }
+    after != before && !(before.is_empty() && after.is_empty())
+}
+
+fn poll_caption_nav(chrome: bool, before: &str, hwnd: Option<isize>) -> bool {
+    if !chrome {
+        return false;
+    }
+    let deadline = Instant::now() + CAPTION_POLL_BUDGET;
+    while Instant::now() < deadline {
+        std::thread::sleep(settle::FRAME_GAP);
+        if caption_nav(chrome, before, &foreground::title(hwnd)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn click_effect_after_settle(
+    hwnd: Option<isize>,
+    title_before: &str,
+    same: bool,
+    focus_lost: bool,
+    allow_poll: bool,
+) -> ClickEffect {
+    let chrome = foreground::target_is_chrome(hwnd);
+    let after = foreground::title(hwnd);
+    let mut navigated = caption_nav(chrome, title_before, &after);
+    if !navigated && allow_poll && same && chrome {
+        navigated = poll_caption_nav(chrome, title_before, hwnd);
+    }
+    if navigated {
+        ClickEffect {
+            navigated: true,
+            miss: None,
+        }
+    } else {
+        ClickEffect {
+            navigated: false,
+            miss: click_miss(same, focus_lost),
+        }
+    }
+}
+
+fn should_retry_click(effect: &ClickEffect) -> bool {
+    effect.miss.is_some() && !effect.navigated
+}
+
 fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let session_id = match session(&req) {
         Ok(id) => id,
@@ -613,6 +683,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_outside_client(&session_id, &info, &resolved)? {
         return Ok(env);
     }
+    let title_before = foreground::title(resolved.hwnd);
     challenge::note_actuation_if_proceeding(false);
     remember_target(resolved.rect);
     let mut rng = Rng::from_time();
@@ -636,9 +707,10 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let focus_lost = foregrounded
         && resolved.hwnd.is_some()
         && !foreground::same_top_level(resolved.hwnd, foreground::foreground_hwnd());
-    let mut miss = click_miss(same, focus_lost);
+    let mut effect =
+        click_effect_after_settle(resolved.hwnd, &title_before, same, focus_lost, true);
     let mut retried = false;
-    if miss.is_some() && lease::poll().is_ok() {
+    if should_retry_click(&effect) && lease::poll().is_ok() {
         retried = true;
         if focus_lost {
             let _ = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
@@ -655,7 +727,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         let focus_lost = foregrounded
             && resolved.hwnd.is_some()
             && !foreground::same_top_level(resolved.hwnd, foreground::foreground_hwnd());
-        miss = click_miss(same, focus_lost);
+        effect = click_effect_after_settle(resolved.hwnd, &title_before, same, focus_lost, false);
     }
     if lease::is_frozen() {
         return base(
@@ -679,7 +751,8 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         foregrounded,
         None,
     )?;
-    env.miss = miss.map(str::to_string);
+    env.miss = effect.miss.map(str::to_string);
+    env.navigated = effect.navigated;
     finalize_envelope(env)
 }
 
@@ -1079,6 +1152,7 @@ mod tests {
             challenge: None,
             roi: None,
             miss: None,
+            navigated: false,
             attempt: None,
             cooldown_ms: None,
             loop_suspected: false,
@@ -1117,6 +1191,7 @@ mod tests {
                 h: 600,
             }),
             miss: None,
+            navigated: false,
             attempt: None,
             cooldown_ms: None,
             loop_suspected: false,
@@ -1151,6 +1226,7 @@ mod tests {
             challenge: None,
             roi: None,
             miss: None,
+            navigated: false,
             attempt: None,
             cooldown_ms: None,
             loop_suspected: false,
@@ -1158,6 +1234,38 @@ mod tests {
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(!json.contains("\"roi\""), "{json}");
+        assert!(!json.contains("\"miss\""), "{json}");
+        assert!(!json.contains("\"navigated\""), "{json}");
+    }
+
+    #[test]
+    fn click_envelope_includes_navigated() {
+        let env = ActuateEnvelope {
+            session_id: "s".into(),
+            ok: true,
+            frozen: false,
+            target: ActuateTarget {
+                kind: "element".into(),
+                id: Some("chr:9".into()),
+                x: 40,
+                y: 50,
+            },
+            retried: false,
+            settled: true,
+            foregrounded: true,
+            error: None,
+            fence: None,
+            challenge: None,
+            roi: None,
+            miss: None,
+            navigated: true,
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
+        };
+        let json = serialize_envelope(&env).expect("json");
+        assert!(json.contains("\"navigated\":true"), "{json}");
         assert!(!json.contains("\"miss\""), "{json}");
     }
 
@@ -1181,6 +1289,7 @@ mod tests {
             challenge: None,
             roi: None,
             miss: Some("no_change".into()),
+            navigated: false,
             attempt: None,
             cooldown_ms: None,
             loop_suspected: false,
@@ -1210,6 +1319,7 @@ mod tests {
             challenge: None,
             roi: None,
             miss: None,
+            navigated: false,
             attempt: None,
             cooldown_ms: None,
             loop_suspected: false,
@@ -1226,6 +1336,178 @@ mod tests {
         assert_eq!(click_miss(true, false), Some("no_change"));
         assert_eq!(click_miss(false, true), Some("focus_lost"));
         assert_eq!(click_miss(true, true), Some("focus_lost"));
+    }
+
+    thread_local! {
+        static TITLE_TICK: std::cell::RefCell<u32> = const { std::cell::RefCell::new(0) };
+    }
+
+    struct CaptionHooks;
+
+    impl Drop for CaptionHooks {
+        fn drop(&mut self) {
+            crate::foreground::set_window_title_hook(None);
+            crate::foreground::set_chrome_target_hook(None);
+            TITLE_TICK.with(|t| *t.borrow_mut() = 0);
+        }
+    }
+
+    fn chrome_yes(_: Option<isize>) -> bool {
+        true
+    }
+
+    fn chrome_no(_: Option<isize>) -> bool {
+        false
+    }
+
+    fn title_story(_: Option<isize>) -> String {
+        "Apple Stock Nears Record High. Why $400 Could Be Next.".into()
+    }
+
+    fn title_full_chart(_: Option<isize>) -> String {
+        "AAPL - Apple Stock Price".into()
+    }
+
+    fn title_star_untitled(_: Option<isize>) -> String {
+        "*Untitled".into()
+    }
+
+    fn title_just_a_moment(_: Option<isize>) -> String {
+        "Just a moment...".into()
+    }
+
+    fn title_a_then_story(_: Option<isize>) -> String {
+        TITLE_TICK.with(|t| {
+            let n = *t.borrow();
+            *t.borrow_mut() = n.saturating_add(1);
+            if n == 0 {
+                "AAPL - Apple Stock Price".into()
+            } else {
+                "Apple Stock Nears Record High. Why $400 Could Be Next.".into()
+            }
+        })
+    }
+
+    fn predicted_left_clicks(effect: &ClickEffect) -> u32 {
+        if should_retry_click(effect) { 2 } else { 1 }
+    }
+
+    #[test]
+    fn chrome_caption_change_is_navigated_no_retry() {
+        let _hooks = CaptionHooks;
+        crate::foreground::set_chrome_target_hook(Some(chrome_yes));
+        crate::foreground::set_window_title_hook(Some(title_story));
+        let effect = click_effect_after_settle(None, "AAPL - Apple Stock Price", true, false, true);
+        assert!(effect.navigated, "{effect:?}");
+        assert_eq!(effect.miss, None);
+        assert!(!should_retry_click(&effect));
+        assert_eq!(predicted_left_clicks(&effect), 1);
+    }
+
+    #[test]
+    fn same_caption_same_roi_is_no_change_one_retry() {
+        let _hooks = CaptionHooks;
+        crate::foreground::set_chrome_target_hook(Some(chrome_yes));
+        crate::foreground::set_window_title_hook(Some(title_full_chart));
+        let effect =
+            click_effect_after_settle(None, "AAPL - Apple Stock Price", true, false, false);
+        assert!(!effect.navigated, "{effect:?}");
+        assert_eq!(effect.miss, Some("no_change"));
+        assert!(should_retry_click(&effect));
+        assert_eq!(predicted_left_clicks(&effect), 2);
+    }
+
+    #[test]
+    fn focus_lost_same_caption_is_not_navigated() {
+        let _hooks = CaptionHooks;
+        crate::foreground::set_chrome_target_hook(Some(chrome_yes));
+        crate::foreground::set_window_title_hook(Some(title_full_chart));
+        let effect = click_effect_after_settle(None, "AAPL - Apple Stock Price", true, true, false);
+        assert!(!effect.navigated, "{effect:?}");
+        assert_eq!(effect.miss, Some("focus_lost"));
+        assert!(should_retry_click(&effect));
+    }
+
+    #[test]
+    fn non_chrome_title_change_is_not_navigated() {
+        let _hooks = CaptionHooks;
+        crate::foreground::set_chrome_target_hook(Some(chrome_no));
+        crate::foreground::set_window_title_hook(Some(title_star_untitled));
+        let effect = click_effect_after_settle(None, "Untitled", true, false, true);
+        assert!(!effect.navigated, "{effect:?}");
+        assert_eq!(effect.miss, Some("no_change"));
+    }
+
+    #[test]
+    fn loading_caption_is_navigated_no_retry() {
+        let _hooks = CaptionHooks;
+        crate::foreground::set_chrome_target_hook(Some(chrome_yes));
+        crate::foreground::set_window_title_hook(Some(title_just_a_moment));
+        let effect = click_effect_after_settle(None, "AAPL - Apple Stock Price", true, false, true);
+        assert!(effect.navigated, "{effect:?}");
+        assert_eq!(effect.miss, None);
+        assert!(!should_retry_click(&effect));
+        assert_eq!(predicted_left_clicks(&effect), 1);
+    }
+
+    #[test]
+    fn poll_detects_late_chrome_caption() {
+        let _hooks = CaptionHooks;
+        crate::foreground::set_chrome_target_hook(Some(chrome_yes));
+        crate::foreground::set_window_title_hook(Some(title_a_then_story));
+        let effect = click_effect_after_settle(None, "AAPL - Apple Stock Price", true, false, true);
+        assert!(effect.navigated, "{effect:?}");
+        assert_eq!(effect.miss, None);
+        assert!(!should_retry_click(&effect));
+    }
+
+    #[test]
+    fn caption_nav_table() {
+        assert!(caption_nav(true, "A", "B"));
+        assert!(!caption_nav(true, "A", "A"));
+        assert!(!caption_nav(true, "", ""));
+        assert!(caption_nav(true, "", "B"));
+        assert!(!caption_nav(false, "Untitled", "*Untitled"));
+        assert!(caption_nav(true, "A", "Just a moment..."));
+        assert!(caption_nav(true, "Just a moment...", "Just a moment..."));
+    }
+
+    #[test]
+    fn click_caption_latency_p50_within_frame_gap() {
+        let _hooks = CaptionHooks;
+        crate::foreground::set_chrome_target_hook(Some(chrome_yes));
+        crate::foreground::set_window_title_hook(Some(title_full_chart));
+        let mut no_nav = Vec::new();
+        let mut immediate_nav = Vec::new();
+        for _ in 0..10 {
+            let t0 = Instant::now();
+            let effect =
+                click_effect_after_settle(None, "AAPL - Apple Stock Price", false, false, false);
+            no_nav.push(t0.elapsed());
+            assert!(!effect.navigated, "{effect:?}");
+            crate::foreground::set_window_title_hook(Some(title_story));
+            let t1 = Instant::now();
+            let effect =
+                click_effect_after_settle(None, "AAPL - Apple Stock Price", false, false, false);
+            immediate_nav.push(t1.elapsed());
+            assert!(effect.navigated, "{effect:?}");
+            crate::foreground::set_window_title_hook(Some(title_full_chart));
+        }
+        no_nav.sort();
+        immediate_nav.sort();
+        let p50 = |xs: &[Duration]| xs[xs.len() / 2];
+        let p95 = |xs: &[Duration]| xs[(xs.len() * 95) / 100];
+        assert!(
+            p50(&no_nav) <= settle::FRAME_GAP,
+            "no-nav p50 {:?} exceeds one FRAME_GAP",
+            p50(&no_nav)
+        );
+        assert!(
+            p50(&immediate_nav) <= settle::FRAME_GAP,
+            "immediate-nav p50 {:?} exceeds one FRAME_GAP",
+            p50(&immediate_nav)
+        );
+        let _ = (p95(&no_nav), p95(&immediate_nav));
     }
 
     fn pixel_resolved(x: i32, y: i32) -> crate::target::ResolvedTarget {
@@ -1349,6 +1631,26 @@ mod tests {
             !body.contains("preprocess::"),
             "click snapshot must not preprocess:\n{body}"
         );
+        let title = body.find("foreground::title").expect("title before click");
+        let effect = body
+            .find("click_effect_after_settle")
+            .expect("click_effect_after_settle");
+        assert!(
+            client < title && title < click && click < effect,
+            "title_before must be after the client guard and before first left_click; effect before retry:\n{body}"
+        );
+        assert!(
+            !body.contains("try_snapshot")
+                && !body.contains("try_resolve")
+                && !body.contains("note_last_url"),
+            "click_inner must not snapshot, resolve, or note_last_url:\n{body}"
+        );
+        let retry = body.find("should_retry_click").expect("should_retry_click");
+        let second = body.rfind("left_click").expect("retry left_click");
+        assert!(
+            effect < retry && retry < second,
+            "retry left_click must follow should_retry_click after the first effect:\n{body}"
+        );
     }
 
     #[test]
@@ -1363,6 +1665,10 @@ mod tests {
         assert!(
             click_desc.contains("miss") || click_desc.contains("no_change"),
             "mcp click description should mention miss or no_change:\n{click_desc}"
+        );
+        assert!(
+            click_desc.contains("navigated"),
+            "mcp click description should mention navigated:\n{click_desc}"
         );
     }
 

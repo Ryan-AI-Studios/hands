@@ -334,7 +334,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Raise a titled window by the same selector as observe --window (pid, unique title substring, or hwnd:<hex>). Not observe. Not confirm-gated. Reports foregrounded honestly; OS may refuse focus. Honor loop_suspected / cooldown_ms; frozen means yield the task."
+        description = "Raise a titled window by the same selector as observe --window (pid, unique title substring, or hwnd:<hex>). Not observe. Not confirm-gated. ok:true is delivery; foregrounded is honest (already-FG counts even if SetForegroundWindow returns 0). When foregrounded:false after a resolved window, reason is stale_hwnd / no_foreground_window / os_refused (not error). Honor loop_suspected / cooldown_ms; frozen means yield the task."
     )]
     fn activate(
         &self,

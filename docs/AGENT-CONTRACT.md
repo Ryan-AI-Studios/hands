@@ -26,6 +26,7 @@ Do not prefer the grid over `chr:` / `uia:` / rect.
 - **Scroll default.** Untargeted `scroll` moves the cursor to the foreground client centre, then injects the wheel. No foreground window → `ok: false`.
 - **Confirm fence.** Gated `click` / `key enter` still need `confirm` then retry. This contract does not bypass the fence.
 - **Desk lease / Pause / cooldown.** Physical input freezes injection (yield the task — not a 2 s wait). Pause/Break and `stop` halt injection. Repeated `ok: false` actuations grow session backoff.
+- **Activate.** `ok: true` means the raise was delivered, not that the OS granted focus. Read `foregrounded`. When `foregrounded: false` after a resolved window, `reason` is `stale_hwnd`, `no_foreground_window`, or `os_refused` (inferred; Win32 does not return a lock-condition code). `error` stays on `ok: false` only. Already-foreground is success. `sequence` still aborts later steps when activate is not foregrounded.
 
 ## `miss` and `navigated`
 

@@ -1689,6 +1689,7 @@ mod tests {
             elements_total: 0,
             elements_truncated: false,
             chrome_connected: false,
+            chrome_walk: None,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),

@@ -30,6 +30,20 @@ pub const CHROME_HINT_HOST_DOWN: &str =
 pub const CHROME_HINT_LOADING: &str = "Page loading — retry observe or wait_settle";
 pub const CHROME_HINT_TIMEOUT: &str =
     "Chrome snapshot timed out (400 ms) — retry observe or wait_settle";
+pub const CHROME_HINT_NOT_CHROME_TAB: &str = "not a Chrome tab; use uia:";
+
+/// Snapshot hints apply only when this observe walked daily Chrome.
+/// Otherwise replace (including HostDown doctor) so agents do not doctor Tauri/Notepad.
+pub(crate) fn chrome_hint_for_observe(
+    chrome_walk: bool,
+    snapshot_hint: Option<String>,
+) -> Option<String> {
+    if chrome_walk {
+        snapshot_hint
+    } else {
+        Some(CHROME_HINT_NOT_CHROME_TAB.into())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum SnapshotOutcome {
@@ -616,6 +630,25 @@ mod tests {
             }
         );
         assert_eq!(rect.center(), (210, 166));
+    }
+
+    #[test]
+    fn chrome_hint_for_observe_table() {
+        let hint = chrome_hint_for_observe(false, Some(CHROME_HINT_HOST_DOWN.into()));
+        assert_eq!(hint.as_deref(), Some(CHROME_HINT_NOT_CHROME_TAB));
+        assert!(
+            !hint.as_deref().unwrap_or("").contains("native-host-doctor"),
+            "non-Chrome walk must not doctor: {hint:?}"
+        );
+        assert_eq!(
+            chrome_hint_for_observe(false, None).as_deref(),
+            Some(CHROME_HINT_NOT_CHROME_TAB)
+        );
+        assert_eq!(
+            chrome_hint_for_observe(true, Some(CHROME_HINT_TIMEOUT.into())).as_deref(),
+            Some(CHROME_HINT_TIMEOUT)
+        );
+        assert_eq!(chrome_hint_for_observe(true, None), None);
     }
 
     #[test]

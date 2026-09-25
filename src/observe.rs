@@ -223,6 +223,7 @@ pub struct ObserveEnvelope {
     pub elements_total: usize,
     pub elements_truncated: bool,
     pub chrome_connected: bool,
+    pub chrome_walk: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chrome_hint: Option<String>,
     pub challenge: ChallengeInfo,
@@ -256,6 +257,8 @@ pub struct ObserveSidecar {
     pub elements_total: usize,
     pub elements_truncated: bool,
     pub chrome_connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_walk: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_hint: Option<String>,
     #[serde(default)]
@@ -636,7 +639,8 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         uia_t.elapsed().as_millis() as u64
     };
     let chrome_connected = chrome_outcome.host_up();
-    let chrome_hint = chrome_outcome.chrome_hint();
+    let chrome_walk = plan.walk_hwnd.is_some_and(foreground::is_chrome_hwnd);
+    let chrome_hint = chrome::chrome_hint_for_observe(chrome_walk, chrome_outcome.chrome_hint());
     let chrome = if skip_walk {
         None
     } else {
@@ -676,6 +680,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         elements_total,
         elements_truncated: false,
         chrome_connected,
+        chrome_walk,
         chrome_hint,
         challenge,
         windows: envelope_windows(&inventory, include_class),
@@ -776,6 +781,7 @@ fn write_sidecar(
         elements_total: envelope.elements_total,
         elements_truncated: false,
         chrome_connected: envelope.chrome_connected,
+        chrome_walk: Some(envelope.chrome_walk),
         chrome_hint: envelope.chrome_hint.clone(),
         challenge: envelope.challenge.clone(),
         windows: envelope.windows.clone(),
@@ -1366,6 +1372,13 @@ fn reshape_from_sidecar(req: &ObserveRequest, from: &str) -> Result<ObserveEnvel
 }
 
 fn envelope_from_sidecar(sidecar: ObserveSidecar, view: ObserveView) -> ObserveEnvelope {
+    let chrome_walk = sidecar.chrome_walk.unwrap_or_else(|| {
+        sidecar
+            .target_window
+            .as_ref()
+            .map(|t| t.chrome_exe)
+            .unwrap_or_else(|| sidecar.fg_window.as_ref().is_some_and(|fg| fg.chrome_exe))
+    });
     let mut extract = sidecar.extract;
     if extract.cards_walked == 0 {
         extract.cards_walked = sidecar.card_counts.cards_walked;
@@ -1382,7 +1395,8 @@ fn envelope_from_sidecar(sidecar: ObserveSidecar, view: ObserveView) -> ObserveE
         elements_total: sidecar.elements_total,
         elements_truncated: sidecar.elements_truncated,
         chrome_connected: sidecar.chrome_connected,
-        chrome_hint: sidecar.chrome_hint,
+        chrome_walk,
+        chrome_hint: chrome::chrome_hint_for_observe(chrome_walk, sidecar.chrome_hint),
         challenge: sidecar.challenge,
         windows_total: sidecar
             .windows_total
@@ -1564,6 +1578,7 @@ mod tests {
             elements_total: n,
             elements_truncated: false,
             chrome_connected: false,
+            chrome_walk: false,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
@@ -1949,6 +1964,7 @@ mod tests {
             elements_total,
             elements_truncated: false,
             chrome_connected,
+            chrome_walk: false,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
@@ -2212,6 +2228,14 @@ mod tests {
             main.contains("click center"),
             "cli observe help must mention click center"
         );
+        assert!(
+            mcp.contains("chrome_walk"),
+            "mcp observe description names chrome_walk"
+        );
+        assert!(
+            main.contains("chrome_walk"),
+            "cli observe help names chrome_walk"
+        );
     }
 
     #[test]
@@ -2414,6 +2438,137 @@ mod tests {
         let json = serialize_envelope(&capped).unwrap();
         assert!(json.contains("chrome_hint"));
         assert!(json.contains("native-host-doctor"));
+        assert!(
+            json.contains("chrome_walk"),
+            "chrome_walk must survive 4 KiB shrink: {json}"
+        );
+    }
+
+    #[test]
+    fn sidecar_chrome_walk_explicit_false_round_trips() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [],
+            "elements_total": 0,
+            "elements_truncated": false,
+            "chrome_connected": true,
+            "chrome_walk": false
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        let env = envelope_from_sidecar(side, ObserveView::Auto);
+        assert!(!env.chrome_walk);
+        assert!(env.chrome_connected);
+        assert_eq!(
+            env.chrome_hint.as_deref(),
+            Some(crate::chrome::CHROME_HINT_NOT_CHROME_TAB)
+        );
+    }
+
+    #[test]
+    fn sidecar_omitted_chrome_walk_derives_from_fg_chrome_exe() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [],
+            "elements_total": 0,
+            "elements_truncated": false,
+            "chrome_connected": true,
+            "fg_window": {"pid":1,"title":"Chrome","class":"Chrome_WidgetWin_1","chrome_exe":true,"hwnd":"1"}
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        let env = envelope_from_sidecar(side, ObserveView::Auto);
+        assert!(env.chrome_walk);
+    }
+
+    #[test]
+    fn sidecar_omitted_chrome_walk_derives_false_without_chrome_exe() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [],
+            "elements_total": 0,
+            "elements_truncated": false,
+            "chrome_connected": true,
+            "fg_window": {"pid":1,"title":"Tauri","class":"Tauri Window","chrome_exe":false,"hwnd":"1"}
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        let env = envelope_from_sidecar(side, ObserveView::Auto);
+        assert!(!env.chrome_walk);
+        assert_eq!(
+            env.chrome_hint.as_deref(),
+            Some(crate::chrome::CHROME_HINT_NOT_CHROME_TAB)
+        );
+        assert!(
+            !env.chrome_hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("native-host-doctor")
+        );
+    }
+
+    #[test]
+    fn sidecar_from_replaces_doctor_hint_when_walk_false() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [],
+            "elements_total": 0,
+            "elements_truncated": false,
+            "chrome_connected": false,
+            "chrome_walk": false,
+            "chrome_hint": "Chrome host down — run hands native-host-doctor (MCP: native_host_doctor)"
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        let env = envelope_from_sidecar(side, ObserveView::Auto);
+        assert!(!env.chrome_walk);
+        assert_eq!(
+            env.chrome_hint.as_deref(),
+            Some(crate::chrome::CHROME_HINT_NOT_CHROME_TAB)
+        );
+        assert!(
+            !env.chrome_hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("native-host-doctor")
+        );
+    }
+
+    #[test]
+    fn sidecar_omitted_chrome_walk_uses_target_chrome_exe() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [],
+            "elements_total": 0,
+            "elements_truncated": false,
+            "chrome_connected": true,
+            "fg_window": {"pid":1,"title":"Notepad","class":"Notepad","chrome_exe":false,"hwnd":"1"},
+            "target_window": {"pid":2,"title":"Chrome","class":"Chrome_WidgetWin_1","chrome_exe":true,"foreground":false,"hwnd":"2"}
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        let env = envelope_from_sidecar(side, ObserveView::Auto);
+        assert!(env.chrome_walk);
     }
 
     fn dialog_el(id: &str, text: &str, rect: Rect) -> Element {
@@ -2484,6 +2639,7 @@ mod tests {
             elements_total,
             elements_truncated: false,
             chrome_connected,
+            chrome_walk: false,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
@@ -2581,6 +2737,7 @@ mod tests {
             elements_total: crate::extract::DEFAULT_ELEMENT_CAP + 1,
             elements_truncated: false,
             chrome_connected: connected,
+            chrome_walk: false,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
@@ -2996,6 +3153,7 @@ mod tests {
             elements_total,
             elements_truncated: false,
             chrome_connected: false,
+            chrome_walk: false,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
@@ -4096,6 +4254,7 @@ mod tests {
             elements_total,
             elements_truncated: false,
             chrome_connected,
+            chrome_walk: false,
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
@@ -4742,6 +4901,7 @@ mod tests {
             elements_total: raw.elements.len(),
             elements_truncated: false,
             chrome_connected: raw.chrome_connected,
+            chrome_walk: Some(raw.chrome_walk),
             chrome_hint: raw.chrome_hint.clone(),
             challenge: raw.challenge.clone(),
             windows: raw.windows.clone(),
@@ -4847,6 +5007,7 @@ mod tests {
             elements_total: 1,
             elements_truncated: false,
             chrome_connected: false,
+            chrome_walk: Some(false),
             chrome_hint: None,
             challenge: ChallengeInfo::default(),
             windows: Vec::new(),
@@ -4924,12 +5085,20 @@ mod tests {
         assert!(agents.contains("cards_walked"));
         assert!(agents.contains("cards_total") || agents.contains("cards_omitted"));
         assert!(agents.contains("--from"));
+        assert!(
+            agents.contains("chrome_walk"),
+            "AGENTS.md must name chrome_walk"
+        );
         let readme = include_str!("../README.md");
         assert!(readme.contains("include_screenshot_path"));
         assert!(readme.contains("blit/preprocess/encode") || readme.contains("full pipeline"));
         assert!(readme.contains("--from"));
         assert!(readme.contains("cards_walked"));
         assert!(readme.contains("cards_total") || readme.contains("cards_omitted"));
+        assert!(
+            readme.contains("chrome_walk"),
+            "README must name chrome_walk"
+        );
         let main = include_str!("main.rs");
         assert!(main.contains("--view"));
         assert!(main.contains("--from"));
@@ -5064,6 +5233,12 @@ mod tests {
         assert!(
             spawn < collect && collect < snapshot && snapshot < join,
             "UIA collect must run overlapped with try_snapshot:\n{live}"
+        );
+        assert!(
+            live.contains("is_chrome_hwnd")
+                && live.contains("chrome_walk")
+                && live.contains("chrome_hint_for_observe"),
+            "observe sets chrome_walk from walk hwnd and routes hint through helper:\n{live}"
         );
         assert!(
             live.contains("popup_rect: snap.popup_rect"),

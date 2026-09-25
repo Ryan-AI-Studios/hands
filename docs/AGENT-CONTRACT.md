@@ -36,7 +36,7 @@ Do not prefer the grid over `chr:` / `uia:` / rect.
 
 ## Windows
 
-Selector: `hwnd:` (optional `0x`) is deterministic and works for a live handle even when it is untitled or absent from the titled list; digit-only is pid; otherwise a unique case-insensitive substring against the **current** inventory (titled on `--scope fg`, expanded on `--scope desktop`). The envelope list is capped (≤12, title ≤40) with `windows_total` / `windows_truncated`. The sidecar holds the full inventory (`class` only on expanded desktop rows). Display caps do not affect matching. `--scope` is observe-only.
+Selector: `hwnd:` (optional `0x`) is deterministic and works for a live handle even when it is untitled or absent from the titled list; digit-only is pid; otherwise a unique **exact title** (trim, case-insensitive) against the **current** inventory wins over a unique case-insensitive substring (titled on `--scope fg`, expanded on `--scope desktop`). Two exact titles or two substring hits with no unique exact stay a fatal multi-match listing `hwnd:<hex> <pid> <title>`. The envelope list is capped (≤12, title ≤40) with `windows_total` / `windows_truncated`. The sidecar holds the full inventory (`class` only on expanded desktop rows). Display caps do not affect matching. `--scope` is observe-only.
 
 ## Envelope hints
 

@@ -933,7 +933,7 @@ fn offered_tools() -> Value {
         ),
         fn_tool(
             "activate",
-            "Raise a titled window (pid, unique title, or hwnd:<hex>). Not observe. Not confirm-gated.",
+            "Raise a titled window (pid, unique exact title then unique substring, or hwnd:<hex>). Not observe. Not confirm-gated.",
             json!({
                 "type": "object",
                 "properties": { "window": { "type": "string" } },

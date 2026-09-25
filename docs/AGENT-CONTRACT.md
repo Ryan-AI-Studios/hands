@@ -33,7 +33,7 @@ Do not prefer the grid over `chr:` / `uia:` / rect.
 
 `miss` is the effect signal: `no_change` or `focus_lost` only. `sequence` already surfaces `executed_steps[i].miss`. A `no_change` miss does **not** flip `ok` or abort the sequence. One retry with re-offer on `focus_lost` (0013) is unchanged.
 
-`navigated` is additive (omitted when false). On daily Chrome, a caption change or a loading interstitial (`title_blocks_settled`) reports `navigated: true`, `miss` omitted, and **no** second click. `sequence` does **not** abort on `navigated`. After `navigated: true`, `chr:` ids died — re-observe. Soft-routes that keep the same caption still look like `no_change`. Non-Chrome title edits (`Untitled` → `*Untitled`) are not `navigated`.
+`navigated` is additive (omitted when false). On daily Chrome, a caption change or a loading interstitial (`title_blocks_settled`) reports `navigated: true`, `miss` omitted, and **no** second click. On daily Chrome, soft-routes that keep the same caption still look like `no_change`. On a non-Chrome window, a changing `http://` / `https://` UIA Document value (`page_url`) is `navigated: true` even if the OS caption is static; missing URL-shaped values fail open to pixel-diff miss. `sequence` does **not** abort on `navigated`. After `navigated: true`, `chr:` ids died — re-observe. Non-Chrome title edits (`Untitled` → `*Untitled`) are not `navigated`.
 
 ## Windows
 

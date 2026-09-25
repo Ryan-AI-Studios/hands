@@ -11,9 +11,11 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Ole::{
     SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
 };
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
-    IUIAutomationValuePattern, UIA_ValuePatternId,
+    IUIAutomationValuePattern, TreeScope_Descendants, UIA_ControlTypePropertyId,
+    UIA_DocumentControlTypeId, UIA_ValuePatternId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GW_ENABLEDPOPUP, GetWindow};
 
@@ -137,6 +139,55 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_focused_leaf_hook(hook: Option<FocusedLeafHook>) {
     FOCUSED_LEAF_HOOK.with(|c| c.set(hook));
+}
+
+#[cfg(test)]
+type PageUrlHook = fn(Option<isize>) -> Option<String>;
+
+#[cfg(test)]
+thread_local! {
+    static PAGE_URL_HOOK: std::cell::Cell<Option<PageUrlHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_page_url_hook(hook: Option<PageUrlHook>) {
+    PAGE_URL_HOOK.with(|c| c.set(hook));
+}
+
+/// First descendant Document ValuePattern if it is `http://` or `https://`.
+pub fn page_url(hwnd: Option<isize>) -> Option<String> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = PAGE_URL_HOOK.with(|c| c.get()) {
+            return hook(hwnd);
+        }
+    }
+    let hwnd = hwnd?;
+    std::thread::Builder::new()
+        .name("hands-uia-sta".into())
+        .spawn(move || sta_page_url(hwnd))
+        .ok()?
+        .join()
+        .ok()?
+}
+
+fn sta_page_url(hwnd: isize) -> Option<String> {
+    let _sta = StaGuard::enter().ok()?;
+    let automation = create_automation().ok()?;
+    let handle = crate::foreground::raw_hwnd(hwnd);
+    crate::foreground::hwnd_raw(handle)?;
+    let root = unsafe { automation.ElementFromHandle(handle) }.ok()?;
+    let condition = unsafe {
+        automation.CreatePropertyCondition(
+            UIA_ControlTypePropertyId,
+            &VARIANT::from(UIA_DocumentControlTypeId.0),
+        )
+    }
+    .ok()?;
+    let document = unsafe { root.FindFirst(TreeScope_Descendants, &condition) }.ok()?;
+    let value = value_pattern(&document)?;
+    crate::extract::http_https_url(Some(&value))
 }
 
 /// Leaf `CurrentControlType` + hwnd. Used by `type`; fence still uses `focused()`.

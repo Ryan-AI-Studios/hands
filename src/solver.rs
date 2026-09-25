@@ -640,6 +640,7 @@ mod tests {
             elements_total: 0,
             elements_truncated: false,
             chrome_connected: false,
+            chrome_walk: false,
             chrome_hint: None,
             windows: Vec::new(),
             windows_total: 0,

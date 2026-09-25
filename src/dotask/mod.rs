@@ -67,7 +67,7 @@ Call only the offered primitives. Do not invent confirm. A fence refuse or chall
 Gray-zone free (cookie Accept, Not now, ZIP) vs confirm (Easy Apply, Follow, lead forms) is enforced in-binary.\n\
 Two challenge tries then yield is Hands policy.\n\
 Prefer chr: / uia: / grid ids from the last observe.\n\
-Call attach if Chrome is needed and not connected. Do not attach again once chrome_connected / a prior attach already succeeded. plan: true is a dry-run; plan: false may launch chrome.exe, which is allowed once.";
+Call attach if Chrome is needed and not connected. Do not attach again once chrome_connected / a prior attach already succeeded. chrome_walk false means this observe is not a Chrome tab; use uia:. Do not attach based on chrome_walk. plan: true is a dry-run; plan: false may launch chrome.exe, which is allowed once.";
 
 const CAUSE_NONE: u8 = 0;
 const CAUSE_PHYSICAL: u8 = 1;
@@ -1537,6 +1537,8 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("Do not invent confirm"));
         assert!(SYSTEM_PROMPT.contains("Do not attach again"));
         assert!(SYSTEM_PROMPT.contains("chrome_connected"));
+        assert!(SYSTEM_PROMPT.contains("chrome_walk"));
+        assert!(SYSTEM_PROMPT.contains("Do not attach based on chrome_walk"));
         assert!(SYSTEM_PROMPT.contains("plan: false"));
         assert!(SYSTEM_PROMPT.contains("chr:"));
         assert!(!SYSTEM_PROMPT.to_ascii_lowercase().contains("you are grok"));

@@ -12,8 +12,8 @@ description: >
 
 First-time install (HKCU, filled JSON, Load unpacked) lives in the Hands repo
 **`README.md`** (“Install on this Windows PC”). Do not copy that here. This skill
-is the **live** loop: get `chrome_connected: true` and use `chr:` on a real https
-tab.
+is the **live** loop: get `chrome_connected: true` **and** `chrome_walk: true`
+and use `chr:` on a real https tab.
 
 Product cwd: the Hands git root (the directory that contains `Cargo.toml` and
 `extension/`). `attach` does not sideload. `observe` does not launch Chrome. No
@@ -32,11 +32,13 @@ Pipe: `\\.\pipe\hands-chrome` (`HANDS_CHROME_PIPE`). Extension id
 
 `chrome_connected` is **host-up** (named pipe or fixture), not snapshot success.
 Loading/`no-content` or a 400 ms timeout keep it true with a retry/`wait_settle`
-hint. Doctor hint only when the host is down. Doctor still splits **pipe** vs
-**snapshot**. `chr:<u32>` appears only when **Chrome is the foreground window**
-and the page is a normal `https://` tab. Content scripts do **not** run on
-`chrome://` (including `chrome://extensions`). Prefer `chr:` for page content;
-Chrome UIA churns.
+hint. Doctor hint only when the host is down **and** `chrome_walk` is true.
+`chrome_walk` is true only when this observe walked daily Chrome
+(`Chrome_WidgetWin_1` × `chrome.exe`). When it is false, use `uia:` / `hwnd:` —
+do not wait for `chr:` and do not run doctor. `chr:<u32>` appears only when
+`chrome_walk` is true and the page is a normal `https://` tab. Content scripts
+do **not** run on `chrome://` (including `chrome://extensions`). Prefer `chr:`
+for page content; Chrome UIA churns.
 
 ## What the extension is (and is not)
 
@@ -59,9 +61,12 @@ scroll first. Do not pass `detail=dom` to “see more”; the sidecar already ha
 ## Before driving a page
 
 1. `attach` (plan: true is dry-run). Daily Chrome, no automation flags.
-2. `observe`. If `chrome_connected: true` and you see `chr:` ids, use them.
-3. If `chrome_connected: false` or no `chr:` on an https FG Chrome tab, diagnose
-   — do not keep clicking `uia:` / pixels and call fusion used.
+2. `observe`. If `chrome_connected: true` and `chrome_walk: true` and you see
+   `chr:` ids, use them.
+3. If `chrome_walk` is false, use `uia:` / `hwnd:` — do not wait for fusion.
+   If `chrome_connected: false` or no `chr:` on an https FG Chrome tab
+   (`chrome_walk: true`), diagnose — do not keep clicking `uia:` / pixels and
+   call fusion used.
 
 Doctor (read-only; does not write HKCU). MCP: `native_host_doctor`. If this MCP
 build lacks that tool, run it from the **same exe Chrome will spawn** (`path` in

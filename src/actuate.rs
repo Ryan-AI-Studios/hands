@@ -2260,6 +2260,59 @@ mod tests {
     }
 
     #[test]
+    fn activate_exact_title_open_beats_substring_opencode_tab() {
+        // HITL 2026-09-24: activate Open must pick the #32770 titled Open, not a
+        // Chrome tab whose title contains "opencode". App copy is comments only.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OFFERS: AtomicUsize = AtomicUsize::new(0);
+        fn offer_ok(hwnd: Option<isize>, _: (i32, i32)) -> bool {
+            OFFERS.fetch_add(1, Ordering::SeqCst);
+            hwnd == Some(0xc1cca)
+        }
+        fn fg_ok() -> Option<isize> {
+            Some(0xc1cca)
+        }
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        let chrome = {
+            let mut w = sample_titled(
+                0x1429ca,
+                5784,
+                "does opencode use agents.md … Google Chrome",
+            );
+            w.class = "Chrome_WidgetWin_1".into();
+            w
+        };
+        let dialog = {
+            let mut w = sample_titled(0xc1cca, 30360, "Open");
+            w.class = "#32770".into();
+            w
+        };
+        crate::foreground::set_titled_windows_hook(Some(vec![chrome, dialog]));
+        OFFERS.store(0, Ordering::SeqCst);
+        let env = activate_with(
+            Some("s-act-0114-open".into()),
+            "Open".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_ok,
+                foreground: fg_ok,
+                is_live: |_| true,
+            },
+        )
+        .expect("activate");
+        crate::foreground::set_titled_windows_hook(None);
+        lease::reset_for_test();
+        assert!(env.ok, "{env:?}");
+        assert!(env.foregrounded);
+        assert_eq!(env.reason, None);
+        assert_eq!(OFFERS.load(Ordering::SeqCst), 1);
+        assert_eq!(env.window.as_ref().map(|w| w.hwnd.as_str()), Some("c1cca"));
+        assert_eq!(env.window.as_ref().map(|w| w.pid), Some(30360));
+        assert_eq!(env.window.as_ref().map(|w| w.title.as_str()), Some("Open"));
+    }
+
+    #[test]
     fn yielded_activate_does_not_offer() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static OFFERS: AtomicUsize = AtomicUsize::new(0);

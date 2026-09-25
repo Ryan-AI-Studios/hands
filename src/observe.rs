@@ -463,11 +463,23 @@ pub(crate) fn resolve_window(
     let matches: Vec<&foreground::TitledWindow> = if let Some(pid) = is_digits_only_pid(query) {
         windows.iter().filter(|w| w.pid == pid).collect()
     } else {
-        let needle = query.to_lowercase();
-        windows
-            .iter()
-            .filter(|w| w.title.to_lowercase().contains(&needle))
-            .collect()
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            Vec::new()
+        } else {
+            let exact: Vec<&foreground::TitledWindow> = windows
+                .iter()
+                .filter(|w| w.title.trim().to_lowercase() == needle)
+                .collect();
+            if !exact.is_empty() {
+                exact
+            } else {
+                windows
+                    .iter()
+                    .filter(|w| w.title.to_lowercase().contains(&needle))
+                    .collect()
+            }
+        }
     };
     match matches.as_slice() {
         [one] => Ok((*one).clone()),
@@ -3630,6 +3642,66 @@ mod tests {
             .to_string();
         assert!(stale.contains("stale hwnd"), "{stale}");
         assert!(stale.contains("hwnd:dead"), "{stale}");
+    }
+
+    #[test]
+    fn resolve_window_exact_title_beats_substring_open_in_opencode() {
+        // HITL 2026-09-24: query Open collided with a Chrome tab whose title
+        // contains "opencode". Unique exact title must win. App copy is comments only.
+        let mut chrome = titled_win(
+            0x1429ca,
+            5784,
+            "does opencode use agents.md … Google Chrome",
+        );
+        chrome.class = "Chrome_WidgetWin_1".into();
+        let mut dialog = titled_win(0xc1cca, 30360, "Open");
+        dialog.class = "#32770".into();
+        let inventory = vec![chrome, dialog];
+        let hit = resolve_window("Open", &inventory).expect("exact Open");
+        assert_eq!(hit.hwnd, 0xc1cca);
+        assert_eq!(hit.pid, 30360);
+        assert_eq!(hit.title, "Open");
+        let padded = resolve_window(" Open ", &inventory).expect("trim");
+        assert_eq!(padded.hwnd, 0xc1cca);
+        assert_eq!(
+            resolve_window("open", &inventory).expect("case").hwnd,
+            0xc1cca
+        );
+        let empty = resolve_window("   ", &inventory).unwrap_err().to_string();
+        assert!(empty.contains("no window matching"), "{empty}");
+        let blank = resolve_window("", &inventory).unwrap_err().to_string();
+        assert!(blank.contains("no window matching"), "{blank}");
+        let observe = plan_observe_target(
+            Some("Open"),
+            &inventory,
+            Some(0x1429ca),
+            ObserveScope::Fg,
+            None,
+        )
+        .expect("observe --window Open");
+        assert_eq!(observe.walk_hwnd, Some(0xc1cca));
+        assert_eq!(
+            resolve_window("hwnd:1429ca", &inventory).unwrap().hwnd,
+            0x1429ca
+        );
+        assert_eq!(resolve_window("30360", &inventory).unwrap().hwnd, 0xc1cca);
+        let two_open = vec![
+            {
+                let mut w = titled_win(0x10, 1, "Open");
+                w.class = "#32770".into();
+                w
+            },
+            {
+                let mut w = titled_win(0x11, 2, "Open");
+                w.class = "#32770".into();
+                w
+            },
+        ];
+        let many = resolve_window("Open", &two_open).unwrap_err().to_string();
+        assert!(many.contains("multiple windows matching"), "{many}");
+        assert!(many.contains("hwnd:10 1"), "{many}");
+        assert!(many.contains("hwnd:11 2"), "{many}");
+        assert!(!many.contains("#32770"), "{many}");
     }
 
     #[test]

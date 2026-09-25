@@ -1867,25 +1867,12 @@ mod tests {
         }
     }
 
-    fn type_focus_lock() -> (
-        TypeFocusGuard,
-        std::sync::MutexGuard<'static, ()>,
-        std::sync::MutexGuard<'static, ()>,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
+    fn type_focus_lock() -> (TypeFocusGuard, std::sync::MutexGuard<'static, ()>) {
         let challenge = crate::challenge::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::challenge::reset_for_test();
-        let cooldown = crate::cooldown::TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        crate::cooldown::reset_for_test();
-        let lease = crate::lease::TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        crate::lease::reset_for_test();
-        (TypeFocusGuard, challenge, cooldown, lease)
+        (TypeFocusGuard, challenge)
     }
 
     fn fg_10() -> Option<isize> {
@@ -1972,7 +1959,6 @@ mod tests {
         assert!(err.contains("click an editable field first"), "{err}");
         let snap = crate::cooldown::snapshot("s-act-0115-nofocus");
         assert_eq!(snap.attempt, 1, "{snap:?}");
-        crate::cooldown::reset_for_test();
     }
 
     #[test]
@@ -1985,7 +1971,6 @@ mod tests {
         assert!(!env.ok, "{env:?}");
         let err = env.error.unwrap_or_default();
         assert!(err.contains("not an edit, combo, or document"), "{err}");
-        crate::cooldown::reset_for_test();
     }
 
     #[test]
@@ -1998,7 +1983,6 @@ mod tests {
         assert!(!env.ok, "{env:?}");
         let err = env.error.unwrap_or_default();
         assert!(err.contains("not in the foreground window"), "{err}");
-        crate::cooldown::reset_for_test();
     }
 
     #[test]
@@ -2011,7 +1995,6 @@ mod tests {
         assert!(!env.ok, "{env:?}");
         let err = env.error.unwrap_or_default();
         assert!(err.contains("not in the foreground window"), "{err}");
-        crate::cooldown::reset_for_test();
     }
 
     #[test]
@@ -2024,7 +2007,6 @@ mod tests {
         assert!(!env.ok, "{env:?}");
         let err = env.error.unwrap_or_default();
         assert!(err.contains("not in the foreground window"), "{err}");
-        crate::cooldown::reset_for_test();
     }
 
     fn type_editable_ok(session: &str, leaf: fn() -> Result<crate::uia::FocusedLeaf, HandsError>) {
@@ -2037,7 +2019,6 @@ mod tests {
         assert!(env.ok, "{env:?}");
         assert!(env.foregrounded, "{env:?}");
         assert!(TYPE_SENDS.with(|c| c.get()) > 0, "{env:?}");
-        crate::cooldown::reset_for_test();
     }
 
     #[test]

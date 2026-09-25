@@ -36,6 +36,21 @@ const CONTROL_ROLES: &[&str] = &[
     "SplitButton",
     "Slider",
 ];
+const PROTECTED_ROLES: &[&str] = &[
+    "Button",
+    "Edit",
+    "ComboBox",
+    "Hyperlink",
+    "CheckBox",
+    "RadioButton",
+    "TabItem",
+    "SplitButton",
+    "Slider",
+    "ListItem",
+    "MenuItem",
+    "TreeItem",
+];
+const CONTAINER_ROLES: &[&str] = &["Document", "Pane", "Group", "Window", "Other"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -669,7 +684,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         Detail::Default => {
             retain_hittable_centers(&mut full.elements, &opts);
             apply_card_offset(&mut full, req.card_offset);
-            finalize_envelope(cap_default_envelope(full))?
+            finalize_envelope(cap_default_envelope_with_client(full, opts.client))?
         }
         Detail::Dom => finalize_envelope(full)?,
     };
@@ -791,8 +806,18 @@ pub fn cap_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
 /// Never drops `challenge`, `chrome_hint`, or the last dialog first.
 /// Last resort: pop extra dialogs after `main_text` is empty. 16 KiB hard fail
 /// stays in `finalize_envelope`.
-pub fn cap_default_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
+pub fn cap_default_envelope(envelope: ObserveEnvelope) -> ObserveEnvelope {
+    cap_default_envelope_with_client(envelope, None)
+}
+
+fn cap_default_envelope_with_client(
+    mut envelope: ObserveEnvelope,
+    client: Option<Rect>,
+) -> ObserveEnvelope {
     promote_reserved_behind_dialogs(&mut envelope);
+    let cover = client.or(envelope.viewport);
+    demote_full_client_unnamed_containers(&mut envelope, cover);
+    prefer_actionable_in_rest(&mut envelope);
     if envelope.elements.len() > VIEWPORT_ENVELOPE_ELEMENT_CAP {
         envelope.elements.truncate(VIEWPORT_ENVELOPE_ELEMENT_CAP);
     }
@@ -833,6 +858,87 @@ pub fn cap_default_envelope(mut envelope: ObserveEnvelope) -> ObserveEnvelope {
     }
     refresh_card_omitted(&mut envelope);
     envelope
+}
+
+fn role_eq_any(role: &str, names: &[&str]) -> bool {
+    names.iter().any(|name| role.eq_ignore_ascii_case(name))
+}
+
+fn rect_intersection_area(a: Rect, b: Rect) -> i64 {
+    if a.w <= 0 || a.h <= 0 || b.w <= 0 || b.h <= 0 {
+        return 0;
+    }
+    let x1 = a.x.max(b.x);
+    let y1 = a.y.max(b.y);
+    let x2 = a.x.saturating_add(a.w).min(b.x.saturating_add(b.w));
+    let y2 = a.y.saturating_add(a.h).min(b.y.saturating_add(b.h));
+    let w = i64::from(x2) - i64::from(x1);
+    let h = i64::from(y2) - i64::from(y1);
+    if w <= 0 || h <= 0 { 0 } else { w * h }
+}
+
+fn inflated_contains_cover(el: Rect, cover: Rect) -> bool {
+    if cover.w <= 0 || cover.h <= 0 {
+        return false;
+    }
+    let left = el.x.saturating_sub(2);
+    let top = el.y.saturating_sub(2);
+    let right = el.x.saturating_add(el.w).saturating_add(2);
+    let bottom = el.y.saturating_add(el.h).saturating_add(2);
+    left <= cover.x
+        && top <= cover.y
+        && right >= cover.x.saturating_add(cover.w)
+        && bottom >= cover.y.saturating_add(cover.h)
+}
+
+fn is_full_client_unnamed_container(el: &Element, cover: Option<Rect>) -> bool {
+    if el.unnamed != Some(true) {
+        return false;
+    }
+    if role_eq_any(&el.role, PROTECTED_ROLES) {
+        return false;
+    }
+    if !role_eq_any(&el.role, CONTAINER_ROLES) {
+        return false;
+    }
+    let Some(cover) = cover else {
+        return false;
+    };
+    let cover_area = cover.area().max(1);
+    rect_intersection_area(el.rect, cover).saturating_mul(10) >= cover_area.saturating_mul(9)
+        || inflated_contains_cover(el.rect, cover)
+}
+
+fn demote_full_client_unnamed_containers(envelope: &mut ObserveEnvelope, cover: Option<Rect>) {
+    let dialog_ids = dialog_id_set(envelope);
+    let is_omit =
+        |el: &Element| !dialog_ids.contains(&el.id) && is_full_client_unnamed_container(el, cover);
+    if envelope.elements.iter().any(|el| !is_omit(el)) {
+        envelope.elements.retain(|el| !is_omit(el));
+    }
+}
+
+fn prefer_actionable_in_rest(envelope: &mut ObserveEnvelope) {
+    let dialog_ids = dialog_id_set(envelope);
+    let viewport = envelope.viewport;
+    let mut head = Vec::new();
+    let mut actionable = Vec::new();
+    let mut other = Vec::new();
+    for el in envelope.elements.drain(..) {
+        if dialog_ids.contains(&el.id)
+            || is_suggestion_row(&el)
+            || is_reserved_control_parts(&el, &dialog_ids, viewport)
+        {
+            head.push(el);
+        } else if role_eq_any(&el.role, PROTECTED_ROLES) {
+            actionable.push(el);
+        } else {
+            other.push(el);
+        }
+    }
+    envelope.elements = head;
+    envelope.elements.extend(actionable);
+    envelope.elements.extend(other);
 }
 
 fn pop_non_reserved_elements(envelope: &mut ObserveEnvelope) {
@@ -1229,11 +1335,12 @@ fn reshape_from_sidecar(req: &ObserveRequest, from: &str) -> Result<ObserveEnvel
         virtual_screen: Some(sidecar.space.as_rect()),
         popup_rect: sidecar.popup_rect,
     };
+    let client = sidecar.client;
     let mut envelope = envelope_from_sidecar(sidecar, req.view);
     envelope.card_counts.cards_walked = envelope.extract.cards_walked;
     retain_hittable_centers(&mut envelope.elements, &opts);
     apply_card_offset(&mut envelope, req.card_offset);
-    let envelope = finalize_envelope(cap_default_envelope(envelope))?;
+    let envelope = finalize_envelope(cap_default_envelope_with_client(envelope, client))?;
     logs::ensure_installed();
     logs::remember_session(&envelope.session_id);
     let _ = logs::record_observe(
@@ -4068,6 +4175,410 @@ mod tests {
         let json = serialize_envelope(&capped).unwrap();
         assert!(json.len() <= DEFAULT_ENVELOPE_MAX_BYTES);
         assert!(!capped.extract.cards.is_empty());
+    }
+
+    fn webview_cover() -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        }
+    }
+
+    fn unnamed_container(id: &str, role: &str) -> Element {
+        Element {
+            id: id.into(),
+            role: role.into(),
+            text: None,
+            rect: webview_cover(),
+            grid: None,
+            unnamed: Some(true),
+        }
+    }
+
+    fn body_button(id: &str, label: &str) -> Element {
+        Element {
+            id: id.into(),
+            role: "Button".into(),
+            text: Some(label.into()),
+            rect: Rect {
+                x: 40,
+                y: 800,
+                w: 120,
+                h: 32,
+            },
+            grid: None,
+            unnamed: None,
+        }
+    }
+
+    fn webview_pack_envelope(elements: Vec<Element>, total: usize) -> ObserveEnvelope {
+        let mut env = fat_envelope(0);
+        env.viewport = Some(webview_cover());
+        env.elements_total = total;
+        env.elements = elements;
+        env
+    }
+
+    #[test]
+    fn unnamed_full_client_containers_leave_the_20_when_buttons_exist() {
+        // Body CTAs are not CONTROL_LEXICON and sit below the top band (y=800).
+        let raw = webview_pack_envelope(
+            vec![
+                unnamed_container("uia:doc", "Document"),
+                unnamed_container("uia:pane", "pane"),
+                body_button("uia:a", "Alpha"),
+                body_button("uia:b", "Bravo"),
+                body_button("uia:c", "Charlie"),
+            ],
+            40,
+        );
+        let capped = cap_default_envelope(raw);
+        let ids: Vec<&str> = capped.elements.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"uia:a"));
+        assert!(ids.contains(&"uia:b"));
+        assert!(ids.contains(&"uia:c"));
+        assert!(!ids.contains(&"uia:doc"));
+        assert!(!ids.contains(&"uia:pane"));
+        assert_eq!(capped.elements_total, 40);
+        assert!(capped.elements_truncated);
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert_eq!(VIEWPORT_ENVELOPE_ELEMENT_CAP, 20);
+    }
+
+    #[test]
+    fn unnamed_full_client_containers_stay_when_they_are_the_only_hittable() {
+        let raw = webview_pack_envelope(
+            vec![
+                unnamed_container("uia:doc", "Document"),
+                unnamed_container("uia:pane", "Other"),
+            ],
+            2,
+        );
+        let capped = cap_default_envelope(raw);
+        let ids: Vec<&str> = capped.elements.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["uia:doc", "uia:pane"]);
+        assert_eq!(capped.elements_total, 2);
+        assert!(!capped.elements_truncated);
+    }
+
+    #[test]
+    fn unnamed_full_client_edit_and_icon_button_are_not_demoted() {
+        let mut edit = unnamed_container("uia:edit", "Edit");
+        edit.text = None;
+        let icon = Element {
+            id: "uia:icon".into(),
+            role: "Button".into(),
+            text: None,
+            rect: Rect {
+                x: 40,
+                y: 800,
+                w: 32,
+                h: 32,
+            },
+            grid: None,
+            unnamed: Some(true),
+        };
+        let raw = webview_pack_envelope(
+            vec![
+                unnamed_container("uia:doc", "Document"),
+                edit,
+                icon,
+                body_button("uia:a", "Alpha"),
+            ],
+            4,
+        );
+        let capped = cap_default_envelope(raw);
+        let ids: Vec<&str> = capped.elements.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"uia:edit"));
+        assert!(ids.contains(&"uia:icon"));
+        assert!(ids.contains(&"uia:a"));
+        assert!(!ids.contains(&"uia:doc"));
+        assert_eq!(capped.elements_total, 4);
+    }
+
+    #[test]
+    fn dialog_still_leads_when_webview_containers_are_demoted() {
+        let mut raw = webview_pack_envelope(
+            vec![
+                unnamed_container("uia:doc", "Document"),
+                body_button("uia:a", "Alpha"),
+                Element {
+                    id: "uia:dlg".into(),
+                    role: "Button".into(),
+                    text: Some("Continue as guest".into()),
+                    rect: Rect {
+                        x: 200,
+                        y: 200,
+                        w: 160,
+                        h: 28,
+                    },
+                    grid: None,
+                    unnamed: None,
+                },
+            ],
+            3,
+        );
+        raw.extract.dialogs = vec![crate::extract::DialogHit {
+            id: "uia:dlg".into(),
+            role: "Button".into(),
+            text: "Continue as guest".into(),
+            rect: Rect {
+                x: 200,
+                y: 200,
+                w: 160,
+                h: 28,
+            },
+            kind: "account".into(),
+        }];
+        let capped = cap_default_envelope(raw);
+        assert_eq!(capped.elements[0].id, "uia:dlg");
+        assert!(capped.elements.iter().any(|e| e.id == "uia:a"));
+        assert!(!capped.elements.iter().any(|e| e.id == "uia:doc"));
+    }
+
+    #[test]
+    fn suggestion_rows_stay_reserved_ahead_of_body_buttons() {
+        let raw = webview_pack_envelope(
+            vec![
+                unnamed_container("uia:doc", "Document"),
+                shopping_el("chr:0", "ListItem", "AAPL 180.12 +1.2", 120),
+                shopping_el("chr:1", "TreeItem", "MSFT row", 150),
+                body_button("uia:a", "Alpha"),
+            ],
+            4,
+        );
+        let capped = cap_default_envelope(raw);
+        let ids: Vec<&str> = capped.elements.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"chr:0"));
+        assert!(ids.contains(&"chr:1"));
+        assert!(ids.contains(&"uia:a"));
+        assert!(!ids.contains(&"uia:doc"));
+        let sug = ids.iter().position(|id| *id == "chr:0").unwrap();
+        let btn = ids.iter().position(|id| *id == "uia:a").unwrap();
+        assert!(sug < btn, "{ids:?}");
+    }
+
+    #[test]
+    fn webview_demote_does_not_change_controls_card_clear() {
+        let mut raw = webview_pack_envelope(
+            vec![
+                unnamed_container("uia:doc", "Document"),
+                body_button("uia:a", "Alpha"),
+            ],
+            2,
+        );
+        raw.view = ObserveView::Controls;
+        raw.extract.cards = (0..3).map(fat_listing_card).collect();
+        raw.card_counts.cards_total = 3;
+        let capped = cap_default_envelope(raw);
+        assert!(capped.extract.cards.is_empty());
+        assert_eq!(capped.card_counts.cards_omitted, 3);
+        assert!(capped.elements.iter().any(|e| e.id == "uia:a"));
+        assert!(!capped.elements.iter().any(|e| e.id == "uia:doc"));
+    }
+
+    #[test]
+    fn prefer_actionable_rest_puts_body_buttons_before_other_tail() {
+        let filler = Element {
+            id: "uia:text".into(),
+            role: "Text".into(),
+            text: Some("caption".into()),
+            rect: Rect {
+                x: 10,
+                y: 700,
+                w: 80,
+                h: 16,
+            },
+            grid: None,
+            unnamed: None,
+        };
+        let raw = webview_pack_envelope(vec![filler, body_button("uia:a", "Alpha")], 2);
+        let capped = cap_default_envelope(raw);
+        assert_eq!(capped.elements[0].id, "uia:a");
+        assert_eq!(capped.elements[1].id, "uia:text");
+    }
+
+    #[test]
+    fn pack_time_demote_is_in_cap_not_walk() {
+        let src = include_str!("observe.rs");
+        let cap = src
+            .find("fn cap_default_envelope_with_client(")
+            .expect("with_client");
+        let pop = src
+            .find("fn pop_non_reserved_elements(")
+            .expect("pop_non_reserved");
+        let slice = &src[cap..pop];
+        assert!(
+            slice.contains("demote_full_client_unnamed_containers")
+                && slice.contains("prefer_actionable_in_rest")
+                && slice.contains("promote_reserved_behind_dialogs"),
+            "{slice}"
+        );
+        let promote = slice
+            .find("promote_reserved_behind_dialogs")
+            .expect("promote");
+        let demote = slice
+            .find("demote_full_client_unnamed_containers")
+            .expect("demote");
+        let prefer = slice.find("prefer_actionable_in_rest").expect("prefer");
+        let trunc = slice.find("elements.truncate").expect("truncate");
+        assert!(
+            promote < demote && demote < prefer && prefer < trunc,
+            "promote, demote, prefer, then truncate:\n{slice}"
+        );
+
+        let filter = src
+            .find("fn filter_viewport_nodes(")
+            .expect("filter_viewport_nodes");
+        let filter_end = src
+            .find("fn filter_viewport_elements(")
+            .expect("filter_viewport_elements");
+        assert!(
+            !src[filter..filter_end].contains("is_full_client_unnamed_container"),
+            "do not demote at walk time"
+        );
+        let fuse = src
+            .find("fn fuse_maps_default(")
+            .expect("fuse_maps_default");
+        let in_vp = src.find("fn in_viewport(").expect("in_viewport");
+        assert!(
+            !src[fuse..in_vp].contains("is_full_client_unnamed_container"),
+            "do not demote in fuse"
+        );
+        let reshape = src
+            .find("fn reshape_from_sidecar(")
+            .expect("reshape_from_sidecar");
+        let env_from = src
+            .find("fn envelope_from_sidecar(")
+            .expect("envelope_from_sidecar");
+        assert!(
+            src[reshape..env_from].contains("cap_default_envelope_with_client"),
+            "reshape must pack-time demote with sidecar client"
+        );
+    }
+
+    #[test]
+    fn cover_none_fails_open_and_client_beats_viewport() {
+        let mut raw = webview_pack_envelope(
+            vec![
+                unnamed_container("uia:doc", "Document"),
+                body_button("uia:a", "Alpha"),
+            ],
+            2,
+        );
+        raw.viewport = None;
+        let capped = cap_default_envelope(raw);
+        assert!(capped.elements.iter().any(|e| e.id == "uia:doc"));
+
+        let mut inset = unnamed_container("uia:doc", "Document");
+        inset.rect = Rect {
+            x: 8,
+            y: 80,
+            w: 1900,
+            h: 980,
+        };
+        let raw = webview_pack_envelope(vec![inset, body_button("uia:a", "Alpha")], 2);
+        let client = Some(Rect {
+            x: 8,
+            y: 80,
+            w: 1900,
+            h: 980,
+        });
+        let capped = cap_default_envelope_with_client(raw, client);
+        assert!(!capped.elements.iter().any(|e| e.id == "uia:doc"));
+        assert!(capped.elements.iter().any(|e| e.id == "uia:a"));
+    }
+
+    #[test]
+    fn two_px_inflate_demotes_when_intersection_is_under_90_percent() {
+        let cover = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 20,
+        };
+        let mut doc = unnamed_container("uia:doc", "Document");
+        doc.rect = Rect {
+            x: 2,
+            y: 2,
+            w: 16,
+            h: 16,
+        };
+        let mut raw = webview_pack_envelope(vec![doc, body_button("uia:a", "Alpha")], 2);
+        raw.viewport = Some(cover);
+        let capped = cap_default_envelope(raw);
+        assert!(!capped.elements.iter().any(|e| e.id == "uia:doc"));
+        assert!(capped.elements.iter().any(|e| e.id == "uia:a"));
+    }
+
+    #[test]
+    fn group_window_demote_and_named_document_stays() {
+        let mut named = unnamed_container("uia:named", "Document");
+        named.unnamed = None;
+        named.text = Some("Main".into());
+        let raw = webview_pack_envelope(
+            vec![
+                unnamed_container("uia:group", "Group"),
+                unnamed_container("uia:win", "Window"),
+                named,
+                body_button("uia:a", "Alpha"),
+            ],
+            4,
+        );
+        let capped = cap_default_envelope(raw);
+        let ids: Vec<&str> = capped.elements.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"uia:named"));
+        assert!(ids.contains(&"uia:a"));
+        assert!(!ids.contains(&"uia:group"));
+        assert!(!ids.contains(&"uia:win"));
+    }
+
+    #[test]
+    fn unnamed_full_client_dialog_container_is_not_omitted() {
+        let mut raw = webview_pack_envelope(
+            vec![
+                unnamed_container("uia:dlg", "Window"),
+                body_button("uia:a", "Alpha"),
+            ],
+            2,
+        );
+        raw.extract.dialogs = vec![crate::extract::DialogHit {
+            id: "uia:dlg".into(),
+            role: "Window".into(),
+            text: String::new(),
+            rect: webview_cover(),
+            kind: "dialog".into(),
+        }];
+        let capped = cap_default_envelope(raw);
+        assert_eq!(capped.elements[0].id, "uia:dlg");
+        assert!(capped.elements.iter().any(|e| e.id == "uia:a"));
+    }
+
+    #[test]
+    fn prefer_actionable_survives_fat_text_rest() {
+        let mut els: Vec<Element> = (0..25)
+            .map(|i| Element {
+                id: format!("uia:text:{i}"),
+                role: "Text".into(),
+                text: Some(format!("row {i}")),
+                rect: Rect {
+                    x: 10,
+                    y: 500 + i,
+                    w: 80,
+                    h: 12,
+                },
+                grid: None,
+                unnamed: None,
+            })
+            .collect();
+        els.push(body_button("uia:a", "Alpha"));
+        let raw = webview_pack_envelope(els, 26);
+        let capped = cap_default_envelope(raw);
+        assert!(capped.elements.iter().any(|e| e.id == "uia:a"));
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert_eq!(capped.elements_total, 26);
     }
 
     #[test]

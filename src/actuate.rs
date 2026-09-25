@@ -9,6 +9,7 @@ use crate::bezier::Rng;
 use crate::challenge::{self, ChallengeInfo, YIELD_ERROR};
 use crate::cooldown::{self, Snapshot};
 use crate::error::HandsError;
+use crate::extract::ControlKind;
 use crate::fence::{self, FenceInfo};
 use crate::foreground;
 use crate::input;
@@ -19,6 +20,7 @@ use crate::session::resolve_session_id_from_os;
 use crate::settle;
 use crate::space::{Rect, Space, ensure_dpi, virtual_screen};
 use crate::target::Target;
+use crate::uia;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ActuateTarget {
@@ -869,14 +871,100 @@ fn type_text_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_unless_focused_editable(&session_id, &info)? {
+        return Ok(env);
+    }
     if let Err(err) = ensure_dpi() {
         return fail(session_id, info, err, false, false, false);
     }
     challenge::note_actuation();
     match input::type_text(text) {
-        Ok(_) => base(session_id, info, true, false, false, false, false, None),
+        Ok(_) => base(session_id, info, true, false, false, false, true, None),
         Err(err) => fail(session_id, info, err, false, false, false),
     }
+}
+
+fn refuse_unless_focused_editable(
+    session_id: &str,
+    info: &ActuateTarget,
+) -> Result<Option<ActuateEnvelope>, HandsError> {
+    let Some(fg) = foreground::foreground_hwnd() else {
+        return fail(
+            session_id.to_string(),
+            info.clone(),
+            HandsError::Target(
+                "focused control is not in the foreground window; activate the intended window and click an editable field first"
+                    .into(),
+            ),
+            false,
+            false,
+            false,
+        )
+        .map(Some);
+    };
+    let leaf = match uia::focused_leaf() {
+        Ok(leaf) => leaf,
+        Err(_) => {
+            return fail(
+                session_id.to_string(),
+                info.clone(),
+                HandsError::Target(
+                    "no focused edit, combo, or document in the foreground window; click an editable field first"
+                        .into(),
+                ),
+                false,
+                false,
+                false,
+            )
+            .map(Some);
+        }
+    };
+    if !matches!(
+        leaf.kind,
+        ControlKind::Edit | ControlKind::ComboBox | ControlKind::Document
+    ) {
+        return fail(
+            session_id.to_string(),
+            info.clone(),
+            HandsError::Target(
+                "focused control is not an edit, combo, or document; click an editable field first"
+                    .into(),
+            ),
+            false,
+            false,
+            false,
+        )
+        .map(Some);
+    }
+    let Some(hwnd) = leaf.hwnd else {
+        return fail(
+            session_id.to_string(),
+            info.clone(),
+            HandsError::Target(
+                "focused control is not in the foreground window; activate the intended window and click an editable field first"
+                    .into(),
+            ),
+            false,
+            false,
+            false,
+        )
+        .map(Some);
+    };
+    if !foreground::related_to_root(hwnd, fg) {
+        return fail(
+            session_id.to_string(),
+            info.clone(),
+            HandsError::Target(
+                "focused control is not in the foreground window; activate the intended window and click an editable field first"
+                    .into(),
+            ),
+            false,
+            false,
+            false,
+        )
+        .map(Some);
+    }
+    Ok(None)
 }
 
 pub fn key(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -1768,6 +1856,218 @@ mod tests {
         .unwrap();
         assert!(!env.ok);
         assert!(env.error.unwrap_or_default().contains("newline"));
+    }
+
+    struct TypeFocusGuard;
+    impl Drop for TypeFocusGuard {
+        fn drop(&mut self) {
+            crate::uia::set_focused_leaf_hook(None);
+            crate::foreground::set_foreground_hwnd_hook(None);
+            crate::input::set_send_inputs_hook(None);
+        }
+    }
+
+    fn type_focus_lock() -> (TypeFocusGuard, std::sync::MutexGuard<'static, ()>) {
+        let challenge = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::challenge::reset_for_test();
+        (TypeFocusGuard, challenge)
+    }
+
+    fn fg_10() -> Option<isize> {
+        Some(0x10)
+    }
+    fn fg_none() -> Option<isize> {
+        None
+    }
+    fn leaf_err() -> Result<crate::uia::FocusedLeaf, HandsError> {
+        Err(HandsError::Uia("GetFocusedElement: not available".into()))
+    }
+    fn leaf_button_fg() -> Result<crate::uia::FocusedLeaf, HandsError> {
+        Ok(crate::uia::FocusedLeaf {
+            kind: ControlKind::Button,
+            hwnd: Some(0x10),
+        })
+    }
+    fn leaf_edit_bg() -> Result<crate::uia::FocusedLeaf, HandsError> {
+        Ok(crate::uia::FocusedLeaf {
+            kind: ControlKind::Edit,
+            hwnd: Some(0x11),
+        })
+    }
+    fn leaf_edit_fg() -> Result<crate::uia::FocusedLeaf, HandsError> {
+        Ok(crate::uia::FocusedLeaf {
+            kind: ControlKind::Edit,
+            hwnd: Some(0x10),
+        })
+    }
+    fn leaf_combo_fg() -> Result<crate::uia::FocusedLeaf, HandsError> {
+        Ok(crate::uia::FocusedLeaf {
+            kind: ControlKind::ComboBox,
+            hwnd: Some(0x10),
+        })
+    }
+    fn leaf_doc_fg() -> Result<crate::uia::FocusedLeaf, HandsError> {
+        Ok(crate::uia::FocusedLeaf {
+            kind: ControlKind::Document,
+            hwnd: Some(0x10),
+        })
+    }
+    fn leaf_edit_windowless() -> Result<crate::uia::FocusedLeaf, HandsError> {
+        Ok(crate::uia::FocusedLeaf {
+            kind: ControlKind::Edit,
+            hwnd: None,
+        })
+    }
+    fn panic_sends(
+        _: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+    ) -> Result<(), HandsError> {
+        panic!("SendInput must not run on type focus refuse");
+    }
+
+    thread_local! {
+        static TYPE_SENDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    fn count_sends(
+        _: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+    ) -> Result<(), HandsError> {
+        TYPE_SENDS.with(|c| c.set(c.get() + 1));
+        Ok(())
+    }
+
+    fn type_hi(session: &str) -> ActuateEnvelope {
+        type_text(ActuateRequest {
+            session_id: Some(session.into()),
+            text: Some("hi".into()),
+            ..ActuateRequest::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn type_no_focus_refuses_without_send() {
+        let _g = type_focus_lock();
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::uia::set_focused_leaf_hook(Some(leaf_err));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let env = type_hi("s-act-0115-nofocus");
+        assert!(!env.ok, "{env:?}");
+        assert!(!env.foregrounded);
+        let err = env.error.unwrap_or_default();
+        assert!(err.contains("no focused edit, combo, or document"), "{err}");
+        assert!(err.contains("click an editable field first"), "{err}");
+        let snap = crate::cooldown::snapshot("s-act-0115-nofocus");
+        assert_eq!(snap.attempt, 1, "{snap:?}");
+    }
+
+    #[test]
+    fn type_button_focus_refuses_without_send() {
+        let _g = type_focus_lock();
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::uia::set_focused_leaf_hook(Some(leaf_button_fg));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let env = type_hi("s-act-0115-button");
+        assert!(!env.ok, "{env:?}");
+        let err = env.error.unwrap_or_default();
+        assert!(err.contains("not an edit, combo, or document"), "{err}");
+    }
+
+    #[test]
+    fn type_edit_outside_fg_refuses_without_send() {
+        let _g = type_focus_lock();
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::uia::set_focused_leaf_hook(Some(leaf_edit_bg));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let env = type_hi("s-act-0115-bg");
+        assert!(!env.ok, "{env:?}");
+        let err = env.error.unwrap_or_default();
+        assert!(err.contains("not in the foreground window"), "{err}");
+    }
+
+    #[test]
+    fn type_windowless_edit_refuses_without_send() {
+        let _g = type_focus_lock();
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::uia::set_focused_leaf_hook(Some(leaf_edit_windowless));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let env = type_hi("s-act-0115-nowin");
+        assert!(!env.ok, "{env:?}");
+        let err = env.error.unwrap_or_default();
+        assert!(err.contains("not in the foreground window"), "{err}");
+    }
+
+    #[test]
+    fn type_no_foreground_window_refuses_without_send() {
+        let _g = type_focus_lock();
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_none));
+        crate::uia::set_focused_leaf_hook(Some(leaf_edit_fg));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let env = type_hi("s-act-0115-nofg");
+        assert!(!env.ok, "{env:?}");
+        let err = env.error.unwrap_or_default();
+        assert!(err.contains("not in the foreground window"), "{err}");
+    }
+
+    fn type_editable_ok(session: &str, leaf: fn() -> Result<crate::uia::FocusedLeaf, HandsError>) {
+        let _g = type_focus_lock();
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::uia::set_focused_leaf_hook(Some(leaf));
+        TYPE_SENDS.with(|c| c.set(0));
+        crate::input::set_send_inputs_hook(Some(count_sends));
+        let env = type_hi(session);
+        assert!(env.ok, "{env:?}");
+        assert!(env.foregrounded, "{env:?}");
+        assert!(TYPE_SENDS.with(|c| c.get()) > 0, "{env:?}");
+    }
+
+    #[test]
+    fn type_edit_in_fg_delivers_and_foregrounded() {
+        type_editable_ok("s-act-0115-edit", leaf_edit_fg);
+    }
+
+    #[test]
+    fn type_combobox_in_fg_delivers() {
+        type_editable_ok("s-act-0115-combo", leaf_combo_fg);
+    }
+
+    #[test]
+    fn type_document_in_fg_delivers() {
+        type_editable_ok("s-act-0115-doc", leaf_doc_fg);
+    }
+
+    #[test]
+    fn type_text_inner_guards_before_note_and_send() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn type_text_inner").expect("type_text_inner");
+        let rest = &src[start..];
+        let end = rest.find("pub fn key").expect("key follows");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("uia::focused("),
+            "type guard must not call uia::focused():\n{body}"
+        );
+        assert!(
+            body.contains("focused_leaf"),
+            "type guard must call focused_leaf:\n{body}"
+        );
+        let guard = body
+            .find("refuse_unless_focused_editable")
+            .expect("refuse_unless_focused_editable");
+        let dpi = body.find("ensure_dpi").expect("ensure_dpi");
+        let note = body
+            .find("challenge::note_actuation")
+            .expect("note_actuation");
+        let send = body.find("input::type_text").expect("input::type_text");
+        assert!(
+            guard < dpi && dpi < note && note < send,
+            "focus guard before dpi/note/send:\n{body}"
+        );
+        let fence = include_str!("fence.rs");
+        assert!(
+            fence.contains("uia::focused(") || fence.contains("crate::uia::focused("),
+            "fence must still call focused()"
+        );
     }
 
     fn yield_machine() {

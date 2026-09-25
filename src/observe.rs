@@ -836,6 +836,7 @@ fn cap_default_envelope_with_client(
     let cover = client.or(envelope.viewport);
     demote_full_client_unnamed_containers(&mut envelope, cover);
     prefer_actionable_in_rest(&mut envelope);
+    pack_file_dialog_hit_list(&mut envelope);
     if envelope.elements.len() > VIEWPORT_ENVELOPE_ELEMENT_CAP {
         envelope.elements.truncate(VIEWPORT_ENVELOPE_ELEMENT_CAP);
     }
@@ -848,8 +849,20 @@ fn cap_default_envelope_with_client(
         return envelope;
     }
     envelope.elements_truncated = true;
-    while !envelope.windows.is_empty() && serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
+    let keep_hwnd = keep_window_hwnd(&envelope).map(str::to_string);
+    let windows_floor = if envelope.windows_total > 0 { 1 } else { 0 };
+    while envelope.windows.len() > windows_floor
+        && serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES
+    {
+        if let Some(keep) = keep_hwnd.as_deref()
+            && envelope.windows.last().is_some_and(|w| w.hwnd == keep)
+            && let Some(idx) = envelope.windows.iter().rposition(|w| w.hwnd != keep)
+        {
+            let last = envelope.windows.len() - 1;
+            envelope.windows.swap(idx, last);
+        }
         envelope.windows.pop();
+        envelope.windows_truncated = true;
     }
     if serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
         shrink_main_text_to_fit(&mut envelope, DEFAULT_ENVELOPE_MAX_BYTES);
@@ -957,6 +970,84 @@ fn prefer_actionable_in_rest(envelope: &mut ObserveEnvelope) {
     envelope.elements = head;
     envelope.elements.extend(actionable);
     envelope.elements.extend(other);
+}
+
+fn is_common_item_dialog(envelope: &ObserveEnvelope) -> bool {
+    match envelope.target_window.as_ref() {
+        Some(target) => target.class == "#32770",
+        None => envelope.fg_window.class == "#32770",
+    }
+}
+
+fn keep_window_hwnd(envelope: &ObserveEnvelope) -> Option<&str> {
+    if let Some(hwnd) = envelope.target_window.as_ref().map(|t| t.hwnd.as_str())
+        && !hwnd.is_empty()
+        && envelope.windows.iter().any(|w| w.hwnd == hwnd)
+    {
+        return Some(hwnd);
+    }
+    let fg = envelope.fg_window.hwnd.as_str();
+    if !fg.is_empty() && envelope.windows.iter().any(|w| w.hwnd == fg) {
+        return Some(fg);
+    }
+    envelope.windows.first().map(|w| w.hwnd.as_str())
+}
+
+fn is_file_dialog_promote(el: &Element) -> bool {
+    let text = el.text.as_deref();
+    if role_eq_any(&el.role, &["Edit", "ComboBox", "combo box"])
+        && text_has_any_token(text, &["file", "name", "folder", "address", "filename"])
+    {
+        return true;
+    }
+    if role_eq_any(&el.role, &["Button"]) {
+        if text_has_any_token(text, &["open", "save", "cancel"]) {
+            return true;
+        }
+        if text_has_any_token(text, &["select"]) && text_has_any_token(text, &["folder"]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_file_dialog_demote(el: &Element) -> bool {
+    if role_eq_any(&el.role, &["Button"])
+        && text_has_any_token(el.text.as_deref(), &["line", "page"])
+        && text_has_any_token(el.text.as_deref(), &["up", "down"])
+    {
+        return true;
+    }
+    role_eq_any(&el.role, &["Slider"]) && text_has_any_token(el.text.as_deref(), &["view"])
+}
+
+fn pack_file_dialog_hit_list(envelope: &mut ObserveEnvelope) {
+    if !is_common_item_dialog(envelope) {
+        return;
+    }
+    if !envelope.elements.iter().any(is_file_dialog_promote) {
+        return;
+    }
+    let dialog_ids = dialog_id_set(envelope);
+    let mut head = Vec::new();
+    let mut promote = Vec::new();
+    let mut rest = Vec::new();
+    let mut demote = Vec::new();
+    for el in envelope.elements.drain(..) {
+        if dialog_ids.contains(&el.id) {
+            head.push(el);
+        } else if is_file_dialog_promote(&el) {
+            promote.push(el);
+        } else if is_file_dialog_demote(&el) {
+            demote.push(el);
+        } else {
+            rest.push(el);
+        }
+    }
+    envelope.elements = head;
+    envelope.elements.extend(promote);
+    envelope.elements.extend(rest);
+    envelope.elements.extend(demote);
 }
 
 fn pop_non_reserved_elements(envelope: &mut ObserveEnvelope) {
@@ -3718,6 +3809,19 @@ mod tests {
             windows_pop < shrink && shrink < call_pop,
             "windows then main_text then non-reserved elements:\n{slice}"
         );
+        let prefer = slice
+            .find("prefer_actionable_in_rest")
+            .expect("0112 prefer");
+        let pack = slice
+            .find("pack_file_dialog_hit_list")
+            .expect("0113 file-dialog pack");
+        let truncate = slice
+            .find("VIEWPORT_ENVELOPE_ELEMENT_CAP")
+            .expect("20-truncate");
+        assert!(
+            prefer < pack && pack < truncate,
+            "file-dialog pack after 0112 prefer, before 20-truncate:\n{slice}"
+        );
         assert!(
             !slice.contains("pop_non_dialog_elements"),
             "old pop-all-non-dialog must not remain:\n{slice}"
@@ -3746,6 +3850,8 @@ mod tests {
                 class: None,
             })
             .collect();
+        raw.windows_total = 12;
+        raw.fg_window.hwnd = "0".into();
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
         assert!(
@@ -3757,6 +3863,12 @@ mod tests {
             !capped.elements.is_empty(),
             "inventory shrink must leave elements"
         );
+        assert!(
+            !capped.windows.is_empty(),
+            "windows floor keeps at least one row when windows_total > 0"
+        );
+        assert!(capped.windows_truncated);
+        assert!(capped.windows.iter().any(|w| w.hwnd == "0"));
         assert!(capped.challenge.present);
         assert_eq!(capped.challenge.kind.as_deref(), Some("recaptcha"));
     }
@@ -4492,6 +4604,230 @@ mod tests {
         assert_eq!(ids, vec!["uia:doc", "uia:pane"]);
         assert_eq!(capped.elements_total, 2);
         assert!(!capped.elements_truncated);
+    }
+
+    fn file_dialog_el(id: &str, role: &str, text: &str, y: i32) -> Element {
+        Element {
+            id: id.into(),
+            role: role.into(),
+            text: Some(text.into()),
+            rect: Rect {
+                x: 40,
+                y,
+                w: 120,
+                h: 24,
+            },
+            grid: None,
+            unnamed: None,
+        }
+    }
+
+    fn file_dialog_windows() -> Vec<DesktopWindow> {
+        (0i32..12)
+            .map(|i| DesktopWindow {
+                pid: 2000 + i as u32,
+                title: format!("W{i:02}-{}", "d".repeat(36)),
+                state: WindowState::Normal,
+                hwnd: format!("{i:x}"),
+                rect: Some(Rect {
+                    x: i * 10,
+                    y: 0,
+                    w: 800,
+                    h: 600,
+                }),
+                class: None,
+            })
+            .collect()
+    }
+
+    fn fat_file_dialog_envelope() -> ObserveEnvelope {
+        let mut elements = Vec::new();
+        elements.push(file_dialog_el(
+            "uia:addr",
+            "combo box",
+            "Address: C:\\tmp",
+            40,
+        ));
+        elements.push(file_dialog_el("uia:crumb", "button", "tmp", 48));
+        elements.push(file_dialog_el("uia:search", "edit", "Search Documents", 56));
+        for label in ["Line up", "Page up", "Page down", "Line down"] {
+            elements.push(file_dialog_el(
+                &format!("uia:{}", label.replace(' ', "-").to_ascii_lowercase()),
+                "button",
+                label,
+                80,
+            ));
+        }
+        elements.push(file_dialog_el("uia:view", "slider", "View Slider", 90));
+        for i in 0..40 {
+            elements.push(file_dialog_el(
+                &format!("uia:file:{i}"),
+                "listitem",
+                &format!("Document-{i:02}-{}", "n".repeat(48)),
+                120 + i * 18,
+            ));
+        }
+        elements.push(file_dialog_el("uia:filename", "edit", "File name:", 900));
+        elements.push(file_dialog_el("uia:open", "button", "Open", 930));
+        elements.push(file_dialog_el("uia:cancel", "button", "Cancel", 960));
+        let n = elements.len();
+        let mut env = fat_envelope(0);
+        env.viewport = Some(Rect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 1000,
+        });
+        env.extract.main_text = "M".repeat(400);
+        env.elements = elements;
+        env.elements_total = n;
+        env.windows = file_dialog_windows();
+        env.windows.reverse();
+        env.windows_total = 35;
+        env.fg_window = FgWindow {
+            pid: 42,
+            title: "Open".into(),
+            class: "#32770".into(),
+            chrome_exe: false,
+            hwnd: "0".into(),
+        };
+        env
+    }
+
+    #[test]
+    fn file_dialog_32770_keeps_filename_open_cancel_not_scrollbars() {
+        let raw = fat_file_dialog_envelope();
+        assert!(raw.elements.len() >= 50);
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        let ids: Vec<&str> = capped.elements.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"uia:filename"), "{ids:?}");
+        assert!(ids.contains(&"uia:open"), "{ids:?}");
+        assert!(ids.contains(&"uia:cancel"), "{ids:?}");
+        assert!(ids.contains(&"uia:addr"), "{ids:?}");
+        assert!(
+            !ids.iter()
+                .any(|id| id.contains("line") || id.contains("page"))
+        );
+        assert!(!ids.contains(&"uia:view"));
+        assert!(capped.elements.len() <= VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        assert!(!capped.windows.is_empty());
+        assert_eq!(capped.windows_total, 35);
+        assert!(capped.windows_truncated);
+        assert!(capped.windows.iter().any(|w| w.hwnd == "0"));
+        assert_eq!(VIEWPORT_ENVELOPE_ELEMENT_CAP, 20);
+    }
+
+    #[test]
+    fn file_dialog_scrollbar_only_stays_when_no_promote() {
+        let raw = webview_pack_envelope(
+            vec![
+                file_dialog_el("uia:line-up", "button", "Line up", 80),
+                file_dialog_el("uia:page-up", "button", "Page up", 100),
+            ],
+            2,
+        );
+        let mut raw = raw;
+        raw.fg_window.class = "#32770".into();
+        let capped = cap_default_envelope(raw);
+        let ids: Vec<&str> = capped.elements.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["uia:line-up", "uia:page-up"]);
+    }
+
+    #[test]
+    fn file_dialog_pack_does_not_run_without_32770() {
+        let mut raw = fat_file_dialog_envelope();
+        raw.fg_window.class = "Tauri Window".into();
+        let capped = cap_default_envelope(raw);
+        let ids: Vec<&str> = capped.elements.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"uia:filename") || ids.iter().any(|id| id.contains("line")),
+            "non-#32770 must not apply file-dialog pack: {ids:?}"
+        );
+        assert!(!ids.contains(&"uia:filename"), "{ids:?}");
+        assert!(!ids.contains(&"uia:open"), "{ids:?}");
+    }
+
+    #[test]
+    fn file_dialog_pack_uses_target_window_class() {
+        let mut raw = fat_file_dialog_envelope();
+        raw.fg_window.class = "Notepad".into();
+        raw.target_window = Some(TargetWindow {
+            pid: 42,
+            title: "Open".into(),
+            class: "#32770".into(),
+            chrome_exe: false,
+            foreground: false,
+            hwnd: "0".into(),
+        });
+        let capped = cap_default_envelope(raw);
+        let ids: Vec<&str> = capped.elements.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"uia:filename"), "{ids:?}");
+        assert!(ids.contains(&"uia:open"), "{ids:?}");
+    }
+
+    #[test]
+    fn file_dialog_from_sidecar_matches_live_pack() {
+        let dir = crate::capture::observe_dir().expect("observe dir");
+        let path = dir.join("observe-0113-dialog-from.json");
+        let raw = fat_file_dialog_envelope();
+        let live = cap_default_envelope_with_client(raw.clone(), raw.viewport);
+        let sidecar = ObserveSidecar {
+            schema: OBSERVE_SCHEMA.to_string(),
+            session_id: "s-0113-from".into(),
+            screenshot_path: raw.screenshot_path.clone(),
+            observe_path: path.to_string_lossy().into(),
+            space: raw.space,
+            viewport: raw.viewport,
+            extract: raw.extract.clone(),
+            elements: raw.elements.clone(),
+            elements_total: raw.elements_total,
+            elements_truncated: false,
+            chrome_connected: raw.chrome_connected,
+            chrome_walk: Some(raw.chrome_walk),
+            chrome_hint: raw.chrome_hint.clone(),
+            challenge: raw.challenge.clone(),
+            windows: raw.windows.clone(),
+            windows_total: raw.windows_total,
+            windows_truncated: false,
+            windows_inventory: raw.windows.clone(),
+            fg_window: Some(raw.fg_window.clone()),
+            target_window: raw.target_window.clone(),
+            view: ObserveView::Auto,
+            observe_source: ObserveSource::Live,
+            card_offset: 0,
+            card_counts: ObserveCardCounts::default(),
+            popup_rect: None,
+            client: raw.viewport,
+            timing: None,
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
+        let env = observe(ObserveRequest {
+            session_id: Some("s-0113-from".into()),
+            detail: Detail::Default,
+            window: None,
+            view: ObserveView::Auto,
+            from: Some(path.to_string_lossy().into()),
+            card_offset: 0,
+            scope: ObserveScope::Fg,
+        });
+        let _ = std::fs::remove_file(&path);
+        let env = env.expect("reshape");
+        let live_ids: Vec<&str> = live.elements.iter().map(|e| e.id.as_str()).collect();
+        let from_ids: Vec<&str> = env.elements.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(from_ids, live_ids);
+        assert!(from_ids.contains(&"uia:filename"));
+        assert!(from_ids.contains(&"uia:open"));
+        assert!(!json_has_client(&env));
+    }
+
+    fn json_has_client(env: &ObserveEnvelope) -> bool {
+        serialize_envelope(env).unwrap().contains("\"client\":")
     }
 
     #[test]

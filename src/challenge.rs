@@ -737,6 +737,7 @@ fn run_watch(session_id: String) -> Result<ChallengeEnvelope, HandsError> {
             from: None,
             card_offset: 0,
             scope: crate::observe::ObserveScope::Fg,
+            fg_preview: false,
         })?;
         Ok(env.challenge)
     }) {
@@ -1705,6 +1706,7 @@ mod tests {
             popup_rect: None,
             client: None,
             timing: None,
+            fg_preview_path: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         path

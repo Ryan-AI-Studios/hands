@@ -261,6 +261,7 @@ pub fn challenge_present(observe_path: Option<&str>) -> Result<bool, HandsError>
                 from: None,
                 card_offset: 0,
                 scope: crate::observe::ObserveScope::Fg,
+                fg_preview: false,
             })?;
             Ok(env.challenge.present)
         }
@@ -1076,6 +1077,7 @@ fn write_sidecar(path: &Path, kind: &str, present: bool) {
         popup_rect: None,
         client: None,
         timing: None,
+        fg_preview_path: None,
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1249,6 +1251,7 @@ mod tests {
                 popup_rect: None,
                 client: None,
                 timing: None,
+                fg_preview_path: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1321,6 +1324,7 @@ mod tests {
                 popup_rect: None,
                 client: None,
                 timing: None,
+                fg_preview_path: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1387,6 +1391,7 @@ mod tests {
                 popup_rect: None,
                 client: None,
                 timing: None,
+                fg_preview_path: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1445,6 +1450,7 @@ mod tests {
                 popup_rect: None,
                 client: None,
                 timing: None,
+                fg_preview_path: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }

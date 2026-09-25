@@ -49,6 +49,31 @@ impl Rect {
         }
         x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
     }
+
+    pub fn union(self, other: Rect) -> Rect {
+        if self.area() == 0 {
+            return other;
+        }
+        if other.area() == 0 {
+            return self;
+        }
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = self
+            .x
+            .saturating_add(self.w)
+            .max(other.x.saturating_add(other.w));
+        let bottom = self
+            .y
+            .saturating_add(self.h)
+            .max(other.y.saturating_add(other.h));
+        Rect {
+            x,
+            y,
+            w: (right - x).max(0),
+            h: (bottom - y).max(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

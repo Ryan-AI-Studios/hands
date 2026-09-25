@@ -21,6 +21,7 @@ pub struct RoiFrame {
 pub struct CapturePaths {
     pub screenshot_path: PathBuf,
     pub observe_path: PathBuf,
+    pub preview_path: PathBuf,
 }
 
 /// BitBlt vs `for_vlm` vs PNG encode+disk. `screenshot_ms` is their sum.
@@ -41,19 +42,26 @@ impl CaptureTiming {
 
 /// Capture the virtual-screen union via GDI BitBlt and write an unlabeled PNG.
 pub fn capture_virtual_screen(space: Space) -> Result<CapturePaths, HandsError> {
-    Ok(capture_virtual_screen_timed(space)?.0)
+    Ok(capture_virtual_screen_timed(space, false)?.0)
 }
 
 pub fn capture_virtual_screen_timed(
     space: Space,
-) -> Result<(CapturePaths, CaptureTiming), HandsError> {
+    keep_raw: bool,
+) -> Result<(CapturePaths, CaptureTiming, Vec<u8>, i32, i32), HandsError> {
     ensure_dpi()?;
     let (width, height) = dims(space)?;
     let blit_t = Instant::now();
     let pixels = blit_rect(space.origin_x, space.origin_y, width, height)?;
     let blit_ms = blit_t.elapsed().as_millis() as u64;
     let paths = observe_paths()?;
-    let (preprocess_ms, encode_ms) = write_png(&paths.screenshot_path, width, height, pixels)?;
+    let (raw, preprocess_ms, encode_ms) = if keep_raw {
+        let timing = write_png(&paths.screenshot_path, width, height, pixels.clone())?;
+        (pixels, timing.0, timing.1)
+    } else {
+        let timing = write_png(&paths.screenshot_path, width, height, pixels)?;
+        (Vec::new(), timing.0, timing.1)
+    };
     Ok((
         paths,
         CaptureTiming {
@@ -61,7 +69,59 @@ pub fn capture_virtual_screen_timed(
             preprocess_ms,
             encode_ms,
         },
+        raw,
+        width,
+        height,
     ))
+}
+
+/// Crop `rect` (virtual-screen coords) from a raw RGBA blit of `buf_w`×`buf_h`
+/// whose (0,0) pixel is `origin`. `None` if the rect is empty or out of bounds.
+pub fn crop_rgba(
+    pixels: &[u8],
+    buf_w: i32,
+    buf_h: i32,
+    origin_x: i32,
+    origin_y: i32,
+    rect: Rect,
+) -> Option<(i32, i32, Vec<u8>)> {
+    if rect.area() == 0 || buf_w <= 0 || buf_h <= 0 {
+        return None;
+    }
+    let x = rect.x.checked_sub(origin_x)?;
+    let y = rect.y.checked_sub(origin_y)?;
+    if x < 0 || y < 0 || x.saturating_add(rect.w) > buf_w || y.saturating_add(rect.h) > buf_h {
+        return None;
+    }
+    let expected = (buf_w as usize)
+        .checked_mul(buf_h as usize)?
+        .checked_mul(4)?;
+    if pixels.len() != expected {
+        return None;
+    }
+    let mut out = Vec::with_capacity(
+        (rect.w as usize)
+            .saturating_mul(rect.h as usize)
+            .saturating_mul(4),
+    );
+    let src_stride = buf_w as usize * 4;
+    let dst_stride = rect.w as usize * 4;
+    let x0 = x as usize;
+    for row in 0..rect.h as usize {
+        let start = (y as usize + row) * src_stride + x0 * 4;
+        let end = start + dst_stride;
+        out.extend_from_slice(pixels.get(start..end)?);
+    }
+    Some((rect.w, rect.h, out))
+}
+
+pub fn write_preview_png(
+    path: &Path,
+    width: i32,
+    height: i32,
+    pixels: Vec<u8>,
+) -> Result<(), HandsError> {
+    write_png(path, width, height, pixels).map(|_| ())
 }
 
 /// In-memory RGBA ROI. No file. Clip to `virtual_screen`. Reject zero area.
@@ -204,6 +264,7 @@ pub fn observe_paths() -> Result<CapturePaths, HandsError> {
     Ok(CapturePaths {
         screenshot_path: dir.join(format!("{stem}.png")),
         observe_path: dir.join(format!("{stem}.json")),
+        preview_path: dir.join(format!("{stem}-preview.png")),
     })
 }
 
@@ -304,6 +365,70 @@ mod tests {
             encode_ms: 5,
         };
         assert_eq!(t.screenshot_ms(), 35);
+    }
+
+    #[test]
+    fn crop_rgba_copies_interior_and_rejects_empty() {
+        let mut pixels = vec![0u8; 20 * 10 * 4];
+        for y in 0..10 {
+            for x in 0..20 {
+                let i = (y * 20 + x) * 4;
+                pixels[i] = x as u8;
+                pixels[i + 1] = y as u8;
+                pixels[i + 2] = 7;
+                pixels[i + 3] = 255;
+            }
+        }
+        let (w, h, out) = crop_rgba(
+            &pixels,
+            20,
+            10,
+            0,
+            0,
+            Rect {
+                x: 2,
+                y: 3,
+                w: 4,
+                h: 2,
+            },
+        )
+        .expect("crop");
+        assert_eq!((w, h), (4, 2));
+        assert_eq!(out.len(), 4 * 2 * 4);
+        assert_eq!(&out[0..4], &[2, 3, 7, 255]);
+        assert_eq!(&out[4..8], &[3, 3, 7, 255]);
+        assert!(
+            crop_rgba(
+                &pixels,
+                20,
+                10,
+                0,
+                0,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 1,
+                },
+            )
+            .is_none()
+        );
+        assert!(
+            crop_rgba(
+                &pixels,
+                20,
+                10,
+                0,
+                0,
+                Rect {
+                    x: 19,
+                    y: 0,
+                    w: 4,
+                    h: 1,
+                },
+            )
+            .is_none()
+        );
     }
 
     #[test]

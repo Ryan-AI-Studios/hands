@@ -87,6 +87,7 @@ pub fn run_solve(session_id: String) -> Result<ChallengeEnvelope, HandsError> {
             from: None,
             card_offset: 0,
             scope: crate::observe::ObserveScope::Fg,
+            fg_preview: false,
         })
     };
     let click = |x: i32, y: i32| {
@@ -657,6 +658,7 @@ mod tests {
             observe_source: crate::observe::ObserveSource::Live,
             card_offset: 0,
             card_counts: crate::observe::ObserveCardCounts::default(),
+            fg_preview_path: None,
             challenge: ChallengeInfo {
                 present,
                 kind,

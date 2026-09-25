@@ -152,6 +152,7 @@ pub struct ObserveRequest {
     pub from: Option<String>,
     pub card_offset: usize,
     pub scope: ObserveScope,
+    pub fg_preview: bool,
 }
 
 impl Default for ObserveRequest {
@@ -164,6 +165,7 @@ impl Default for ObserveRequest {
             from: None,
             card_offset: 0,
             scope: ObserveScope::Fg,
+            fg_preview: false,
         }
     }
 }
@@ -241,6 +243,8 @@ pub struct ObserveEnvelope {
     pub card_offset: usize,
     #[serde(flatten)]
     pub card_counts: ObserveCardCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fg_preview_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +293,8 @@ pub struct ObserveSidecar {
     pub client: Option<Rect>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<ObserveTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg_preview_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -588,7 +594,8 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let session_id = resolve_session_id_from_os(req.session_id.as_deref());
     logs::check_write_id(&session_id)?;
     let space = virtual_screen()?;
-    let (paths, cap_t) = capture_virtual_screen_timed(space)?;
+    let (paths, cap_t, raw_blit, blit_w, blit_h) =
+        capture_virtual_screen_timed(space, req.fg_preview)?;
     let screenshot_ms = cap_t.screenshot_ms();
     let screenshot_path = display_path(&paths.screenshot_path);
     let observe_path = display_path(&paths.observe_path);
@@ -668,6 +675,16 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         &elements,
     );
     let challenge = challenge::apply_observe(&session_id, hit);
+    let fg_preview_path = maybe_fg_preview(
+        req.fg_preview,
+        &paths,
+        space,
+        &raw_blit,
+        blit_w,
+        blit_h,
+        plan.walk_hwnd,
+        snap.popup_rect,
+    );
 
     let mut full = ObserveEnvelope {
         session_id,
@@ -695,6 +712,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
             cards_walked,
             ..ObserveCardCounts::default()
         },
+        fg_preview_path,
     };
     let sidecar_full = full.clone();
     let envelope = match req.detail {
@@ -800,6 +818,7 @@ fn write_sidecar(
         popup_rect,
         client,
         timing,
+        fg_preview_path: envelope.fg_preview_path.clone(),
     };
     let json = serde_json::to_string_pretty(&sidecar)
         .map_err(|err| HandsError::Observe(format!("sidecar serialize: {err}")))?;
@@ -1251,10 +1270,23 @@ pub fn serialize_mcp_envelope(
     envelope: &ObserveEnvelope,
     include_screenshot_path: bool,
 ) -> Result<String, HandsError> {
+    serialize_mcp_envelope_opts(envelope, include_screenshot_path, false)
+}
+
+pub fn serialize_mcp_envelope_opts(
+    envelope: &ObserveEnvelope,
+    include_screenshot_path: bool,
+    include_fg_preview: bool,
+) -> Result<String, HandsError> {
     let mut value = serde_json::to_value(envelope)
         .map_err(|err| HandsError::Observe(format!("envelope serialize: {err}")))?;
-    if !include_screenshot_path && let Some(obj) = value.as_object_mut() {
-        obj.remove("screenshot_path");
+    if let Some(obj) = value.as_object_mut() {
+        if !include_screenshot_path {
+            obj.remove("screenshot_path");
+        }
+        if !include_fg_preview {
+            obj.remove("fg_preview_path");
+        }
     }
     serde_json::to_string(&value)
         .map_err(|err| HandsError::Observe(format!("envelope serialize: {err}")))
@@ -1504,7 +1536,35 @@ fn envelope_from_sidecar(sidecar: ObserveSidecar, view: ObserveView) -> ObserveE
             cards_walked,
             ..ObserveCardCounts::default()
         },
+        fg_preview_path: sidecar.fg_preview_path,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_fg_preview(
+    enabled: bool,
+    paths: &crate::capture::CapturePaths,
+    space: Space,
+    raw: &[u8],
+    blit_w: i32,
+    blit_h: i32,
+    walk_hwnd: Option<isize>,
+    popup_rect: Option<Rect>,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let hwnd = walk_hwnd?;
+    if foreground::is_iconic(hwnd) {
+        return None;
+    }
+    let client = foreground::client_rect(hwnd)?;
+    let region = popup_rect.map(|p| client.union(p)).unwrap_or(client);
+    let clipped = space.clip_rect(region);
+    let (w, h, pixels) =
+        crate::capture::crop_rgba(raw, blit_w, blit_h, space.origin_x, space.origin_y, clipped)?;
+    crate::capture::write_preview_png(&paths.preview_path, w, h, pixels).ok()?;
+    Some(crate::capture::display_path(&paths.preview_path))
 }
 
 fn allowlisted_observe_sidecar(user: &str) -> Result<std::path::PathBuf, HandsError> {
@@ -1681,6 +1741,7 @@ mod tests {
             observe_source: ObserveSource::Live,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
+            fg_preview_path: None,
         }
     }
 
@@ -2067,6 +2128,7 @@ mod tests {
             observe_source: ObserveSource::Live,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
+            fg_preview_path: None,
         };
         assert!(raw.viewport.is_some());
         let capped = cap_default_envelope(raw);
@@ -2742,6 +2804,7 @@ mod tests {
             observe_source: ObserveSource::Live,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
+            fg_preview_path: None,
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -2840,6 +2903,7 @@ mod tests {
             observe_source: ObserveSource::Live,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
+            fg_preview_path: None,
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -3256,6 +3320,7 @@ mod tests {
             observe_source: ObserveSource::Live,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
+            fg_preview_path: None,
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -4038,6 +4103,7 @@ mod tests {
             from: None,
             card_offset: 0,
             scope: ObserveScope::Desktop,
+            fg_preview: false,
         })
         .unwrap_err()
         .to_string();
@@ -4378,6 +4444,7 @@ mod tests {
             observe_source: ObserveSource::Live,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
+            fg_preview_path: None,
         }
     }
 
@@ -4805,6 +4872,7 @@ mod tests {
             popup_rect: None,
             client: raw.viewport,
             timing: None,
+            fg_preview_path: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
         let env = observe(ObserveRequest {
@@ -4815,6 +4883,7 @@ mod tests {
             from: Some(path.to_string_lossy().into()),
             card_offset: 0,
             scope: ObserveScope::Fg,
+            fg_preview: false,
         });
         let _ = std::fs::remove_file(&path);
         let env = env.expect("reshape");
@@ -5192,6 +5261,7 @@ mod tests {
             from: Some(r"C:\tmp\observe-x.json".into()),
             card_offset: 0,
             scope: ObserveScope::Fg,
+            fg_preview: false,
         })
         .unwrap_err();
         assert!(
@@ -5207,6 +5277,7 @@ mod tests {
             from: Some(r"C:\tmp\observe-x.json".into()),
             card_offset: 0,
             scope: ObserveScope::Fg,
+            fg_preview: false,
         })
         .unwrap_err();
         assert!(
@@ -5253,6 +5324,7 @@ mod tests {
             popup_rect: None,
             client: raw.viewport,
             timing: None,
+            fg_preview_path: None,
         };
         let sidecar_ids: std::collections::HashSet<String> =
             sidecar.elements.iter().map(|e| e.id.clone()).collect();
@@ -5267,6 +5339,7 @@ mod tests {
             from: Some(path.to_string_lossy().into()),
             card_offset: 3,
             scope: ObserveScope::Fg,
+            fg_preview: false,
         });
         let _ = std::fs::remove_file(&path);
         let env = env.expect("reshape");
@@ -5359,6 +5432,7 @@ mod tests {
             popup_rect: Some(popup),
             client: None,
             timing: None,
+            fg_preview_path: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
         let with_popup = observe(ObserveRequest {
@@ -5369,6 +5443,7 @@ mod tests {
             from: Some(path.to_string_lossy().into()),
             card_offset: 0,
             scope: ObserveScope::Fg,
+            fg_preview: false,
         });
         let _ = std::fs::remove_file(&path);
         let env = with_popup.expect("reshape popup");
@@ -5439,9 +5514,85 @@ mod tests {
         assert!(main.contains("--view"));
         assert!(main.contains("--from"));
         assert!(main.contains("--card-offset") || main.contains("card_offset"));
+        assert!(main.contains("fg_preview") || main.contains("--fg-preview"));
+        assert!(mcp.contains("fg_preview"));
         assert_eq!(DEFAULT_ENVELOPE_MAX_BYTES, 4096);
         assert_eq!(VIEWPORT_ENVELOPE_ELEMENT_CAP, 20);
         assert_eq!(crate::extract::DEFAULT_ELEMENT_CAP, 250);
+    }
+
+    #[test]
+    fn fg_preview_path_omitted_when_none_and_survives_4kib() {
+        let env = fat_envelope(0);
+        let json = serialize_envelope(&env).unwrap();
+        assert!(!json.contains("fg_preview_path"), "{json}");
+        let mut raw = fat_envelope(400);
+        raw.fg_preview_path = Some(r"C:\tmp\hands\observe\observe-x-preview.png".into());
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        assert!(json.contains("fg_preview_path"), "{json}");
+        let mcp = serialize_mcp_envelope_opts(&capped, false, true).unwrap();
+        assert!(!mcp.contains("screenshot_path"));
+        assert!(mcp.contains("fg_preview_path"));
+        let mcp_default = serialize_mcp_envelope(&fat_envelope(0), false).unwrap();
+        assert!(!mcp_default.contains("fg_preview_path"));
+        assert!(!mcp_default.contains("screenshot_path"));
+        let mcp_from = serialize_mcp_envelope_opts(&capped, false, false).unwrap();
+        assert!(
+            !mcp_from.contains("fg_preview_path"),
+            "MCP omits preview unless this call flagged fg_preview: {mcp_from}"
+        );
+    }
+
+    #[test]
+    fn capture_virtual_screen_timed_always_write_png_and_observe_keeps_raw_only_when_preview() {
+        let cap = include_str!("capture.rs");
+        let start = cap
+            .find("pub fn capture_virtual_screen_timed(")
+            .expect("timed");
+        let body = &cap[start..cap.find("pub fn crop_rgba(").expect("crop")];
+        assert!(
+            body.contains("write_png(&paths.screenshot_path"),
+            "full virtual-screen PNG must still be written:\n{body}"
+        );
+        let obs = include_str!("observe.rs");
+        let live = obs
+            .split("pub fn observe(req: ObserveRequest)")
+            .nth(1)
+            .and_then(|s| s.split("fn stamp_grid").next())
+            .expect("observe");
+        assert!(
+            live.contains("capture_virtual_screen_timed(space, req.fg_preview)"),
+            "keep raw blit only when fg_preview:\n{live}"
+        );
+        assert!(
+            live.contains("maybe_fg_preview"),
+            "preview after collect:\n{live}"
+        );
+        let preview = obs
+            .split("fn maybe_fg_preview(")
+            .nth(1)
+            .and_then(|s| s.split("fn allowlisted_observe_sidecar").next())
+            .expect("maybe_fg_preview");
+        assert!(
+            preview.contains("is_iconic"),
+            "preview skips iconic:\n{preview}"
+        );
+        let dotask = include_str!("dotask/mod.rs");
+        let exec = dotask
+            .split("fn live_exec(")
+            .nth(1)
+            .and_then(|s| s.split("\"click\"").next())
+            .expect("observe arm");
+        assert!(
+            exec.contains("fg_preview: true"),
+            "do_task observe must request preview:\n{exec}"
+        );
     }
 
     #[test]

@@ -760,6 +760,7 @@ fn live_exec(name: &str, args: &Value, session_id: &str) -> Result<String, Hands
                 from: None,
                 card_offset: 0,
                 scope: crate::observe::ObserveScope::Fg,
+                fg_preview: true,
             })?;
             observe::serialize_envelope(&env)
         }
@@ -1073,7 +1074,11 @@ fn push_dropped(items: &mut Vec<TurnItem>, extras: &[FnCall]) {
 
 fn attach_latest_image(observe_json: &str) -> Option<String> {
     let value: Value = serde_json::from_str(observe_json).ok()?;
-    let path = value.get("screenshot_path").and_then(Value::as_str)?;
+    let path = value
+        .get("fg_preview_path")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+        .or_else(|| value.get("screenshot_path").and_then(Value::as_str))?;
     read_png_b64(Path::new(path))
 }
 
@@ -1525,6 +1530,32 @@ mod tests {
 
     fn observe_ok() -> String {
         json!({"ok":true,"screenshot_path":"x"}).to_string()
+    }
+
+    #[test]
+    fn attach_latest_image_prefers_fg_preview_path() {
+        let dir = std::env::temp_dir();
+        let preview = dir.join("hands-0118-preview.png");
+        let full = dir.join("hands-0118-full.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .save(&preview)
+            .unwrap();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([9, 9, 9, 255]))
+            .save(&full)
+            .unwrap();
+        let json = json!({
+            "fg_preview_path": preview.to_string_lossy(),
+            "screenshot_path": full.to_string_lossy()
+        })
+        .to_string();
+        let b64 = attach_latest_image(&json).expect("preview");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("b64");
+        let img = image::load_from_memory(&bytes).expect("png").to_rgba8();
+        assert_eq!(img.get_pixel(0, 0).0, [1, 2, 3, 255]);
+        let _ = std::fs::remove_file(&preview);
+        let _ = std::fs::remove_file(&full);
     }
 
     #[test]

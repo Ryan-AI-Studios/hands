@@ -1006,6 +1006,7 @@ fn live_observe(session_id: &str) -> Result<ObserveSummary, HandsError> {
         from: None,
         card_offset: 0,
         scope: crate::observe::ObserveScope::Fg,
+        fg_preview: false,
     })?;
     Ok(ObserveSummary {
         observe_path: env.observe_path,

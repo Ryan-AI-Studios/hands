@@ -1394,6 +1394,7 @@ mod tests {
             popup_rect: None,
             client: None,
             timing: None,
+            fg_preview_path: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
         path

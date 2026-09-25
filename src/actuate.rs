@@ -654,9 +654,17 @@ fn poll_caption_nav(chrome: bool, before: &str, hwnd: Option<isize>) -> bool {
     false
 }
 
+fn url_nav(before: Option<&str>, after: Option<&str>) -> bool {
+    match (before, after) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
 fn click_effect_after_settle(
     hwnd: Option<isize>,
     title_before: &str,
+    url_before: Option<&str>,
     same: bool,
     focus_lost: bool,
     allow_poll: bool,
@@ -664,6 +672,9 @@ fn click_effect_after_settle(
     let chrome = foreground::target_is_chrome(hwnd);
     let after = foreground::title(hwnd);
     let mut navigated = caption_nav(chrome, title_before, &after);
+    if !navigated && !chrome {
+        navigated = url_nav(url_before, uia::page_url(hwnd).as_deref());
+    }
     if !navigated && allow_poll && same && chrome {
         navigated = poll_caption_nav(chrome, title_before, hwnd);
     }
@@ -714,6 +725,12 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         return Ok(env);
     }
     let title_before = foreground::title(resolved.hwnd);
+    let chrome = foreground::target_is_chrome(resolved.hwnd);
+    let url_before = if chrome {
+        None
+    } else {
+        uia::page_url(resolved.hwnd)
+    };
     challenge::note_actuation_if_proceeding(false);
     remember_target(resolved.rect);
     let mut rng = Rng::from_time();
@@ -737,8 +754,14 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let focus_lost = foregrounded
         && resolved.hwnd.is_some()
         && !foreground::same_top_level(resolved.hwnd, foreground::foreground_hwnd());
-    let mut effect =
-        click_effect_after_settle(resolved.hwnd, &title_before, same, focus_lost, true);
+    let mut effect = click_effect_after_settle(
+        resolved.hwnd,
+        &title_before,
+        url_before.as_deref(),
+        same,
+        focus_lost,
+        true,
+    );
     let mut retried = false;
     if should_retry_click(&effect) && lease::poll().is_ok() {
         retried = true;
@@ -757,7 +780,14 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         let focus_lost = foregrounded
             && resolved.hwnd.is_some()
             && !foreground::same_top_level(resolved.hwnd, foreground::foreground_hwnd());
-        effect = click_effect_after_settle(resolved.hwnd, &title_before, same, focus_lost, false);
+        effect = click_effect_after_settle(
+            resolved.hwnd,
+            &title_before,
+            url_before.as_deref(),
+            same,
+            focus_lost,
+            false,
+        );
     }
     if lease::is_frozen() {
         return base(
@@ -1464,6 +1494,7 @@ mod tests {
         fn drop(&mut self) {
             crate::foreground::set_window_title_hook(None);
             crate::foreground::set_chrome_target_hook(None);
+            crate::uia::set_page_url_hook(None);
             TITLE_TICK.with(|t| *t.borrow_mut() = 0);
         }
     }
@@ -1513,7 +1544,8 @@ mod tests {
         let _hooks = CaptionHooks;
         crate::foreground::set_chrome_target_hook(Some(chrome_yes));
         crate::foreground::set_window_title_hook(Some(title_story));
-        let effect = click_effect_after_settle(None, "AAPL - Apple Stock Price", true, false, true);
+        let effect =
+            click_effect_after_settle(None, "AAPL - Apple Stock Price", None, true, false, true);
         assert!(effect.navigated, "{effect:?}");
         assert_eq!(effect.miss, None);
         assert!(!should_retry_click(&effect));
@@ -1526,7 +1558,7 @@ mod tests {
         crate::foreground::set_chrome_target_hook(Some(chrome_yes));
         crate::foreground::set_window_title_hook(Some(title_full_chart));
         let effect =
-            click_effect_after_settle(None, "AAPL - Apple Stock Price", true, false, false);
+            click_effect_after_settle(None, "AAPL - Apple Stock Price", None, true, false, false);
         assert!(!effect.navigated, "{effect:?}");
         assert_eq!(effect.miss, Some("no_change"));
         assert!(should_retry_click(&effect));
@@ -1538,7 +1570,8 @@ mod tests {
         let _hooks = CaptionHooks;
         crate::foreground::set_chrome_target_hook(Some(chrome_yes));
         crate::foreground::set_window_title_hook(Some(title_full_chart));
-        let effect = click_effect_after_settle(None, "AAPL - Apple Stock Price", true, true, false);
+        let effect =
+            click_effect_after_settle(None, "AAPL - Apple Stock Price", None, true, true, false);
         assert!(!effect.navigated, "{effect:?}");
         assert_eq!(effect.miss, Some("focus_lost"));
         assert!(should_retry_click(&effect));
@@ -1549,7 +1582,7 @@ mod tests {
         let _hooks = CaptionHooks;
         crate::foreground::set_chrome_target_hook(Some(chrome_no));
         crate::foreground::set_window_title_hook(Some(title_star_untitled));
-        let effect = click_effect_after_settle(None, "Untitled", true, false, true);
+        let effect = click_effect_after_settle(None, "Untitled", None, true, false, true);
         assert!(!effect.navigated, "{effect:?}");
         assert_eq!(effect.miss, Some("no_change"));
     }
@@ -1559,7 +1592,8 @@ mod tests {
         let _hooks = CaptionHooks;
         crate::foreground::set_chrome_target_hook(Some(chrome_yes));
         crate::foreground::set_window_title_hook(Some(title_just_a_moment));
-        let effect = click_effect_after_settle(None, "AAPL - Apple Stock Price", true, false, true);
+        let effect =
+            click_effect_after_settle(None, "AAPL - Apple Stock Price", None, true, false, true);
         assert!(effect.navigated, "{effect:?}");
         assert_eq!(effect.miss, None);
         assert!(!should_retry_click(&effect));
@@ -1571,7 +1605,8 @@ mod tests {
         let _hooks = CaptionHooks;
         crate::foreground::set_chrome_target_hook(Some(chrome_yes));
         crate::foreground::set_window_title_hook(Some(title_a_then_story));
-        let effect = click_effect_after_settle(None, "AAPL - Apple Stock Price", true, false, true);
+        let effect =
+            click_effect_after_settle(None, "AAPL - Apple Stock Price", None, true, false, true);
         assert!(effect.navigated, "{effect:?}");
         assert_eq!(effect.miss, None);
         assert!(!should_retry_click(&effect));
@@ -1586,6 +1621,60 @@ mod tests {
         assert!(!caption_nav(false, "Untitled", "*Untitled"));
         assert!(caption_nav(true, "A", "Just a moment..."));
         assert!(caption_nav(true, "Just a moment...", "Just a moment..."));
+        assert!(url_nav(
+            Some("http://tauri.localhost/a"),
+            Some("http://tauri.localhost/b")
+        ));
+        assert!(!url_nav(
+            Some("http://tauri.localhost/a"),
+            Some("http://tauri.localhost/a")
+        ));
+        assert!(!url_nav(None, Some("http://tauri.localhost/a")));
+        assert!(!url_nav(Some("http://tauri.localhost/a"), None));
+        assert!(!url_nav(None, None));
+    }
+
+    fn url_after_b(_: Option<isize>) -> Option<String> {
+        Some("http://tauri.localhost/matters/b".into())
+    }
+
+    #[test]
+    fn non_chrome_page_url_change_is_navigated_no_retry() {
+        let _hooks = CaptionHooks;
+        crate::foreground::set_chrome_target_hook(Some(chrome_no));
+        crate::foreground::set_window_title_hook(Some(|_| "Dedupe Desk".into()));
+        crate::uia::set_page_url_hook(Some(url_after_b));
+        let effect = click_effect_after_settle(
+            None,
+            "Dedupe Desk",
+            Some("http://tauri.localhost/matters/a"),
+            true,
+            false,
+            true,
+        );
+        assert!(effect.navigated, "{effect:?}");
+        assert_eq!(effect.miss, None);
+        assert!(!should_retry_click(&effect));
+        assert_eq!(predicted_left_clicks(&effect), 1);
+    }
+
+    #[test]
+    fn chrome_ignores_page_url_change() {
+        let _hooks = CaptionHooks;
+        crate::foreground::set_chrome_target_hook(Some(chrome_yes));
+        crate::foreground::set_window_title_hook(Some(title_full_chart));
+        crate::uia::set_page_url_hook(Some(url_after_b));
+        let effect = click_effect_after_settle(
+            None,
+            "AAPL - Apple Stock Price",
+            Some("http://tauri.localhost/matters/a"),
+            true,
+            false,
+            false,
+        );
+        assert!(!effect.navigated, "{effect:?}");
+        assert_eq!(effect.miss, Some("no_change"));
+        assert!(should_retry_click(&effect));
     }
 
     #[test]
@@ -1597,14 +1686,26 @@ mod tests {
         let mut immediate_nav = Vec::new();
         for _ in 0..10 {
             let t0 = Instant::now();
-            let effect =
-                click_effect_after_settle(None, "AAPL - Apple Stock Price", false, false, false);
+            let effect = click_effect_after_settle(
+                None,
+                "AAPL - Apple Stock Price",
+                None,
+                false,
+                false,
+                false,
+            );
             no_nav.push(t0.elapsed());
             assert!(!effect.navigated, "{effect:?}");
             crate::foreground::set_window_title_hook(Some(title_story));
             let t1 = Instant::now();
-            let effect =
-                click_effect_after_settle(None, "AAPL - Apple Stock Price", false, false, false);
+            let effect = click_effect_after_settle(
+                None,
+                "AAPL - Apple Stock Price",
+                None,
+                false,
+                false,
+                false,
+            );
             immediate_nav.push(t1.elapsed());
             assert!(effect.navigated, "{effect:?}");
             crate::foreground::set_window_title_hook(Some(title_full_chart));
@@ -1760,6 +1861,10 @@ mod tests {
                 && !body.contains("try_resolve")
                 && !body.contains("note_last_url"),
             "click_inner must not snapshot, resolve, or note_last_url:\n{body}"
+        );
+        assert!(
+            body.contains("page_url"),
+            "click_inner must probe page_url on non-Chrome:\n{body}"
         );
         let retry = body.find("should_retry_click").expect("should_retry_click");
         let second = body.rfind("left_click").expect("retry left_click");

@@ -272,7 +272,7 @@ impl HandsServer {
 
     #[tool(
         name = "type",
-        description = "Type text: short Unicode keystrokes or long clipboard paste+restore"
+        description = "Type text: short Unicode keystrokes or long clipboard paste+restore. Refuses unless a focused edit, combo, or document is in the foreground window; click an editable field first."
     )]
     fn r#type(
         &self,

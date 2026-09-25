@@ -259,7 +259,27 @@ pub fn same_top_level(a: Option<isize>, b: Option<isize>) -> bool {
     }
 }
 
+#[cfg(test)]
+type ForegroundHwndHook = fn() -> Option<isize>;
+
+#[cfg(test)]
+thread_local! {
+    static FG_HWND_HOOK: std::cell::Cell<Option<ForegroundHwndHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_foreground_hwnd_hook(hook: Option<ForegroundHwndHook>) {
+    FG_HWND_HOOK.with(|c| c.set(hook));
+}
+
 pub fn foreground_hwnd() -> Option<isize> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = FG_HWND_HOOK.with(|c| c.get()) {
+            return hook();
+        }
+    }
     hwnd_raw(unsafe { GetForegroundWindow() })
 }
 

@@ -83,7 +83,7 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
-    /// Type text (short Unicode or long clipboard paste+restore)
+    /// Type text (short Unicode or long clipboard paste+restore). Refuses unless a focused edit, combo, or document is in the foreground window; click an editable field first.
     Type {
         #[arg(long)]
         text: String,

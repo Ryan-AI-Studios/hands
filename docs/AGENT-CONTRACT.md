@@ -27,6 +27,7 @@ Do not prefer the grid over `chr:` / `uia:` / rect.
 - **Confirm fence.** Gated `click` / `key enter` still need `confirm` then retry. This contract does not bypass the fence.
 - **Desk lease / Pause / cooldown.** Physical input freezes injection (yield the task — not a 2 s wait). Pause/Break and `stop` halt injection. Repeated `ok: false` actuations grow session backoff.
 - **Activate.** `ok: true` means the raise was delivered, not that the OS granted focus. Read `foregrounded`. When `foregrounded: false` after a resolved window, `reason` is `stale_hwnd`, `no_foreground_window`, or `os_refused` (inferred; Win32 does not return a lock-condition code). `error` stays on `ok: false` only. Already-foreground is success. `sequence` still aborts later steps when activate is not foregrounded.
+- **Type focus.** `type` refuses (`ok: false`, named error, cooldown) unless a focused UIA **leaf** is `Edit`, `ComboBox`, or `Document` in the foreground window (owned popups count). No `SendInput` and no clipboard paste on refuse. Click an editable field first. A focused search box still receives keys — `type` has no `--element-id`. `sequence` aborts on type `ok: false` (`PrerequisiteFailed`).
 
 ## `miss` and `navigated`
 

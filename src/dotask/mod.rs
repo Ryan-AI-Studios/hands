@@ -886,7 +886,7 @@ fn offered_tools() -> Value {
         ),
         fn_tool(
             "type",
-            "Type text (short Unicode or long clipboard paste+restore)",
+            "Type text (short Unicode or long clipboard paste+restore). Refuses unless a focused edit, combo, or document is in the foreground window; click an editable field first.",
             json!({
                 "type": "object",
                 "properties": { "text": { "type": "string" } },

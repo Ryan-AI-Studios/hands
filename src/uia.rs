@@ -43,6 +43,13 @@ pub struct HitElement {
     pub value: Option<String>,
 }
 
+/// Focused leaf control type + native hwnd. No ancestor name walk, no localized role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FocusedLeaf {
+    pub kind: ControlKind,
+    pub hwnd: Option<isize>,
+}
+
 pub fn collect(detail: Detail, hwnd: Option<isize>) -> Result<UiaSnapshot, HandsError> {
     let cap = detail.element_cap();
     std::thread::Builder::new()
@@ -118,6 +125,36 @@ pub fn focused() -> Result<HitElement, HandsError> {
         .map_err(|_| HandsError::Uia("UIA STA thread panicked".to_string()))?
 }
 
+#[cfg(test)]
+type FocusedLeafHook = fn() -> Result<FocusedLeaf, HandsError>;
+
+#[cfg(test)]
+thread_local! {
+    static FOCUSED_LEAF_HOOK: std::cell::Cell<Option<FocusedLeafHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_focused_leaf_hook(hook: Option<FocusedLeafHook>) {
+    FOCUSED_LEAF_HOOK.with(|c| c.set(hook));
+}
+
+/// Leaf `CurrentControlType` + hwnd. Used by `type`; fence still uses `focused()`.
+pub fn focused_leaf() -> Result<FocusedLeaf, HandsError> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = FOCUSED_LEAF_HOOK.with(|c| c.get()) {
+            return hook();
+        }
+    }
+    std::thread::Builder::new()
+        .name("hands-uia-sta".into())
+        .spawn(sta_focused_leaf)
+        .map_err(|err| HandsError::Uia(format!("spawn STA thread: {err}")))?
+        .join()
+        .map_err(|_| HandsError::Uia("UIA STA thread panicked".to_string()))?
+}
+
 fn sta_hit_test(x: i32, y: i32) -> Result<HitElement, HandsError> {
     let _sta = StaGuard::enter()?;
     let automation = create_automation()?;
@@ -132,6 +169,22 @@ fn sta_focused() -> Result<HitElement, HandsError> {
     let element = unsafe { automation.GetFocusedElement() }
         .map_err(|err| HandsError::Uia(format!("GetFocusedElement: {err}")))?;
     describe_element(&automation, &element)
+}
+
+fn sta_focused_leaf() -> Result<FocusedLeaf, HandsError> {
+    let _sta = StaGuard::enter()?;
+    let automation = create_automation()?;
+    let element = unsafe { automation.GetFocusedElement() }
+        .map_err(|err| HandsError::Uia(format!("GetFocusedElement: {err}")))?;
+    let control_id = unsafe { element.CurrentControlType() }
+        .map_err(|err| HandsError::Uia(format!("CurrentControlType: {err}")))?
+        .0;
+    let walker = unsafe { automation.ControlViewWalker() }
+        .map_err(|err| HandsError::Uia(format!("ControlViewWalker: {err}")))?;
+    Ok(FocusedLeaf {
+        kind: ControlKind::from_uia_id(control_id),
+        hwnd: native_hwnd(&walker, &element),
+    })
 }
 
 fn describe_element(

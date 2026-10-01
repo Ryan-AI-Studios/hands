@@ -69,6 +69,11 @@ enum Command {
         y: Option<i32>,
         #[arg(long)]
         session_id: Option<String>,
+        #[arg(
+            long,
+            help = "skip target verification for a same-IL UIA-opaque surface; requires --x/--y or --grid; does not verify effect; does not reach elevated windows; activate first"
+        )]
+        blind: bool,
     },
     /// Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms. Same client-rect guard as click (`ok:false` named refusal; no `--window`). `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content.
     Hover {
@@ -92,6 +97,11 @@ enum Command {
         text: String,
         #[arg(long)]
         session_id: Option<String>,
+        #[arg(
+            long,
+            help = "skip the focused edit-leaf guard for a same-IL UIA-opaque surface; does not verify effect; does not reach elevated windows; newline still refused"
+        )]
+        blind: bool,
     },
     /// Press a named key or combo. ctrl+l is Control+L (Chrome omnibox). ctrl+t is Control+T (Chrome new tab). win+shift+s is Windows Screen snipping.
     Key {
@@ -166,7 +176,11 @@ enum Command {
     Confirm {
         #[arg(long, required_unless_present = "list")]
         domain: Option<String>,
-        #[arg(long, required_unless_present = "list")]
+        #[arg(
+            long,
+            required_unless_present = "list",
+            help = "fence category: money, messages, applications, account, deletes, installs, elevated, save, social, lead, blind"
+        )]
         category: Option<String>,
         #[arg(long, value_enum, required_unless_present = "list")]
         mode: Option<ConfirmModeArg>,
@@ -280,6 +294,8 @@ enum Command {
     },
     /// Read-only native-host JSON/HKCU/pipe doctor (does not write the registry; does not kill Chrome)
     NativeHostDoctor,
+    /// Read-only UIAccess / integrity self-report (no SendInput; does not install the desk lease)
+    ElevationStatus,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -458,6 +474,7 @@ async fn main() {
             native_host_manifest_main(extension_id, exe)
         }
         Command::NativeHostDoctor => native_host_doctor_main(),
+        Command::ElevationStatus => elevation_status_main(),
         other => {
             if let Err(err) = dpi {
                 fail(err);
@@ -650,12 +667,14 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             x,
             y,
             session_id,
+            blind,
         } => pack(actuate::click(ActuateRequest {
             session_id,
             element_id,
             grid,
             x,
             y,
+            blind,
             ..ActuateRequest::default()
         }))?,
         Command::Hover {
@@ -672,9 +691,14 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             y,
             ..ActuateRequest::default()
         }))?,
-        Command::Type { text, session_id } => pack(actuate::type_text(ActuateRequest {
+        Command::Type {
+            text,
+            session_id,
+            blind,
+        } => pack(actuate::type_text(ActuateRequest {
             session_id,
             text: Some(text),
+            blind,
             ..ActuateRequest::default()
         }))?,
         Command::Key { name, session_id } => pack(actuate::key(ActuateRequest {
@@ -762,7 +786,8 @@ fn input_main(command: Command) -> Result<(), HandsError> {
         | Command::Logs { .. }
         | Command::NativeHost { .. }
         | Command::NativeHostManifest { .. }
-        | Command::NativeHostDoctor => {
+        | Command::NativeHostDoctor
+        | Command::ElevationStatus => {
             unreachable!()
         }
     };
@@ -782,6 +807,13 @@ fn pack(result: Result<hands::ActuateEnvelope, HandsError>) -> Result<(String, b
 fn native_host_doctor_main() -> Result<(), HandsError> {
     let report = host_doctor::run();
     let json = host_doctor::serialize_report(&report)?;
+    println!("{json}");
+    Ok(())
+}
+
+fn elevation_status_main() -> Result<(), HandsError> {
+    let status = hands::elevation::status()?;
+    let json = hands::elevation::serialize_status(&status)?;
     println!("{json}");
     Ok(())
 }
@@ -821,6 +853,31 @@ mod tests {
             Command::NativeHostDoctor => {}
             _ => panic!("expected NativeHostDoctor"),
         }
+    }
+
+    #[test]
+    fn elevation_status_parses_and_skips_input_main() {
+        let cli = Cli::try_parse_from(["hands", "elevation-status"]).expect("parse");
+        match cli.command {
+            Command::ElevationStatus => {}
+            _ => panic!("expected ElevationStatus"),
+        }
+        let src = include_str!("main.rs");
+        let dispatch = src
+            .find("Command::NativeHostDoctor => native_host_doctor_main()")
+            .expect("doctor dispatch");
+        let elevation = src
+            .find("Command::ElevationStatus => elevation_status_main()")
+            .expect("elevation-status dispatch");
+        let other = src.find("other => {").expect("input_main fallback");
+        assert!(
+            dispatch < elevation && elevation < other,
+            "elevation-status must dispatch like NativeHostDoctor, not input_main"
+        );
+        assert!(
+            src.contains("| Command::ElevationStatus => {"),
+            "elevation-status must be unreachable in input_main"
+        );
     }
 
     #[test]

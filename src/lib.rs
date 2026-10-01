@@ -14,6 +14,7 @@ pub mod classify;
 pub mod cooldown;
 pub mod dialogs;
 pub mod dotask;
+pub mod elevation;
 pub mod error;
 pub mod extract;
 pub mod fence;

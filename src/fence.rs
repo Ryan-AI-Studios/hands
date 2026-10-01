@@ -90,6 +90,46 @@ pub fn decide(session_id: &str, evidence: &Evidence, domain: &str) -> Result<Gat
     }
 }
 
+pub fn gate_high_il(
+    session_id: &str,
+    hwnd: Option<isize>,
+) -> Result<Option<FenceInfo>, HandsError> {
+    ensure_installed();
+    let Some(hwnd) = hwnd else {
+        return Ok(None);
+    };
+    if !crate::elevation::window_is_high_il(hwnd) {
+        return Ok(None);
+    }
+    if !crate::elevation::process_uiaccess()? {
+        return Err(HandsError::Fence(crate::elevation::UNGRANTED_MSG.into()));
+    }
+    match allows::check(session_id, "desktop", classify::Category::Elevated)? {
+        AllowHit::Miss => Ok(Some(FenceInfo {
+            domain: "desktop".into(),
+            category: classify::Category::Elevated.to_string(),
+            name: "elevated window".into(),
+            role: "window".into(),
+            modes: vec!["once".into(), "session".into(), "persist".into()],
+        })),
+        _ => Ok(None),
+    }
+}
+
+pub fn gate_blind(session_id: &str) -> Result<Option<FenceInfo>, HandsError> {
+    ensure_installed();
+    match allows::check(session_id, "desktop", classify::Category::Blind)? {
+        AllowHit::Miss => Ok(Some(FenceInfo {
+            domain: "desktop".into(),
+            category: classify::Category::Blind.to_string(),
+            name: "blind actuation".into(),
+            role: "desktop".into(),
+            modes: vec!["once".into(), "session".into(), "persist".into()],
+        })),
+        _ => Ok(None),
+    }
+}
+
 pub fn gate_click(
     session_id: &str,
     resolved: &ResolvedTarget,
@@ -427,6 +467,29 @@ mod tests {
         )
         .expect_err("UIA failure must not become unlabeled-free");
         assert!(err.to_string().contains("ElementFromPoint"), "{err}");
+    }
+
+    #[test]
+    fn gate_high_il_ungranted_is_named_error_granted_is_desktop_elevated() {
+        let _elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        let err = gate_high_il("s-0119", Some(0x22)).expect_err("ungranted");
+        assert!(err.to_string().contains("UIAccess"), "{err}");
+        crate::elevation::set_uiaccess_hook(Some(|| true));
+        allows::with_test_env(|| {
+            let fence = gate_high_il("s-0119", Some(0x22))
+                .unwrap()
+                .expect("Elevated fence");
+            assert_eq!(fence.category, "elevated");
+            assert_eq!(fence.domain, "desktop");
+            allows::grant("s-0119", "desktop", Category::Elevated, AllowMode::Persist).unwrap();
+            assert_eq!(gate_high_il("s-0119", Some(0x22)).unwrap(), None);
+        });
+        crate::elevation::set_high_il_hook(None);
+        crate::elevation::set_uiaccess_hook(None);
     }
 
     #[test]

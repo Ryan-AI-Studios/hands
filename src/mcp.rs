@@ -55,6 +55,9 @@ pub struct ClickParams {
     pub x: Option<i32>,
     #[serde(default)]
     pub y: Option<i32>,
+    /// Skip target verification (click/type only). Hover with blind:true is refused. Does not verify effect and does not reach elevated windows.
+    #[serde(default)]
+    pub blind: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -62,6 +65,9 @@ pub struct TypeParams {
     pub text: String,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Skip the focused edit-leaf guard. Does not verify effect and does not reach elevated windows.
+    #[serde(default)]
+    pub blind: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -227,6 +233,9 @@ pub struct DoTaskParams {
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct NativeHostDoctorParams {}
 
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct ElevationStatusParams {}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LogsParams {
     #[serde(default)]
@@ -253,7 +262,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. Point must be inside the intended window's true client or an owned popup (no --window on click; activate first). Out-of-client is ok:false (named refusal, cooldown), not SendInput. ok:true means delivered; miss (no_change / focus_lost) is the effect signal. navigated:true is a Chrome caption change or loading interstitial, or a non-Chrome http(s) UIA Document URL change — miss is omitted, no retry; chr: ids died, re-observe. Chrome soft-routes with the same caption stay no_change. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on focus_lost. Honor loop_suspected / cooldown_ms; frozen means yield the task. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default."
+        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. Point must be inside the intended window's true client or an owned popup (no --window on click; activate first). Out-of-client is ok:false (named refusal, cooldown), not SendInput. ok:true means delivered; miss (no_change / focus_lost) is the effect signal. navigated:true is a Chrome caption change or loading interstitial, or a non-Chrome http(s) UIA Document URL change — miss is omitted, no retry; chr: ids died, re-observe. Chrome soft-routes with the same caption stay no_change. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on focus_lost. Honor loop_suspected / cooldown_ms; frozen means yield the task. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default. Opt-in blind:true skips hit_test for a same-IL UIA-opaque surface (explicit x/y or grid only); ok:true then serializes verified:false (dispatch only, not effect); does not reach elevated windows; lower-assurance (no Money/Messages classifier); activate first; confirm category blind on desktop (once/session recommended)."
     )]
     fn click(
         &self,
@@ -263,7 +272,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms (no click). Same client-rect guard as click (ok:false named refusal; no --window). uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content."
+        description = "Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms (no click). Same client-rect guard as click (ok:false named refusal; no --window). uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. The shared ClickParams.blind field is click/type only — hover with blind:true is refused."
     )]
     fn hover(
         &self,
@@ -274,7 +283,7 @@ impl HandsServer {
 
     #[tool(
         name = "type",
-        description = "Type text: short Unicode keystrokes or long clipboard paste+restore. Refuses unless a focused edit, combo, or document is in the foreground window; click an editable field first."
+        description = "Type text: short Unicode keystrokes or long clipboard paste+restore. Refuses unless a focused edit, combo, or document is in the foreground window; click an editable field first. Opt-in blind:true skips the edit-leaf guard for a same-IL UIA-opaque surface; ok:true then serializes verified:false (dispatch only); does not reach elevated windows; newline still refused; confirm category blind on desktop."
     )]
     fn r#type(
         &self,
@@ -283,6 +292,7 @@ impl HandsServer {
         Ok(run_actuate(actuate::type_text(ActuateRequest {
             session_id: params.session_id,
             text: Some(params.text),
+            blind: params.blind,
             ..ActuateRequest::default()
         })))
     }
@@ -459,6 +469,16 @@ impl HandsServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(run_native_host_doctor())
     }
+
+    #[tool(
+        description = "Read-only UIAccess / integrity self-report for this process. No SendInput. Does not install the desk lease. Default cargo PE is ungranted; elevated input requires the signed Program Files copy."
+    )]
+    fn elevation_status(
+        &self,
+        Parameters(_params): Parameters<ElevationStatusParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_elevation_status())
+    }
 }
 
 fn click_req(params: ClickParams) -> ActuateRequest {
@@ -468,6 +488,7 @@ fn click_req(params: ClickParams) -> ActuateRequest {
         grid: params.grid,
         x: params.x,
         y: params.y,
+        blind: params.blind,
         ..ActuateRequest::default()
     }
 }
@@ -644,6 +665,13 @@ fn run_native_host_doctor() -> CallToolResult {
     }
 }
 
+fn run_elevation_status() -> CallToolResult {
+    match crate::elevation::status().and_then(|s| crate::elevation::serialize_status(&s)) {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
 fn observe_envelope(params: ObserveParams) -> Result<String, HandsError> {
     let detail = Detail::parse_arg(params.detail.as_deref()).map_err(HandsError::Observe)?;
     let view = ObserveView::parse_arg(params.view.as_deref()).map_err(HandsError::Observe)?;
@@ -697,6 +725,21 @@ mod tests {
         assert_eq!(err.is_error, Some(true));
         let ok = sequence_tool_result(true, "{\"ok\":true}".into());
         assert_eq!(ok.is_error, Some(false));
+    }
+
+    #[test]
+    fn elevation_status_tool_is_named() {
+        let src = include_str!("mcp.rs");
+        let start = src.find("fn elevation_status(").expect("elevation_status");
+        let body = src[start..]
+            .split("fn run_")
+            .next()
+            .unwrap_or(&src[start..]);
+        assert!(src.contains("ElevationStatusParams"));
+        assert!(
+            !body.contains("lease::install"),
+            "elevation_status tool must not install the desk lease:\n{body}"
+        );
     }
 
     #[test]

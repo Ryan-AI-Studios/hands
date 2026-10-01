@@ -6,7 +6,8 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
 };
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
 };
 use windows::core::BOOL;
 
@@ -218,13 +219,28 @@ impl Space {
 static DPI: OnceLock<Result<(), String>> = OnceLock::new();
 
 /// Set PMv2 once, before any metric or capture. Later calls reuse the first result.
+/// The application manifest also declares permonitorv2; a second SetProcess then
+/// returns ACCESS_DENIED, which is success when the thread is already PMv2.
 pub fn ensure_dpi() -> Result<(), HandsError> {
     match DPI.get_or_init(|| {
-        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
-            .map_err(|err| err.to_string())
+        match unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
+            Ok(()) => Ok(()),
+            Err(_) if thread_is_pmv2() => Ok(()),
+            Err(err) => Err(err.to_string()),
+        }
     }) {
         Ok(()) => Ok(()),
         Err(err) => Err(HandsError::Dpi(err.clone())),
+    }
+}
+
+fn thread_is_pmv2() -> bool {
+    unsafe {
+        AreDpiAwarenessContextsEqual(
+            GetThreadDpiAwarenessContext(),
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+        .as_bool()
     }
 }
 
@@ -318,6 +334,12 @@ unsafe extern "system" fn enum_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_dpi_treats_already_pmv2_as_success() {
+        assert!(ensure_dpi().is_ok(), "already-PMv2 must not be a DPI error");
+        assert!(thread_is_pmv2(), "ensure_dpi must leave the thread PMv2");
+    }
 
     #[test]
     fn grid_negative_origin_cell_id() {

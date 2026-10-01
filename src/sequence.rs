@@ -764,7 +764,9 @@ fn record_step(
     error: Option<&str>,
     type_len: Option<usize>,
 ) -> Result<(), HandsError> {
-    logs::record_actuate(session_id, tool, ok, error, None, None, type_len, None)
+    logs::record_actuate(
+        session_id, tool, ok, error, None, None, type_len, None, false,
+    )
 }
 
 fn finish_log(env: &SequenceEnvelope, fence: Option<&FenceInfo>) -> Result<(), HandsError> {
@@ -783,6 +785,7 @@ fn finish_log(env: &SequenceEnvelope, fence: Option<&FenceInfo>) -> Result<(), H
         fence,
         None,
         None,
+        false,
     )
 }
 

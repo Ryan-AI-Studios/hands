@@ -201,6 +201,7 @@ fn log_listen_err(session_id: &str, err: HandsError) -> HandsError {
         None,
         None,
         None,
+        false,
     );
     err
 }
@@ -217,6 +218,7 @@ fn finish(env: ListenEnvelope) -> Result<ListenEnvelope, HandsError> {
         None,
         None,
         None,
+        false,
     );
     Ok(env)
 }

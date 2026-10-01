@@ -319,7 +319,8 @@ fn activate_with(
             });
         }
     };
-    if crate::elevation::window_is_high_il(hit.hwnd) && !crate::elevation::process_uiaccess()? {
+    let granted = crate::elevation::process_uiaccess().unwrap_or(false);
+    if crate::elevation::window_is_high_il(hit.hwnd) && !granted {
         return finish_activate(ActivateEnvelope {
             session_id,
             ok: false,
@@ -536,7 +537,7 @@ fn fail(
     retried: bool,
     settled: bool,
 ) -> Result<ActuateEnvelope, HandsError> {
-    let frozen = matches!(err, HandsError::Lease(_));
+    let frozen = matches!(err, HandsError::Lease(_)) || lease::is_frozen();
     base(
         session_id,
         target,
@@ -752,6 +753,9 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
+    }
     if let Some(env) = refuse_if_high_il(
         &session_id,
         &info,
@@ -765,9 +769,6 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         Ok(None) => {}
         Ok(Some(info_fence)) => return refuse_fence(session_id, info, info_fence),
         Err(err) => return fail(session_id, info, err, false, false, false),
-    }
-    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
-        return Ok(env);
     }
     if let Some(env) = refuse_if_outside_client(&session_id, &info, &resolved)? {
         return Ok(env);
@@ -885,15 +886,15 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
+    }
     if let Some(env) = refuse_if_high_il(
         &session_id,
         &info,
         resolved.hwnd,
         Some((resolved.x, resolved.y)),
     )? {
-        return Ok(env);
-    }
-    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
     if let Some(env) = refuse_if_outside_client(&session_id, &info, &resolved)? {
@@ -954,10 +955,10 @@ fn type_text_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             false,
         );
     }
-    if let Some(env) = refuse_if_high_il(&session_id, &info, None, None)? {
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
-    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+    if let Some(env) = refuse_if_high_il(&session_id, &info, None, None)? {
         return Ok(env);
     }
     if let Some(env) = refuse_unless_focused_editable(&session_id, &info)? {
@@ -1080,6 +1081,9 @@ fn key_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
+    }
     if let Some(env) = refuse_if_high_il(&session_id, &info, None, None)? {
         return Ok(env);
     }
@@ -1090,9 +1094,6 @@ fn key_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             Ok(Some(info_fence)) => return refuse_fence(session_id, info, info_fence),
             Err(err) => return fail(session_id, info, err, false, false, false),
         }
-    }
-    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
-        return Ok(env);
     }
     if let Err(err) = ensure_dpi() {
         return fail(session_id, info, err, false, false, false);
@@ -1130,10 +1131,10 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
-    if !has_target && let Some(env) = refuse_if_high_il(&session_id, &info, None, None)? {
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
-    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+    if !has_target && let Some(env) = refuse_if_high_il(&session_id, &info, None, None)? {
         return Ok(env);
     }
     if has_target {
@@ -2244,6 +2245,45 @@ mod tests {
     }
 
     #[test]
+    fn inners_refuse_blocked_before_high_il() {
+        let src = include_str!("actuate.rs");
+        for (fn_name, follow) in [
+            ("fn click_inner", "pub fn hover"),
+            ("fn hover_inner", "pub fn type_text"),
+            ("fn type_text_inner", "pub fn key"),
+            ("fn key_inner", "pub fn scroll"),
+            ("fn scroll_inner", "pub fn wait_settle"),
+        ] {
+            let start = src.find(fn_name).unwrap_or_else(|| panic!("{fn_name}"));
+            let rest = &src[start..];
+            let end = rest
+                .find(follow)
+                .unwrap_or_else(|| panic!("{follow} after {fn_name}"));
+            let body = &rest[..end];
+            let blocked = body
+                .find("refuse_if_blocked")
+                .unwrap_or_else(|| panic!("{fn_name} refuse_if_blocked"));
+            let probe = body
+                .find("refuse_if_high_il")
+                .unwrap_or_else(|| panic!("{fn_name} refuse_if_high_il"));
+            assert!(
+                blocked < probe,
+                "{fn_name} must refuse_if_blocked before refuse_if_high_il:\n{body}"
+            );
+        }
+        let fail_fn = src.find("fn fail(").expect("fn fail");
+        let fail_end = src[fail_fn..]
+            .find("\nfn ")
+            .map(|i| fail_fn + i)
+            .unwrap_or(src.len());
+        let fail_src = &src[fail_fn..fail_end];
+        assert!(
+            fail_src.contains("lease::is_frozen()"),
+            "fail() must preserve desk freeze:\n{fail_src}"
+        );
+    }
+
+    #[test]
     fn click_inner_probes_high_il_before_gate_click() {
         let src = include_str!("actuate.rs");
         let start = src.find("fn click_inner").expect("click_inner");
@@ -2984,6 +3024,11 @@ mod tests {
         let _ch = crate::challenge::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _elev_hooks = ElevationGuard;
+        crate::elevation::set_high_il_hook(Some(|_| false));
         lease::reset_for_test();
         crate::cooldown::reset_for_test();
         crate::challenge::reset_for_test();

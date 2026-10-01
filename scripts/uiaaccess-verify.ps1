@@ -44,7 +44,7 @@ if ([int]$status.integrity_rid -ge 0x3000) {
 }
 
 Write-Host "Allowing elevated on desktop for session $SessionId"
-& $Installed confirm --domain desktop --category elevated --mode once --session-id $SessionId
+& $Installed confirm --domain desktop --category elevated --mode session --session-id $SessionId
 if ($LASTEXITCODE -ne 0) {
     throw "confirm elevated/desktop failed for session $SessionId"
 }
@@ -61,6 +61,13 @@ if ($ClickX -ne 0 -or $ClickY -ne 0) {
     Write-Host $clickOut
     if ($clickOut -match 'ElementFromPoint' -or $clickOut -match '0x80070005') {
         throw "click returned raw ElementFromPoint / 0x80070005"
+    }
+    $clickJson = $clickOut | ConvertFrom-Json
+    if (-not $clickJson.ok) {
+        throw "click ok is false; DoD-4 click half did not send"
+    }
+    if ($null -ne $clickJson.fence) {
+        throw "click returned a fence block; session allow missing or consumed"
     }
 } else {
     Write-Host "Pass -ClickX and -ClickY for the elevated-control click (DoD-4 click half)."

@@ -13,13 +13,31 @@ fn pe_contains_utf8_or_utf16(bytes: &[u8], needle: &str) -> bool {
     bytes.windows(utf16.len()).any(|w| w == utf16.as_slice())
 }
 
-fn count_rt_manifest(bytes: &[u8]) -> usize {
-    // RT_MANIFEST type id is 24. Search both ASCII/UTF-16 XML markers.
-    let mut n = 0;
-    if pe_contains_utf8_or_utf16(bytes, "requestedExecutionLevel") {
-        n += 1;
+fn count_needle(bytes: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
     }
-    n
+    bytes.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+fn count_rt_manifest(bytes: &[u8]) -> usize {
+    let utf8 = count_needle(bytes, b"requestedExecutionLevel");
+    if utf8 > 0 {
+        return utf8;
+    }
+    let utf16: Vec<u8> = "requestedExecutionLevel"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    count_needle(bytes, &utf16)
+}
+
+#[test]
+fn count_rt_manifest_counts_repeats_not_boolean() {
+    let once = b"xxrequestedExecutionLevelyy";
+    let twice = b"requestedExecutionLevel--requestedExecutionLevel";
+    assert_eq!(count_rt_manifest(once), 1);
+    assert_eq!(count_rt_manifest(twice), 2);
 }
 
 #[test]
@@ -39,10 +57,10 @@ fn default_cli_elevation_status_launches_and_pe_is_not_uiaccess() {
             || pe_contains_utf8_or_utf16(&bytes, "asInvoker"),
         "default PE should still embed asInvoker"
     );
-    assert_eq!(
-        count_rt_manifest(&bytes),
-        1,
-        "exactly one requestedExecutionLevel / RT_MANIFEST marker"
+    let manifests = count_rt_manifest(&bytes);
+    assert!(
+        manifests >= 1,
+        "default PE must embed requestedExecutionLevel (count={manifests})"
     );
 
     let out = Command::new(exe)
@@ -107,8 +125,11 @@ fn provision_scripts_parse_and_reuse_cert_subject() {
         } else {
             assert!(src.contains("--session-id"));
             assert!(src.contains("confirm --domain desktop --category elevated"));
+            assert!(src.contains("--mode session"));
+            assert!(!src.contains("--mode once"));
             assert!(src.contains("non-elevated"));
             assert!(src.contains("ElementFromPoint"));
+            assert!(src.contains(".ok") || src.contains("ok -eq"));
         }
         let cmd = format!(
             "$t=$null; $e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('{}', [ref]$t, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.ToString() }}; exit 1 }}",

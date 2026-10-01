@@ -336,6 +336,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ensure_dpi_treats_already_pmv2_as_success() {
+        assert!(ensure_dpi().is_ok(), "already-PMv2 must not be a DPI error");
+        assert!(thread_is_pmv2(), "ensure_dpi must leave the thread PMv2");
+    }
+
+    #[test]
     fn grid_negative_origin_cell_id() {
         let space = Space::new(-1920, 0, 3840, 1080).unwrap();
         assert_eq!(space.cell_id(-1920, 0), "g:0:0");

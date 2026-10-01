@@ -2356,6 +2356,7 @@ mod tests {
         let _g = elevation_lock();
         crate::elevation::set_high_il_hook(Some(|_| true));
         crate::elevation::set_uiaccess_hook(Some(|| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
         crate::input::set_send_inputs_hook(Some(panic_sends));
         let env = click(ActuateRequest {
             session_id: Some("s-0119-click-ungranted".into()),

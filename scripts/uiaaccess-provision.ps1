@@ -102,4 +102,7 @@ Sign-Copy $built $InstallExe $cert
 Write-Host "Installed: $InstallExe"
 Write-Host "Point harness MCP/CLI at this exe for elevated input. Launch via Start-Process / ShellExecute."
 Write-Host "Do not rewrite native-host JSON (Chrome CreateProcess of a UIAccess PE can return 740)."
-Write-Host "Then run: $InstallExe elevation-status"
+Write-Host "Then from a NORMAL non-elevated console (not this RunAs shell):"
+Write-Host "  $InstallExe elevation-status"
+Write-Host "  scripts\uiaaccess-verify.ps1"
+Write-Host "asInvoker inherits High IL from an elevated parent; that is a contract abort, not Done."

@@ -70,6 +70,21 @@ fn default_cli_elevation_status_launches_and_pe_is_not_uiaccess() {
 }
 
 #[test]
+fn click_high_il_test_hooks_foreground_hwnd() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let src = std::fs::read_to_string(format!("{root}\\src\\actuate.rs")).unwrap();
+    let needle = "fn click_high_il_ungranted_is_named_refuse_not_elementfrompoint()";
+    let start = src.find(needle).expect(needle);
+    let rest = &src[start..];
+    let end = rest.find("fn yield_machine()").unwrap_or(rest.len());
+    let body = &rest[..end];
+    assert!(
+        body.contains("set_foreground_hwnd_hook"),
+        "pixel-click High-IL test must hook FG so unattended NULL cannot skip gate_high_il"
+    );
+}
+
+#[test]
 fn provision_scripts_parse_and_reuse_cert_subject() {
     let root = env!("CARGO_MANIFEST_DIR");
     for name in ["uiaaccess-provision.ps1", "uiaaccess-verify.ps1"] {
@@ -85,6 +100,15 @@ fn provision_scripts_parse_and_reuse_cert_subject() {
                 src.contains("Do not rewrite native-host JSON")
                     || src.contains("Do not rewrite native-host")
             );
+            assert!(
+                src.contains("non-elevated"),
+                "provision must warn verify from a non-elevated console"
+            );
+        } else {
+            assert!(src.contains("--session-id"));
+            assert!(src.contains("confirm --domain desktop --category elevated"));
+            assert!(src.contains("non-elevated"));
+            assert!(src.contains("ElementFromPoint"));
         }
         let cmd = format!(
             "$t=$null; $e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('{}', [ref]$t, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.ToString() }}; exit 1 }}",

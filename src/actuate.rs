@@ -3681,12 +3681,23 @@ mod tests {
 
     #[test]
     fn blind_click_honors_frozen() {
-        let _g = elevation_lock();
         let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cool = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ch = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _elev_hooks = ElevationGuard;
         crate::elevation::set_high_il_hook(Some(|_| false));
         crate::input::set_send_inputs_hook(Some(panic_sends));
         crate::uia::set_hit_test_hook(Some(panic_hit_test));
         lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::challenge::reset_for_test();
         lease::freeze_now_with(lease::FreezeCause::Physical);
         let env = click(ActuateRequest {
             session_id: Some("s-0121-frozen".into()),

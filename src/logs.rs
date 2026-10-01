@@ -60,6 +60,8 @@ pub struct Event {
     pub cooldown_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blind: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,6 +221,7 @@ fn pause_event(session_id: &str) -> Event {
         client: None,
         cooldown_ms: None,
         attempt: None,
+        blind: false,
     }
 }
 
@@ -241,6 +244,7 @@ fn stop_event(session_id: &str, from_tool: bool) -> Event {
         client: None,
         cooldown_ms: None,
         attempt: None,
+        blind: false,
     }
 }
 
@@ -436,6 +440,7 @@ pub fn record_yield(session_id: &str, reason: &str) -> Result<(), HandsError> {
         client: None,
         cooldown_ms: None,
         attempt: None,
+        blind: false,
     })
 }
 
@@ -484,6 +489,7 @@ pub fn record_observe_row(session_id: &str, observe: LogObserve) -> Result<(), H
         client: None,
         cooldown_ms: None,
         attempt: None,
+        blind: false,
     })
 }
 
@@ -522,6 +528,7 @@ pub fn record_confirm(
         client: None,
         cooldown_ms: None,
         attempt: None,
+        blind: false,
     })
 }
 
@@ -535,6 +542,7 @@ pub fn record_actuate(
     fence: Option<LogFence>,
     type_len: Option<usize>,
     key: Option<&str>,
+    blind: bool,
 ) -> Result<(), HandsError> {
     let refuse = fence.is_some();
     let stop = tool == "stop" && !refuse;
@@ -563,6 +571,7 @@ pub fn record_actuate(
         client: None,
         cooldown_ms: None,
         attempt: None,
+        blind,
     })
 }
 
@@ -847,6 +856,7 @@ mod tests {
             client: None,
             cooldown_ms: None,
             attempt: None,
+            blind: false,
         }
     }
 
@@ -1000,6 +1010,7 @@ mod tests {
                 None,
                 Some(secret.chars().count()),
                 None,
+                false,
             )
             .unwrap();
             let path = jsonl_path("s-redact").unwrap();
@@ -1136,6 +1147,7 @@ mod tests {
                     client: None,
                     cooldown_ms: None,
                     attempt: None,
+                    blind: false,
                 });
             }
             let env = read_tail("s-fat", Some(200)).unwrap();
@@ -1185,6 +1197,7 @@ mod tests {
             client: None,
             cooldown_ms: None,
             attempt: None,
+            blind: false,
         }
     }
 
@@ -1207,6 +1220,7 @@ mod tests {
             client: None,
             cooldown_ms: None,
             attempt: None,
+            blind: false,
         }
     }
 

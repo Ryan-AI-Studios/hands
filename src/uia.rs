@@ -109,7 +109,27 @@ fn sta_resolve(want: &[i32]) -> Result<ResolvedElement, HandsError> {
     })
 }
 
+#[cfg(test)]
+type HitTestHook = fn(i32, i32) -> Result<HitElement, HandsError>;
+
+#[cfg(test)]
+thread_local! {
+    static HIT_TEST_HOOK: std::cell::Cell<Option<HitTestHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_hit_test_hook(hook: Option<HitTestHook>) {
+    HIT_TEST_HOOK.with(|c| c.set(hook));
+}
+
 pub fn hit_test(x: i32, y: i32) -> Result<HitElement, HandsError> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = HIT_TEST_HOOK.with(|c| c.get()) {
+            return hook(x, y);
+        }
+    }
     std::thread::Builder::new()
         .name("hands-uia-sta".into())
         .spawn(move || sta_hit_test(x, y))

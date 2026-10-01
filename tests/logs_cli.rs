@@ -39,6 +39,7 @@ fn cli_logs_reads_prior_lines_and_does_not_mint() {
         client: None,
         cooldown_ms: None,
         attempt: None,
+        blind: false,
     });
 
     let exe = env!("CARGO_BIN_EXE_hands");
@@ -129,6 +130,7 @@ fn cli_logs_default_tail_fits_4kib_and_keeps_newest_stop() {
             client: None,
             cooldown_ms: None,
             attempt: None,
+            blind: false,
         }) {
             write_err = Some(err);
             break;
@@ -154,6 +156,7 @@ fn cli_logs_default_tail_fits_4kib_and_keeps_newest_stop() {
                 client: None,
                 cooldown_ms: None,
                 attempt: None,
+                blind: false,
             }) {
                 write_err = Some(err);
                 break;

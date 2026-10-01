@@ -17,10 +17,11 @@ pub enum Category {
     Save,
     Social,
     Lead,
+    Blind,
 }
 
 impl Category {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Money,
         Self::Messages,
         Self::Applications,
@@ -31,6 +32,7 @@ impl Category {
         Self::Save,
         Self::Social,
         Self::Lead,
+        Self::Blind,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -45,6 +47,7 @@ impl Category {
             Self::Save => "save",
             Self::Social => "social",
             Self::Lead => "lead",
+            Self::Blind => "blind",
         }
     }
 
@@ -74,6 +77,7 @@ impl FromStr for Category {
             "save" => Ok(Self::Save),
             "social" => Ok(Self::Social),
             "lead" => Ok(Self::Lead),
+            "blind" => Ok(Self::Blind),
             other => Err(HandsError::Fence(format!("unknown category '{other}'"))),
         }
     }

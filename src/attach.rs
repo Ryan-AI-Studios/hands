@@ -670,6 +670,7 @@ pub fn run_attach_identity(
         None,
         None,
         None,
+        false,
     );
     Ok(envelope)
 }

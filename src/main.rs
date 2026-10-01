@@ -69,6 +69,11 @@ enum Command {
         y: Option<i32>,
         #[arg(long)]
         session_id: Option<String>,
+        #[arg(
+            long,
+            help = "skip target verification for a same-IL UIA-opaque surface; requires --x/--y or --grid; does not verify effect; does not reach elevated windows; activate first"
+        )]
+        blind: bool,
     },
     /// Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms. Same client-rect guard as click (`ok:false` named refusal; no `--window`). `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content.
     Hover {
@@ -92,6 +97,11 @@ enum Command {
         text: String,
         #[arg(long)]
         session_id: Option<String>,
+        #[arg(
+            long,
+            help = "skip the focused edit-leaf guard for a same-IL UIA-opaque surface; does not verify effect; does not reach elevated windows; newline still refused"
+        )]
+        blind: bool,
     },
     /// Press a named key or combo. ctrl+l is Control+L (Chrome omnibox). ctrl+t is Control+T (Chrome new tab). win+shift+s is Windows Screen snipping.
     Key {
@@ -166,7 +176,11 @@ enum Command {
     Confirm {
         #[arg(long, required_unless_present = "list")]
         domain: Option<String>,
-        #[arg(long, required_unless_present = "list")]
+        #[arg(
+            long,
+            required_unless_present = "list",
+            help = "fence category: money, messages, applications, account, deletes, installs, elevated, save, social, lead, blind"
+        )]
         category: Option<String>,
         #[arg(long, value_enum, required_unless_present = "list")]
         mode: Option<ConfirmModeArg>,
@@ -653,12 +667,14 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             x,
             y,
             session_id,
+            blind,
         } => pack(actuate::click(ActuateRequest {
             session_id,
             element_id,
             grid,
             x,
             y,
+            blind,
             ..ActuateRequest::default()
         }))?,
         Command::Hover {
@@ -675,9 +691,14 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             y,
             ..ActuateRequest::default()
         }))?,
-        Command::Type { text, session_id } => pack(actuate::type_text(ActuateRequest {
+        Command::Type {
+            text,
+            session_id,
+            blind,
+        } => pack(actuate::type_text(ActuateRequest {
             session_id,
             text: Some(text),
+            blind,
             ..ActuateRequest::default()
         }))?,
         Command::Key { name, session_id } => pack(actuate::key(ActuateRequest {

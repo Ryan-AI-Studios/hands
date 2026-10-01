@@ -55,6 +55,9 @@ pub struct ClickParams {
     pub x: Option<i32>,
     #[serde(default)]
     pub y: Option<i32>,
+    /// Skip target verification (click/type only). Hover with blind:true is refused. Does not verify effect and does not reach elevated windows.
+    #[serde(default)]
+    pub blind: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -62,6 +65,9 @@ pub struct TypeParams {
     pub text: String,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Skip the focused edit-leaf guard. Does not verify effect and does not reach elevated windows.
+    #[serde(default)]
+    pub blind: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -256,7 +262,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. Point must be inside the intended window's true client or an owned popup (no --window on click; activate first). Out-of-client is ok:false (named refusal, cooldown), not SendInput. ok:true means delivered; miss (no_change / focus_lost) is the effect signal. navigated:true is a Chrome caption change or loading interstitial, or a non-Chrome http(s) UIA Document URL change — miss is omitted, no retry; chr: ids died, re-observe. Chrome soft-routes with the same caption stay no_change. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on focus_lost. Honor loop_suspected / cooldown_ms; frozen means yield the task. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default."
+        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. Point must be inside the intended window's true client or an owned popup (no --window on click; activate first). Out-of-client is ok:false (named refusal, cooldown), not SendInput. ok:true means delivered; miss (no_change / focus_lost) is the effect signal. navigated:true is a Chrome caption change or loading interstitial, or a non-Chrome http(s) UIA Document URL change — miss is omitted, no retry; chr: ids died, re-observe. Chrome soft-routes with the same caption stay no_change. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on focus_lost. Honor loop_suspected / cooldown_ms; frozen means yield the task. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default. Opt-in blind:true skips hit_test for a same-IL UIA-opaque surface (explicit x/y or grid only); ok:true then serializes verified:false (dispatch only, not effect); does not reach elevated windows; lower-assurance (no Money/Messages classifier); activate first; confirm category blind on desktop (once/session recommended)."
     )]
     fn click(
         &self,
@@ -266,7 +272,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms (no click). Same client-rect guard as click (ok:false named refusal; no --window). uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content."
+        description = "Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms (no click). Same client-rect guard as click (ok:false named refusal; no --window). uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. The shared ClickParams.blind field is click/type only — hover with blind:true is refused."
     )]
     fn hover(
         &self,
@@ -277,7 +283,7 @@ impl HandsServer {
 
     #[tool(
         name = "type",
-        description = "Type text: short Unicode keystrokes or long clipboard paste+restore. Refuses unless a focused edit, combo, or document is in the foreground window; click an editable field first."
+        description = "Type text: short Unicode keystrokes or long clipboard paste+restore. Refuses unless a focused edit, combo, or document is in the foreground window; click an editable field first. Opt-in blind:true skips the edit-leaf guard for a same-IL UIA-opaque surface; ok:true then serializes verified:false (dispatch only); does not reach elevated windows; newline still refused; confirm category blind on desktop."
     )]
     fn r#type(
         &self,
@@ -286,6 +292,7 @@ impl HandsServer {
         Ok(run_actuate(actuate::type_text(ActuateRequest {
             session_id: params.session_id,
             text: Some(params.text),
+            blind: params.blind,
             ..ActuateRequest::default()
         })))
     }
@@ -481,6 +488,7 @@ fn click_req(params: ClickParams) -> ActuateRequest {
         grid: params.grid,
         x: params.x,
         y: params.y,
+        blind: params.blind,
         ..ActuateRequest::default()
     }
 }

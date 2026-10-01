@@ -116,6 +116,20 @@ pub fn gate_high_il(
     }
 }
 
+pub fn gate_blind(session_id: &str) -> Result<Option<FenceInfo>, HandsError> {
+    ensure_installed();
+    match allows::check(session_id, "desktop", classify::Category::Blind)? {
+        AllowHit::Miss => Ok(Some(FenceInfo {
+            domain: "desktop".into(),
+            category: classify::Category::Blind.to_string(),
+            name: "blind actuation".into(),
+            role: "desktop".into(),
+            modes: vec!["once".into(), "session".into(), "persist".into()],
+        })),
+        _ => Ok(None),
+    }
+}
+
 pub fn gate_click(
     session_id: &str,
     resolved: &ResolvedTarget,

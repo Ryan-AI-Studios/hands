@@ -273,7 +273,17 @@ fn run_dotask_inner(
     let session_id = resolve_session_id_from_os(req.session_id.as_deref());
     logs::check_write_id(&session_id)?;
     logs::remember_session(&session_id);
-    let _ = logs::record_actuate(&session_id, "do_task", true, None, None, None, None, None);
+    let _ = logs::record_actuate(
+        &session_id,
+        "do_task",
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
 
     let provider = adapter::resolve_provider();
     let model = match &provider {
@@ -314,6 +324,7 @@ fn run_dotask_inner(
         None,
         None,
         None,
+        false,
     );
     Ok(env)
 }

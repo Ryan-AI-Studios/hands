@@ -136,7 +136,17 @@ pub fn run_solve_with(
     }
     let first = (hooks.observe)()?;
     if !first.challenge.present {
-        let _ = logs::record_actuate(&session_id, "challenge", true, None, None, None, None, None);
+        let _ = logs::record_actuate(
+            &session_id,
+            "challenge",
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
         return solve_envelope(
             session_id,
             true,
@@ -172,8 +182,17 @@ pub fn run_solve_with(
         cycles = cycles.saturating_add(1);
         last = (hooks.observe)()?;
         if !last.challenge.present {
-            let _ =
-                logs::record_actuate(&session_id, "challenge", true, None, None, None, None, None);
+            let _ = logs::record_actuate(
+                &session_id,
+                "challenge",
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            );
             return solve_envelope(
                 session_id,
                 true,
@@ -198,6 +217,7 @@ pub fn run_solve_with(
         None,
         None,
         None,
+        false,
     );
     solve_envelope(
         session_id,
@@ -220,6 +240,7 @@ fn refuse_daily(session_id: &str) -> Result<ChallengeEnvelope, HandsError> {
         None,
         None,
         None,
+        false,
     );
     solve_envelope(
         session_id.to_string(),
@@ -254,6 +275,7 @@ fn interstitial_refuse(
         None,
         None,
         None,
+        false,
     );
     solve_envelope(
         session_id,
@@ -282,6 +304,7 @@ fn frozen_abort(
         None,
         None,
         None,
+        false,
     );
     solve_envelope(
         session_id,

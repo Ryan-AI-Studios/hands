@@ -315,6 +315,7 @@ fn finish_tool((env, elements): (PickEnvelope, Vec<Element>)) -> Result<PickEnve
         None,
         None,
         None,
+        false,
     );
     Ok(env)
 }

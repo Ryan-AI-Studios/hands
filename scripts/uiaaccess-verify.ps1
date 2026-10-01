@@ -11,6 +11,10 @@ param(
     [int]$ClickY = 0
 )
 
+if ($ClickX -eq 0 -or $ClickY -eq 0) {
+    throw "DoD-4 click half requires nonzero -ClickX and -ClickY; omitting them is not a pass"
+}
+
 $ErrorActionPreference = 'Stop'
 
 function Test-IsAdmin {
@@ -49,28 +53,25 @@ if ($LASTEXITCODE -ne 0) {
     throw "confirm elevated/desktop failed for session $SessionId"
 }
 
-Write-Host "Focus an elevated edit (elevated Notepad / PowerShell). Typing nonce: $Nonce"
+Write-Host "Focus an elevated edit (elevated Notepad / PowerShell) now. Typing nonce in 5s: $Nonce"
+Start-Sleep -Seconds 5
 & $Installed type --text $Nonce --session-id $SessionId
 if ($LASTEXITCODE -ne 0) {
     throw "type refused or failed; High-IL still ungranted or fence-blocked"
 }
 
-if ($ClickX -ne 0 -or $ClickY -ne 0) {
-    Write-Host "Clicking elevated control at $ClickX,$ClickY"
-    $clickOut = & $Installed click --x $ClickX --y $ClickY --session-id $SessionId 2>&1 | Out-String
-    Write-Host $clickOut
-    if ($clickOut -match 'ElementFromPoint' -or $clickOut -match '0x80070005') {
-        throw "click returned raw ElementFromPoint / 0x80070005"
-    }
-    $clickJson = $clickOut | ConvertFrom-Json
-    if (-not $clickJson.ok) {
-        throw "click ok is false; DoD-4 click half did not send"
-    }
-    if ($null -ne $clickJson.fence) {
-        throw "click returned a fence block; session allow missing or consumed"
-    }
-} else {
-    Write-Host "Pass -ClickX and -ClickY for the elevated-control click (DoD-4 click half)."
+Write-Host "Clicking elevated control at $ClickX,$ClickY"
+$clickOut = & $Installed click --x $ClickX --y $ClickY --session-id $SessionId 2>&1 | Out-String
+Write-Host $clickOut
+if ($clickOut -match 'ElementFromPoint' -or $clickOut -match '0x80070005') {
+    throw "click returned raw ElementFromPoint / 0x80070005"
+}
+$clickJson = $clickOut | ConvertFrom-Json
+if (-not $clickJson.ok) {
+    throw "click ok is false; DoD-4 click half did not send"
+}
+if ($null -ne $clickJson.fence) {
+    throw "click returned a fence block; session allow missing or consumed"
 }
 
 Write-Host "Read back the nonce in the elevated window (owner visual check)."

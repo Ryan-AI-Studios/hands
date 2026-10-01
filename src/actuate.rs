@@ -2032,18 +2032,30 @@ mod tests {
     struct TypeFocusGuard;
     impl Drop for TypeFocusGuard {
         fn drop(&mut self) {
+            crate::elevation::set_high_il_hook(None);
             crate::uia::set_focused_leaf_hook(None);
             crate::foreground::set_foreground_hwnd_hook(None);
             crate::input::set_send_inputs_hook(None);
         }
     }
 
-    fn type_focus_lock() -> (TypeFocusGuard, std::sync::MutexGuard<'static, ()>) {
+    fn type_focus_lock() -> (
+        TypeFocusGuard,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let challenge = crate::challenge::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
         crate::challenge::reset_for_test();
-        (TypeFocusGuard, challenge)
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        (TypeFocusGuard, lease, elev, challenge)
     }
 
     fn fg_10() -> Option<isize> {
@@ -2549,18 +2561,26 @@ mod tests {
 
     #[test]
     fn stop_shared_notifies_stop_once_with_ingest_on() {
-        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         lease::reset_for_test();
+        crate::elevation::set_high_il_hook(Some(|_| false));
         with_stop_env(|| {
             with_stop_request_path(|_| {
+                lease::reset_for_test();
+                logs::reinstall_for_test();
                 let _ingest = lease::enable_stop_ingest_for_test();
                 fence::reinstall_for_test();
-                logs::reinstall_for_test();
                 let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
                 let slot = seen.clone();
                 lease::subscribe(move |cause| {
                     slot.lock().unwrap_or_else(|e| e.into_inner()).push(cause);
                 });
+                let desk_before = logs::read_tail("desk", None)
+                    .map(|d| d.events.iter().filter(|e| e.kind == "stop").count())
+                    .unwrap_or(0);
                 let env = stop_cli_noop(ActuateRequest {
                     session_id: Some("s-stop-once".into()),
                     ..ActuateRequest::default()
@@ -2579,10 +2599,15 @@ mod tests {
                 assert_eq!(stops[0].tool.as_deref(), Some("stop"));
                 let desk = logs::read_tail("desk", None).unwrap();
                 let desk_stops: Vec<_> = desk.events.iter().filter(|e| e.kind == "stop").collect();
-                assert_eq!(desk_stops.len(), 1, "{desk:?}");
-                assert_eq!(desk_stops[0].tool.as_deref(), None);
+                assert_eq!(
+                    desk_stops.len(),
+                    desk_before + 1,
+                    "this stop must append one desk stop; before={desk_before} desk={desk:?}"
+                );
+                assert_eq!(desk_stops.last().and_then(|e| e.tool.as_deref()), None);
             });
         });
+        crate::elevation::set_high_il_hook(None);
         lease::reset_for_test();
     }
 
@@ -2807,6 +2832,30 @@ mod tests {
         }
     }
 
+    struct ActivateFixtureGuard;
+    impl Drop for ActivateFixtureGuard {
+        fn drop(&mut self) {
+            crate::elevation::set_high_il_hook(None);
+            crate::elevation::set_uiaccess_hook(None);
+            crate::foreground::set_titled_windows_hook(None);
+        }
+    }
+
+    fn activate_fixture_lock() -> (
+        ActivateFixtureGuard,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        (ActivateFixtureGuard, lease, elev)
+    }
+
     #[test]
     fn activate_hwnd_offers_and_reports_foregrounded() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2818,8 +2867,7 @@ mod tests {
         fn fg_ok() -> Option<isize> {
             Some(0x11)
         }
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![
             sample_titled(0x11, 99, "Chrome A"),
             sample_titled(0x22, 99, "Chrome B"),
@@ -2836,8 +2884,6 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(env.foregrounded);
         assert_eq!(env.reason, None);
@@ -2854,8 +2900,7 @@ mod tests {
             OFFERS.fetch_add(1, Ordering::SeqCst);
             true
         }
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![
             sample_titled(0x11, 99, "Chrome A"),
             sample_titled(0x22, 99, "Chrome B"),
@@ -2890,8 +2935,6 @@ mod tests {
             },
         )
         .expect("stale");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(!stale.ok, "{stale:?}");
         assert!(
             stale
@@ -2916,8 +2959,7 @@ mod tests {
         fn fg_ok() -> Option<isize> {
             Some(0xc1cca)
         }
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         let chrome = {
             let mut w = sample_titled(
                 0x1429ca,
@@ -2945,8 +2987,6 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(env.foregrounded);
         assert_eq!(env.reason, None);
@@ -2964,11 +3004,10 @@ mod tests {
             OFFERS.fetch_add(1, Ordering::SeqCst);
             true
         }
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _fix = activate_fixture_lock();
         let _g = crate::challenge::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
         crate::challenge::reset_for_test();
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
         OFFERS.store(0, Ordering::SeqCst);
@@ -2984,9 +3023,7 @@ mod tests {
             },
         )
         .expect("yield envelope");
-        crate::foreground::set_titled_windows_hook(None);
         crate::challenge::reset_for_test();
-        lease::reset_for_test();
         assert!(!env.ok, "{env:?}");
         assert_eq!(env.error.as_deref(), Some(YIELD_ERROR));
         assert_eq!(OFFERS.load(Ordering::SeqCst), 0);
@@ -3147,8 +3184,7 @@ mod tests {
 
     #[test]
     fn activate_already_fg_is_foregrounded_even_when_offer_fails() {
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
         let env = activate_with(
             Some("s-act-already-fg".into()),
@@ -3161,8 +3197,6 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(env.foregrounded, "{env:?}");
         assert_eq!(env.reason, None);
@@ -3171,8 +3205,7 @@ mod tests {
 
     #[test]
     fn activate_offer_fail_no_fg_is_no_foreground_window() {
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
         let env = activate_with(
             Some("s-act-no-fg".into()),
@@ -3185,8 +3218,6 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(!env.foregrounded, "{env:?}");
         assert_eq!(env.reason.as_deref(), Some("no_foreground_window"));
@@ -3195,8 +3226,7 @@ mod tests {
 
     #[test]
     fn activate_offer_fail_other_fg_is_os_refused() {
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
         let env = activate_with(
             Some("s-act-os-refused".into()),
@@ -3209,8 +3239,6 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(!env.foregrounded, "{env:?}");
         assert_eq!(env.reason.as_deref(), Some("os_refused"));
@@ -3219,8 +3247,7 @@ mod tests {
 
     #[test]
     fn activate_dead_hwnd_after_resolve_is_stale_hwnd() {
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
         let env = activate_with(
             Some("s-act-dead".into()),
@@ -3233,11 +3260,75 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(!env.foregrounded, "{env:?}");
         assert_eq!(env.reason.as_deref(), Some("stale_hwnd"));
+        assert_eq!(env.error, None);
+    }
+
+    #[test]
+    fn activate_high_il_ungranted_is_named_refuse() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OFFERS: AtomicUsize = AtomicUsize::new(0);
+        fn offer_count(_: Option<isize>, _: (i32, i32)) -> bool {
+            OFFERS.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Elevated")]));
+        OFFERS.store(0, Ordering::SeqCst);
+        let env = activate_with(
+            Some("s-0119-act-ungranted".into()),
+            "hwnd:11".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_count,
+                foreground: || Some(0x11),
+                is_live: live_always,
+            },
+        )
+        .expect("activate");
+        crate::foreground::set_titled_windows_hook(None);
+        assert!(!env.ok, "{env:?}");
+        let err = env.error.unwrap_or_default();
+        assert!(err.contains("UIAccess"), "{err}");
+        assert_eq!(OFFERS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn activate_high_il_granted_raises() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OFFERS: AtomicUsize = AtomicUsize::new(0);
+        fn offer_ok(hwnd: Option<isize>, _: (i32, i32)) -> bool {
+            OFFERS.fetch_add(1, Ordering::SeqCst);
+            hwnd == Some(0x11)
+        }
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| true));
+        crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Elevated")]));
+        OFFERS.store(0, Ordering::SeqCst);
+        let env = activate_with(
+            Some("s-0119-act-granted".into()),
+            "hwnd:11".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_ok,
+                foreground: || Some(0x11),
+                is_live: live_always,
+            },
+        )
+        .expect("activate");
+        crate::foreground::set_titled_windows_hook(None);
+        assert!(env.ok, "{env:?}");
+        assert!(env.foregrounded, "{env:?}");
+        assert_eq!(OFFERS.load(Ordering::SeqCst), 1);
         assert_eq!(env.error, None);
     }
 

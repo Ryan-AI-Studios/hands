@@ -54,6 +54,7 @@ function Build-UiAccessExe {
     if (-not (Test-Path $built)) {
         throw "missing feature PE $built"
     }
+    Write-Host "Feature PE $built is unsigned; do not execute it (740 / ERROR_ELEVATION_REQUIRED). Sign via this script into Program Files."
     return $built
 }
 

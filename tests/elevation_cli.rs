@@ -88,6 +88,42 @@ fn default_cli_elevation_status_launches_and_pe_is_not_uiaccess() {
 }
 
 #[test]
+fn type_focus_lock_isolates_lease_and_high_il() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let src = std::fs::read_to_string(format!("{root}\\src\\actuate.rs")).unwrap();
+    let start = src.find("fn type_focus_lock()").expect("type_focus_lock");
+    let rest = &src[start..];
+    let end = rest.find("fn fg_10()").unwrap_or(rest.len());
+    let body = &rest[..end];
+    assert!(
+        body.contains("lease::TEST_LOCK"),
+        "type_focus_lock must take lease::TEST_LOCK:\n{body}"
+    );
+    assert!(
+        body.contains("elevation::TEST_LOCK"),
+        "type_focus_lock must take elevation::TEST_LOCK:\n{body}"
+    );
+    assert!(
+        body.contains("set_high_il_hook(Some(|_| false))"),
+        "non-High-IL type tests must hook high_il=false:\n{body}"
+    );
+}
+
+#[test]
+fn activate_high_il_tests_exist() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let src = std::fs::read_to_string(format!("{root}\\src\\actuate.rs")).unwrap();
+    assert!(
+        src.contains("fn activate_high_il_ungranted_is_named_refuse()"),
+        "activate High-IL ungranted refuse must be locked"
+    );
+    assert!(
+        src.contains("fn activate_high_il_granted_raises()"),
+        "activate High-IL granted raise must be locked"
+    );
+}
+
+#[test]
 fn click_high_il_test_hooks_foreground_hwnd() {
     let root = env!("CARGO_MANIFEST_DIR");
     let src = std::fs::read_to_string(format!("{root}\\src\\actuate.rs")).unwrap();
@@ -122,6 +158,10 @@ fn provision_scripts_parse_and_reuse_cert_subject() {
                 src.contains("non-elevated"),
                 "provision must warn verify from a non-elevated console"
             );
+            assert!(
+                src.contains("unsigned") && src.contains("740"),
+                "provision must warn that target\\uiaccess PE is unsigned"
+            );
         } else {
             assert!(src.contains("--session-id"));
             assert!(src.contains("confirm --domain desktop --category elevated"));
@@ -130,6 +170,18 @@ fn provision_scripts_parse_and_reuse_cert_subject() {
             assert!(src.contains("non-elevated"));
             assert!(src.contains("ElementFromPoint"));
             assert!(src.contains(".ok") || src.contains("ok -eq"));
+            assert!(
+                src.contains("nonzero -ClickX") || src.contains("requires nonzero"),
+                "verify must throw when -ClickX/-ClickY are omitted"
+            );
+            assert!(
+                src.contains("Start-Sleep"),
+                "verify must dwell so the owner can focus the elevated edit"
+            );
+            assert!(
+                !src.contains("Pass -ClickX"),
+                "verify must not silently skip the click half"
+            );
         }
         let cmd = format!(
             "$t=$null; $e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('{}', [ref]$t, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.ToString() }}; exit 1 }}",

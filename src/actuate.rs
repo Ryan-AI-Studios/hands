@@ -319,6 +319,23 @@ fn activate_with(
             });
         }
     };
+    let granted = crate::elevation::process_uiaccess().unwrap_or(false);
+    if crate::elevation::window_is_high_il(hit.hwnd) && !granted {
+        return finish_activate(ActivateEnvelope {
+            session_id,
+            ok: false,
+            foregrounded: false,
+            window: None,
+            frozen: false,
+            error: Some(crate::elevation::UNGRANTED_MSG.into()),
+            reason: None,
+            challenge: None,
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
+        });
+    }
     challenge::note_actuation();
     let center = match hit.rect {
         Some(r) => (r.x + r.w / 2, r.y + r.h / 2),
@@ -462,6 +479,30 @@ fn refuse_if_outside_client(
     .map(Some)
 }
 
+fn refuse_if_high_il(
+    session_id: &str,
+    info: &ActuateTarget,
+    hwnd: Option<isize>,
+    point: Option<(i32, i32)>,
+) -> Result<Option<ActuateEnvelope>, HandsError> {
+    let probe = crate::elevation::probe_target(hwnd, point);
+    match fence::gate_high_il(session_id, probe) {
+        Ok(None) => Ok(None),
+        Ok(Some(fence_info)) => {
+            refuse_fence(session_id.to_string(), info.clone(), fence_info).map(Some)
+        }
+        Err(err) => fail(
+            session_id.to_string(),
+            info.clone(),
+            err,
+            false,
+            false,
+            false,
+        )
+        .map(Some),
+    }
+}
+
 fn refuse_fence(
     session_id: String,
     target: ActuateTarget,
@@ -496,7 +537,7 @@ fn fail(
     retried: bool,
     settled: bool,
 ) -> Result<ActuateEnvelope, HandsError> {
-    let frozen = matches!(err, HandsError::Lease(_));
+    let frozen = matches!(err, HandsError::Lease(_)) || lease::is_frozen();
     base(
         session_id,
         target,
@@ -712,14 +753,22 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
+    }
+    if let Some(env) = refuse_if_high_il(
+        &session_id,
+        &info,
+        resolved.hwnd,
+        Some((resolved.x, resolved.y)),
+    )? {
+        return Ok(env);
+    }
     fence::ensure_installed();
     match fence::gate_click(&session_id, &resolved) {
         Ok(None) => {}
         Ok(Some(info_fence)) => return refuse_fence(session_id, info, info_fence),
         Err(err) => return fail(session_id, info, err, false, false, false),
-    }
-    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
-        return Ok(env);
     }
     if let Some(env) = refuse_if_outside_client(&session_id, &info, &resolved)? {
         return Ok(env);
@@ -840,6 +889,14 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_if_high_il(
+        &session_id,
+        &info,
+        resolved.hwnd,
+        Some((resolved.x, resolved.y)),
+    )? {
+        return Ok(env);
+    }
     if let Some(env) = refuse_if_outside_client(&session_id, &info, &resolved)? {
         return Ok(env);
     }
@@ -899,6 +956,9 @@ fn type_text_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         );
     }
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
+    }
+    if let Some(env) = refuse_if_high_il(&session_id, &info, None, None)? {
         return Ok(env);
     }
     if let Some(env) = refuse_unless_focused_editable(&session_id, &info)? {
@@ -1021,6 +1081,12 @@ fn key_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
+    }
+    if let Some(env) = refuse_if_high_il(&session_id, &info, None, None)? {
+        return Ok(env);
+    }
     if input::is_enter_key(name) {
         fence::ensure_installed();
         match fence::gate_enter(&session_id) {
@@ -1028,9 +1094,6 @@ fn key_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             Ok(Some(info_fence)) => return refuse_fence(session_id, info, info_fence),
             Err(err) => return fail(session_id, info, err, false, false, false),
         }
-    }
-    if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
-        return Ok(env);
     }
     if let Err(err) = ensure_dpi() {
         return fail(session_id, info, err, false, false, false);
@@ -1069,6 +1132,9 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         return Ok(env);
     }
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
+        return Ok(env);
+    }
+    if !has_target && let Some(env) = refuse_if_high_il(&session_id, &info, None, None)? {
         return Ok(env);
     }
     if has_target {
@@ -1966,18 +2032,30 @@ mod tests {
     struct TypeFocusGuard;
     impl Drop for TypeFocusGuard {
         fn drop(&mut self) {
+            crate::elevation::set_high_il_hook(None);
             crate::uia::set_focused_leaf_hook(None);
             crate::foreground::set_foreground_hwnd_hook(None);
             crate::input::set_send_inputs_hook(None);
         }
     }
 
-    fn type_focus_lock() -> (TypeFocusGuard, std::sync::MutexGuard<'static, ()>) {
+    fn type_focus_lock() -> (
+        TypeFocusGuard,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let challenge = crate::challenge::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
         crate::challenge::reset_for_test();
-        (TypeFocusGuard, challenge)
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        (TypeFocusGuard, lease, elev, challenge)
     }
 
     fn fg_10() -> Option<isize> {
@@ -2156,6 +2234,9 @@ mod tests {
             body.contains("focused_leaf"),
             "type guard must call focused_leaf:\n{body}"
         );
+        let probe = body
+            .find("refuse_if_high_il")
+            .expect("type_text_inner must consult High-IL probe");
         let guard = body
             .find("refuse_unless_focused_editable")
             .expect("refuse_unless_focused_editable");
@@ -2165,13 +2246,183 @@ mod tests {
             .expect("note_actuation");
         let send = body.find("input::type_text").expect("input::type_text");
         assert!(
-            guard < dpi && dpi < note && note < send,
-            "focus guard before dpi/note/send:\n{body}"
+            probe < guard && guard < dpi && dpi < note && note < send,
+            "High-IL probe before focus guard/dpi/note/send:\n{body}"
         );
         let fence = include_str!("fence.rs");
         assert!(
             fence.contains("uia::focused(") || fence.contains("crate::uia::focused("),
             "fence must still call focused()"
+        );
+    }
+
+    #[test]
+    fn inners_refuse_blocked_before_high_il() {
+        let src = include_str!("actuate.rs");
+        for (fn_name, follow) in [
+            ("fn click_inner", "pub fn hover"),
+            ("fn hover_inner", "pub fn type_text"),
+            ("fn type_text_inner", "pub fn key"),
+            ("fn key_inner", "pub fn scroll"),
+            ("fn scroll_inner", "pub fn wait_settle"),
+        ] {
+            let start = src.find(fn_name).unwrap_or_else(|| panic!("{fn_name}"));
+            let rest = &src[start..];
+            let end = rest
+                .find(follow)
+                .unwrap_or_else(|| panic!("{follow} after {fn_name}"));
+            let body = &rest[..end];
+            let blocked = body
+                .find("refuse_if_blocked")
+                .unwrap_or_else(|| panic!("{fn_name} refuse_if_blocked"));
+            let probe = body
+                .find("refuse_if_high_il")
+                .unwrap_or_else(|| panic!("{fn_name} refuse_if_high_il"));
+            assert!(
+                blocked < probe,
+                "{fn_name} must refuse_if_blocked before refuse_if_high_il:\n{body}"
+            );
+        }
+        let fail_fn = src.find("fn fail(").expect("fn fail");
+        let fail_end = src[fail_fn..]
+            .find("\nfn ")
+            .map(|i| fail_fn + i)
+            .unwrap_or(src.len());
+        let fail_src = &src[fail_fn..fail_end];
+        assert!(
+            fail_src.contains("lease::is_frozen()"),
+            "fail() must preserve desk freeze:\n{fail_src}"
+        );
+    }
+
+    #[test]
+    fn click_inner_probes_high_il_before_gate_click() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let rest = &src[start..];
+        let end = rest.find("pub fn hover").expect("hover follows");
+        let body = &rest[..end];
+        let probe = body.find("refuse_if_high_il").expect("High-IL probe");
+        let gate = body.find("gate_click").expect("gate_click");
+        assert!(
+            probe < gate,
+            "High-IL probe must run before UIA hit_test via gate_click:\n{body}"
+        );
+    }
+
+    struct ElevationGuard;
+    impl Drop for ElevationGuard {
+        fn drop(&mut self) {
+            crate::elevation::set_high_il_hook(None);
+            crate::elevation::set_uiaccess_hook(None);
+            crate::input::set_send_inputs_hook(None);
+            crate::foreground::set_foreground_hwnd_hook(None);
+            crate::uia::set_focused_leaf_hook(None);
+        }
+    }
+
+    fn elevation_lock() -> (
+        ElevationGuard,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let challenge = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::challenge::reset_for_test();
+        (ElevationGuard, elev, challenge)
+    }
+
+    fn key_named(session: &str, name: &str) -> ActuateEnvelope {
+        key(ActuateRequest {
+            session_id: Some(session.into()),
+            name: Some(name.into()),
+            ..ActuateRequest::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn type_and_key_high_il_ungranted_refuse_without_send() {
+        let _g = elevation_lock();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let typed = type_hi("s-0119-type-ungranted");
+        assert!(!typed.ok, "{typed:?}");
+        let err = typed.error.unwrap_or_default();
+        assert!(err.contains("UIAccess"), "{err}");
+        assert!(err.contains("elevation-status"), "{err}");
+        let keyed = key_named("s-0119-key-ungranted", "tab");
+        assert!(!keyed.ok, "{keyed:?}");
+        let kerr = keyed.error.unwrap_or_default();
+        assert!(kerr.contains("UIAccess"), "{kerr}");
+    }
+
+    #[test]
+    fn high_il_granted_without_allow_is_elevated_fence() {
+        let _g = elevation_lock();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| true));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        crate::allows::with_test_env(|| {
+            let env = type_hi("s-0119-type-fence");
+            assert!(!env.ok, "{env:?}");
+            let fence = env.fence.as_ref().expect("Elevated fence");
+            assert_eq!(fence.category, "elevated");
+            assert_eq!(fence.domain, "desktop");
+            assert!(env.error.is_none(), "{env:?}");
+        });
+    }
+
+    #[test]
+    fn high_il_granted_with_allow_types() {
+        let _g = elevation_lock();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| true));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::uia::set_focused_leaf_hook(Some(leaf_edit_fg));
+        TYPE_SENDS.with(|c| c.set(0));
+        crate::input::set_send_inputs_hook(Some(count_sends));
+        crate::allows::with_test_env(|| {
+            crate::allows::grant(
+                "s-0119-type-allow",
+                "desktop",
+                crate::classify::Category::Elevated,
+                crate::allows::AllowMode::Session,
+            )
+            .unwrap();
+            let env = type_hi("s-0119-type-allow");
+            assert!(env.ok, "{env:?}");
+            assert!(TYPE_SENDS.with(|c| c.get()) > 0, "{env:?}");
+        });
+    }
+
+    #[test]
+    fn click_high_il_ungranted_is_named_refuse_not_elementfrompoint() {
+        let _g = elevation_lock();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let env = click(ActuateRequest {
+            session_id: Some("s-0119-click-ungranted".into()),
+            x: Some(10),
+            y: Some(10),
+            ..ActuateRequest::default()
+        })
+        .unwrap();
+        assert!(!env.ok, "{env:?}");
+        let err = env.error.unwrap_or_default();
+        assert!(err.contains("UIAccess"), "{err}");
+        assert!(
+            !err.contains("ElementFromPoint"),
+            "probe must run before UIA hit_test:\n{err}"
         );
     }
 
@@ -2310,18 +2561,26 @@ mod tests {
 
     #[test]
     fn stop_shared_notifies_stop_once_with_ingest_on() {
-        let _g = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         lease::reset_for_test();
+        crate::elevation::set_high_il_hook(Some(|_| false));
         with_stop_env(|| {
             with_stop_request_path(|_| {
+                lease::reset_for_test();
+                logs::reinstall_for_test();
                 let _ingest = lease::enable_stop_ingest_for_test();
                 fence::reinstall_for_test();
-                logs::reinstall_for_test();
                 let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
                 let slot = seen.clone();
                 lease::subscribe(move |cause| {
                     slot.lock().unwrap_or_else(|e| e.into_inner()).push(cause);
                 });
+                let desk_before = logs::read_tail("desk", None)
+                    .map(|d| d.events.iter().filter(|e| e.kind == "stop").count())
+                    .unwrap_or(0);
                 let env = stop_cli_noop(ActuateRequest {
                     session_id: Some("s-stop-once".into()),
                     ..ActuateRequest::default()
@@ -2340,10 +2599,15 @@ mod tests {
                 assert_eq!(stops[0].tool.as_deref(), Some("stop"));
                 let desk = logs::read_tail("desk", None).unwrap();
                 let desk_stops: Vec<_> = desk.events.iter().filter(|e| e.kind == "stop").collect();
-                assert_eq!(desk_stops.len(), 1, "{desk:?}");
-                assert_eq!(desk_stops[0].tool.as_deref(), None);
+                assert_eq!(
+                    desk_stops.len(),
+                    desk_before + 1,
+                    "this stop must append one desk stop; before={desk_before} desk={desk:?}"
+                );
+                assert_eq!(desk_stops.last().and_then(|e| e.tool.as_deref()), None);
             });
         });
+        crate::elevation::set_high_il_hook(None);
         lease::reset_for_test();
     }
 
@@ -2568,6 +2832,30 @@ mod tests {
         }
     }
 
+    struct ActivateFixtureGuard;
+    impl Drop for ActivateFixtureGuard {
+        fn drop(&mut self) {
+            crate::elevation::set_high_il_hook(None);
+            crate::elevation::set_uiaccess_hook(None);
+            crate::foreground::set_titled_windows_hook(None);
+        }
+    }
+
+    fn activate_fixture_lock() -> (
+        ActivateFixtureGuard,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        (ActivateFixtureGuard, lease, elev)
+    }
+
     #[test]
     fn activate_hwnd_offers_and_reports_foregrounded() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2579,8 +2867,7 @@ mod tests {
         fn fg_ok() -> Option<isize> {
             Some(0x11)
         }
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![
             sample_titled(0x11, 99, "Chrome A"),
             sample_titled(0x22, 99, "Chrome B"),
@@ -2597,8 +2884,6 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(env.foregrounded);
         assert_eq!(env.reason, None);
@@ -2615,8 +2900,7 @@ mod tests {
             OFFERS.fetch_add(1, Ordering::SeqCst);
             true
         }
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![
             sample_titled(0x11, 99, "Chrome A"),
             sample_titled(0x22, 99, "Chrome B"),
@@ -2651,8 +2935,6 @@ mod tests {
             },
         )
         .expect("stale");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(!stale.ok, "{stale:?}");
         assert!(
             stale
@@ -2677,8 +2959,7 @@ mod tests {
         fn fg_ok() -> Option<isize> {
             Some(0xc1cca)
         }
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         let chrome = {
             let mut w = sample_titled(
                 0x1429ca,
@@ -2706,8 +2987,6 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(env.foregrounded);
         assert_eq!(env.reason, None);
@@ -2725,11 +3004,10 @@ mod tests {
             OFFERS.fetch_add(1, Ordering::SeqCst);
             true
         }
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _fix = activate_fixture_lock();
         let _g = crate::challenge::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
         crate::challenge::reset_for_test();
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
         OFFERS.store(0, Ordering::SeqCst);
@@ -2745,9 +3023,7 @@ mod tests {
             },
         )
         .expect("yield envelope");
-        crate::foreground::set_titled_windows_hook(None);
         crate::challenge::reset_for_test();
-        lease::reset_for_test();
         assert!(!env.ok, "{env:?}");
         assert_eq!(env.error.as_deref(), Some(YIELD_ERROR));
         assert_eq!(OFFERS.load(Ordering::SeqCst), 0);
@@ -2785,6 +3061,11 @@ mod tests {
         let _ch = crate::challenge::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _elev_hooks = ElevationGuard;
+        crate::elevation::set_high_il_hook(Some(|_| false));
         lease::reset_for_test();
         crate::cooldown::reset_for_test();
         crate::challenge::reset_for_test();
@@ -2903,8 +3184,7 @@ mod tests {
 
     #[test]
     fn activate_already_fg_is_foregrounded_even_when_offer_fails() {
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
         let env = activate_with(
             Some("s-act-already-fg".into()),
@@ -2917,8 +3197,6 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(env.foregrounded, "{env:?}");
         assert_eq!(env.reason, None);
@@ -2927,8 +3205,7 @@ mod tests {
 
     #[test]
     fn activate_offer_fail_no_fg_is_no_foreground_window() {
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
         let env = activate_with(
             Some("s-act-no-fg".into()),
@@ -2941,8 +3218,6 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(!env.foregrounded, "{env:?}");
         assert_eq!(env.reason.as_deref(), Some("no_foreground_window"));
@@ -2951,8 +3226,7 @@ mod tests {
 
     #[test]
     fn activate_offer_fail_other_fg_is_os_refused() {
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
         let env = activate_with(
             Some("s-act-os-refused".into()),
@@ -2965,8 +3239,6 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(!env.foregrounded, "{env:?}");
         assert_eq!(env.reason.as_deref(), Some("os_refused"));
@@ -2975,8 +3247,7 @@ mod tests {
 
     #[test]
     fn activate_dead_hwnd_after_resolve_is_stale_hwnd() {
-        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        lease::reset_for_test();
+        let _g = activate_fixture_lock();
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Chrome")]));
         let env = activate_with(
             Some("s-act-dead".into()),
@@ -2989,11 +3260,75 @@ mod tests {
             },
         )
         .expect("activate");
-        crate::foreground::set_titled_windows_hook(None);
-        lease::reset_for_test();
         assert!(env.ok, "{env:?}");
         assert!(!env.foregrounded, "{env:?}");
         assert_eq!(env.reason.as_deref(), Some("stale_hwnd"));
+        assert_eq!(env.error, None);
+    }
+
+    #[test]
+    fn activate_high_il_ungranted_is_named_refuse() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OFFERS: AtomicUsize = AtomicUsize::new(0);
+        fn offer_count(_: Option<isize>, _: (i32, i32)) -> bool {
+            OFFERS.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Elevated")]));
+        OFFERS.store(0, Ordering::SeqCst);
+        let env = activate_with(
+            Some("s-0119-act-ungranted".into()),
+            "hwnd:11".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_count,
+                foreground: || Some(0x11),
+                is_live: live_always,
+            },
+        )
+        .expect("activate");
+        crate::foreground::set_titled_windows_hook(None);
+        assert!(!env.ok, "{env:?}");
+        let err = env.error.unwrap_or_default();
+        assert!(err.contains("UIAccess"), "{err}");
+        assert_eq!(OFFERS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn activate_high_il_granted_raises() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OFFERS: AtomicUsize = AtomicUsize::new(0);
+        fn offer_ok(hwnd: Option<isize>, _: (i32, i32)) -> bool {
+            OFFERS.fetch_add(1, Ordering::SeqCst);
+            hwnd == Some(0x11)
+        }
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| true));
+        crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Elevated")]));
+        OFFERS.store(0, Ordering::SeqCst);
+        let env = activate_with(
+            Some("s-0119-act-granted".into()),
+            "hwnd:11".into(),
+            ActivateHooks {
+                inventory: crate::foreground::titled_windows,
+                offer: offer_ok,
+                foreground: || Some(0x11),
+                is_live: live_always,
+            },
+        )
+        .expect("activate");
+        crate::foreground::set_titled_windows_hook(None);
+        assert!(env.ok, "{env:?}");
+        assert!(env.foregrounded, "{env:?}");
+        assert_eq!(OFFERS.load(Ordering::SeqCst), 1);
         assert_eq!(env.error, None);
     }
 

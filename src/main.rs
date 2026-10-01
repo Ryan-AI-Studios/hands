@@ -280,6 +280,8 @@ enum Command {
     },
     /// Read-only native-host JSON/HKCU/pipe doctor (does not write the registry; does not kill Chrome)
     NativeHostDoctor,
+    /// Read-only UIAccess / integrity self-report (no SendInput; does not install the desk lease)
+    ElevationStatus,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -458,6 +460,7 @@ async fn main() {
             native_host_manifest_main(extension_id, exe)
         }
         Command::NativeHostDoctor => native_host_doctor_main(),
+        Command::ElevationStatus => elevation_status_main(),
         other => {
             if let Err(err) = dpi {
                 fail(err);
@@ -762,7 +765,8 @@ fn input_main(command: Command) -> Result<(), HandsError> {
         | Command::Logs { .. }
         | Command::NativeHost { .. }
         | Command::NativeHostManifest { .. }
-        | Command::NativeHostDoctor => {
+        | Command::NativeHostDoctor
+        | Command::ElevationStatus => {
             unreachable!()
         }
     };
@@ -782,6 +786,13 @@ fn pack(result: Result<hands::ActuateEnvelope, HandsError>) -> Result<(String, b
 fn native_host_doctor_main() -> Result<(), HandsError> {
     let report = host_doctor::run();
     let json = host_doctor::serialize_report(&report)?;
+    println!("{json}");
+    Ok(())
+}
+
+fn elevation_status_main() -> Result<(), HandsError> {
+    let status = hands::elevation::status()?;
+    let json = hands::elevation::serialize_status(&status)?;
     println!("{json}");
     Ok(())
 }
@@ -821,6 +832,31 @@ mod tests {
             Command::NativeHostDoctor => {}
             _ => panic!("expected NativeHostDoctor"),
         }
+    }
+
+    #[test]
+    fn elevation_status_parses_and_skips_input_main() {
+        let cli = Cli::try_parse_from(["hands", "elevation-status"]).expect("parse");
+        match cli.command {
+            Command::ElevationStatus => {}
+            _ => panic!("expected ElevationStatus"),
+        }
+        let src = include_str!("main.rs");
+        let dispatch = src
+            .find("Command::NativeHostDoctor => native_host_doctor_main()")
+            .expect("doctor dispatch");
+        let elevation = src
+            .find("Command::ElevationStatus => elevation_status_main()")
+            .expect("elevation-status dispatch");
+        let other = src.find("other => {").expect("input_main fallback");
+        assert!(
+            dispatch < elevation && elevation < other,
+            "elevation-status must dispatch like NativeHostDoctor, not input_main"
+        );
+        assert!(
+            src.contains("| Command::ElevationStatus => {"),
+            "elevation-status must be unreachable in input_main"
+        );
     }
 
     #[test]

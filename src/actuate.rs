@@ -319,6 +319,22 @@ fn activate_with(
             });
         }
     };
+    if crate::elevation::window_is_high_il(hit.hwnd) && !crate::elevation::process_uiaccess()? {
+        return finish_activate(ActivateEnvelope {
+            session_id,
+            ok: false,
+            foregrounded: false,
+            window: None,
+            frozen: false,
+            error: Some(crate::elevation::UNGRANTED_MSG.into()),
+            reason: None,
+            challenge: None,
+            attempt: None,
+            cooldown_ms: None,
+            loop_suspected: false,
+            guidance: None,
+        });
+    }
     challenge::note_actuation();
     let center = match hit.rect {
         Some(r) => (r.x + r.w / 2, r.y + r.h / 2),
@@ -460,6 +476,30 @@ fn refuse_if_outside_client(
         false,
     )
     .map(Some)
+}
+
+fn refuse_if_high_il(
+    session_id: &str,
+    info: &ActuateTarget,
+    hwnd: Option<isize>,
+    point: Option<(i32, i32)>,
+) -> Result<Option<ActuateEnvelope>, HandsError> {
+    let probe = crate::elevation::probe_target(hwnd, point);
+    match fence::gate_high_il(session_id, probe) {
+        Ok(None) => Ok(None),
+        Ok(Some(fence_info)) => {
+            refuse_fence(session_id.to_string(), info.clone(), fence_info).map(Some)
+        }
+        Err(err) => fail(
+            session_id.to_string(),
+            info.clone(),
+            err,
+            false,
+            false,
+            false,
+        )
+        .map(Some),
+    }
 }
 
 fn refuse_fence(
@@ -712,6 +752,14 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_if_high_il(
+        &session_id,
+        &info,
+        resolved.hwnd,
+        Some((resolved.x, resolved.y)),
+    )? {
+        return Ok(env);
+    }
     fence::ensure_installed();
     match fence::gate_click(&session_id, &resolved) {
         Ok(None) => {}
@@ -837,6 +885,14 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_if_high_il(
+        &session_id,
+        &info,
+        resolved.hwnd,
+        Some((resolved.x, resolved.y)),
+    )? {
+        return Ok(env);
+    }
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
@@ -897,6 +953,9 @@ fn type_text_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             false,
             false,
         );
+    }
+    if let Some(env) = refuse_if_high_il(&session_id, &info, None, None)? {
+        return Ok(env);
     }
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
@@ -1021,6 +1080,9 @@ fn key_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
+    if let Some(env) = refuse_if_high_il(&session_id, &info, None, None)? {
+        return Ok(env);
+    }
     if input::is_enter_key(name) {
         fence::ensure_installed();
         match fence::gate_enter(&session_id) {
@@ -1066,6 +1128,9 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let foregrounded;
     let mut info = none_target();
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
+        return Ok(env);
+    }
+    if !has_target && let Some(env) = refuse_if_high_il(&session_id, &info, None, None)? {
         return Ok(env);
     }
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
@@ -2156,6 +2221,9 @@ mod tests {
             body.contains("focused_leaf"),
             "type guard must call focused_leaf:\n{body}"
         );
+        let probe = body
+            .find("refuse_if_high_il")
+            .expect("type_text_inner must consult High-IL probe");
         let guard = body
             .find("refuse_unless_focused_editable")
             .expect("refuse_unless_focused_editable");
@@ -2165,13 +2233,143 @@ mod tests {
             .expect("note_actuation");
         let send = body.find("input::type_text").expect("input::type_text");
         assert!(
-            guard < dpi && dpi < note && note < send,
-            "focus guard before dpi/note/send:\n{body}"
+            probe < guard && guard < dpi && dpi < note && note < send,
+            "High-IL probe before focus guard/dpi/note/send:\n{body}"
         );
         let fence = include_str!("fence.rs");
         assert!(
             fence.contains("uia::focused(") || fence.contains("crate::uia::focused("),
             "fence must still call focused()"
+        );
+    }
+
+    #[test]
+    fn click_inner_probes_high_il_before_gate_click() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let rest = &src[start..];
+        let end = rest.find("pub fn hover").expect("hover follows");
+        let body = &rest[..end];
+        let probe = body.find("refuse_if_high_il").expect("High-IL probe");
+        let gate = body.find("gate_click").expect("gate_click");
+        assert!(
+            probe < gate,
+            "High-IL probe must run before UIA hit_test via gate_click:\n{body}"
+        );
+    }
+
+    struct ElevationGuard;
+    impl Drop for ElevationGuard {
+        fn drop(&mut self) {
+            crate::elevation::set_high_il_hook(None);
+            crate::elevation::set_uiaccess_hook(None);
+            crate::input::set_send_inputs_hook(None);
+            crate::foreground::set_foreground_hwnd_hook(None);
+            crate::uia::set_focused_leaf_hook(None);
+        }
+    }
+
+    fn elevation_lock() -> (
+        ElevationGuard,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let elev = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let challenge = crate::challenge::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::challenge::reset_for_test();
+        (ElevationGuard, elev, challenge)
+    }
+
+    fn key_named(session: &str, name: &str) -> ActuateEnvelope {
+        key(ActuateRequest {
+            session_id: Some(session.into()),
+            name: Some(name.into()),
+            ..ActuateRequest::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn type_and_key_high_il_ungranted_refuse_without_send() {
+        let _g = elevation_lock();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let typed = type_hi("s-0119-type-ungranted");
+        assert!(!typed.ok, "{typed:?}");
+        let err = typed.error.unwrap_or_default();
+        assert!(err.contains("UIAccess"), "{err}");
+        assert!(err.contains("elevation-status"), "{err}");
+        let keyed = key_named("s-0119-key-ungranted", "tab");
+        assert!(!keyed.ok, "{keyed:?}");
+        let kerr = keyed.error.unwrap_or_default();
+        assert!(kerr.contains("UIAccess"), "{kerr}");
+    }
+
+    #[test]
+    fn high_il_granted_without_allow_is_elevated_fence() {
+        let _g = elevation_lock();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| true));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        crate::allows::with_test_env(|| {
+            let env = type_hi("s-0119-type-fence");
+            assert!(!env.ok, "{env:?}");
+            let fence = env.fence.as_ref().expect("Elevated fence");
+            assert_eq!(fence.category, "elevated");
+            assert_eq!(fence.domain, "desktop");
+            assert!(env.error.is_none(), "{env:?}");
+        });
+    }
+
+    #[test]
+    fn high_il_granted_with_allow_types() {
+        let _g = elevation_lock();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| true));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::uia::set_focused_leaf_hook(Some(leaf_edit_fg));
+        TYPE_SENDS.with(|c| c.set(0));
+        crate::input::set_send_inputs_hook(Some(count_sends));
+        crate::allows::with_test_env(|| {
+            crate::allows::grant(
+                "s-0119-type-allow",
+                "desktop",
+                crate::classify::Category::Elevated,
+                crate::allows::AllowMode::Session,
+            )
+            .unwrap();
+            let env = type_hi("s-0119-type-allow");
+            assert!(env.ok, "{env:?}");
+            assert!(TYPE_SENDS.with(|c| c.get()) > 0, "{env:?}");
+        });
+    }
+
+    #[test]
+    fn click_high_il_ungranted_is_named_refuse_not_elementfrompoint() {
+        let _g = elevation_lock();
+        crate::elevation::set_high_il_hook(Some(|_| true));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let env = click(ActuateRequest {
+            session_id: Some("s-0119-click-ungranted".into()),
+            x: Some(10),
+            y: Some(10),
+            ..ActuateRequest::default()
+        })
+        .unwrap();
+        assert!(!env.ok, "{env:?}");
+        let err = env.error.unwrap_or_default();
+        assert!(err.contains("UIAccess"), "{err}");
+        assert!(
+            !err.contains("ElementFromPoint"),
+            "probe must run before UIA hit_test:\n{err}"
         );
     }
 

@@ -227,6 +227,9 @@ pub struct DoTaskParams {
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct NativeHostDoctorParams {}
 
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct ElevationStatusParams {}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LogsParams {
     #[serde(default)]
@@ -459,6 +462,16 @@ impl HandsServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(run_native_host_doctor())
     }
+
+    #[tool(
+        description = "Read-only UIAccess / integrity self-report for this process. No SendInput. Does not install the desk lease. Default cargo PE is ungranted; elevated input requires the signed Program Files copy."
+    )]
+    fn elevation_status(
+        &self,
+        Parameters(_params): Parameters<ElevationStatusParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_elevation_status())
+    }
 }
 
 fn click_req(params: ClickParams) -> ActuateRequest {
@@ -644,6 +657,13 @@ fn run_native_host_doctor() -> CallToolResult {
     }
 }
 
+fn run_elevation_status() -> CallToolResult {
+    match crate::elevation::status().and_then(|s| crate::elevation::serialize_status(&s)) {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
 fn observe_envelope(params: ObserveParams) -> Result<String, HandsError> {
     let detail = Detail::parse_arg(params.detail.as_deref()).map_err(HandsError::Observe)?;
     let view = ObserveView::parse_arg(params.view.as_deref()).map_err(HandsError::Observe)?;
@@ -697,6 +717,21 @@ mod tests {
         assert_eq!(err.is_error, Some(true));
         let ok = sequence_tool_result(true, "{\"ok\":true}".into());
         assert_eq!(ok.is_error, Some(false));
+    }
+
+    #[test]
+    fn elevation_status_tool_is_named() {
+        let src = include_str!("mcp.rs");
+        let start = src.find("fn elevation_status(").expect("elevation_status");
+        let body = src[start..]
+            .split("fn run_")
+            .next()
+            .unwrap_or(&src[start..]);
+        assert!(src.contains("ElevationStatusParams"));
+        assert!(
+            !body.contains("lease::install"),
+            "elevation_status tool must not install the desk lease:\n{body}"
+        );
     }
 
     #[test]

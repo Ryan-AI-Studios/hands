@@ -375,6 +375,32 @@ mod tests {
         });
     }
 
+    #[test]
+    fn semantic_stale_session_allow_not_reused() {
+        // Retained 0004 disposition: a wiped session allow must not be reused by
+        // the semantic path, because every call re-decides the fence.
+        allows::with_test_env(|| {
+            allows::grant(
+                "s-sem-stale",
+                "desktop",
+                Category::Messages,
+                AllowMode::Session,
+            )
+            .expect("grant");
+            assert!(
+                gate_semantic("s-sem-stale", &semantic_target("Send", "button"))
+                    .expect("gate")
+                    .is_none(),
+                "a live session allow should pass the first gate"
+            );
+            allows::clear_session_allows();
+            let refused = gate_semantic("s-sem-stale", &semantic_target("Send", "button"))
+                .expect("gate")
+                .expect("refused after wipe");
+            assert_eq!(refused.category, "messages");
+        });
+    }
+
     fn with_url_slot<T>(f: impl FnOnce() -> T) -> T {
         let _g = URL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_last_url_for_test();

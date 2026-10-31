@@ -153,6 +153,29 @@ pub fn gate_enter(session_id: &str) -> Result<Option<FenceInfo>, HandsError> {
     }
 }
 
+/// Fence gate for semantic UIA actions. Evidence comes from the resolved
+/// element and its owning window only — never from `ElementFromPoint`, so a
+/// buried background target cannot borrow whatever is on screen at its
+/// coordinates. Unnamed targets are refused by the caller before this runs;
+/// when they reach it they refuse here too.
+pub fn gate_semantic(
+    session_id: &str,
+    resolved: &ResolvedTarget,
+) -> Result<Option<FenceInfo>, HandsError> {
+    ensure_installed();
+    if resolved.name.trim().is_empty() {
+        return Err(HandsError::Target(
+            "no element evidence: resolved UIA element has no name after the 8-ancestor walk; semantic actions refuse unnamed targets".into(),
+        ));
+    }
+    let (evidence, address) = merge_click_evidence(resolved, None);
+    let domain = domain_for(&evidence, address.as_deref());
+    match decide(session_id, &evidence, &domain)? {
+        Gate::Refused { fence } => Ok(Some(fence)),
+        Gate::Free | Gate::Allowed(_) => Ok(None),
+    }
+}
+
 pub fn domain_for(evidence: &Evidence, address_value: Option<&str>) -> String {
     classify::resolve_domain(
         last_url().as_deref(),
@@ -292,6 +315,64 @@ mod tests {
             window_title: "Untitled - Notepad".into(),
             window_class: "Notepad".into(),
         }
+    }
+
+    fn semantic_target(name: &str, role: &str) -> ResolvedTarget {
+        ResolvedTarget {
+            target: crate::target::Target::ElementId("uia:1.2".into()),
+            kind: "element",
+            id: Some("uia:1.2".into()),
+            x: 40,
+            y: 50,
+            rect: crate::space::Rect {
+                x: 10,
+                y: 20,
+                w: 60,
+                h: 20,
+            },
+            hwnd: None,
+            name: name.into(),
+            role: role.into(),
+        }
+    }
+
+    #[test]
+    fn gate_semantic_evidence_never_calls_hit_test() {
+        let src = include_str!("fence.rs");
+        let start = src.find("pub fn gate_semantic(").expect("gate_semantic");
+        // Run to the next item, so the scan covers the body only.
+        let end = src[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset)
+            .expect("gate_semantic end");
+        let body = &src[start..end];
+        for banned in ["hit_test(", "evidence_for_click("] {
+            assert!(
+                !body.contains(banned),
+                "gate_semantic must not use {banned}"
+            );
+        }
+        assert!(body.contains("merge_click_evidence"));
+    }
+
+    #[test]
+    fn gate_semantic_refuses_empty_name() {
+        allows::with_test_env(|| {
+            let err = gate_semantic("s-sem-empty", &semantic_target("", "button"))
+                .expect_err("unnamed target must refuse");
+            assert!(err.tool_message().contains("no element evidence"), "{err}");
+        });
+    }
+
+    #[test]
+    fn gate_semantic_gates_send_button_like_click() {
+        allows::with_test_env(|| {
+            let fence = gate_semantic("s-sem-send", &semantic_target("Send", "button"))
+                .expect("gate")
+                .expect("refused");
+            assert_eq!(fence.category, "messages");
+            assert_eq!(fence.name, "Send");
+        });
     }
 
     fn with_url_slot<T>(f: impl FnOnce() -> T) -> T {

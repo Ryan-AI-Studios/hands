@@ -18,6 +18,7 @@ use crate::logs;
 use crate::observe::{ObserveRequest, ObserveScope, ObserveView, observe};
 use crate::pick::{self, GroundRequest, PickRequest};
 use crate::sequence;
+use crate::uia_actions;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ObserveParams {
@@ -58,6 +59,22 @@ pub struct ClickParams {
     /// Skip target verification (click/type only). Hover with blind:true is refused. Does not verify effect and does not reach elevated windows.
     #[serde(default)]
     pub blind: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UiaActionParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// UIA RuntimeId (`uia:1.2.3`). Other target kinds are refused.
+    pub element_id: String,
+    /// `invoke` | `toggle` | `expand` | `collapse` | `select` | `set-value`
+    pub action: String,
+    /// `set-value` text, or the desired toggle state (`on|off|true|false|checked|unchecked`).
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Dispatch deadline in ms (default 3000, min 500).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -269,6 +286,23 @@ impl HandsServer {
         Parameters(params): Parameters<ClickParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(run_actuate(actuate::click(click_req(params))))
+    }
+
+    #[tool(
+        description = "Semantic UIA action on a `uia:` element: invoke | toggle | expand | collapse | select | set-value. Requires `uia:` (grid/pixel/chr are refused) and a resolved native window handle. No pointer move, no SetForegroundWindow, no SendInput; the fence runs on target evidence only and refuses unnamed targets. ok:true means the pattern call succeeded — not proof of effect; `delivery` is delivered / undelivered / unknown, and ok:true with delivery:unknown means \"call returned success, effect unproven\". `invoke` is dispatch-only (verified:false). `set-value` replaces text, admits only Edit/Document/ComboBox roles, and never logs the value (len only). `toggle` with value on|off|true|false|checked|unchecked is idempotent; omitted flips. No outcome is ever retried or downgraded to physical input. Honor loop_suspected / cooldown_ms; frozen means yield the task."
+    )]
+    fn uia_action(
+        &self,
+        Parameters(params): Parameters<UiaActionParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_actuate(uia_actions::uia_action(ActuateRequest {
+            session_id: params.session_id,
+            element_id: Some(params.element_id),
+            action: Some(params.action),
+            value: params.value,
+            timeout_ms: params.timeout_ms,
+            ..ActuateRequest::default()
+        })))
     }
 
     #[tool(
@@ -740,6 +774,24 @@ mod tests {
             !body.contains("lease::install"),
             "elevation_status tool must not install the desk lease:\n{body}"
         );
+    }
+
+    #[test]
+    fn uia_action_tool_description_names_limits() {
+        let src = include_str!("mcp.rs");
+        let start = src.find("fn uia_action(").expect("uia_action tool");
+        let head = &src[start.saturating_sub(1_600)..start];
+        assert!(head.contains("uia:"), "names the id space");
+        assert!(head.contains("delivery"), "names delivery");
+        assert!(
+            head.contains("No pointer move") || head.contains("no SetForegroundWindow"),
+            "names the no-input guarantee"
+        );
+        assert!(
+            head.contains("never retried") || head.contains("No outcome is ever retried"),
+            "names the no-retry rule"
+        );
+        assert!(head.contains("effect unproven"), "names ok:true+unknown");
     }
 
     #[test]

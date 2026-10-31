@@ -62,6 +62,8 @@ pub struct Event {
     pub attempt: Option<u32>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub blind: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ActionMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,6 +73,17 @@ pub struct LogTarget {
     pub id: Option<String>,
     pub x: i32,
     pub y: i32,
+}
+
+/// Additive semantic-action metadata. `len` is the only value-derived field
+/// (never the typed text); `state_after` is deliberately absent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionMeta {
+    pub action: String,
+    pub delivery: String,
+    pub verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -222,6 +235,7 @@ fn pause_event(session_id: &str) -> Event {
         cooldown_ms: None,
         attempt: None,
         blind: false,
+        action: None,
     }
 }
 
@@ -245,6 +259,7 @@ fn stop_event(session_id: &str, from_tool: bool) -> Event {
         cooldown_ms: None,
         attempt: None,
         blind: false,
+        action: None,
     }
 }
 
@@ -441,6 +456,7 @@ pub fn record_yield(session_id: &str, reason: &str) -> Result<(), HandsError> {
         cooldown_ms: None,
         attempt: None,
         blind: false,
+        action: None,
     })
 }
 
@@ -490,6 +506,7 @@ pub fn record_observe_row(session_id: &str, observe: LogObserve) -> Result<(), H
         cooldown_ms: None,
         attempt: None,
         blind: false,
+        action: None,
     })
 }
 
@@ -529,6 +546,7 @@ pub fn record_confirm(
         cooldown_ms: None,
         attempt: None,
         blind: false,
+        action: None,
     })
 }
 
@@ -572,6 +590,50 @@ pub fn record_actuate(
         cooldown_ms: None,
         attempt: None,
         blind,
+        action: None,
+    })
+}
+
+/// Log one semantic action. `len` is the value length only for `set-value`;
+/// the value text and any read-back state never reach the log.
+#[allow(clippy::too_many_arguments)]
+pub fn record_uia_action(
+    session_id: &str,
+    action: &str,
+    delivery: &str,
+    verified: bool,
+    len: Option<usize>,
+    ok: bool,
+    error: Option<&str>,
+    target: Option<LogTarget>,
+    fence: Option<LogFence>,
+) -> Result<(), HandsError> {
+    let kind = if fence.is_some() { "refuse" } else { "tool" };
+    record(Event {
+        schema: LOGS_SCHEMA.into(),
+        ts: now_ts(),
+        session_id: session_id.into(),
+        kind: kind.into(),
+        tool: Some("uia-action".into()),
+        ok: Some(ok),
+        error: error.map(str::to_string),
+        target,
+        fence,
+        confirm: None,
+        observe: None,
+        type_meta: None,
+        key: None,
+        yield_info: None,
+        client: None,
+        cooldown_ms: None,
+        attempt: None,
+        blind: false,
+        action: Some(ActionMeta {
+            action: action.into(),
+            delivery: delivery.into(),
+            verified,
+            len,
+        }),
     })
 }
 
@@ -857,6 +919,7 @@ mod tests {
             cooldown_ms: None,
             attempt: None,
             blind: false,
+            action: None,
         }
     }
 
@@ -1148,6 +1211,7 @@ mod tests {
                     cooldown_ms: None,
                     attempt: None,
                     blind: false,
+                    action: None,
                 });
             }
             let env = read_tail("s-fat", Some(200)).unwrap();
@@ -1198,6 +1262,7 @@ mod tests {
             cooldown_ms: None,
             attempt: None,
             blind: false,
+            action: None,
         }
     }
 
@@ -1221,6 +1286,7 @@ mod tests {
             cooldown_ms: None,
             attempt: None,
             blind: false,
+            action: None,
         }
     }
 

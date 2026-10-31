@@ -505,7 +505,7 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Read-only UIAccess / integrity self-report for this process. No SendInput. Does not install the desk lease. Default cargo PE is ungranted; elevated input requires the signed Program Files copy."
+        description = "Read-only UIAccess / integrity self-report for this process. Includes role (cli|stdio-desk|pipe-desk), privileged (High IL), and pipe name when applicable. No SendInput. Does not install the desk lease."
     )]
     fn elevation_status(
         &self,

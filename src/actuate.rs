@@ -340,23 +340,42 @@ fn activate_with(
             });
         }
     };
-    let granted = crate::elevation::process_uiaccess().unwrap_or(false);
-    if crate::elevation::window_is_high_il(hit.hwnd) && !granted {
-        return finish_activate(ActivateEnvelope {
-            session_id,
-            ok: false,
-            foregrounded: false,
-            window: None,
-            frozen: false,
-            error: Some(crate::elevation::UNGRANTED_MSG.into()),
-            reason: None,
-            challenge: None,
-            attempt: None,
-            cooldown_ms: None,
-            loop_suspected: false,
-            guidance: None,
-        });
-    }
+    match crate::elevation::high_il_reach(Some(hit.hwnd)) {
+        Ok(crate::elevation::HighIlReach::Allow) => {}
+        Ok(crate::elevation::HighIlReach::ConfirmElevated) => {}
+        Ok(crate::elevation::HighIlReach::Refuse) => {
+            return finish_activate(ActivateEnvelope {
+                session_id,
+                ok: false,
+                foregrounded: false,
+                window: None,
+                frozen: false,
+                error: Some(crate::elevation::UNGRANTED_MSG.into()),
+                reason: None,
+                challenge: None,
+                attempt: None,
+                cooldown_ms: None,
+                loop_suspected: false,
+                guidance: None,
+            });
+        }
+        Err(e) => {
+            return finish_activate(ActivateEnvelope {
+                session_id,
+                ok: false,
+                foregrounded: false,
+                window: None,
+                frozen: false,
+                error: Some(e.tool_message()),
+                reason: None,
+                challenge: None,
+                attempt: None,
+                cooldown_ms: None,
+                loop_suspected: false,
+                guidance: None,
+            });
+        }
+    };
     challenge::note_actuation();
     let center = match hit.rect {
         Some(r) => (r.x + r.w / 2, r.y + r.h / 2),
@@ -2179,6 +2198,7 @@ mod tests {
     impl Drop for TypeFocusGuard {
         fn drop(&mut self) {
             crate::elevation::set_high_il_hook(None);
+            crate::elevation::set_caller_rid_hook(None);
             crate::uia::set_focused_leaf_hook(None);
             crate::foreground::set_foreground_hwnd_hook(None);
             crate::input::set_send_inputs_hook(None);
@@ -2200,6 +2220,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         lease::reset_for_test();
         crate::challenge::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| false));
         (TypeFocusGuard, lease, elev, challenge)
     }
@@ -2460,6 +2481,7 @@ mod tests {
     impl Drop for ElevationGuard {
         fn drop(&mut self) {
             crate::elevation::set_high_il_hook(None);
+            crate::elevation::set_caller_rid_hook(None);
             crate::elevation::set_uiaccess_hook(None);
             crate::input::set_send_inputs_hook(None);
             crate::foreground::set_foreground_hwnd_hook(None);
@@ -2496,6 +2518,7 @@ mod tests {
     #[test]
     fn type_and_key_high_il_ungranted_refuse_without_send() {
         let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| true));
         crate::elevation::set_uiaccess_hook(Some(|| false));
         crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
@@ -2504,7 +2527,10 @@ mod tests {
         assert!(!typed.ok, "{typed:?}");
         let err = typed.error.unwrap_or_default();
         assert!(err.contains("UIAccess"), "{err}");
-        assert!(err.contains("elevation-status"), "{err}");
+        assert!(
+            err.contains(r"hands serve --pipe \\.\pipe\hands-elev"),
+            "{err}"
+        );
         let keyed = key_named("s-0119-key-ungranted", "tab");
         assert!(!keyed.ok, "{keyed:?}");
         let kerr = keyed.error.unwrap_or_default();
@@ -2514,6 +2540,7 @@ mod tests {
     #[test]
     fn high_il_granted_without_allow_is_elevated_fence() {
         let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| true));
         crate::elevation::set_uiaccess_hook(Some(|| true));
         crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
@@ -2531,6 +2558,7 @@ mod tests {
     #[test]
     fn high_il_granted_with_allow_types() {
         let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| true));
         crate::elevation::set_uiaccess_hook(Some(|| true));
         crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
@@ -2554,6 +2582,7 @@ mod tests {
     #[test]
     fn click_high_il_ungranted_is_named_refuse_not_elementfrompoint() {
         let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| true));
         crate::elevation::set_uiaccess_hook(Some(|| false));
         crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
@@ -2714,6 +2743,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         lease::reset_for_test();
+        let _hooks = crate::elevation::HookGuard;
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| false));
         with_stop_env(|| {
             with_stop_request_path(|_| {
@@ -2756,6 +2787,7 @@ mod tests {
             });
         });
         crate::elevation::set_high_il_hook(None);
+        crate::elevation::set_caller_rid_hook(None);
         lease::reset_for_test();
     }
 
@@ -2984,6 +3016,7 @@ mod tests {
     impl Drop for ActivateFixtureGuard {
         fn drop(&mut self) {
             crate::elevation::set_high_il_hook(None);
+            crate::elevation::set_caller_rid_hook(None);
             crate::elevation::set_uiaccess_hook(None);
             crate::foreground::set_titled_windows_hook(None);
         }
@@ -2999,6 +3032,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         lease::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| false));
         crate::elevation::set_uiaccess_hook(Some(|| false));
         (ActivateFixtureGuard, lease, elev)
@@ -3213,6 +3247,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _elev_hooks = ElevationGuard;
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| false));
         lease::reset_for_test();
         crate::cooldown::reset_for_test();
@@ -3425,6 +3460,7 @@ mod tests {
         let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = elevation_lock();
         lease::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| true));
         crate::elevation::set_uiaccess_hook(Some(|| false));
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Elevated")]));
@@ -3458,6 +3494,7 @@ mod tests {
         let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = elevation_lock();
         lease::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| true));
         crate::elevation::set_uiaccess_hook(Some(|| true));
         crate::foreground::set_titled_windows_hook(Some(vec![sample_titled(0x11, 7, "Elevated")]));
@@ -3559,6 +3596,7 @@ mod tests {
     #[test]
     fn blind_click_dispatches_without_hit_test_and_verified_false() {
         let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| false));
         crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
         crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
@@ -3587,6 +3625,7 @@ mod tests {
     #[test]
     fn blind_click_element_id_refuses_before_resolve() {
         let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| false));
         crate::input::set_send_inputs_hook(Some(panic_sends));
         crate::uia::set_hit_test_hook(Some(panic_hit_test));
@@ -3615,6 +3654,7 @@ mod tests {
     #[test]
     fn blind_type_skips_edit_leaf_and_verified_false() {
         let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| false));
         crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
         crate::uia::set_focused_leaf_hook(Some(leaf_button_fg));
@@ -3659,6 +3699,7 @@ mod tests {
     #[test]
     fn blind_click_and_type_high_il_ungranted_refuse() {
         let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| true));
         crate::elevation::set_uiaccess_hook(Some(|| false));
         crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
@@ -3719,6 +3760,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _elev_hooks = ElevationGuard;
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| false));
         crate::input::set_send_inputs_hook(Some(panic_sends));
         crate::uia::set_hit_test_hook(Some(panic_hit_test));

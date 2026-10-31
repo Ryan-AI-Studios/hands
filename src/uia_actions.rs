@@ -1360,10 +1360,65 @@ mod tests {
     }
 
     #[test]
+    fn semantic_notes_actuation_only_when_dispatching() {
+        // Each mutating action notes the challenge actuation exactly once, only
+        // after the last state read / skip decision and immediately before the
+        // mutating pattern call. A dropped, moved or duplicated note fails here.
+        let src = include_str!("uia_actions.rs");
+        let cases: [(&str, &str, Option<&str>); 5] = [
+            ("fn invoke(", ".Invoke()", None),
+            ("fn toggle(", ".Toggle()", Some("CurrentToggleState")),
+            (
+                "fn expand_collapse(",
+                ".Expand()",
+                Some("CurrentExpandCollapseState"),
+            ),
+            ("fn select(", ".Select()", Some("CurrentIsSelected")),
+            ("fn set_value(", ".SetValue(", Some("CurrentIsReadOnly")),
+        ];
+        for (signature, dispatch, last_read) in cases {
+            let start = src.find(signature).unwrap_or_else(|| panic!("{signature}"));
+            let end = src[start..]
+                .find("\n}\n")
+                .map(|offset| start + offset)
+                .unwrap_or_else(|| panic!("{signature} end"));
+            let body = &src[start..end];
+            let notes = body
+                .matches("challenge::note_actuation_if_proceeding(false)")
+                .count();
+            assert_eq!(notes, 1, "{signature} must note exactly once:\n{body}");
+            let note = body
+                .find("challenge::note_actuation_if_proceeding(false)")
+                .expect("note");
+            let call = body
+                .find(dispatch)
+                .unwrap_or_else(|| panic!("{signature} missing {dispatch}"));
+            assert!(note < call, "{signature}: note must precede {dispatch}");
+            if let Some(read) = last_read {
+                assert!(
+                    body[..note].contains(read),
+                    "{signature}: a {read} read must precede the note"
+                );
+            }
+            // No note may precede the skip decision.
+            if let Some(skip) = body.find("skipped()") {
+                assert!(
+                    skip < note,
+                    "{signature}: a skip must return before the note"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn semantic_source_order_resolve_yielded_blocked_high_il_ensure_installed_gate() {
         let src = include_str!("uia_actions.rs");
-        let body_start = src.find("fn run(").expect("run");
-        let body = &src[body_start..body_start + 4_000];
+        let start = src.find("fn run(").expect("run");
+        let end = src[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset)
+            .expect("run end");
+        let body = &src[start..end];
         let order = [
             "env.resolve",
             "env.yielded",
@@ -1380,6 +1435,21 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {needle} in order"));
             cursor += found;
         }
+        // `ensure_installed` runs inside the live fence gate, which the pipeline
+        // reaches before `gate_semantic`; pin that composition too.
+        let env_start = src.find("impl PolicyEnv for LiveEnv").expect("LiveEnv");
+        let env_body = &src[env_start..env_start + 2_500];
+        let fence_fn = env_body.find("fn fence(").expect("LiveEnv::fence");
+        let ensure = env_body[fence_fn..]
+            .find("fence::ensure_installed()")
+            .expect("ensure_installed before the gate");
+        let gate = env_body[fence_fn..]
+            .find("fence::gate_semantic(")
+            .expect("gate_semantic call");
+        assert!(
+            ensure < gate,
+            "ensure_installed must run before gate_semantic"
+        );
     }
 
     #[test]

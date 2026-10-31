@@ -1281,6 +1281,19 @@ mod tests {
     }
 
     #[test]
+    fn sequence_allowlist_still_rejects_uia_action() {
+        let src = include_str!("sequence.rs");
+        let start = src.find("fn parse_one(").expect("parse_one");
+        let end = src[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset)
+            .expect("parse_one end");
+        let body = &src[start..end];
+        assert!(!body.contains("uia-action"), "allowlist must stay closed");
+        assert!(!body.contains("Semantic"), "no semantic verb in v1");
+    }
+
+    #[test]
     fn unknown_key_aborts_later_type() {
         let mut hooks = test_hooks();
         hooks.key = |_, name| {

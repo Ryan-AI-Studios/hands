@@ -75,6 +75,28 @@ enum Command {
         )]
         blind: bool,
     },
+    /// Invoke / toggle / expand / collapse / select / set-value a `uia:` element through UIA patterns. No pointer move, no foreground steal, no SendInput. `ok:true` means the pattern call succeeded (not proof of effect); `delivery` is `delivered` / `undelivered` / `unknown`, and `unknown` is never retried. `set-value` replaces text (read-only, password and non-text roles refuse); `toggle` with `--value on|off|true|false|checked|unchecked` is idempotent, omitted flips.
+    UiaAction {
+        #[arg(
+            long,
+            help = "UIA RuntimeId (uia:1.2.3); required, other target kinds are refused"
+        )]
+        element_id: Option<String>,
+        #[arg(
+            long,
+            help = "invoke | toggle | expand | collapse | select | set-value (set_value accepted)"
+        )]
+        action: Option<String>,
+        #[arg(long, help = "set-value text, or the desired toggle state")]
+        value: Option<String>,
+        #[arg(
+            long,
+            help = "dispatch deadline in ms (default 3000, min 500; env HANDS_UIA_ACTION_TIMEOUT_MS)"
+        )]
+        timeout_ms: Option<u64>,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
     /// Bézier-move to a UIA id, Chrome `chr:` id, grid cell, or pixel and pause 100 ms. Same client-rect guard as click (`ok:false` named refusal; no `--window`). `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content.
     Hover {
         #[arg(
@@ -677,6 +699,20 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             blind,
             ..ActuateRequest::default()
         }))?,
+        Command::UiaAction {
+            element_id,
+            action,
+            value,
+            timeout_ms,
+            session_id,
+        } => pack(hands::uia_actions::uia_action(ActuateRequest {
+            session_id,
+            element_id,
+            action,
+            value,
+            timeout_ms,
+            ..ActuateRequest::default()
+        }))?,
         Command::Hover {
             element_id,
             grid,
@@ -845,6 +881,50 @@ fn fail(err: HandsError) -> ! {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn uia_action_parses_and_routes_through_input_main() {
+        let cli = Cli::try_parse_from([
+            "hands",
+            "uia-action",
+            "--element-id",
+            "uia:1.2",
+            "--action",
+            "toggle",
+            "--value",
+            "on",
+            "--timeout-ms",
+            "1500",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::UiaAction {
+                element_id,
+                action,
+                value,
+                timeout_ms,
+                ..
+            } => {
+                assert_eq!(element_id.as_deref(), Some("uia:1.2"));
+                assert_eq!(action.as_deref(), Some("toggle"));
+                assert_eq!(value.as_deref(), Some("on"));
+                assert_eq!(timeout_ms, Some(1500));
+            }
+            _ => panic!("expected UiaAction"),
+        }
+        let src = include_str!("main.rs");
+        let start = src.find("fn input_main(").expect("input_main");
+        let body = &src[start..start + 8_000];
+        assert!(body.contains("Command::UiaAction"));
+        assert!(body.contains("uia_actions::uia_action"));
+        // Actuation installs the desk lease: uia-action must not be listed in
+        // the no-lease/unreachable arm.
+        let unreachable_arm = &src[src.find("Command::Mcp\n").expect("arm")..];
+        assert!(
+            !unreachable_arm[..600].contains("Command::UiaAction { .. }"),
+            "uia-action must stay out of the unreachable arm"
+        );
+    }
 
     #[test]
     fn native_host_doctor_parses() {

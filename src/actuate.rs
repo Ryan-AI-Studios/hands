@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::bezier::Rng;
 use crate::challenge::{self, ChallengeInfo, YIELD_ERROR};
@@ -22,7 +22,7 @@ use crate::space::{Rect, Space, ensure_dpi, virtual_screen};
 use crate::target::Target;
 use crate::uia;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActuateTarget {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -31,7 +31,7 @@ pub struct ActuateTarget {
     pub y: i32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActuateEnvelope {
     pub session_id: String,
     pub ok: bool,
@@ -62,6 +62,8 @@ pub struct ActuateEnvelope {
     pub guidance: Option<String>,
     #[serde(default = "verified_default", skip_serializing_if = "verified_is_true")]
     pub verified: bool,
+    #[serde(flatten, default)]
+    pub semantic: Option<crate::uia_actions::SemanticInfo>,
 }
 
 #[allow(dead_code)]
@@ -88,6 +90,9 @@ pub struct ActuateRequest {
     pub dy: Option<i32>,
     pub dx: Option<i32>,
     pub blind: bool,
+    pub action: Option<String>,
+    pub value: Option<String>,
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -204,7 +209,7 @@ fn stamp_activate(env: &mut ActivateEnvelope, snap: Snapshot) {
     env.guidance = cooldown::guidance(env.frozen, snap);
 }
 
-fn refuse_if_blocked(
+pub(crate) fn refuse_if_blocked(
     session_id: &str,
     target: ActuateTarget,
 ) -> Result<Option<ActuateEnvelope>, HandsError> {
@@ -236,6 +241,7 @@ fn refuse_if_blocked(
         loop_suspected: false,
         guidance: None,
         verified: true,
+        semantic: None,
     })
     .map(Some)
 }
@@ -414,6 +420,7 @@ fn base(
         loop_suspected: false,
         guidance: None,
         verified: true,
+        semantic: None,
     })
 }
 
@@ -437,10 +444,11 @@ fn refuse_yield(session_id: String, target: ActuateTarget) -> Result<ActuateEnve
         loop_suspected: false,
         guidance: None,
         verified: true,
+        semantic: None,
     })
 }
 
-fn refuse_if_yielded(
+pub(crate) fn refuse_if_yielded(
     session_id: &str,
     target: ActuateTarget,
 ) -> Result<Option<ActuateEnvelope>, HandsError> {
@@ -496,7 +504,7 @@ fn refuse_if_outside_client(
     .map(Some)
 }
 
-fn refuse_if_high_il(
+pub(crate) fn refuse_if_high_il(
     session_id: &str,
     info: &ActuateTarget,
     hwnd: Option<isize>,
@@ -520,7 +528,7 @@ fn refuse_if_high_il(
     }
 }
 
-fn refuse_fence(
+pub(crate) fn refuse_fence(
     session_id: String,
     target: ActuateTarget,
     fence: FenceInfo,
@@ -544,6 +552,7 @@ fn refuse_fence(
         loop_suspected: false,
         guidance: None,
         verified: true,
+        semantic: None,
     })
 }
 
@@ -591,7 +600,7 @@ fn raw_session(req: &ActuateRequest) -> String {
     resolve_session_id_from_os(req.session_id.as_deref())
 }
 
-fn session(req: &ActuateRequest) -> Result<String, HandsError> {
+pub(crate) fn session(req: &ActuateRequest) -> Result<String, HandsError> {
     logs::ensure_installed();
     let id = raw_session(req);
     logs::check_write_id(&id)?;
@@ -618,7 +627,26 @@ fn log_fence(fence: &FenceInfo) -> LogFence {
 }
 
 fn counts_rejection(tool: &str) -> bool {
-    matches!(tool, "click" | "hover" | "type" | "key" | "scroll")
+    matches!(
+        tool,
+        "click" | "hover" | "type" | "key" | "scroll" | "uia-action"
+    )
+}
+
+/// Session-cooldown bookkeeping shared by the physical tools and `uia-action`.
+///
+/// `ok` counts as success (it means the call was accepted, not that the effect was
+/// verified); anything else is a rejection that arms `loop_suspected` / `cooldown_ms`.
+pub(crate) fn settle_cooldown(tool: &str, env: &mut ActuateEnvelope) {
+    if !counts_rejection(tool) {
+        return;
+    }
+    if env.ok {
+        cooldown::note_success(&env.session_id);
+    } else {
+        let snap = cooldown::note_rejection(&env.session_id);
+        stamp_actuate(env, snap);
+    }
 }
 
 fn after_actuate(
@@ -631,14 +659,7 @@ fn after_actuate(
     logs::ensure_installed();
     let result = match result {
         Ok(mut env) => {
-            if counts_rejection(tool) {
-                if env.ok {
-                    cooldown::note_success(&env.session_id);
-                } else {
-                    let snap = cooldown::note_rejection(&env.session_id);
-                    stamp_actuate(&mut env, snap);
-                }
-            }
+            settle_cooldown(tool, &mut env);
             Ok(env)
         }
         Err(err) => Err(err),
@@ -1482,6 +1503,7 @@ mod tests {
             loop_suspected: false,
             guidance: None,
             verified: true,
+            semantic: None,
         };
         let err = finalize_envelope(env).expect_err("must not emit oversize");
         assert!(err.to_string().contains("16384"), "{err}");
@@ -1522,6 +1544,7 @@ mod tests {
             loop_suspected: false,
             guidance: None,
             verified: true,
+            semantic: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"roi\""), "{json}");
@@ -1558,6 +1581,7 @@ mod tests {
             loop_suspected: false,
             guidance: None,
             verified: true,
+            semantic: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(!json.contains("\"roi\""), "{json}");
@@ -1592,6 +1616,7 @@ mod tests {
             loop_suspected: false,
             guidance: None,
             verified: true,
+            semantic: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"navigated\":true"), "{json}");
@@ -1624,6 +1649,7 @@ mod tests {
             loop_suspected: false,
             guidance: None,
             verified: true,
+            semantic: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"miss\":\"no_change\""), "{json}");
@@ -1655,6 +1681,7 @@ mod tests {
             loop_suspected: false,
             guidance: None,
             verified: true,
+            semantic: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(!json.contains("\"miss\""), "{json}");

@@ -80,6 +80,25 @@ fn sta_resolve(want: &[i32]) -> Result<ResolvedElement, HandsError> {
     }
     let _sta = StaGuard::enter()?;
     let automation = create_automation()?;
+    Ok(resolve_on(&automation, want)?.resolved)
+}
+
+/// A resolved element plus the live COM element it came from. Both stay on the
+/// caller's STA thread; COM pointers never cross it.
+pub(crate) struct ResolvedComElement {
+    pub element: IUIAutomationElement,
+    pub resolved: ResolvedElement,
+}
+
+/// Control-view walk + RuntimeId compare on an existing automation object.
+/// The caller must already be on an STA thread (the semantic worker owns it).
+pub(crate) fn resolve_on(
+    automation: &IUIAutomation,
+    want: &[i32],
+) -> Result<ResolvedComElement, HandsError> {
+    if want.is_empty() {
+        return Err(HandsError::Target("empty RuntimeId".into()));
+    }
     let walker = unsafe { automation.ControlViewWalker() }
         .map_err(|err| HandsError::Uia(format!("ControlViewWalker: {err}")))?;
     let root = unsafe { automation.GetRootElement() }
@@ -101,11 +120,14 @@ fn sta_resolve(want: &[i32]) -> Result<ResolvedElement, HandsError> {
     };
     let (name, role) = name_and_role(&walker, &element);
     let hwnd = native_hwnd(&walker, &element);
-    Ok(ResolvedElement {
-        rect,
-        name,
-        role,
-        hwnd,
+    Ok(ResolvedComElement {
+        element,
+        resolved: ResolvedElement {
+            rect,
+            name,
+            role,
+            hwnd,
+        },
     })
 }
 
@@ -454,7 +476,7 @@ fn prepend_owned_popup(
     Some(rect)
 }
 
-fn create_automation() -> Result<IUIAutomation, HandsError> {
+pub(crate) fn create_automation() -> Result<IUIAutomation, HandsError> {
     unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
         .map_err(|err| HandsError::Uia(format!("CoCreateInstance(CUIAutomation): {err}")))
 }
@@ -615,10 +637,10 @@ fn value_pattern(element: &IUIAutomationElement) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-struct StaGuard;
+pub(crate) struct StaGuard;
 
 impl StaGuard {
-    fn enter() -> Result<Self, HandsError> {
+    pub(crate) fn enter() -> Result<Self, HandsError> {
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
             .ok()
             .map_err(|err| HandsError::Uia(format!("CoInitializeEx(STA): {err}")))?;

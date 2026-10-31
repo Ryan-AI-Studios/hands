@@ -37,6 +37,7 @@ pub mod solver;
 pub mod space;
 pub mod target;
 pub mod uia;
+pub mod uia_actions;
 
 pub use actuate::{ActivateEnvelope, ActuateEnvelope, ActuateRequest};
 pub use error::HandsError;

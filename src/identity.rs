@@ -656,10 +656,13 @@ mod tests {
     }
 
     #[test]
-    fn maximal_ref_json_length_is_bounded() {
+    fn maximal_emitted_ref_json_length_is_bounded() {
+        // 0123 emits frame 0 only; nonzero frames are 0131 and must use the compact encoding
+        // before they are emitted. Pin the emitted frame-0 maximum against the DoD-4 45-byte
+        // `"ref":` key+value bound.
         let r = SnapshotRef::Chrome {
             tab: u32::MAX,
-            frame: u32::MAX,
+            frame: 0,
             doc: "ffff".into(),
             snap: "ffffffff".into(),
             idx: 1_679_615,
@@ -668,8 +671,8 @@ mod tests {
         assert!(canonical.len() <= 64, "{canonical}");
         let json_key_len = "\"ref\":".len() + serde_json::to_string(&canonical).unwrap().len();
         assert!(
-            json_key_len <= 52,
-            "maximal ref key+value is {json_key_len} bytes ({canonical})"
+            json_key_len <= 45,
+            "emitted frame-0 ref key+value is {json_key_len} bytes ({canonical})"
         );
     }
 }

@@ -1327,6 +1327,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static BINDING_STUB: std::cell::RefCell<Option<Result<BindingEvidence, IdentityReport>>> =
         const { std::cell::RefCell::new(None) };
+    static BINDING_SEQUENCE: std::cell::RefCell<Vec<Result<BindingEvidence, IdentityReport>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -1337,6 +1339,11 @@ pub(crate) fn set_scoped_resolve_stub(stub: Option<Result<ChromeHit, IdentityRep
 #[cfg(test)]
 pub(crate) fn set_binding_stub(stub: Option<Result<BindingEvidence, IdentityReport>>) {
     BINDING_STUB.with(|c| *c.borrow_mut() = stub);
+}
+
+#[cfg(test)]
+pub(crate) fn set_binding_sequence(sequence: Vec<Result<BindingEvidence, IdentityReport>>) {
+    BINDING_SEQUENCE.with(|c| *c.borrow_mut() = sequence);
 }
 
 /// Scoped Chrome resolve. Live mode requires the current foreground HWND to be the intended
@@ -1428,6 +1435,17 @@ fn scoped_fixture_hit(
 pub fn verify_binding(tab: u32) -> Result<BindingEvidence, IdentityReport> {
     #[cfg(test)]
     {
+        let next = BINDING_SEQUENCE.with(|c| {
+            let mut sequence = c.borrow_mut();
+            if sequence.is_empty() {
+                None
+            } else {
+                Some(sequence.remove(0))
+            }
+        });
+        if let Some(result) = next {
+            return result;
+        }
         if let Some(stub) = BINDING_STUB.with(|c| c.borrow().clone()) {
             return stub;
         }

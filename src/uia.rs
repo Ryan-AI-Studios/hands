@@ -214,31 +214,45 @@ pub(crate) fn resolve_on(
         None => unsafe { automation.GetRootElement() }
             .map_err(|err| HandsError::Uia(format!("GetRootElement: {err}")))?,
     };
-    let (mut matches, cap_hit) = find_runtime_ids(&walker, &root, want, SCOPED_NODE_CAP);
-    if cap_hit {
-        return Err(HandsError::Target(
-            "UIA walk cap reached before the RuntimeId was resolved; unknown".into(),
-        ));
-    }
-    if matches.is_empty() {
-        return Err(HandsError::Target(format!(
-            "no UIA element with RuntimeId {}; RuntimeId does not survive navigation / a destroyed control; re-observe",
-            want.iter()
-                .map(i32::to_string)
-                .collect::<Vec<_>>()
-                .join(".")
-        )));
-    }
-    if matches.len() > 1 {
-        return Err(HandsError::Target(format!(
-            "multiple UIA elements with RuntimeId {}; ambiguous; re-observe",
-            want.iter()
-                .map(i32::to_string)
-                .collect::<Vec<_>>()
-                .join(".")
-        )));
-    }
-    let element = matches.remove(0);
+    let element = if root_hwnd.is_some() {
+        let (mut matches, cap_hit) = find_runtime_ids(&walker, &root, want, SCOPED_NODE_CAP);
+        if cap_hit {
+            return Err(HandsError::Target(
+                "UIA walk cap reached before the RuntimeId was resolved; unknown".into(),
+            ));
+        }
+        if matches.is_empty() {
+            return Err(HandsError::Target(format!(
+                "no UIA element with RuntimeId {}; RuntimeId does not survive navigation / a destroyed control; re-observe",
+                want.iter()
+                    .map(i32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            )));
+        }
+        if matches.len() > 1 {
+            return Err(HandsError::Target(format!(
+                "multiple UIA elements with RuntimeId {}; ambiguous; re-observe",
+                want.iter()
+                    .map(i32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            )));
+        }
+        matches.remove(0)
+    } else {
+        // Legacy `uia:` keeps its original unbounded, first-match walk. Only scoped refs
+        // carry the new cap/duplicate rule.
+        find_runtime_id(&walker, &root, want).ok_or_else(|| {
+            HandsError::Target(format!(
+                "no UIA element with RuntimeId {}; RuntimeId does not survive navigation / a destroyed control; re-observe",
+                want.iter()
+                    .map(i32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            ))
+        })?
+    };
     let rect = unsafe {
         element
             .CurrentBoundingRectangle()
@@ -548,6 +562,24 @@ fn find_runtime_ids(
         push_children(walker, &element, &mut stack);
     }
     (matches, false)
+}
+
+/// Legacy `uia:` walk: unbounded first match, unchanged from the pre-0123 behavior.
+fn find_runtime_id(
+    walker: &IUIAutomationTreeWalker,
+    root: &IUIAutomationElement,
+    want: &[i32],
+) -> Option<IUIAutomationElement> {
+    let mut stack = vec![root.clone()];
+    while let Some(element) = stack.pop() {
+        if let Some(id) = runtime_id(&element)
+            && id == want
+        {
+            return Some(element);
+        }
+        push_children(walker, &element, &mut stack);
+    }
+    None
 }
 
 fn native_hwnd(walker: &IUIAutomationTreeWalker, element: &IUIAutomationElement) -> Option<isize> {
@@ -1292,6 +1324,20 @@ mod tests {
         assert!(src.contains("WorkerSlot::acquire"));
         let actions = include_str!("uia_actions.rs");
         assert!(actions.contains("uia::WorkerSlot::acquire"));
+    }
+
+    #[test]
+    fn legacy_uia_path_stays_unbounded_first_match() {
+        let src = include_str!("uia.rs");
+        let resolve = &src
+            [src.find("pub(crate) fn resolve_on(").unwrap()..src.find("fn pick_named(").unwrap()];
+        assert!(resolve.contains("if root_hwnd.is_some()"));
+        assert!(resolve.contains("find_runtime_id(&walker, &root, want)"));
+        assert!(resolve.contains("find_runtime_ids(&walker, &root, want, SCOPED_NODE_CAP)"));
+        let legacy =
+            &src[src.find("fn find_runtime_id(").unwrap()..src.find("fn native_hwnd(").unwrap()];
+        assert!(!legacy.contains("SCOPED_NODE_CAP"));
+        assert!(!legacy.contains("ambiguous"));
     }
 
     #[test]

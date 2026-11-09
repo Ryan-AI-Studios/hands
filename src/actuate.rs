@@ -801,14 +801,20 @@ pub(crate) fn refuse_transform(
     identity: Option<IdentityReport>,
 ) -> Result<ActuateEnvelope, HandsError> {
     // Spec §3.7: the identity resolves, but the 0129 transform refuses. Keep `state` as the
-    // resolved identity (exact/legacy) and put the named transform reason in `error`; the
-    // envelope is `ok:false` + `verified:false` + `point.transform.valid=false`, so 0124 must
-    // gate on those, not on `identity.state` alone.
+    // resolved identity (exact/legacy) and put the named transform reason in both `error` and
+    // `identity.reason`; the envelope is `ok:false` + `verified:false` +
+    // `point.transform.valid=false`, so 0124 must gate on those, not on `identity.state` alone.
     let reason = contract
         .transform
         .reason
         .clone()
         .unwrap_or_else(|| "transform is not valid".into());
+    let identity = identity.map(|mut report| {
+        // Name the 0129 transform reason in the identity block too; `state` stays exact
+        // because the ref resolved, while `ok:false`/`verified:false` mark "nothing sent".
+        report.reason = Some(reason.clone());
+        report
+    });
     finalize_envelope(ActuateEnvelope {
         session_id,
         ok: false,
@@ -987,7 +993,7 @@ fn final_live_remap(
             resolved.map = Some(new_map);
             info.x = p.x;
             info.y = p.y;
-            if let Some(env) = scoped_binding_refusal(session_id, info, resolved)? {
+            if let Some(env) = scoped_binding_refusal(session_id, info, &resolved.target)? {
                 return Ok(Some(env));
             }
             Ok(None)
@@ -1019,9 +1025,9 @@ fn point_for_dispatch(resolved: &ResolvedTarget) -> Option<PointContract> {
 fn scoped_binding_refusal(
     session_id: &str,
     info: &ActuateTarget,
-    resolved: &ResolvedTarget,
+    target: &Target,
 ) -> Result<Option<ActuateEnvelope>, HandsError> {
-    let Target::Scoped(r @ SnapshotRef::Chrome { tab, .. }) = &resolved.target else {
+    let Target::Scoped(r @ SnapshotRef::Chrome { tab, .. }) = target else {
         return Ok(None);
     };
     // `evidence.window` is corroboration only: a window drag/move keeps the tab-id binding
@@ -1291,7 +1297,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     // Narrow R7: re-probe tabs/windows immediately before the click. A tab switch during
     // offer/move/capture is still refused with no input; the probe→click microseconds remain
     // the named residual.
-    if let Some(env) = scoped_binding_refusal(&session_id, &info, &resolved)? {
+    if let Some(env) = scoped_binding_refusal(&session_id, &info, &resolved.target)? {
         return Ok(env);
     }
     if let Err(err) = input::left_click(&mut rng) {
@@ -1336,6 +1342,10 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         retried = true;
         if focus_lost {
             let _ = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
+        }
+        // A tab switch during the first click/settle must not re-click the foreground tab.
+        if let Some(env) = scoped_binding_refusal(&session_id, &info, &resolved.target)? {
+            return Ok(env);
         }
         if let Err(err) = input::left_click(&mut rng) {
             return fail_with_point_unverified(
@@ -1566,6 +1576,11 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     remember_target(resolved.rect);
     let mut rng = Rng::from_time();
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
+    // Re-probe after `offer` and immediately before the pointer move; a tab switch here must
+    // not land the pointer in the foreground tab (B1).
+    if let Some(env) = scoped_binding_refusal(&session_id, &info, &resolved.target)? {
+        return Ok(env);
+    }
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
         return fail_with_point(
             session_id,
@@ -1891,6 +1906,13 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         if let Err(err) = input::move_to(space, cx, cy, &mut rng) {
             return fail(session_id, info, err, foregrounded, false, false);
         }
+    }
+    // Re-probe after the hover dwell and immediately before the wheel; a tab switch during
+    // hover must not send the wheel into the foreground tab (B1).
+    if let Ok(target) = Target::parse(req.element_id.as_deref(), req.grid.as_deref(), req.x, req.y)
+        && let Some(env) = scoped_binding_refusal(&session_id, &info, &target)?
+    {
+        return Ok(env);
     }
     challenge::note_actuation();
     match input::scroll_wheel(dy, req.dx) {
@@ -6465,6 +6487,10 @@ mod tests {
             env.identity.as_ref().map(|i| i.state),
             Some(IdentityState::Exact)
         );
+        assert_eq!(
+            env.identity.as_ref().and_then(|i| i.reason.as_deref()),
+            Some("no_viewport_anchor")
+        );
         let point = env.point.as_ref().expect("point contract");
         assert!(!point.transform.valid);
     }
@@ -6538,12 +6564,105 @@ mod tests {
         let body = &src[start..end];
         let capture = body.find("capture_roi").expect("capture_roi");
         let probe = body
-            .find("scoped_binding_refusal(&session_id, &info, &resolved)")
+            .find("scoped_binding_refusal(&session_id, &info, &resolved.target)")
             .expect("pre-click binding probe");
         let click = body.find("input::left_click").expect("left_click");
         assert!(capture < probe);
         assert!(probe < click);
         assert!(body.contains("Narrow R7"));
+    }
+
+    #[test]
+    fn hover_reprobes_before_move_and_dwell() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn hover_inner(").expect("hover_inner");
+        let end = src.find("pub fn type_text(").expect("type_text");
+        let body = &src[start..end];
+        let offer = body.find("foreground::offer").expect("offer");
+        let probe = body
+            .find("scoped_binding_refusal(&session_id, &info, &resolved.target)")
+            .expect("hover binding probe");
+        let move_to = body.find("input::move_to").expect("move_to");
+        let dwell = body.find("hover_dwell").expect("hover_dwell");
+        assert!(offer < probe);
+        assert!(probe < move_to);
+        assert!(move_to < dwell);
+    }
+
+    #[test]
+    fn scroll_reprobes_before_scroll_wheel() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn scroll_inner(").expect("scroll_inner");
+        let end = src.find("pub fn wait_settle(").expect("wait_settle");
+        let body = &src[start..end];
+        let probe = body
+            .find("scoped_binding_refusal(&session_id, &info, &target)")
+            .expect("scroll binding probe");
+        let wheel = body.find("input::scroll_wheel").expect("scroll_wheel");
+        assert!(probe < wheel);
+    }
+
+    #[test]
+    fn click_retry_reprobes_before_second_click() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner(").expect("click_inner");
+        let end = src
+            .find("fn dispatch_blind_click(")
+            .expect("dispatch_blind_click");
+        let body = &src[start..end];
+        let retry = body.find("should_retry_click").expect("retry branch");
+        let tail = &body[retry..];
+        let probe = tail
+            .find("scoped_binding_refusal(&session_id, &info, &resolved.target)")
+            .expect("retry binding probe");
+        let click = tail.find("input::left_click").expect("retry click");
+        assert!(probe < click);
+    }
+
+    #[test]
+    fn scoped_binding_refusal_refuses_a_flip_to_background() {
+        let r = SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 7,
+        };
+        let target = Target::Scoped(r.clone());
+        let info = ActuateTarget {
+            kind: "element".into(),
+            id: Some(r.to_string()),
+            x: 10,
+            y: 20,
+        };
+        chrome::set_binding_sequence(vec![
+            Ok(chrome::BindingEvidence {
+                tab: 12,
+                window: Some(45),
+                active: true,
+                focused: true,
+            }),
+            Ok(chrome::BindingEvidence {
+                tab: 12,
+                window: Some(45),
+                active: false,
+                focused: true,
+            }),
+        ]);
+        assert!(
+            scoped_binding_refusal("s-flip", &info, &target)
+                .expect("first probe")
+                .is_none()
+        );
+        let refusal = scoped_binding_refusal("s-flip", &info, &target)
+            .expect("second probe")
+            .expect("refusal");
+        assert!(!refusal.ok);
+        assert_eq!(refusal.error.as_deref(), Some("tab_not_active"));
+        assert!(refusal.point.is_none());
+        let identity = refusal.identity.expect("identity");
+        assert_eq!(identity.state, IdentityState::Unknown);
+        assert_eq!(identity.reason.as_deref(), Some("tab_not_active"));
     }
 
     #[test]

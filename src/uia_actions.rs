@@ -34,7 +34,7 @@ use crate::challenge;
 use crate::error::HandsError;
 use crate::fence::{self, FenceInfo};
 use crate::foreground;
-use crate::identity::IdentityReport;
+use crate::identity::{IdentityReport, IdentityState, SnapshotRef};
 use crate::input;
 use crate::logs::{self, LogFence, LogTarget};
 use crate::space::{ensure_dpi, virtual_screen};
@@ -143,6 +143,8 @@ pub(crate) struct SemanticResult {
     pub foreground_changed: bool,
     pub pointer_moved: bool,
     pub error: Option<SemanticError>,
+    /// Pre-dispatch worker identity failure (state, closed reason), if any.
+    pub identity: Option<(IdentityState, &'static str)>,
 }
 
 impl SemanticResult {
@@ -156,6 +158,7 @@ impl SemanticResult {
             foreground_changed: false,
             pointer_moved: false,
             error: Some(SemanticError { code }),
+            identity: identity_for_code(code),
         }
     }
 
@@ -169,7 +172,18 @@ impl SemanticResult {
             foreground_changed: false,
             pointer_moved: false,
             error: Some(SemanticError { code }),
+            identity: None,
         }
+    }
+}
+
+fn identity_for_code(code: &'static str) -> Option<(IdentityState, &'static str)> {
+    match code {
+        "stale_identity" => Some((IdentityState::Stale, "identity_mismatch")),
+        "stale_target" | "stale_element" => Some((IdentityState::Stale, "stale_element")),
+        "duplicate_runtime_id" => Some((IdentityState::Ambiguous, "duplicate_runtime_id")),
+        "provider_timeout" | "window_unreadable" => Some((IdentityState::Unknown, code)),
+        _ => None,
     }
 }
 
@@ -249,6 +263,12 @@ pub(crate) fn resolve_code(err: &HandsError) -> &'static str {
     let message = err.tool_message();
     if message.starts_with("no UIA element with RuntimeId") {
         "stale_target"
+    } else if message.starts_with("multiple UIA elements with RuntimeId") {
+        "duplicate_runtime_id"
+    } else if message.starts_with("UIA walk cap reached") {
+        "provider_timeout"
+    } else if message.starts_with("window_unreadable") {
+        "window_unreadable"
     } else {
         // Zero-area / off-screen-centre / any other resolution failure.
         "target_unavailable"
@@ -466,6 +486,12 @@ fn dispatched_envelope(
         foreground_changed: result.foreground_changed,
         pointer_moved: result.pointer_moved,
     });
+    if let Some((state, reason)) = result.identity
+        && let Some(id) = env.target.id.as_deref()
+        && let Ok(r) = SnapshotRef::parse(id)
+    {
+        env.identity = Some(IdentityReport::uia_failure(&r, state, reason));
+    }
     match result.error {
         Some(err) => {
             env.ok = false;
@@ -900,6 +926,7 @@ fn com_error(err: windows::core::Error) -> SemanticResult {
         foreground_changed: false,
         pointer_moved: false,
         error: Some(SemanticError { code }),
+        identity: None,
     }
 }
 
@@ -932,6 +959,7 @@ fn delivered_readback(verified: bool, state: Option<String>) -> SemanticResult {
         foreground_changed: false,
         pointer_moved: false,
         error: None,
+        identity: None,
     }
 }
 
@@ -945,6 +973,7 @@ fn skipped() -> SemanticResult {
         foreground_changed: false,
         pointer_moved: false,
         error: None,
+        identity: None,
     }
 }
 
@@ -966,6 +995,7 @@ fn invoke(element: &IUIAutomationElement) -> SemanticResult {
         foreground_changed: false,
         pointer_moved: false,
         error: None,
+        identity: None,
     }
 }
 
@@ -1613,6 +1643,7 @@ mod tests {
             foreground_changed: false,
             pointer_moved: false,
             error: None,
+            identity: None,
         });
         let env_out = run_with(&env, &backend, &request("invoke", None));
         let info = env_out.semantic.expect("semantic");
@@ -2134,5 +2165,69 @@ mod tests {
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
         let semantic = out.semantic.expect("semantic");
         assert_eq!(semantic.delivery, Delivery::Undelivered);
+    }
+
+    #[test]
+    fn worker_stale_identity_is_undelivered_with_identity_and_no_cooldown() {
+        let _g = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        let r = crate::identity::SnapshotRef::Uia {
+            hwnd: 0x1a2b3c,
+            fp: "7d0e1f22".into(),
+            ridh: "42a1b2c3".into(),
+        };
+        let mut resolved = resolved_target("Send", "button", Some(0x1a2b3c));
+        resolved.target = Target::Scoped(r);
+        resolved.id = Some("sref1:u.1a2b3c.7d0e1f22.42a1b2c3".into());
+        resolved.uia_runtime_id = Some(vec![1, 2]);
+        resolved.uia_expected_fp = Some(0x7d0e1f22);
+        let env = FakeEnv::ok();
+        *env.resolved.lock().unwrap() = Some(Ok(TargetOutcome::Resolved(Box::new(resolved))));
+        let backend = FakeBackend::with(SemanticResult::refusal("stale_identity"));
+        let mut out = run_with(&env, &backend, &scoped_uia_request());
+        assert!(!out.ok);
+        let identity = out.identity.as_ref().expect("worker identity");
+        assert_eq!(identity.state, crate::identity::IdentityState::Stale);
+        assert_eq!(identity.reason.as_deref(), Some("identity_mismatch"));
+        assert_eq!(
+            out.semantic.as_ref().map(|s| s.delivery),
+            Some(Delivery::Undelivered)
+        );
+        crate::actuate::settle_cooldown("uia-action", &mut out);
+        assert_eq!(
+            crate::cooldown::snapshot("uia-action-scoped").attempt,
+            0,
+            "worker stale identity must not arm cooldown"
+        );
+    }
+
+    #[test]
+    fn resolve_code_maps_dispatch_ambiguity_and_cap() {
+        assert_eq!(
+            resolve_code(&HandsError::Target(
+                "multiple UIA elements with RuntimeId 1.2; ambiguous; re-observe".into()
+            )),
+            "duplicate_runtime_id"
+        );
+        assert_eq!(
+            resolve_code(&HandsError::Target(
+                "UIA walk cap reached before the RuntimeId was resolved; unknown".into()
+            )),
+            "provider_timeout"
+        );
+        assert_eq!(
+            resolve_code(&HandsError::Target(
+                "window_unreadable: UIA root handle is unavailable".into()
+            )),
+            "window_unreadable"
+        );
+        assert_eq!(
+            resolve_code(&HandsError::Target(
+                "no UIA element with RuntimeId 1.2; re-observe".into()
+            )),
+            "stale_target"
+        );
     }
 }

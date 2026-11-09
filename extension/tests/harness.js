@@ -131,6 +131,14 @@ function scopedResolve(context, message) {
   return vm.runInContext("resolveScoped(__msg)", context);
 }
 
+function listenerResolve(context, message) {
+  let response = null;
+  context.__listener(message, null, (value) => {
+    response = value;
+  });
+  return response;
+}
+
 function contentTests() {
   const context = contentContext();
   const node = element({ tag: "BUTTON", attrs: { "aria-label": "Send" } });
@@ -189,15 +197,25 @@ function contentTests() {
   reply = scopedResolve(context, { doc: "dddd", snap: "44444444" });
   assert.equal(reply.error, undefined, "password value must not affect the key");
 
-  // Listener routes a scoped request before the legacy buildResolve path.
-  const scoped = scopedResolve(context, { doc: "dddd", snap: "44444444" });
-  assert.equal(scoped.id, "chr:0");
+  // Listener predicate routes a scoped request before the legacy buildResolve path.
+  const listenerScoped = listenerResolve(context, {
+    op: "resolve",
+    v: 1,
+    frame: 0,
+    doc: "dddd",
+    snap: "44444444",
+    idx: 0,
+  });
+  assert.equal(listenerScoped.id, "chr:0");
+  const listenerLegacy = listenerResolve(context, { op: "resolve", id: "chr:0" });
+  assert.equal(listenerLegacy.error, "not-found");
 }
 
 function swContext() {
   const calls = { query: 0, get: 0, windows: 0, send: [], posts: [] };
   const tabs = {
-    12: { id: 12, windowId: 45, active: true, url: "https://example.test/", title: "Example" },
+    12: { id: 12, windowId: 45, active: true, url: "https://example.test/", title: "Same title" },
+    14: { id: 14, windowId: 46, active: true, url: "https://other.test/", title: "Same title" },
   };
   const port = {
     onMessage: { addListener() {} },
@@ -281,6 +299,9 @@ function swContext() {
     setFocused(value) {
       focused = value;
     },
+    setActive(tabId, value) {
+      tabs[tabId].active = value;
+    },
     setContentReply(value) {
       contentReply = value;
     },
@@ -313,6 +334,70 @@ function swTests() {
   assert.equal(reply.fallback, false);
   assert.equal(reply.doc, "9f3a");
 
+  harness.setActive(12, false);
+  reply = harness.forward({
+    op: "resolve",
+    v: 1,
+    tab: 12,
+    frame: 0,
+    doc: "9f3a",
+    snap: "a1b2c3d4",
+    idx: 7,
+  });
+  assert.equal(reply.active, false, "background tab is labelled, not routed elsewhere");
+  harness.setActive(12, true);
+
+  harness.setContentReply({
+    id: "chr:7",
+    role: "Button",
+    text: "Sign in",
+    rectCss: { left: 10, top: 20, width: 100, height: 40 },
+    metrics: {},
+    doc: "9f3a",
+    snap: "a1b2c3d4",
+    idx: 7,
+    frame: 0,
+    visibilityState: "hidden",
+  });
+  reply = harness.forward({
+    op: "resolve",
+    v: 1,
+    tab: 12,
+    frame: 0,
+    doc: "9f3a",
+    snap: "a1b2c3d4",
+    idx: 7,
+  });
+  assert.equal(reply.visibilityState, "hidden");
+
+  harness.setContentReply({
+    id: "chr:7",
+    role: "Button",
+    text: "Sign in",
+    rectCss: { left: 10, top: 20, width: 100, height: 40 },
+    metrics: {},
+    doc: "9f3a",
+    snap: "a1b2c3d4",
+    idx: 7,
+    frame: 0,
+    title: "",
+    visibilityState: "visible",
+  });
+  reply = harness.forward({
+    op: "resolve",
+    v: 1,
+    tab: 14,
+    frame: 0,
+    doc: "9f3a",
+    snap: "a1b2c3d4",
+    idx: 7,
+  });
+  assert.equal(reply.tab, 14);
+  assert.equal(reply.window, 46);
+  assert.equal(reply.title, "");
+  assert.equal(reply.fallback, false, "same-title/empty-title never uses the fallback");
+
+  const sendsBeforeMissing = harness.calls.send.length;
   reply = harness.forward({
     op: "resolve",
     v: 1,
@@ -324,7 +409,7 @@ function swTests() {
   });
   assert.equal(reply.error, "tab_unavailable");
   assert.equal(harness.calls.query, 0, "missing named tab must not fall back");
-  assert.equal(harness.calls.send.length, 1);
+  assert.equal(harness.calls.send.length, sendsBeforeMissing);
 
   harness.setContentReply({ error: "stale_document" });
   reply = harness.forward({
@@ -341,16 +426,17 @@ function swTests() {
   assert.equal(reply.fallback, false);
 
   harness.setFocused(false);
+  const sendsBeforeBinding = harness.calls.send.length;
   reply = harness.forward({ op: "binding", tab: 12 });
   assert.equal(reply.tab, 12);
   assert.equal(reply.active, true);
   assert.equal(reply.focused, false);
-  assert.equal(harness.calls.send.length, 2, "binding must not read content");
+  assert.equal(harness.calls.send.length, sendsBeforeBinding, "binding must not read content");
 
   reply = harness.forward({ op: "binding" });
   assert.equal(reply.error, "protocol_error");
   assert.equal(harness.calls.query, 0);
-  assert.equal(harness.calls.send.length, 2);
+  assert.equal(harness.calls.send.length, sendsBeforeBinding);
 }
 
 function main() {

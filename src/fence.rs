@@ -336,6 +336,10 @@ mod tests {
             hwnd: None,
             name: name.into(),
             role: role.into(),
+            css_point: None,
+            css_rect: None,
+            contract: None,
+            map: None,
         }
     }
 
@@ -512,6 +516,10 @@ mod tests {
             hwnd: None,
             name: String::new(),
             role: String::new(),
+            css_point: None,
+            css_rect: None,
+            contract: None,
+            map: None,
         }
     }
 
@@ -637,6 +645,32 @@ mod tests {
         assert_eq!(
             classify::classify(&evidence),
             crate::classify::Verdict::Free
+        );
+    }
+
+    #[test]
+    fn chr_hwnd_evidence_domain_and_title_are_pinned() {
+        // The documented delta: a valid chr: target carries its Chrome HWND, so the window
+        // title/class are read for fence evidence. Fence logic is not rewritten.
+        let src = include_str!("fence.rs");
+        let start = src
+            .find("fn merge_click_evidence(")
+            .expect("merge_click_evidence");
+        let end = src
+            .find("fn evidence_for_focused(")
+            .expect("evidence_for_focused");
+        let slice = &src[start..end];
+        assert!(slice.contains("let mut hwnd = resolved.hwnd;"));
+        assert!(slice.contains("window_title(hwnd)"));
+        assert!(slice.contains("window_class(hwnd)"));
+        // A Chrome caption with no last_url resolves to `unknown`, not `desktop`.
+        assert_eq!(
+            classify::resolve_domain(None, "", "", "Chrome_WidgetWin_1",),
+            "unknown"
+        );
+        assert_eq!(
+            classify::resolve_domain(None, "", "", "Notepad",),
+            "desktop"
         );
     }
 }

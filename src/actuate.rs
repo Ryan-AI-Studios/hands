@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bezier::Rng;
 use crate::challenge::{self, ChallengeInfo, YIELD_ERROR};
+use crate::chrome;
 use crate::cooldown::{self, Snapshot};
 use crate::error::HandsError;
 use crate::extract::ControlKind;
@@ -16,10 +17,13 @@ use crate::input;
 use crate::lease;
 use crate::logs::{self, LogFence, LogTarget};
 use crate::observe::ENVELOPE_MAX_BYTES;
+use crate::point::{
+    PointContract, PointSource, TransformConfidence, TransformMethod, contract_for, map_rect,
+};
 use crate::session::resolve_session_id_from_os;
 use crate::settle;
 use crate::space::{Rect, Space, ensure_dpi, virtual_screen};
-use crate::target::Target;
+use crate::target::{ResolvedTarget, Target, TargetOutcome};
 use crate::uia;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +64,9 @@ pub struct ActuateEnvelope {
     pub loop_suspected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guidance: Option<String>,
+    /// Full point contract for `chr:` and explicit targets. Absent on pre-contract refusals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point: Option<crate::point::PointContract>,
     #[serde(default = "verified_default", skip_serializing_if = "verified_is_true")]
     pub verified: bool,
     #[serde(flatten, default)]
@@ -240,6 +247,7 @@ pub(crate) fn refuse_if_blocked(
         cooldown_ms: None,
         loop_suspected: false,
         guidance: None,
+        point: None,
         verified: true,
         semantic: None,
     })
@@ -438,6 +446,7 @@ fn base(
         cooldown_ms: None,
         loop_suspected: false,
         guidance: None,
+        point: None,
         verified: true,
         semantic: None,
     })
@@ -462,6 +471,7 @@ fn refuse_yield(session_id: String, target: ActuateTarget) -> Result<ActuateEnve
         cooldown_ms: None,
         loop_suspected: false,
         guidance: None,
+        point: None,
         verified: true,
         semantic: None,
     })
@@ -570,6 +580,7 @@ pub(crate) fn refuse_fence(
         cooldown_ms: None,
         loop_suspected: false,
         guidance: None,
+        point: None,
         verified: true,
         semantic: None,
     })
@@ -594,6 +605,40 @@ fn fail(
         foregrounded,
         Some(err.tool_message()),
     )
+}
+
+/// Failure after a point contract existed (dispatch/attempt path). `point` is retained.
+#[allow(clippy::too_many_arguments)]
+fn fail_with_point(
+    session_id: String,
+    target: ActuateTarget,
+    err: HandsError,
+    foregrounded: bool,
+    retried: bool,
+    settled: bool,
+    point: Option<PointContract>,
+) -> Result<ActuateEnvelope, HandsError> {
+    let mut env = fail(session_id, target, err, foregrounded, retried, settled)?;
+    env.point = point;
+    finalize_envelope(env)
+}
+
+/// Failure after dispatch may have sent input (for example a post-dispatch freeze): keep the
+/// contract but serialize `verified:false` so consumers do not read `ok:false` as "nothing sent".
+#[allow(clippy::too_many_arguments)]
+fn fail_with_point_unverified(
+    session_id: String,
+    target: ActuateTarget,
+    err: HandsError,
+    foregrounded: bool,
+    retried: bool,
+    settled: bool,
+    point: Option<PointContract>,
+) -> Result<ActuateEnvelope, HandsError> {
+    let mut env = fail(session_id, target, err, foregrounded, retried, settled)?;
+    env.point = point;
+    env.verified = false;
+    finalize_envelope(env)
 }
 
 fn none_target() -> ActuateTarget {
@@ -700,12 +745,145 @@ fn after_actuate(
     result
 }
 
-fn resolve_req(
-    req: &ActuateRequest,
-    space: Space,
-) -> Result<crate::target::ResolvedTarget, HandsError> {
+fn resolve_req(req: &ActuateRequest, space: Space) -> Result<TargetOutcome, HandsError> {
     let target = Target::parse(req.element_id.as_deref(), req.grid.as_deref(), req.x, req.y)?;
-    target.resolve(space)
+    target.resolve_with(space, foreground::foreground_hwnd())
+}
+
+/// Transform-invalid refusal: `ok:false`, `verified:false`, full `point` contract, no
+/// `offer`, no `SendInput`, and no fence prompt (this runs before `ensure_installed`).
+pub(crate) fn refuse_transform(
+    session_id: String,
+    target: ActuateTarget,
+    contract: PointContract,
+) -> Result<ActuateEnvelope, HandsError> {
+    let reason = contract
+        .transform
+        .reason
+        .clone()
+        .unwrap_or_else(|| "transform is not valid".into());
+    finalize_envelope(ActuateEnvelope {
+        session_id,
+        ok: false,
+        frozen: lease::is_frozen(),
+        target,
+        retried: false,
+        settled: false,
+        foregrounded: false,
+        error: Some(reason),
+        fence: None,
+        challenge: None,
+        roi: None,
+        miss: None,
+        navigated: false,
+        attempt: None,
+        cooldown_ms: None,
+        loop_suspected: false,
+        guidance: None,
+        point: Some(contract),
+        verified: false,
+        semantic: None,
+    })
+}
+
+fn unresolved_info(target: &Target, contract: &PointContract) -> ActuateTarget {
+    let id = match target {
+        Target::ElementId(id) => Some(id.clone()),
+        Target::Grid { col, row } => Some(format!("g:{col}:{row}")),
+        Target::Pixel { .. } => None,
+    };
+    let (x, y) = contract.physical.map(|p| (p.x, p.y)).unwrap_or((0, 0));
+    ActuateTarget {
+        kind: "element".into(),
+        id,
+        x,
+        y,
+    }
+}
+
+/// Final live re-map: live Win32 geometry + recorded page metrics, before the outside-client
+/// guard and any side effect. Move-only updates the point; a size/basis/DPI/monitor change
+/// returns a `stale_viewport` refusal.
+fn final_live_remap(
+    session_id: &str,
+    info: &mut ActuateTarget,
+    resolved: &mut ResolvedTarget,
+) -> Result<Option<ActuateEnvelope>, HandsError> {
+    let Some(contract) = resolved.contract.as_ref() else {
+        // No contract at all: fail closed rather than dispatching at the resolve-time point.
+        let bad = crate::point::PointContract {
+            source: PointSource::Chr,
+            css: None,
+            physical: None,
+            transform: crate::point::TransformReport::invalid(
+                "window_mismatch: target has no point contract to re-map",
+                None,
+            ),
+        };
+        return refuse_transform(session_id.to_string(), info.clone(), bad).map(Some);
+    };
+    if contract.source != PointSource::Chr {
+        return Ok(None);
+    }
+    // Fail closed: a `chr:` contract without its recorded CSS point or map cannot be re-mapped.
+    let (Some(css), Some(map)) = (resolved.css_point, resolved.map.as_ref()) else {
+        let mut bad = contract.clone();
+        bad.physical = None;
+        bad.transform.valid = false;
+        bad.transform.method = TransformMethod::None;
+        bad.transform.confidence = TransformConfidence::None;
+        bad.transform.reason =
+            Some("stale_viewport: chr: target has no recorded CSS point or map".into());
+        return refuse_transform(session_id.to_string(), info.clone(), bad).map(Some);
+    };
+    let Some(hwnd) = resolved.hwnd else {
+        let mut bad = contract.clone();
+        bad.physical = None;
+        bad.transform.valid = false;
+        bad.transform.method = TransformMethod::None;
+        bad.transform.confidence = TransformConfidence::None;
+        bad.transform.reason = Some("window_mismatch: chr: target has no Chrome HWND".into());
+        return refuse_transform(session_id.to_string(), info.clone(), bad).map(Some);
+    };
+    match chrome::remap_chr(map, hwnd) {
+        Ok(new_map) => {
+            let new_contract = contract_for(&new_map, css);
+            let Some(p) = new_contract.physical else {
+                let mut bad = new_contract;
+                bad.physical = None;
+                bad.transform.valid = false;
+                bad.transform.method = TransformMethod::None;
+                bad.transform.confidence = TransformConfidence::None;
+                bad.transform.reason = Some("stale_viewport: point left the viewport".into());
+                return refuse_transform(session_id.to_string(), info.clone(), bad).map(Some);
+            };
+            let rect = resolved
+                .css_rect
+                .and_then(|r| map_rect(&new_contract, r).ok())
+                .unwrap_or(resolved.rect);
+            resolved.x = p.x;
+            resolved.y = p.y;
+            resolved.rect = rect;
+            resolved.contract = Some(new_contract);
+            resolved.map = Some(new_map);
+            info.x = p.x;
+            info.y = p.y;
+            Ok(None)
+        }
+        Err(reason) => {
+            let mut bad = contract.clone();
+            bad.physical = None;
+            bad.transform.valid = false;
+            bad.transform.method = TransformMethod::None;
+            bad.transform.confidence = TransformConfidence::None;
+            bad.transform.reason = Some(reason);
+            refuse_transform(session_id.to_string(), info.clone(), bad).map(Some)
+        }
+    }
+}
+
+fn point_for_dispatch(resolved: &ResolvedTarget) -> Option<PointContract> {
+    resolved.contract.clone()
 }
 
 pub fn click(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -818,25 +996,40 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             false,
         );
     }
-    let resolved = match resolve_req(&req, space) {
+    let outcome = match resolve_req(&req, space) {
         Ok(r) => r,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
-    let info = resolved_info(resolved.kind, resolved.id.clone(), resolved.x, resolved.y);
+    let (mut resolved, contract_refusal, mut info, guard_hwnd, guard_point) = match outcome {
+        TargetOutcome::Resolved(r) => {
+            let info = resolved_info(r.kind, r.id.clone(), r.x, r.y);
+            (Some(*r), None, info, None, None)
+        }
+        TargetOutcome::Unresolved {
+            target,
+            contract,
+            hwnd,
+        } => {
+            let info = unresolved_info(&target, &contract);
+            let point = contract.physical.map(|p| (p.x, p.y));
+            (None, Some(contract), info, hwnd, point)
+        }
+    };
+    let guard_hwnd = guard_hwnd.or_else(|| resolved.as_ref().and_then(|r| r.hwnd));
+    let guard_point = guard_point.or_else(|| resolved.as_ref().map(|r| (r.x, r.y)));
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
-    if let Some(env) = refuse_if_high_il(
-        &session_id,
-        &info,
-        resolved.hwnd,
-        Some((resolved.x, resolved.y)),
-    )? {
+    if let Some(env) = refuse_if_high_il(&session_id, &info, guard_hwnd, guard_point)? {
         return Ok(env);
     }
+    if let Some(contract) = contract_refusal {
+        return refuse_transform(session_id, info, *contract);
+    }
+    let resolved_ref = resolved.as_mut().expect("resolved outcome");
     fence::ensure_installed();
     if req.blind {
         match fence::gate_blind(&session_id) {
@@ -845,12 +1038,18 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             Err(err) => return fail(session_id, info, err, false, false, false),
         }
     } else {
-        match fence::gate_click(&session_id, &resolved) {
+        match fence::gate_click(&session_id, resolved_ref) {
             Ok(None) => {}
             Ok(Some(info_fence)) => return refuse_fence(session_id, info, info_fence),
             Err(err) => return fail(session_id, info, err, false, false, false),
         }
     }
+    if !req.blind
+        && let Some(env) = final_live_remap(&session_id, &mut info, resolved_ref)?
+    {
+        return Ok(env);
+    }
+    let resolved = resolved.expect("resolved outcome");
     if let Some(env) = refuse_if_outside_client(&session_id, &info, &resolved)? {
         return Ok(env);
     }
@@ -870,18 +1069,54 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let roi = settle::default_roi(space, Some(resolved.rect), (resolved.x, resolved.y));
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point(
+            session_id,
+            info,
+            err,
+            foregrounded,
+            false,
+            false,
+            point_for_dispatch(&resolved),
+        );
     }
     let snapshot = match crate::capture::capture_roi(space, roi) {
         Ok(f) => f,
-        Err(err) => return fail(session_id, info, err, foregrounded, false, false),
+        Err(err) => {
+            return fail_with_point(
+                session_id,
+                info,
+                err,
+                foregrounded,
+                false,
+                false,
+                point_for_dispatch(&resolved),
+            );
+        }
     };
     if let Err(err) = input::left_click(&mut rng) {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point_unverified(
+            session_id,
+            info,
+            err,
+            foregrounded,
+            false,
+            false,
+            point_for_dispatch(&resolved),
+        );
     }
     let (mut settled, after) = match settle::wait_settle(space, roi) {
         Ok(v) => v,
-        Err(err) => return fail(session_id, info, err, foregrounded, false, false),
+        Err(err) => {
+            return fail_with_point_unverified(
+                session_id,
+                info,
+                err,
+                foregrounded,
+                false,
+                false,
+                point_for_dispatch(&resolved),
+            );
+        }
     };
     let same = settle::roi_unchanged(&snapshot, &after);
     let focus_lost = foregrounded
@@ -902,11 +1137,29 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             let _ = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
         }
         if let Err(err) = input::left_click(&mut rng) {
-            return fail(session_id, info, err, foregrounded, true, settled);
+            return fail_with_point_unverified(
+                session_id,
+                info,
+                err,
+                foregrounded,
+                true,
+                settled,
+                point_for_dispatch(&resolved),
+            );
         }
         let (settled2, after2) = match settle::wait_settle(space, roi) {
             Ok(v) => v,
-            Err(err) => return fail(session_id, info, err, foregrounded, true, settled),
+            Err(err) => {
+                return fail_with_point_unverified(
+                    session_id,
+                    info,
+                    err,
+                    foregrounded,
+                    true,
+                    settled,
+                    point_for_dispatch(&resolved),
+                );
+            }
         };
         settled = settled2;
         let same = settle::roi_unchanged(&snapshot, &after2);
@@ -923,7 +1176,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         );
     }
     if lease::is_frozen() {
-        return base(
+        let mut env = base(
             session_id,
             info,
             false,
@@ -932,7 +1185,11 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             settled,
             foregrounded,
             Some("desk lease frozen (physical input or Pause/Break)".into()),
-        );
+        )?;
+        env.point = point_for_dispatch(&resolved);
+        // The click may already have landed at the now-frozen desk.
+        env.verified = false;
+        return finalize_envelope(env);
     }
     let mut env = base(
         session_id,
@@ -944,6 +1201,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         foregrounded,
         None,
     )?;
+    env.point = point_for_dispatch(&resolved);
     env.miss = effect.miss.map(str::to_string);
     env.navigated = effect.navigated;
     finalize_envelope(env)
@@ -957,16 +1215,31 @@ fn dispatch_blind_click(
 ) -> Result<ActuateEnvelope, HandsError> {
     challenge::note_actuation_if_proceeding(false);
     remember_target(resolved.rect);
+    let point = Some(crate::point::explicit_contract(
+        PointSource::Blind,
+        crate::point::PhysicalPoint {
+            x: resolved.x,
+            y: resolved.y,
+        },
+    ));
     let mut rng = Rng::from_time();
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point(session_id, info, err, foregrounded, false, false, point);
     }
     if let Err(err) = input::left_click(&mut rng) {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point_unverified(
+            session_id,
+            info,
+            err,
+            foregrounded,
+            false,
+            false,
+            point,
+        );
     }
     if lease::is_frozen() {
-        return base(
+        let mut env = base(
             session_id,
             info,
             false,
@@ -975,7 +1248,11 @@ fn dispatch_blind_click(
             false,
             foregrounded,
             Some("desk lease frozen (physical input or Pause/Break)".into()),
-        );
+        )?;
+        env.point = point;
+        // The click may already have landed at an unverified blind target.
+        env.verified = false;
+        return finalize_envelope(env);
     }
     let mut env = base(
         session_id,
@@ -988,6 +1265,13 @@ fn dispatch_blind_click(
         None,
     )?;
     env.verified = false;
+    env.point = Some(crate::point::explicit_contract(
+        PointSource::Blind,
+        crate::point::PhysicalPoint {
+            x: resolved.x,
+            y: resolved.y,
+        },
+    ));
     finalize_envelope(env)
 }
 
@@ -1015,25 +1299,44 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         Ok(s) => s,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
-    let resolved = match resolve_req(&req, space) {
+    let outcome = match resolve_req(&req, space) {
         Ok(r) => r,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
-    let info = resolved_info(resolved.kind, resolved.id.clone(), resolved.x, resolved.y);
+    let (mut resolved, contract_refusal, mut info, guard_hwnd, guard_point) = match outcome {
+        TargetOutcome::Resolved(r) => {
+            let info = resolved_info(r.kind, r.id.clone(), r.x, r.y);
+            (Some(*r), None, info, None, None)
+        }
+        TargetOutcome::Unresolved {
+            target,
+            contract,
+            hwnd,
+        } => {
+            let info = unresolved_info(&target, &contract);
+            let point = contract.physical.map(|p| (p.x, p.y));
+            (None, Some(contract), info, hwnd, point)
+        }
+    };
+    let guard_hwnd = guard_hwnd.or_else(|| resolved.as_ref().and_then(|r| r.hwnd));
+    let guard_point = guard_point.or_else(|| resolved.as_ref().map(|r| (r.x, r.y)));
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
-    if let Some(env) = refuse_if_high_il(
-        &session_id,
-        &info,
-        resolved.hwnd,
-        Some((resolved.x, resolved.y)),
-    )? {
+    if let Some(env) = refuse_if_high_il(&session_id, &info, guard_hwnd, guard_point)? {
         return Ok(env);
     }
+    if let Some(contract) = contract_refusal {
+        return refuse_transform(session_id, info, *contract);
+    }
+    let resolved_ref = resolved.as_mut().expect("resolved outcome");
+    if let Some(env) = final_live_remap(&session_id, &mut info, resolved_ref)? {
+        return Ok(env);
+    }
+    let resolved = resolved.expect("resolved outcome");
     if let Some(env) = refuse_if_outside_client(&session_id, &info, &resolved)? {
         return Ok(env);
     }
@@ -1041,12 +1344,28 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let mut rng = Rng::from_time();
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point(
+            session_id,
+            info,
+            err,
+            foregrounded,
+            false,
+            false,
+            point_for_dispatch(&resolved),
+        );
     }
     if let Err(err) = hover_dwell() {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point_unverified(
+            session_id,
+            info,
+            err,
+            foregrounded,
+            false,
+            false,
+            point_for_dispatch(&resolved),
+        );
     }
-    base(
+    let mut env = base(
         session_id,
         info,
         true,
@@ -1055,7 +1374,9 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         false,
         foregrounded,
         None,
-    )
+    )?;
+    env.point = point_for_dispatch(&resolved);
+    finalize_envelope(env)
 }
 
 pub fn type_text(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -1280,6 +1601,7 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         req.element_id.is_some() || req.grid.is_some() || req.x.is_some() || req.y.is_some();
     let foregrounded;
     let mut info = none_target();
+    let mut point = None;
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
@@ -1304,6 +1626,7 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
                 }
                 foregrounded = env.foregrounded;
                 info = env.target;
+                point = env.point;
             }
             Err(err) => return fail(session_id, info, err, false, false, false),
         }
@@ -1347,17 +1670,23 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     }
     challenge::note_actuation();
     match input::scroll_wheel(dy, req.dx) {
-        Ok(()) => base(
-            session_id,
-            info,
-            true,
-            false,
-            false,
-            false,
-            foregrounded,
-            None,
-        ),
-        Err(err) => fail(session_id, info, err, foregrounded, false, false),
+        Ok(()) => {
+            let mut env = base(
+                session_id,
+                info,
+                true,
+                false,
+                false,
+                false,
+                foregrounded,
+                None,
+            )?;
+            env.point = point;
+            finalize_envelope(env)
+        }
+        Err(err) => {
+            fail_with_point_unverified(session_id, info, err, foregrounded, false, false, point)
+        }
     }
 }
 
@@ -1435,7 +1764,22 @@ pub fn hover_dwell_slice_count() -> u64 {
     HOVER_DWELL_MS.div_ceil(HOVER_DWELL_SLICE_MS)
 }
 
+#[cfg(test)]
+type HoverDwellHook = fn() -> Result<(), HandsError>;
+
+#[cfg(test)]
+thread_local! {
+    static HOVER_DWELL_HOOK: std::cell::RefCell<Option<HoverDwellHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn hover_dwell() -> Result<(), HandsError> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = HOVER_DWELL_HOOK.with(|c| *c.borrow()) {
+            return hook();
+        }
+    }
     let mut left = HOVER_DWELL_MS;
     while left > 0 {
         let step = left.min(HOVER_DWELL_SLICE_MS);
@@ -1521,6 +1865,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1562,6 +1907,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1599,6 +1945,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1634,6 +1981,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1667,6 +2015,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1699,6 +2048,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1969,6 +2319,10 @@ mod tests {
             hwnd: None,
             name: String::new(),
             role: String::new(),
+            css_point: None,
+            css_rect: None,
+            contract: None,
+            map: None,
         }
     }
 
@@ -2488,6 +2842,8 @@ mod tests {
             crate::foreground::set_client_rect_hook(None);
             crate::uia::set_focused_leaf_hook(None);
             crate::uia::set_hit_test_hook(None);
+            crate::capture::set_capture_roi_hook(None);
+            HOVER_DWELL_HOOK.with(|c| *c.borrow_mut() = None);
         }
     }
 
@@ -2993,6 +3349,55 @@ mod tests {
         assert_eq!(crate::challenge::snapshot().attempts, 0);
         assert!(!crate::challenge::snapshot().yielded);
         crate::challenge::reset_for_test();
+    }
+
+    fn gated_buy_hit(_: i32, _: i32) -> Result<crate::uia::HitElement, HandsError> {
+        Ok(crate::uia::HitElement {
+            name: "Buy".into(),
+            role: "button".into(),
+            hwnd: Some(0x10),
+            value: None,
+        })
+    }
+
+    #[test]
+    fn confirm_gated_click_returns_fence_envelope_before_dispatch() {
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_800x600));
+        crate::uia::set_hit_test_hook(Some(gated_buy_hit));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        lease::reset_for_test();
+        let _ = crate::foreground::take_offer_calls();
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            let env = click(ActuateRequest {
+                session_id: Some("s-0129-confirm".into()),
+                x: Some(x),
+                y: Some(y),
+                ..ActuateRequest::default()
+            })
+            .expect("click envelope");
+            assert!(!env.ok, "{env:?}");
+            assert!(!env.settled, "{env:?}");
+            assert!(!env.retried, "{env:?}");
+            let fence = env.fence.as_ref().expect("confirm fence envelope");
+            assert_eq!(fence.category, "money", "{env:?}");
+            assert!(env.error.is_none(), "{env:?}");
+            assert!(
+                env.point.is_none(),
+                "confirm envelope must precede dispatch/remap: {env:?}"
+            );
+            assert!(
+                crate::foreground::take_offer_calls().is_empty(),
+                "no offer before confirm"
+            );
+        });
     }
 
     fn sample_titled(hwnd: isize, pid: u32, title: &str) -> crate::foreground::TitledWindow {
@@ -3781,6 +4186,210 @@ mod tests {
         lease::reset_for_test();
     }
 
+    fn freeze_on_click_release(
+        inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+    ) -> Result<(), HandsError> {
+        // Freeze on the button-up so `left_click` still returns Ok and the post-dispatch
+        // frozen branch (not the pre-dispatch move/error branch) is exercised.
+        if inputs.iter().any(|input| {
+            unsafe { input.Anonymous.mi.dwFlags }
+                .contains(windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP)
+        }) {
+            lease::freeze_now_with(lease::FreezeCause::Physical);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blind_click_frozen_after_dispatch_keeps_point() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::uia::set_hit_test_hook(Some(panic_hit_test));
+        crate::input::set_send_inputs_hook(Some(freeze_on_click_release));
+        lease::reset_for_test();
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            grant_blind("s-0121-frozen-point");
+            let env = click(blind_pixel_req("s-0121-frozen-point", x, y)).expect("click");
+            assert!(!env.ok, "{env:?}");
+            assert!(env.frozen, "{env:?}");
+            assert!(
+                !env.verified,
+                "post-dispatch freeze must be unverified: {env:?}"
+            );
+            let point = env
+                .point
+                .as_ref()
+                .expect("point on frozen dispatch envelope");
+            assert_eq!(point.source, crate::point::PointSource::Blind);
+            assert_eq!(point.physical, Some(crate::point::PhysicalPoint { x, y }));
+            assert_eq!(
+                point.transform.method,
+                crate::point::TransformMethod::Explicit
+            );
+            assert!(point.transform.valid);
+            let json = serialize_envelope(&env).expect("json");
+            assert!(json.contains("\"point\""), "{json}");
+            assert!(json.contains("\"source\":\"blind\""), "{json}");
+            assert!(json.contains("\"verified\":false"), "{json}");
+        });
+        lease::reset_for_test();
+    }
+
+    fn free_hit(_: i32, _: i32) -> Result<crate::uia::HitElement, HandsError> {
+        Ok(crate::uia::HitElement {
+            name: String::new(),
+            role: "Other".into(),
+            hwnd: Some(0x10),
+            value: None,
+        })
+    }
+
+    fn fake_capture(space: Space, rect: Rect) -> Result<crate::capture::RoiFrame, HandsError> {
+        let clipped = space.clip_rect(rect);
+        let w = clipped.w.max(1);
+        let h = clipped.h.max(1);
+        Ok(crate::capture::RoiFrame {
+            width: w,
+            height: h,
+            pixels: vec![0; (w * h * 4) as usize],
+        })
+    }
+
+    #[test]
+    fn non_blind_click_frozen_after_dispatch_is_unverified() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::uia::set_hit_test_hook(Some(free_hit));
+        crate::input::set_send_inputs_hook(Some(freeze_on_click_release));
+        crate::capture::set_capture_roi_hook(Some(fake_capture));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            let env = click(ActuateRequest {
+                session_id: Some("s-0129-nonblind-frozen".into()),
+                x: Some(x),
+                y: Some(y),
+                ..ActuateRequest::default()
+            })
+            .expect("click");
+            assert!(!env.ok, "{env:?}");
+            assert!(env.frozen, "{env:?}");
+            assert!(
+                !env.verified,
+                "post-dispatch freeze must be unverified: {env:?}"
+            );
+            let point = env.point.as_ref().expect("point contract");
+            assert_eq!(point.source, crate::point::PointSource::Pixel);
+            assert_eq!(point.physical, Some(crate::point::PhysicalPoint { x, y }));
+            let json = serialize_envelope(&env).expect("json");
+            assert!(json.contains("\"verified\":false"), "{json}");
+            assert!(json.contains("\"point\""), "{json}");
+        });
+        lease::reset_for_test();
+    }
+
+    fn freeze_on_wheel(
+        inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+    ) -> Result<(), HandsError> {
+        if inputs.iter().any(|input| {
+            unsafe { input.Anonymous.mi.dwFlags }
+                .contains(windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_WHEEL)
+        }) {
+            lease::freeze_now_with(lease::FreezeCause::Physical);
+        }
+        Ok(())
+    }
+
+    fn noop_sends(
+        _: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+    ) -> Result<(), HandsError> {
+        Ok(())
+    }
+
+    fn dwell_fails() -> Result<(), HandsError> {
+        Err(HandsError::Input("hover dwell failed".into()))
+    }
+
+    #[test]
+    fn non_blind_scroll_frozen_after_dispatch_is_unverified() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(freeze_on_wheel));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        let env = scroll(ActuateRequest {
+            session_id: Some("s-0129-nonblind-scroll".into()),
+            dy: Some(1),
+            ..ActuateRequest::default()
+        })
+        .expect("scroll");
+        assert!(!env.ok, "{env:?}");
+        assert!(
+            !env.verified,
+            "post-dispatch scroll must be unverified: {env:?}"
+        );
+        let json = serialize_envelope(&env).expect("json");
+        assert!(json.contains("\"verified\":false"), "{json}");
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn non_blind_hover_failure_after_dispatch_is_unverified() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(noop_sends));
+        HOVER_DWELL_HOOK.with(|c| *c.borrow_mut() = Some(dwell_fails));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            let env = hover(ActuateRequest {
+                session_id: Some("s-0129-nonblind-hover".into()),
+                x: Some(x),
+                y: Some(y),
+                ..ActuateRequest::default()
+            })
+            .expect("hover");
+            assert!(!env.ok, "{env:?}");
+            assert!(
+                !env.verified,
+                "post-dispatch hover must be unverified: {env:?}"
+            );
+            let point = env.point.as_ref().expect("point contract");
+            assert_eq!(point.source, crate::point::PointSource::Pixel);
+            let json = serialize_envelope(&env).expect("json");
+            assert!(json.contains("\"verified\":false"), "{json}");
+        });
+        lease::reset_for_test();
+    }
+
     #[test]
     fn blind_paths_consult_req_blind_before_guards() {
         let src = include_str!("actuate.rs");
@@ -3835,5 +4444,1278 @@ mod tests {
         let contract = include_str!("../docs/AGENT-CONTRACT.md");
         assert!(contract.contains("Blind actuation"), "{contract}");
         assert!(contract.contains("lower-assurance"), "{contract}");
+    }
+
+    fn invalid_chr_contract(reason: &str) -> crate::point::PointContract {
+        crate::point::PointContract {
+            source: crate::point::PointSource::Chr,
+            css: Some(crate::point::CssPoint::new(312.5, 208.25)),
+            physical: None,
+            transform: crate::point::TransformReport::invalid(
+                reason,
+                Some("f3a9c1d2e4b5a607".into()),
+            ),
+        }
+    }
+
+    #[test]
+    fn transform_refusal_verified_false() {
+        let env = refuse_transform(
+            "s-0129".into(),
+            none_target(),
+            invalid_chr_contract("no_viewport_anchor"),
+        )
+        .unwrap();
+        assert!(!env.ok);
+        assert!(!env.verified);
+        let point = env.point.as_ref().expect("point contract");
+        assert_eq!(point.source, crate::point::PointSource::Chr);
+        assert!(point.physical.is_none());
+        let json = serialize_envelope(&env).unwrap();
+        assert!(json.contains("\"verified\":false"), "{json}");
+        assert!(json.contains("\"physical\":null"), "{json}");
+        assert!(json.contains("\"reason\":\"no_viewport_anchor"), "{json}");
+    }
+
+    #[test]
+    fn unknown_transform_refuses_before_fence_without_offer() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let end = src[..src.len()]
+            .find("fn dispatch_blind_click")
+            .expect("blind");
+        let body = &src[start..end];
+        let transform = body
+            .find("refuse_transform(session_id, info, *contract)")
+            .expect("transform refusal");
+        let fence = body.find("fence::ensure_installed").expect("fence");
+        assert!(
+            transform < fence,
+            "transform refusal must precede fence::ensure_installed:\n{body}"
+        );
+        let helper_start = src.find("pub(crate) fn refuse_transform").unwrap();
+        let helper_end = src[helper_start..]
+            .find("fn unresolved_info")
+            .map(|i| helper_start + i)
+            .expect("unresolved_info");
+        let helper = &src[helper_start..helper_end];
+        for forbidden in [
+            "foreground::offer",
+            "input::left_click",
+            "input::move_to",
+            "ensure_installed",
+        ] {
+            assert!(
+                !helper.contains(forbidden),
+                "refuse_transform must not call {forbidden}:\n{helper}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_viewport_refuses_before_outside_client_and_remember() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let end = src.find("fn dispatch_blind_click").expect("blind");
+        let body = &src[start..end];
+        let remap = body.find("final_live_remap").expect("final_live_remap");
+        let client = body
+            .find("refuse_if_outside_client")
+            .expect("outside client");
+        let remember = body.find("remember_target").expect("remember");
+        assert!(
+            remap < client && client < remember,
+            "click order must be remap -> outside_client -> remember:\n{body}"
+        );
+        let helper_start = src.find("fn final_live_remap").unwrap();
+        let helper_end = src.find("fn point_for_dispatch").unwrap();
+        let helper = &src[helper_start..helper_end];
+        assert!(!helper.contains("remember_target"));
+        assert!(!helper.contains("challenge::note_actuation"));
+        assert!(helper.contains("stale_viewport") || helper.contains("chrome::remap_chr"));
+    }
+
+    thread_local! {
+        static ACT_REMAP_ANCHOR: std::cell::Cell<Rect> =
+            const { std::cell::Cell::new(Rect { x: 100, y: 80, w: 1200, h: 900 }) };
+    }
+
+    fn act_remap_page() -> crate::point::PageMetrics {
+        crate::point::PageMetrics {
+            inner_width: Some(1200.0),
+            inner_height: Some(900.0),
+            client_width: Some(1200.0),
+            client_height: Some(900.0),
+            dpr: Some(1.0),
+            ..crate::point::PageMetrics::default()
+        }
+    }
+
+    fn act_remap_map(x: i32, y: i32) -> crate::point::ViewportMap {
+        crate::point::build_map(crate::point::MapInputs {
+            hwnd: Some(0x1234),
+            window_rect: Some(Rect {
+                x: -10,
+                y: -10,
+                w: 4000,
+                h: 3000,
+            }),
+            dpi: Some(96),
+            virtual_screen: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            page: act_remap_page(),
+            render_widgets: vec![Rect {
+                x,
+                y,
+                w: 1200,
+                h: 900,
+            }],
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: Some("Owner Web Access".into()),
+            identity: crate::point::WindowIdentity::Confirmed,
+            ..crate::point::MapInputs::default()
+        })
+    }
+
+    fn act_remap_geometry(page: crate::point::PageMetrics, hwnd: isize) -> crate::point::MapInputs {
+        crate::point::MapInputs {
+            hwnd: Some(hwnd),
+            window_rect: Some(Rect {
+                x: -10,
+                y: -10,
+                w: 4000,
+                h: 3000,
+            }),
+            dpi: Some(96),
+            virtual_screen: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            page,
+            render_widgets: vec![ACT_REMAP_ANCHOR.with(|c| c.get())],
+            uia_document: None,
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: Some("Owner Web Access".into()),
+            fixture: false,
+            identity: crate::point::WindowIdentity::Confirmed,
+            fixture_origin: None,
+        }
+    }
+
+    fn act_remap_identity(_: isize) -> (Option<String>, usize, bool) {
+        (Some("Owner Web Access - Google Chrome".into()), 1, true)
+    }
+
+    fn edge_page() -> crate::point::PageMetrics {
+        crate::point::PageMetrics {
+            inner_width: Some(100.0),
+            inner_height: Some(100.0),
+            client_width: Some(100.0),
+            client_height: Some(100.0),
+            dpr: Some(1.0),
+            ..crate::point::PageMetrics::default()
+        }
+    }
+
+    fn edge_map_inputs(anchor_x: i32) -> crate::point::MapInputs {
+        crate::point::MapInputs {
+            hwnd: Some(0x1234),
+            window_rect: Some(Rect {
+                x: -200,
+                y: -50,
+                w: 600,
+                h: 400,
+            }),
+            dpi: Some(96),
+            virtual_screen: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            page: edge_page(),
+            render_widgets: vec![Rect {
+                x: anchor_x,
+                y: 0,
+                w: 100,
+                h: 100,
+            }],
+            uia_document: None,
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: Some("Edge".into()),
+            fixture: false,
+            identity: crate::point::WindowIdentity::Confirmed,
+            fixture_origin: None,
+        }
+    }
+
+    fn edge_remap_geometry(page: crate::point::PageMetrics, _: isize) -> crate::point::MapInputs {
+        let mut inputs = edge_map_inputs(-99);
+        inputs.page = page;
+        inputs
+    }
+
+    fn edge_remap_identity(_: isize) -> (Option<String>, usize, bool) {
+        (Some("Edge - Google Chrome".into()), 1, true)
+    }
+
+    struct FinalRemapSeam;
+
+    impl Drop for FinalRemapSeam {
+        fn drop(&mut self) {
+            chrome::set_remap_geometry_hook(None);
+            chrome::set_remap_identity_hook(None);
+            chrome::set_resolve_stub(None);
+            crate::foreground::set_foreground_hwnd_hook(None);
+            crate::foreground::set_chrome_target_hook(None);
+            crate::input::set_send_inputs_hook(None);
+            HOVER_DWELL_HOOK.with(|c| *c.borrow_mut() = None);
+            let _ = crate::foreground::take_offer_calls();
+        }
+    }
+
+    fn chr_hit(anchor_x: i32, anchor_y: i32) -> (chrome::ChromeHit, crate::point::CssRect) {
+        let map = act_remap_map(anchor_x, anchor_y);
+        let css = crate::point::CssRect {
+            left: 50.0,
+            top: 40.0,
+            width: 100.0,
+            height: 20.0,
+        };
+        let contract = contract_for(&map, css.center());
+        let rect = map_rect(&contract, css).expect("chr rect");
+        (
+            chrome::ChromeHit {
+                id: "chr:5".into(),
+                name: "Continue".into(),
+                role: "button".into(),
+                rect,
+                css_rect: css,
+                css_point: css.center(),
+                contract,
+                hwnd: Some(0x1234),
+                map: Some(map),
+            },
+            css,
+        )
+    }
+
+    fn hover_ok() -> Result<(), HandsError> {
+        Ok(())
+    }
+
+    fn final_remap_fixture() -> (
+        ResolvedTarget,
+        ActuateTarget,
+        crate::point::CssRect,
+        Rect,
+        crate::point::PointContract,
+    ) {
+        let old = act_remap_map(100, 80);
+        let css = crate::point::CssRect {
+            left: 50.0,
+            top: 40.0,
+            width: 100.0,
+            height: 20.0,
+        };
+        let contract = contract_for(&old, css.center());
+        let old_rect = map_rect(&contract, css).expect("old rect");
+        assert_eq!(
+            contract.physical,
+            Some(crate::point::PhysicalPoint { x: 200, y: 130 })
+        );
+        assert_eq!(old_rect.center(), (200, 130));
+        let resolved = ResolvedTarget {
+            target: Target::ElementId("chr:5".into()),
+            kind: "element",
+            id: Some("chr:5".into()),
+            x: 200,
+            y: 130,
+            rect: old_rect,
+            hwnd: Some(0x1234),
+            name: String::new(),
+            role: String::new(),
+            css_point: Some(css.center()),
+            css_rect: Some(css),
+            contract: Some(contract.clone()),
+            map: Some(old),
+        };
+        let info = resolved_info("element", Some("chr:5".into()), 200, 130);
+        (resolved, info, css, old_rect, contract)
+    }
+
+    #[test]
+    fn final_remap_after_move_updates_rect_and_point() {
+        // Behavioural: call `final_live_remap` itself. A move-only re-map must update the
+        // point, the rect and the envelope target; deleting any of those assignments fails here.
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 100,
+                y: 80,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        let (mut resolved, mut info, css, old_rect, old_contract) = final_remap_fixture();
+        assert_eq!(old_contract.physical.map(|p| (p.x, p.y)), Some((200, 130)));
+
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1200,
+                h: 900,
+            })
+        });
+        let refusal =
+            final_live_remap("s-0129", &mut info, &mut resolved).expect("final remap result");
+        assert!(
+            refusal.is_none(),
+            "move-only remap must proceed: {refusal:?}"
+        );
+
+        let contract = resolved.contract.as_ref().expect("updated contract");
+        assert_eq!(
+            contract.physical,
+            Some(crate::point::PhysicalPoint { x: 400, y: 250 }),
+            "contract.physical must follow the moved window"
+        );
+        assert_eq!(
+            (resolved.x, resolved.y),
+            (400, 250),
+            "resolved.x/y must follow the moved window"
+        );
+        assert_eq!(
+            resolved.rect,
+            map_rect(contract, css).expect("new rect"),
+            "resolved.rect must be re-mapped"
+        );
+        assert_ne!(
+            resolved.rect, old_rect,
+            "rect must not stay at the old origin"
+        );
+        assert_eq!(resolved.rect.center(), (400, 250));
+        assert_eq!(
+            (info.x, info.y),
+            (400, 250),
+            "envelope target must follow the moved window"
+        );
+        assert_eq!(
+            resolved
+                .map
+                .as_ref()
+                .and_then(|m| m.anchor)
+                .map(|r| (r.x, r.y)),
+            Some((300, 200))
+        );
+        assert!(crate::foreground::take_offer_calls().is_empty());
+    }
+
+    #[test]
+    fn final_remap_stale_viewport_refuses_without_input_or_offer() {
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 100,
+                y: 80,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let (mut resolved, mut info, _, old_rect, _) = final_remap_fixture();
+        let _ = crate::foreground::take_offer_calls();
+        let seed = distinctive_seed_rect();
+        remember_target(seed);
+
+        // Same origin, changed size: the recorded page metrics no longer match.
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1100,
+                h: 900,
+            })
+        });
+        let env = final_live_remap("s-0129", &mut info, &mut resolved)
+            .expect("final remap result")
+            .expect("stale refusal envelope");
+        assert!(!env.ok, "{env:?}");
+        assert!(!env.verified, "{env:?}");
+        assert!(env.fence.is_none(), "{env:?}");
+        assert!(
+            env.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("stale_viewport"),
+            "{env:?}"
+        );
+        let point = env.point.as_ref().expect("point contract");
+        assert_eq!(point.source, crate::point::PointSource::Chr);
+        assert!(point.physical.is_none(), "{point:?}");
+        assert!(
+            point
+                .transform
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("stale_viewport"),
+            "{point:?}"
+        );
+        // A refused re-map must not move the target, the envelope or `LAST_TARGET`.
+        assert_eq!((resolved.x, resolved.y), (200, 130));
+        assert_eq!(resolved.rect, old_rect);
+        assert_eq!(last_target(), Some(seed));
+        assert!(crate::foreground::take_offer_calls().is_empty());
+    }
+
+    #[test]
+    fn final_remap_missing_contract_point_refuses_fail_closed() {
+        let _seam = FinalRemapSeam;
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+
+        let assert_refusal = |label: &str, env: Option<ActuateEnvelope>, reason: &str| {
+            let env = env.unwrap_or_else(|| panic!("{label}: must refuse, not fail open"));
+            assert!(!env.ok, "{label}: {env:?}");
+            assert!(!env.verified, "{label}: {env:?}");
+            assert!(env.fence.is_none(), "{label}: {env:?}");
+            let point = env.point.as_ref().expect("point contract");
+            assert!(point.physical.is_none(), "{label}: {point:?}");
+            assert!(
+                point
+                    .transform
+                    .reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with(reason),
+                "{label}: {point:?}"
+            );
+        };
+
+        // Missing map.
+        let (mut resolved, mut info, _, _, _) = final_remap_fixture();
+        resolved.map = None;
+        let env = final_live_remap("s-0129", &mut info, &mut resolved).expect("remap result");
+        assert_refusal("missing map", env, "stale_viewport");
+
+        // Missing CSS point.
+        let (mut resolved, mut info, _, _, _) = final_remap_fixture();
+        resolved.css_point = None;
+        let env = final_live_remap("s-0129", &mut info, &mut resolved).expect("remap result");
+        assert_refusal("missing css point", env, "stale_viewport");
+
+        // Missing contract fails closed rather than returning Ok(None).
+        let (mut resolved, mut info, _, _, _) = final_remap_fixture();
+        resolved.contract = None;
+        let env = final_live_remap("s-0129", &mut info, &mut resolved).expect("remap result");
+        assert_refusal("missing contract", env, "window_mismatch");
+
+        // Missing HWND still uses the existing named refusal.
+        let (mut resolved, mut info, _, _, _) = final_remap_fixture();
+        resolved.hwnd = None;
+        let env = final_live_remap("s-0129", &mut info, &mut resolved).expect("remap result");
+        assert_refusal("missing hwnd", env, "window_mismatch");
+        assert!(crate::foreground::take_offer_calls().is_empty());
+    }
+
+    fn fg_notepad() -> Option<isize> {
+        Some(0x9999)
+    }
+
+    fn only_target_chrome(hwnd: Option<isize>) -> bool {
+        hwnd == Some(0x1234)
+    }
+
+    #[test]
+    fn final_remap_non_chrome_foreground_refuses_window_mismatch() {
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        // No identity hook: exercise the production foreground comparison.
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_notepad));
+        crate::foreground::set_chrome_target_hook(Some(only_target_chrome));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let _ = crate::foreground::take_offer_calls();
+        let (mut resolved, mut info, _, old_rect, _) = final_remap_fixture();
+
+        let env = final_live_remap("s-0129", &mut info, &mut resolved)
+            .expect("remap result")
+            .expect("window_mismatch refusal");
+        assert!(!env.ok, "{env:?}");
+        assert!(!env.verified, "{env:?}");
+        assert!(
+            env.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("window_mismatch"),
+            "{env:?}"
+        );
+        let point = env.point.as_ref().expect("point contract");
+        assert!(point.physical.is_none(), "{point:?}");
+        assert!(
+            point
+                .transform
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("window_mismatch"),
+            "{point:?}"
+        );
+        // A refused re-map must not move the target or dispatch.
+        assert_eq!((resolved.x, resolved.y), (200, 130));
+        assert_eq!(resolved.rect, old_rect);
+        assert!(crate::foreground::take_offer_calls().is_empty());
+    }
+
+    #[test]
+    fn chr_click_dispatches_the_final_remap_point_and_rect() {
+        let _g = elevation_lock();
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        let (hit, css) = chr_hit(100, 80);
+        chrome::set_resolve_stub(Some(hit));
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(noop_sends));
+        crate::capture::set_capture_roi_hook(Some(fake_capture));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        let _ = crate::foreground::take_offer_calls();
+
+        let env = click(ActuateRequest {
+            session_id: Some("s-0129-chr-remap".into()),
+            element_id: Some("chr:5".into()),
+            ..ActuateRequest::default()
+        })
+        .expect("click");
+        assert!(env.ok, "{env:?}");
+        let expected = (400, 250);
+        assert_eq!((env.target.x, env.target.y), expected, "{env:?}");
+        let contract = env.point.as_ref().expect("point contract");
+        assert_eq!(
+            contract.physical,
+            Some(crate::point::PhysicalPoint {
+                x: expected.0,
+                y: expected.1
+            })
+        );
+        assert_eq!(
+            last_target(),
+            Some(map_rect(contract, css).expect("remapped rect"))
+        );
+        let offers = crate::foreground::take_offer_calls();
+        assert!(
+            offers
+                .iter()
+                .any(|(hwnd, point)| *hwnd == Some(0x1234) && *point == expected),
+            "offer must use the re-mapped point: {offers:?}"
+        );
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn chr_click_stale_remap_refuses_before_offer_and_input() {
+        let _g = elevation_lock();
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1100,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        let (hit, _) = chr_hit(100, 80);
+        chrome::set_resolve_stub(Some(hit));
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        let seed = distinctive_seed_rect();
+        remember_target(seed);
+        let _ = crate::foreground::take_offer_calls();
+
+        let env = click(ActuateRequest {
+            session_id: Some("s-0129-chr-stale".into()),
+            element_id: Some("chr:5".into()),
+            ..ActuateRequest::default()
+        })
+        .expect("click");
+        assert!(!env.ok, "{env:?}");
+        assert!(!env.verified, "{env:?}");
+        assert!(
+            env.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("stale_viewport"),
+            "{env:?}"
+        );
+        let point = env.point.as_ref().expect("point contract");
+        assert!(point.physical.is_none(), "{point:?}");
+        assert_eq!((env.target.x, env.target.y), (200, 130), "{env:?}");
+        assert_eq!(last_target(), Some(seed));
+        assert!(crate::foreground::take_offer_calls().is_empty());
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn chr_hover_dispatches_the_final_remap_point() {
+        let _g = elevation_lock();
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        let (hit, _) = chr_hit(100, 80);
+        chrome::set_resolve_stub(Some(hit));
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(noop_sends));
+        HOVER_DWELL_HOOK.with(|c| *c.borrow_mut() = Some(hover_ok));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        let _ = crate::foreground::take_offer_calls();
+
+        let env = hover(ActuateRequest {
+            session_id: Some("s-0129-chr-hover".into()),
+            element_id: Some("chr:5".into()),
+            ..ActuateRequest::default()
+        })
+        .expect("hover");
+        assert!(env.ok, "{env:?}");
+        assert_eq!((env.target.x, env.target.y), (400, 250), "{env:?}");
+        let offers = crate::foreground::take_offer_calls();
+        assert!(
+            offers
+                .iter()
+                .any(|(hwnd, point)| *hwnd == Some(0x1234) && *point == (400, 250)),
+            "{offers:?}"
+        );
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn final_remap_point_left_viewport_serializes_invalid_contract() {
+        // A 1 px move (-100 -> -99) across the half-open physical viewport edge: the CSS point
+        // 99.5 rounds to -1 inside the old viewport but +1 outside the new one. The refusal must
+        // clear `valid`, not emit `valid:true` with `physical:null`.
+        let _seam = FinalRemapSeam;
+        chrome::set_remap_geometry_hook(Some(edge_remap_geometry));
+        chrome::set_remap_identity_hook(Some(edge_remap_identity));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let old_map = crate::point::build_map(edge_map_inputs(-100));
+        assert!(old_map.report.valid, "{:?}", old_map.report.reason);
+        let css = crate::point::CssPoint::new(99.5, 50.0);
+        let old_contract = contract_for(&old_map, css);
+        let old_point = old_contract.physical.expect("old point inside edge");
+        let css_rect = crate::point::CssRect {
+            left: 99.0,
+            top: 49.0,
+            width: 1.0,
+            height: 2.0,
+        };
+        let old_rect = map_rect(&old_contract, css_rect).expect("old rect");
+        let mut resolved = ResolvedTarget {
+            target: Target::ElementId("chr:5".into()),
+            kind: "element",
+            id: Some("chr:5".into()),
+            x: old_point.x,
+            y: old_point.y,
+            rect: old_rect,
+            hwnd: Some(0x1234),
+            name: String::new(),
+            role: String::new(),
+            css_point: Some(css),
+            css_rect: Some(css_rect),
+            contract: Some(old_contract),
+            map: Some(old_map),
+        };
+        let mut info = resolved_info("element", Some("chr:5".into()), old_point.x, old_point.y);
+        let _ = crate::foreground::take_offer_calls();
+
+        let env = final_live_remap("s-0129", &mut info, &mut resolved)
+            .expect("remap result")
+            .expect("edge refusal");
+        assert!(!env.ok, "{env:?}");
+        assert!(!env.verified, "{env:?}");
+        assert!(
+            env.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("stale_viewport"),
+            "{env:?}"
+        );
+        let point = env.point.as_ref().expect("point contract");
+        assert!(!point.transform.valid, "{point:?}");
+        assert!(point.physical.is_none(), "{point:?}");
+        assert!(
+            point
+                .transform
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("stale_viewport"),
+            "{point:?}"
+        );
+        assert_eq!((resolved.x, resolved.y), (old_point.x, old_point.y));
+        assert_eq!(resolved.rect, old_rect);
+        let json = serialize_envelope(&env).expect("json");
+        assert!(json.contains("\"valid\":false"), "{json}");
+        assert!(json.contains("\"physical\":null"), "{json}");
+        assert!(json.contains("\"verified\":false"), "{json}");
+        assert!(crate::foreground::take_offer_calls().is_empty());
+    }
+
+    #[test]
+    fn final_remap_updates_envelope_target() {
+        let src = include_str!("actuate.rs");
+        let helper = &src
+            [src.find("fn final_live_remap").unwrap()..src.find("fn point_for_dispatch").unwrap()];
+        assert!(helper.contains("info.x = p.x"));
+        assert!(helper.contains("info.y = p.y"));
+        let click =
+            &src[src.find("fn click_inner").unwrap()..src.find("fn dispatch_blind_click").unwrap()];
+        assert!(click.contains("final_live_remap(&session_id, &mut info, resolved_ref)"));
+        let hover =
+            &src[src.find("fn hover_inner").unwrap()..src.find("pub fn type_text").unwrap()];
+        assert!(hover.contains("final_live_remap(&session_id, &mut info, resolved_ref)"));
+    }
+
+    #[test]
+    fn hover_transform_guard_before_remember_and_offer() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn hover_inner").expect("hover_inner");
+        let end = src.find("pub fn type_text").expect("type_text");
+        let body = &src[start..end];
+        let transform = body.find("refuse_transform").expect("refuse_transform");
+        let remap = body.find("final_live_remap").expect("final_live_remap");
+        let client = body
+            .find("refuse_if_outside_client")
+            .expect("outside_client");
+        let remember = body.find("remember_target").expect("remember");
+        let offer = body.find("foreground::offer").expect("offer");
+        assert!(
+            transform < remap && remap < client && client < remember && remember < offer,
+            "hover order: transform -> remap -> outside_client -> remember -> offer:\n{body}"
+        );
+        assert!(!body.contains("note_actuation"));
+    }
+
+    #[test]
+    fn scroll_target_refuses_invalid_transform_without_move() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn scroll_inner").expect("scroll_inner");
+        let end = src.find("pub fn wait_settle").expect("wait_settle");
+        let body = &src[start..end];
+        assert!(body.contains("hover_inner"));
+        let hover =
+            &src[src.find("fn hover_inner").unwrap()..src.find("pub fn type_text").unwrap()];
+        let transform = hover.find("refuse_transform").unwrap();
+        let move_to = hover.find("input::move_to").unwrap();
+        assert!(transform < move_to);
+        assert!(body.contains("point = env.point"));
+        assert!(body.contains("env.point = point"));
+    }
+
+    #[test]
+    fn scroll_dispatch_failure_retains_point() {
+        // F2: a targeted scroll's scroll_wheel failure must keep the same point contract.
+        let contract = crate::point::PointContract {
+            source: PointSource::Chr,
+            css: Some(crate::point::CssPoint::new(10.0, 20.0)),
+            physical: Some(crate::point::PhysicalPoint { x: 110, y: 120 }),
+            transform: crate::point::TransformReport {
+                valid: true,
+                method: TransformMethod::RenderWidgetHost,
+                confidence: TransformConfidence::High,
+                scale: Some(1.0),
+                dpr: Some(1.0),
+                dpi: Some(96),
+                page_zoom: Some(1.0),
+                page_viewport: Some(Rect {
+                    x: 100,
+                    y: 100,
+                    w: 500,
+                    h: 400,
+                }),
+                anchor_basis: Some(crate::point::CssBasis::Inner),
+                layout_basis: Some(crate::point::CssBasis::Inner),
+                reason: None,
+                observe_id: Some("f3a9c1d2e4b5a607".into()),
+            },
+        };
+        let target = none_target();
+        let mut success = base(
+            "s-scroll".into(),
+            target.clone(),
+            true,
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        success.point = Some(contract.clone());
+        let failure = fail_with_point_unverified(
+            "s-scroll".into(),
+            target,
+            HandsError::Input("scroll blocked".into()),
+            false,
+            false,
+            false,
+            Some(contract),
+        )
+        .unwrap();
+        assert!(!failure.ok);
+        assert!(!failure.verified, "post-dispatch failure is unverified");
+        assert_eq!(failure.point, success.point);
+        let success_point = success.point.expect("success point");
+        let failure_point = failure.point.as_ref().expect("failure point");
+        assert_eq!(failure_point.source, success_point.source);
+        assert_eq!(failure_point.css, success_point.css);
+        assert_eq!(failure_point.physical, success_point.physical);
+        assert_eq!(failure_point.transform, success_point.transform);
+        let json = serialize_envelope(&failure).unwrap();
+        assert!(json.contains("\"point\""), "{json}");
+        assert!(
+            json.contains("\"physical\":{\"x\":110,\"y\":120}"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"observe_id\":\"f3a9c1d2e4b5a607\""),
+            "{json}"
+        );
+
+        // The scroll error branch uses the point-retaining failure helper.
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn scroll_inner").expect("scroll_inner");
+        let end = src.find("pub fn wait_settle").expect("wait_settle");
+        let body = &src[start..end];
+        assert!(
+            body.contains(
+                "fail_with_point_unverified(session_id, info, err, foregrounded, false, false, point)"
+            ),
+            "scroll_wheel failure must retain the point and be unverified:\n{body}"
+        );
+    }
+
+    #[test]
+    fn post_dispatch_error_sites_use_unverified_helper() {
+        let src = include_str!("actuate.rs");
+        let click_start = src.find("fn click_inner").expect("click_inner");
+        let click_end = src.find("fn dispatch_blind_click").expect("blind");
+        let click = &src[click_start..click_end];
+        let first_click = click.find("input::left_click").expect("click left_click");
+        let after_click = &click[first_click..];
+        assert!(
+            after_click.contains("fail_with_point_unverified("),
+            "post-dispatch click failures must use the unverified helper:\n{after_click}"
+        );
+        assert!(
+            !after_click.contains("fail_with_point("),
+            "post-dispatch click failure still uses the verified helper:\n{after_click}"
+        );
+        assert!(
+            click.contains("env.verified = false;"),
+            "click freeze branch must clear verified"
+        );
+
+        let blind_start = src.find("fn dispatch_blind_click").expect("blind");
+        let blind_end = src.find("pub fn hover(").expect("hover");
+        let blind = &src[blind_start..blind_end];
+        let blind_click = blind.find("input::left_click").expect("blind left_click");
+        assert!(
+            blind[blind_click..].contains("fail_with_point_unverified("),
+            "post-dispatch blind click failure must be unverified"
+        );
+        assert!(
+            !blind[blind_click..].contains("fail_with_point("),
+            "post-dispatch blind click failure still uses the verified helper"
+        );
+        assert!(blind.contains("env.verified = false;"));
+
+        let hover_start = src.find("fn hover_inner").expect("hover_inner");
+        let hover_end = src.find("pub fn type_text").expect("type_text");
+        let hover = &src[hover_start..hover_end];
+        let hover_dwell = hover.find("hover_dwell()").expect("hover_dwell");
+        assert!(
+            hover[hover_dwell..].contains("fail_with_point_unverified("),
+            "post-dispatch hover failure must be unverified"
+        );
+        assert!(
+            !hover[hover_dwell..].contains("fail_with_point("),
+            "post-dispatch hover failure still uses the verified helper"
+        );
+
+        let scroll_start = src.find("fn scroll_inner").expect("scroll_inner");
+        let scroll_end = src.find("pub fn wait_settle").expect("wait_settle");
+        let scroll = &src[scroll_start..scroll_end];
+        let wheel = scroll.find("input::scroll_wheel").expect("scroll_wheel");
+        assert!(
+            scroll[wheel..].contains("fail_with_point_unverified("),
+            "scroll dispatch failure must be unverified"
+        );
+        assert!(
+            !scroll[wheel..].contains("fail_with_point("),
+            "scroll dispatch failure still uses the verified helper"
+        );
+    }
+
+    #[test]
+    fn no_send_input_on_transform_unknown_source_lock() {
+        let src = include_str!("actuate.rs");
+        let helper = &src[src.find("pub(crate) fn refuse_transform").unwrap()
+            ..src.find("fn unresolved_info").unwrap()];
+        assert!(!helper.contains("SendInput"));
+        assert!(!helper.contains("left_click"));
+        assert!(!helper.contains("move_to"));
+        assert!(!helper.contains("offer"));
+    }
+
+    #[test]
+    fn chr_high_il_probe_uses_resolved_hwnd() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let end = src.find("fn dispatch_blind_click").expect("blind");
+        let body = &src[start..end];
+        let high = body.find("refuse_if_high_il").expect("high_il");
+        let resolve = body.find("resolve_req").expect("resolve");
+        assert!(resolve < high);
+        assert!(body.contains("guard_hwnd"));
+        assert!(body.contains("resolved.as_ref().and_then(|r| r.hwnd)"));
+    }
+
+    fn production(src: &str) -> &str {
+        src.split_once("mod tests {")
+            .map(|(prod, _)| prod)
+            .unwrap_or(src)
+    }
+
+    fn compact(src: &str) -> String {
+        src.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Whitespace-normalized legacy subtraction detector: does any `outer_*` token have a
+    /// `-` and its `inner_*` counterpart within a short operand window?
+    fn legacy_subtraction(src: &str) -> bool {
+        let text = compact(src);
+        for (a, b) in [
+            ("outer_height", "inner_height"),
+            ("outer_width", "inner_width"),
+        ] {
+            for (pos, _) in text.match_indices(a) {
+                let rest = &text[pos + a.len()..];
+                if let Some(rel) = rest.find(b)
+                    && rel <= 64
+                    && rest[..rel].contains('-')
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn function_spans(src: &str) -> Vec<(&str, &str)> {
+        let positions: Vec<usize> = src.match_indices("fn ").map(|(i, _)| i).collect();
+        let mut out = Vec::new();
+        for (n, &start) in positions.iter().enumerate() {
+            let name_start = start + 3;
+            let name_end = src[name_start..]
+                .find('(')
+                .map(|i| name_start + i)
+                .unwrap_or(name_start);
+            let name = src[name_start..name_end].trim();
+            let end = positions.get(n + 1).copied().unwrap_or(src.len());
+            out.push((name, &src[start..end]));
+        }
+        out
+    }
+
+    fn span_of<'a>(spans: &'a [(&str, &str)], name: &str) -> Option<&'a str> {
+        spans
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, body)| *body)
+    }
+
+    fn inject_after_open_brace(src: &str, fname: &str, code: &str) -> String {
+        let needle = format!("fn {fname}(");
+        let start = src.find(&needle).expect("function to mutate");
+        let brace = src[start..]
+            .find('{')
+            .map(|i| start + i)
+            .expect("function body");
+        let mut out = String::with_capacity(src.len() + code.len());
+        out.push_str(&src[..=brace]);
+        out.push_str(code);
+        out.push_str(&src[brace + 1..]);
+        out
+    }
+
+    /// Pure source-lock predicate. Returns human-readable violations (empty = clean).
+    fn transform_lock_violations(chrome: &str, target: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let prod = production(chrome);
+        let norm = prod.split_whitespace().collect::<Vec<_>>().join(" ");
+        let spans = function_spans(&norm);
+
+        let legacy_fns: Vec<&str> = spans
+            .iter()
+            .filter(|(_, body)| legacy_subtraction(body))
+            .map(|(name, _)| *name)
+            .collect();
+        if legacy_fns != vec!["fixture_listing_origin"] {
+            out.push(format!(
+                "only fixture_listing_origin may contain outer-inner subtraction: {legacy_fns:?}"
+            ));
+        }
+
+        let calls: Vec<usize> = norm
+            .match_indices("fixture_listing_origin(")
+            .map(|(i, _)| i)
+            .collect();
+        if calls.len() != 2 {
+            out.push(format!(
+                "fixture_listing_origin must have exactly one call site: {calls:?}"
+            ));
+        } else if let (Some(def_start), Some(def_end), Some(fixture), Some(fixture_start)) = (
+            norm.find("fn fixture_listing_origin("),
+            norm.find("fn fixture_listing_origin(")
+                .and_then(|s| norm[s..].find("fn make_observe_id(").map(|i| s + i)),
+            span_of(&spans, "fixture_map"),
+            norm.find("fn fixture_map("),
+        ) {
+            let call = *calls.iter().find(|i| **i > def_end).unwrap_or(&def_start);
+            if !(call > fixture_start && call < fixture_start + fixture.len()) {
+                out.push("fixture_listing_origin must be called only from fixture_map".into());
+            }
+            if !fixture.contains("fixture: true") {
+                out.push("fixture_map must set fixture: true".into());
+            }
+            if !fixture.contains("fixture_origin: fixture_listing_origin(") {
+                out.push(
+                    "fixture_map must use fixture_listing_origin for its listing origin".into(),
+                );
+            }
+        } else {
+            out.push("fixture_listing_origin / fixture_map structure is missing".into());
+        }
+
+        // Global rule: `outer_width` / `outer_height` may appear only in the ChromeMetrics
+        // definition/serde or inside the single fixture_listing_origin function span. This is
+        // stronger than a proximity matcher: aliasing a local and subtracting it later, reversed
+        // subtraction, or an unnamed helper all fail.
+        let cm_start = chrome.find("pub struct ChromeMetrics {");
+        let cm_end = cm_start.and_then(|s| chrome[s..].find("\n}").map(|i| s + i + 2));
+        let fixture_start = chrome.find("fn fixture_listing_origin(");
+        let fixture_end = fixture_start.and_then(|s| chrome[s..].find("\n}").map(|i| s + i + 2));
+        let (Some(cm_start), Some(cm_end), Some(fixture_start), Some(fixture_end)) =
+            (cm_start, cm_end, fixture_start, fixture_end)
+        else {
+            out.push("ChromeMetrics/fixture_listing_origin allowed spans are missing".into());
+            return out;
+        };
+        for ident in ["outer_width", "outer_height"] {
+            for (pos, _) in chrome.match_indices(ident) {
+                let in_metrics = pos >= cm_start && pos < cm_end;
+                let in_fixture = pos >= fixture_start && pos < fixture_end;
+                if !in_metrics && !in_fixture {
+                    out.push(format!(
+                        "{ident} appears outside ChromeMetrics/fixture_listing_origin at byte {pos}"
+                    ));
+                }
+            }
+        }
+
+        // Keep explicit proof that the single fixture helper still owns the legacy subtraction.
+        if !legacy_subtraction(&chrome[fixture_start..fixture_end]) {
+            out.push("fixture_listing_origin no longer contains the legacy subtraction".into());
+        }
+
+        match span_of(&spans, "hit_from_raw") {
+            Some(hit) if hit.contains("contract_for(") => {}
+            Some(_) => {
+                out.push("hit_from_raw must build the live contract via contract_for".into())
+            }
+            None => {}
+        }
+
+        let target_norm = production(target)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        match span_of(&function_spans(&target_norm), "finish_chr") {
+            Some(finish) => {
+                let finish = compact(finish);
+                if !finish.contains("contract_for(") {
+                    out.push("finish_chr must call contract_for".into());
+                }
+                if !finish.contains("map_point(&contract,css_rect.center())") {
+                    out.push("finish_chr must map the contract point".into());
+                }
+                if !finish.contains("map_rect(&contract,css_rect)") {
+                    out.push("finish_chr must map the contract rect".into());
+                }
+                if finish.contains("found.rect.center()") {
+                    out.push("finish_chr must not use a raw rect centre".into());
+                }
+            }
+            None => out.push("missing target::finish_chr".into()),
+        }
+        out
+    }
+
+    #[test]
+    fn click_hover_scroll_paths_have_no_outer_inner_transform() {
+        // Production code outside the test module must have no legacy subtraction at all.
+        for src in [
+            production(include_str!("actuate.rs")),
+            production(include_str!("target.rs")),
+            production(include_str!("point.rs")),
+        ] {
+            assert!(
+                !legacy_subtraction(src),
+                "legacy outer-inner arithmetic leaked outside chrome's fixture helper"
+            );
+        }
+
+        // Positive control: the current tree must satisfy every structural lock.
+        let violations =
+            transform_lock_violations(include_str!("chrome.rs"), include_str!("target.rs"));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn transform_lock_rejects_alias_and_whitespace_mutations() {
+        let chrome = include_str!("chrome.rs");
+        let target = include_str!("target.rs");
+        assert!(transform_lock_violations(chrome, target).is_empty());
+
+        // Negative 1: alias the outer metric into a local inside a live function, then subtract.
+        let alias = inject_after_open_brace(
+            chrome,
+            "live_map_inputs",
+            " let oh = metrics.outer_height; let _offset = oh - metrics.inner_height;",
+        );
+        let violations = transform_lock_violations(&alias, target);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("outer_height") && v.contains("outside")),
+            "alias mutation must be rejected: {violations:?}"
+        );
+
+        // Negative 2: whitespace/formatting variant of the legacy subtraction in a live function.
+        let weird = inject_after_open_brace(
+            chrome,
+            "map_from_raw",
+            " let _ = metrics.outer_width\n\t\t-\n metrics.inner_width;",
+        );
+        let violations = transform_lock_violations(&weird, target);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("outer_width") && v.contains("outside")),
+            "whitespace mutation must be rejected: {violations:?}"
+        );
+
+        // Negative 3: split alias in an unnamed helper, even outside the named live spans.
+        let hidden = inject_after_open_brace(
+            chrome,
+            "fixture_map",
+            " fn hidden_helper(metrics: &ChromeMetrics) -> f64 { let oh = metrics.outer_height; let ih = metrics.inner_height; oh - ih }",
+        );
+        let violations = transform_lock_violations(&hidden, target);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("outer_height") && v.contains("outside")),
+            "unnamed-helper alias must be rejected: {violations:?}"
+        );
+
+        assert!(legacy_subtraction(
+            "metrics.outer_height\n\t-\nmetrics.inner_height"
+        ));
+        assert!(legacy_subtraction(
+            "metrics . outer_width  -  metrics . inner_width"
+        ));
+    }
+
+    #[test]
+    fn no_cdp_or_synthetic_dom_input() {
+        for src in [
+            include_str!("actuate.rs"),
+            include_str!("target.rs"),
+            include_str!("point.rs"),
+            include_str!("observe.rs"),
+        ] {
+            assert!(!src.contains(&["--remote", "debugging", "port"].join("-")));
+            assert!(!src.contains(&["--enable", "automation"].join("-")));
+            assert!(!src.contains(&["Play", "wright"].join("")));
+            assert!(!src.contains(&["element", ".click("].join("")));
+            assert!(!src.contains(&["dispatch", "Event("].join("")));
+        }
+        let ext = include_str!("../extension/content.js");
+        assert!(!ext.contains(&["element", ".click("].join("")));
+        assert!(!ext.contains(&["dispatch", "Event("].join("")));
+        assert!(!ext.contains(&["all_frames", ": true"].join("")));
+    }
+
+    #[test]
+    fn no_process_global_offset_cache() {
+        // The map is rebuilt per observe/resolve/guard; no calibrated-once constant.
+        let src = include_str!("actuate.rs");
+        assert!(src.contains("final_live_remap"));
+        assert!(!src.contains(&["OFFSET", "_CACHE"].join("")));
+        assert!(!src.contains(&["static ", "OFFSET"].join("")));
     }
 }

@@ -6,8 +6,8 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
 };
 use windows::Win32::UI::HiDpi::{
-    AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-    GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
+    AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor,
+    GetThreadDpiAwarenessContext, MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
 };
 use windows::core::BOOL;
 
@@ -327,6 +327,54 @@ unsafe extern "system" fn enum_monitor(
     let ok = unsafe { GetMonitorInfoW(monitor, &raw mut info) };
     if ok.as_bool() {
         acc.include(info.rcMonitor);
+    }
+    BOOL(1)
+}
+
+/// Read-only effective-DPI monitor list for the transform's mixed-DPI check.
+/// Never changes display settings and never blocks on a window.
+pub fn monitor_dpis() -> Vec<crate::point::MonitorDpi> {
+    let mut out: Vec<crate::point::MonitorDpi> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(enum_monitor_dpi),
+            LPARAM(&raw mut out as isize),
+        );
+    }
+    out
+}
+
+unsafe extern "system" fn enum_monitor_dpi(
+    monitor: HMONITOR,
+    _hdc: HDC,
+    _clip: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    let Some(out) = (unsafe { (data.0 as *mut Vec<crate::point::MonitorDpi>).as_mut() }) else {
+        return BOOL(0);
+    };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &raw mut info) }.as_bool() {
+        let mut dx = 0u32;
+        let mut dy = 0u32;
+        if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut dx, &raw mut dy) }.is_ok()
+            && dx > 0
+        {
+            out.push(crate::point::MonitorDpi {
+                rect: Rect {
+                    x: info.rcMonitor.left,
+                    y: info.rcMonitor.top,
+                    w: info.rcMonitor.right - info.rcMonitor.left,
+                    h: info.rcMonitor.bottom - info.rcMonitor.top,
+                },
+                dpi: dx,
+            });
+        }
     }
     BOOL(1)
 }

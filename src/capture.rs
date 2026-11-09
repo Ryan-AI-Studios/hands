@@ -125,7 +125,27 @@ pub fn write_preview_png(
 }
 
 /// In-memory RGBA ROI. No file. Clip to `virtual_screen`. Reject zero area.
+#[cfg(test)]
+type CaptureRoiHook = fn(Space, Rect) -> Result<RoiFrame, HandsError>;
+
+#[cfg(test)]
+thread_local! {
+    static CAPTURE_ROI_HOOK: std::cell::RefCell<Option<CaptureRoiHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_capture_roi_hook(hook: Option<CaptureRoiHook>) {
+    CAPTURE_ROI_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
 pub fn capture_roi(space: Space, rect: Rect) -> Result<RoiFrame, HandsError> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = CAPTURE_ROI_HOOK.with(|c| *c.borrow()) {
+            return hook(space, rect);
+        }
+    }
     ensure_dpi()?;
     let clipped = space.clip_rect(rect);
     if clipped.area() == 0 {

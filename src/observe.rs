@@ -236,6 +236,9 @@ pub struct ObserveEnvelope {
     pub fg_window: FgWindow,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_window: Option<TargetWindow>,
+    /// Compact validated CSS->physical transform (absent for desktop/non-Chrome walks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<crate::point::TransformReport>,
     #[serde(skip_serializing_if = "skip_auto_view")]
     pub view: ObserveView,
     pub observe_source: ObserveSource,
@@ -279,6 +282,8 @@ pub struct ObserveSidecar {
     pub fg_window: Option<FgWindow>,
     #[serde(default)]
     pub target_window: Option<TargetWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<crate::point::TransformReport>,
     #[serde(default, skip_serializing_if = "skip_auto_view")]
     pub view: ObserveView,
     #[serde(default)]
@@ -628,7 +633,9 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         )
     };
     let chrome_t = Instant::now();
-    let chrome_outcome = chrome::try_snapshot(req.detail);
+    let chrome_walk = plan.walk_hwnd.is_some_and(foreground::is_chrome_hwnd);
+    let snap_hwnd = plan.walk_hwnd.filter(|h| foreground::is_chrome_hwnd(*h));
+    let chrome_outcome = chrome::try_snapshot(req.detail, snap_hwnd);
     let chrome_ms = chrome_t.elapsed().as_millis() as u64;
     let snap = match uia_h {
         None => uia::UiaSnapshot {
@@ -646,12 +653,16 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         uia_t.elapsed().as_millis() as u64
     };
     let chrome_connected = chrome_outcome.host_up();
-    let chrome_walk = plan.walk_hwnd.is_some_and(foreground::is_chrome_hwnd);
     let chrome_hint = chrome::chrome_hint_for_observe(chrome_walk, chrome_outcome.chrome_hint());
     let chrome = if skip_walk {
         None
     } else {
         chrome_outcome.into_map()
+    };
+    let transform = if skip_walk || !chrome_walk {
+        None
+    } else {
+        chrome.as_ref().and_then(|m| m.transform.clone())
     };
     let opts = FuseOpts {
         viewport: plan.viewport,
@@ -664,7 +675,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let (mut extract, mut elements, elements_total, _) =
         fuse_maps(req.detail, &snap.title, &snap.nodes, chrome, opts);
     crate::dialogs::promote(&mut extract, &mut elements);
-    stamp_grid(space, &mut elements);
+    stamp_grid_if_clickable(space, &mut elements, transform.as_ref());
     let fusion_ms = fusion_t.elapsed().as_millis() as u64;
     crate::fence::note_last_url(extract.url.as_deref());
     let cards_walked = extract.cards_walked;
@@ -707,6 +718,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         target_window: plan.target_window,
         view: req.view,
         observe_source: ObserveSource::Live,
+        transform,
         card_offset: 0,
         card_counts: ObserveCardCounts {
             cards_walked,
@@ -778,6 +790,19 @@ fn stamp_grid(space: Space, elements: &mut [Element]) {
     }
 }
 
+/// Fixture-mode rects come from the legacy listing origin and are not a click contract; do not
+/// stamp them as grid cells, so `click --grid` cannot inherit a fixture listing coordinate.
+fn stamp_grid_if_clickable(
+    space: Space,
+    elements: &mut [Element],
+    transform: Option<&crate::point::TransformReport>,
+) {
+    if transform.is_some_and(|t| t.method == crate::point::TransformMethod::Fixture) {
+        return;
+    }
+    stamp_grid(space, elements);
+}
+
 fn write_sidecar(
     path: &std::path::Path,
     envelope: &ObserveEnvelope,
@@ -808,6 +833,7 @@ fn write_sidecar(
         windows_inventory: inventory_windows(inventory, include_class),
         fg_window: Some(envelope.fg_window.clone()),
         target_window: envelope.target_window.clone(),
+        transform: envelope.transform.clone(),
         view: envelope.view,
         observe_source: envelope.observe_source,
         card_offset: 0,
@@ -1529,6 +1555,7 @@ fn envelope_from_sidecar(sidecar: ObserveSidecar, view: ObserveView) -> ObserveE
         windows: sidecar.windows,
         fg_window: sidecar.fg_window.unwrap_or_else(empty_fg_window),
         target_window: sidecar.target_window,
+        transform: sidecar.transform,
         view,
         observe_source: ObserveSource::Sidecar,
         card_offset: 0,
@@ -1739,6 +1766,7 @@ mod tests {
             target_window: None,
             view: ObserveView::Auto,
             observe_source: ObserveSource::Live,
+            transform: None,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
@@ -1853,6 +1881,7 @@ mod tests {
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
+            transform: None,
         };
         let nodes: Vec<RawNode> = (0..5).map(uia).collect();
         let (extract, els, total, connected) = fuse_maps(
@@ -1880,7 +1909,7 @@ mod tests {
         crate::fence::clear_last_url_for_test();
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default)
+        let map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("fixture");
         let (extract, els, _total, connected) = fuse_maps(
@@ -2051,7 +2080,7 @@ mod tests {
     fn default_fuse_drops_desktop_noise_keeps_fixture_chr() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default)
+        let map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("fixture");
         let mut nodes = viewport_buttons(5);
@@ -2086,7 +2115,7 @@ mod tests {
     fn default_envelope_fits_4kib_and_caps_20() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default)
+        let map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("fixture");
         let mut nodes = viewport_buttons(40);
@@ -2126,6 +2155,7 @@ mod tests {
             target_window: None,
             view: ObserveView::Auto,
             observe_source: ObserveSource::Live,
+            transform: None,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
@@ -2151,7 +2181,7 @@ mod tests {
     fn dom_fuse_can_include_noise_and_more_than_20() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default)
+        let map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("fixture");
         let mut nodes = viewport_buttons(25);
@@ -2170,7 +2200,7 @@ mod tests {
     fn chrome_connected_but_not_foreground_has_no_chr() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default)
+        let map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("fixture");
         let nodes = vec![uia_node(
@@ -2207,7 +2237,7 @@ mod tests {
         crate::fence::note_last_url(Some("https://cars.com/search"));
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default)
+        let map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("fixture");
         let nodes = vec![uia_node(
@@ -2245,7 +2275,7 @@ mod tests {
     fn no_foreground_viewport_empties_default_elements() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default)
+        let map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("fixture");
         let mut nodes = viewport_buttons(8);
@@ -2754,7 +2784,7 @@ mod tests {
     fn fixture_plus_continue_as_leads_envelope() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default)
+        let map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("fixture");
         let mut nodes = viewport_buttons(8);
@@ -2802,6 +2832,7 @@ mod tests {
             target_window: None,
             view: ObserveView::Auto,
             observe_source: ObserveSource::Live,
+            transform: None,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
@@ -2852,6 +2883,7 @@ mod tests {
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
+            transform: None,
         };
         let nodes = vec![uia_node(
             42,
@@ -2901,6 +2933,7 @@ mod tests {
             target_window: None,
             view: ObserveView::Auto,
             observe_source: ObserveSource::Live,
+            transform: None,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
@@ -2987,6 +3020,7 @@ mod tests {
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
+            transform: None,
         };
         let (mut extract, mut elements, _total, connected) = fuse_maps(
             Detail::Default,
@@ -3104,7 +3138,7 @@ mod tests {
     fn stamp_grid_fixture_chr0_is_g21() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default)
+        let map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("fixture");
         let (_extract, mut elements, _total, _connected) =
@@ -3124,6 +3158,31 @@ mod tests {
         assert_eq!(chr0.rect.center(), (210, 166));
         assert_eq!(chr0.grid.as_deref(), Some("g:21:16"));
         assert_eq!(chr0.grid.as_ref().unwrap(), &space.cell_id(210, 166));
+    }
+
+    #[test]
+    fn fixture_transform_does_not_stamp_grid() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default, None)
+            .into_map()
+            .expect("fixture");
+        let transform = map.transform.clone();
+        assert!(
+            transform
+                .as_ref()
+                .is_some_and(|t| t.method == crate::point::TransformMethod::Fixture),
+            "{transform:?}"
+        );
+        let (_extract, mut elements, _total, _connected) =
+            fuse_maps(Detail::Default, "UIA", &[], Some(map), fixture_opts(true));
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        stamp_grid_if_clickable(space, &mut elements, transform.as_ref());
+        assert!(
+            elements.iter().all(|e| e.grid.is_none()),
+            "{:?}",
+            elements.iter().find(|e| e.grid.is_some())
+        );
     }
 
     #[test]
@@ -3318,6 +3377,7 @@ mod tests {
             target_window: None,
             view: ObserveView::Auto,
             observe_source: ObserveSource::Live,
+            transform: None,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
@@ -3773,6 +3833,7 @@ mod tests {
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
+            transform: None,
         };
         let nodes = vec![uia_node(
             9,
@@ -3819,6 +3880,7 @@ mod tests {
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
+            transform: None,
         };
         let (dom_extract, dom_els, _, _) = fuse_maps(
             Detail::Dom,
@@ -4413,7 +4475,8 @@ mod tests {
             .join("tests/fixtures/chrome-spa-autocomplete.json")
     }
 
-    fn envelope_from_chrome_map(map: chrome::ChromeMap) -> ObserveEnvelope {
+    fn envelope_from_chrome_map(mut map: chrome::ChromeMap) -> ObserveEnvelope {
+        let transform = map.transform.take();
         let (extract, elements, elements_total, chrome_connected) = fuse_maps(
             Detail::Default,
             "Barchart",
@@ -4442,6 +4505,7 @@ mod tests {
             target_window: None,
             view: ObserveView::Auto,
             observe_source: ObserveSource::Live,
+            transform,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
@@ -4452,7 +4516,7 @@ mod tests {
     fn spa_autocomplete_options_survive_20_cap() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&spa_autocomplete_fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default)
+        let map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("spa fixture");
         assert!(map.elements.len() > VIEWPORT_ENVELOPE_ELEMENT_CAP);
@@ -4488,7 +4552,7 @@ mod tests {
     fn spa_closed_menu_omits_option_rows() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&spa_autocomplete_fixture_path()));
-        let mut map = chrome::try_snapshot(Detail::Default)
+        let mut map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("spa fixture");
         map.elements
@@ -4509,7 +4573,7 @@ mod tests {
     fn non_menu_baseline_fixture_envelope_stays_capped() {
         let g = chrome::EnvGuard::lock();
         g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
-        let map = chrome::try_snapshot(Detail::Default)
+        let map = chrome::try_snapshot(Detail::Default, None)
             .into_map()
             .expect("baseline fixture");
         let raw = envelope_from_chrome_map(map);
@@ -4867,6 +4931,7 @@ mod tests {
             target_window: raw.target_window.clone(),
             view: ObserveView::Auto,
             observe_source: ObserveSource::Live,
+            transform: None,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             popup_rect: None,
@@ -5319,6 +5384,7 @@ mod tests {
             target_window: raw.target_window.clone(),
             view: ObserveView::Auto,
             observe_source: ObserveSource::Live,
+            transform: None,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             popup_rect: None,
@@ -5427,6 +5493,7 @@ mod tests {
             target_window: None,
             view: ObserveView::Auto,
             observe_source: ObserveSource::Live,
+            transform: None,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             popup_rect: Some(popup),
@@ -5882,7 +5949,7 @@ mod tests {
             let mut samples = Vec::new();
             for _ in 0..8 {
                 let t = Instant::now();
-                let outcome = chrome::try_snapshot(Detail::Default);
+                let outcome = chrome::try_snapshot(Detail::Default, None);
                 assert!(
                     outcome.into_map().is_some(),
                     "fixture must parse {}",
@@ -5903,5 +5970,215 @@ mod tests {
             );
             assert_eq!(samples.len(), 8);
         }
+    }
+
+    fn valid_transform() -> crate::point::TransformReport {
+        crate::point::TransformReport {
+            valid: true,
+            method: crate::point::TransformMethod::RenderWidgetHost,
+            confidence: crate::point::TransformConfidence::High,
+            scale: Some(1.25),
+            dpr: Some(1.25),
+            dpi: Some(120),
+            page_zoom: Some(1.0),
+            page_viewport: Some(Rect {
+                x: 100,
+                y: 80,
+                w: 1500,
+                h: 1125,
+            }),
+            anchor_basis: Some(crate::point::CssBasis::Inner),
+            layout_basis: Some(crate::point::CssBasis::Client),
+            reason: None,
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+        }
+    }
+
+    #[test]
+    fn transform_block_survives_4kib_and_keeps_element_count() {
+        // C9: the compact block survives shrink; element count stays pinned at the cap.
+        let mut env = fat_envelope(30);
+        env.transform = Some(valid_transform());
+        let capped = cap_default_envelope(env);
+        assert!(capped.transform.is_some(), "transform must never be popped");
+        assert_eq!(capped.elements.len(), VIEWPORT_ENVELOPE_ELEMENT_CAP);
+        let json = serde_json::to_string(&capped).unwrap();
+        assert!(json.len() <= DEFAULT_ENVELOPE_MAX_BYTES, "{}", json.len());
+    }
+
+    fn live_map_geometry(
+        metrics: &chrome::ChromeMetrics,
+        _: Option<&str>,
+        hwnd: isize,
+    ) -> crate::point::MapInputs {
+        crate::point::MapInputs {
+            hwnd: Some(hwnd),
+            window_rect: Some(Rect {
+                x: -10,
+                y: -10,
+                w: 4000,
+                h: 3000,
+            }),
+            dpi: Some(120),
+            virtual_screen: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            page: crate::point::PageMetrics {
+                inner_width: Some(metrics.inner_width),
+                inner_height: Some(metrics.inner_height),
+                client_width: metrics.client_width,
+                client_height: metrics.client_height,
+                dpr: Some(metrics.device_pixel_ratio),
+                ..crate::point::PageMetrics::default()
+            },
+            render_widgets: vec![Rect {
+                x: 100,
+                y: 80,
+                w: 1500,
+                h: 1125,
+            }],
+            uia_document: None,
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: Some("Example".into()),
+            fixture: false,
+            identity: crate::point::WindowIdentity::Confirmed,
+            fixture_origin: None,
+        }
+    }
+
+    fn invalid_live_map_geometry(
+        metrics: &chrome::ChromeMetrics,
+        title: Option<&str>,
+        hwnd: isize,
+    ) -> crate::point::MapInputs {
+        let mut inputs = live_map_geometry(metrics, title, hwnd);
+        inputs.render_widgets.clear();
+        inputs
+    }
+
+    #[test]
+    fn live_invalid_transform_omits_chr_names_and_reason() {
+        // C10: drive the production live map (geometry seam, not fixture). The element has a
+        // `chr:` id and `chr:` text; an invalid live map must drop it and explain why.
+        let raw = serde_json::json!({
+            "url": "https://example.com/",
+            "title": "Example",
+            "elements": [{
+                "id": "chr:7",
+                "role": "Button",
+                "text": "chr: fake page text",
+                "rectCss": { "left": 10.0, "top": 10.0, "width": 100.0, "height": 30.0 }
+            }],
+            "metrics": {
+                "screenX": 0.0, "screenY": 0.0,
+                "outerWidth": 1200.0, "outerHeight": 900.0,
+                "innerWidth": 1200.0, "innerHeight": 900.0,
+                "devicePixelRatio": 1.25
+            }
+        })
+        .to_string();
+
+        chrome::set_geometry_hook(Some(live_map_geometry));
+        let valid = chrome::map_from_raw_json(&raw, Some(0x1234), "f3a9c1d2e4b5a607".into());
+        assert!(
+            valid.transform.as_ref().is_some_and(|t| t.valid),
+            "{:?}",
+            valid.transform
+        );
+        assert!(
+            valid
+                .elements
+                .iter()
+                .any(|e| e.id == "chr:7" && e.text.as_deref().unwrap_or_default().contains("chr:")),
+            "control: valid live map must list the chr: element"
+        );
+
+        chrome::set_geometry_hook(Some(invalid_live_map_geometry));
+        let map = chrome::map_from_raw_json(&raw, Some(0x1234), "f3a9c1d2e4b5a607".into());
+        let env = envelope_from_chrome_map(map);
+        chrome::set_geometry_hook(None);
+
+        let transform = env.transform.as_ref().expect("envelope transform");
+        assert!(!transform.valid, "{transform:?}");
+        assert!(
+            transform
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("no_viewport_anchor"),
+            "{transform:?}"
+        );
+        assert!(env.elements.is_empty(), "{:?}", env.elements);
+        assert_eq!(env.elements_total, 0, "no fabricated coordinates");
+        assert!(
+            env.elements.iter().all(|e| {
+                !e.id.contains("chr:") && !e.text.as_deref().unwrap_or_default().contains("chr:")
+            }),
+            "{:?}",
+            env.elements
+        );
+        let json = serialize_envelope(&env).unwrap();
+        assert!(json.contains("\"valid\":false"), "{json}");
+        assert!(json.contains("no_viewport_anchor"), "{json}");
+    }
+
+    #[test]
+    fn transform_uses_live_anchor_not_outer_inner() {
+        // Source lock: observe passes the walk Chrome HWND; chrome validates from the anchor.
+        let src = include_str!("observe.rs");
+        assert!(
+            src.contains("plan.walk_hwnd.filter(|h| foreground::is_chrome_hwnd(*h))"),
+            "observe must filter the walk HWND before chrome::try_snapshot"
+        );
+        assert!(src.contains("chrome::try_snapshot(req.detail, snap_hwnd)"));
+        let chrome = include_str!("chrome.rs");
+        let start = chrome
+            .find("fn live_inputs_from_page(")
+            .expect("live_inputs_from_page");
+        let end = chrome.find("fn build_live_map(").expect("build_live_map");
+        let slice = &chrome[start..end];
+        assert!(slice.contains("render_widget_host_rects"));
+        assert!(!slice.contains("outer_width") && !slice.contains("outer_height"));
+    }
+
+    #[test]
+    fn from_sidecar_keeps_transform_and_old_sidecar_parses() {
+        let env = {
+            let mut e = fat_envelope(1);
+            e.transform = Some(valid_transform());
+            e
+        };
+        let path = std::env::temp_dir().join("hands-0129-sidecar.json");
+        write_sidecar(&path, &env, None, None, None, &[], false).expect("write sidecar");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let side: ObserveSidecar = serde_json::from_str(&text).unwrap();
+        let reshaped = envelope_from_sidecar(side, ObserveView::Auto);
+        assert_eq!(reshaped.transform, env.transform);
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value.as_object_mut().unwrap().remove("transform");
+        let old: ObserveSidecar = serde_json::from_value(value).expect("old sidecar parses");
+        assert!(old.transform.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn non_chrome_walk_skips_enumeration() {
+        // `chrome::live_map_inputs` checks is_chrome_hwnd before EnumChildWindows/UIA.
+        let chrome = include_str!("chrome.rs");
+        let start = chrome
+            .find("fn live_inputs_from_page(")
+            .expect("live_inputs_from_page");
+        let end = chrome.find("fn build_live_map(").expect("build_live_map");
+        let slice = &chrome[start..end];
+        assert!(slice.contains("foreground::is_chrome_hwnd(hwnd)"));
+        assert!(slice.contains("if chrome"));
+        assert!(!slice.contains("outer_width") && !slice.contains("outer_height"));
+        // No transform block for a non-Chrome walk.
+        let obs = include_str!("observe.rs");
+        assert!(obs.contains("if skip_walk || !chrome_walk {\n        None"));
     }
 }

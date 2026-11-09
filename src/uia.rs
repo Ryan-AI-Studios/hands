@@ -19,6 +19,10 @@ use windows::Win32::UI::Accessibility::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GW_ENABLEDPOPUP, GetWindow};
 
+use std::collections::VecDeque;
+use std::sync::mpsc;
+use std::time::Duration;
+
 use crate::error::HandsError;
 use crate::extract::{ControlKind, Detail, MAIN_TEXT_MAX_CHARS, RawNode};
 use crate::space::Rect;
@@ -60,6 +64,61 @@ pub fn collect(detail: Detail, hwnd: Option<isize>) -> Result<UiaSnapshot, Hands
         .map_err(|err| HandsError::Uia(format!("spawn STA thread: {err}")))?
         .join()
         .map_err(|_| HandsError::Uia("UIA STA thread panicked".to_string()))?
+}
+
+/// Secondary anchor: UIA `Document` bounding rectangle under `hwnd`, bounded to depth 8 /
+/// 256 nodes and never using `GetRootElement` when an HWND is given. Runs on a named STA
+/// worker and waits at most `deadline`; timeout/worker loss returns `None` and detaches.
+pub fn document_rect(hwnd: isize, deadline: Duration) -> Option<Rect> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("hands-uia-document".into())
+        .spawn(move || {
+            let _ = tx.send(sta_document_rect(hwnd));
+        })
+        .ok()?;
+    recv_document(&rx, deadline)
+}
+
+fn recv_document(rx: &mpsc::Receiver<Option<Rect>>, deadline: Duration) -> Option<Rect> {
+    rx.recv_timeout(deadline).ok().flatten()
+}
+
+fn sta_document_rect(hwnd: isize) -> Option<Rect> {
+    let _sta = StaGuard::enter().ok()?;
+    let automation = create_automation().ok()?;
+    let root = unsafe { automation.ElementFromHandle(crate::foreground::raw_hwnd(hwnd)) }.ok()?;
+    let walker = unsafe { automation.ControlViewWalker() }.ok()?;
+    let mut queue: VecDeque<(IUIAutomationElement, usize)> = VecDeque::new();
+    queue.push_back((root, 0));
+    let mut visited = 0usize;
+    while let Some((element, depth)) = queue.pop_front() {
+        visited += 1;
+        if visited > 256 {
+            break;
+        }
+        if let Ok(control) = unsafe { element.CurrentControlType() }
+            && control.0 == UIA_DocumentControlTypeId.0
+            && let Ok(bounds) = unsafe { element.CurrentBoundingRectangle() }
+        {
+            let rect = rect_from_uia(bounds);
+            if rect.w > 0 && rect.h > 0 {
+                return Some(rect);
+            }
+        }
+        if depth >= 8 {
+            continue;
+        }
+        if let Ok(first) = unsafe { walker.GetFirstChildElement(&element) } {
+            let mut current = Some(first);
+            while let Some(child) = current {
+                let next = unsafe { walker.GetNextSiblingElement(&child) }.ok();
+                queue.push_back((child, depth + 1));
+                current = next;
+            }
+        }
+    }
+    None
 }
 
 /// Fresh control-view walk + RuntimeId compare. `ElementFromRuntimeId` is not
@@ -810,5 +869,44 @@ mod tests {
             slice.contains("Some(h)"),
             "Dom must branch on hwnd:\n{slice}"
         );
+    }
+
+    #[test]
+    fn document_rect_bounded_no_root() {
+        let src = include_str!("uia.rs");
+        let start = src
+            .find("fn sta_document_rect(")
+            .expect("sta_document_rect");
+        let end = src
+            .find("pub fn resolve_runtime_id(")
+            .expect("resolve_runtime_id");
+        let slice = &src[start..end];
+        assert!(slice.contains("ElementFromHandle"));
+        assert!(!slice.contains("GetRootElement"));
+        assert!(slice.contains("depth >= 8"));
+        assert!(slice.contains("visited > 256"));
+    }
+
+    #[test]
+    fn document_rect_deadline_returns_none() {
+        let (tx, rx) = mpsc::channel();
+        let start = std::time::Instant::now();
+        let out = recv_document(&rx, Duration::from_millis(10));
+        assert!(out.is_none());
+        assert!(start.elapsed() >= Duration::from_millis(10));
+        drop(tx);
+    }
+
+    #[test]
+    fn document_rect_runs_on_named_sta_worker() {
+        let src = include_str!("uia.rs");
+        let start = src.find("pub fn document_rect(").expect("document_rect");
+        let end = src.find("fn recv_document(").expect("recv_document");
+        let slice = &src[start..end];
+        assert!(slice.contains("\"hands-uia-document\""));
+        assert!(slice.contains("recv_document("));
+        let worker = &src[src.find("fn sta_document_rect(").unwrap()
+            ..src.find("pub fn resolve_runtime_id(").unwrap()];
+        assert!(worker.contains("StaGuard::enter"));
     }
 }

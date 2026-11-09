@@ -351,6 +351,7 @@ fn base_envelope(
         cooldown_ms: None,
         loop_suspected: false,
         guidance: None,
+        point: None,
         verified: false,
         semantic: Some(SemanticInfo {
             action: action.as_str().to_string(),
@@ -1105,6 +1106,10 @@ mod tests {
             hwnd,
             name: name.into(),
             role: role.into(),
+            css_point: None,
+            css_rect: None,
+            contract: None,
+            map: None,
         }
     }
 

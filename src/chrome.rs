@@ -18,7 +18,12 @@ use crate::extract::{
     RADIUS_CAP, RESULT_COUNT_CAP, ZIP_CAP, infer_card_kind, prefer_local_cards, take_chars,
     take_opt_chars,
 };
+use crate::foreground;
 use crate::native_host::{CLIENT_TIMEOUT_MS, client_timeout, exchange_pipe_deadline, pipe_name};
+use crate::point::{
+    CssPoint, CssRect, MapInputs, PageMetrics, PointContract, TransformReport, ViewportMap,
+    build_map, contract_for, identity_from, map_rect_unbounded, next_generation, observe_id, remap,
+};
 use crate::space::Rect;
 
 static LAST_PIPE_DETAIL: Mutex<Detail> = Mutex::new(Detail::Default);
@@ -96,6 +101,8 @@ pub struct ChromeMap {
     pub cards: Vec<Card>,
     pub listing: ListingMeta,
     pub cards_walked: usize,
+    /// Page-level map/validity. Serialized as the observe envelope's compact `transform`.
+    pub transform: Option<TransformReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,9 +111,14 @@ pub struct ChromeHit {
     pub name: String,
     pub role: String,
     pub rect: Rect,
+    pub css_rect: CssRect,
+    pub css_point: CssPoint,
+    pub contract: PointContract,
+    pub hwnd: Option<isize>,
+    pub(crate) map: Option<ViewportMap>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ChromeMetrics {
     #[serde(rename = "screenX")]
     pub screen_x: f64,
@@ -122,14 +134,43 @@ pub struct ChromeMetrics {
     pub inner_height: f64,
     #[serde(rename = "devicePixelRatio")]
     pub device_pixel_ratio: f64,
+    #[serde(default, rename = "clientWidth")]
+    pub client_width: Option<f64>,
+    #[serde(default, rename = "clientHeight")]
+    pub client_height: Option<f64>,
+    #[serde(default, rename = "visualViewportWidth")]
+    pub visual_viewport_width: Option<f64>,
+    #[serde(default, rename = "visualViewportHeight")]
+    pub visual_viewport_height: Option<f64>,
+    #[serde(default, rename = "visualViewportScale")]
+    pub visual_viewport_scale: Option<f64>,
+    #[serde(default, rename = "visualViewportOffsetLeft")]
+    pub visual_viewport_offset_left: Option<f64>,
+    #[serde(default, rename = "visualViewportOffsetTop")]
+    pub visual_viewport_offset_top: Option<f64>,
+    #[serde(default, rename = "screenAvailLeft")]
+    pub screen_avail_left: Option<f64>,
+    #[serde(default, rename = "screenAvailTop")]
+    pub screen_avail_top: Option<f64>,
+    #[serde(default, rename = "screenWidth")]
+    pub screen_width: Option<f64>,
+    #[serde(default, rename = "screenHeight")]
+    pub screen_height: Option<f64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct CssRect {
-    pub left: f64,
-    pub top: f64,
-    pub width: f64,
-    pub height: f64,
+impl ChromeMetrics {
+    fn page(&self) -> PageMetrics {
+        PageMetrics {
+            inner_width: Some(self.inner_width),
+            inner_height: Some(self.inner_height),
+            client_width: self.client_width,
+            client_height: self.client_height,
+            dpr: Some(self.device_pixel_ratio),
+            visual_scale: self.visual_viewport_scale,
+            visual_offset_left: self.visual_viewport_offset_left,
+            visual_offset_top: self.visual_viewport_offset_top,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -197,12 +238,11 @@ struct RawSnapshot {
     cards_walked: Option<usize>,
 }
 
-pub fn css_rect_to_physical(metrics: &ChromeMetrics, rect: &CssRect) -> Option<Rect> {
+/// Fixture/diagnostic **listing** origin using the legacy `outer-inner` formula.
+/// Production-reachable only through `HANDS_CHROME_SNAPSHOT`; never called by a click.
+fn fixture_listing_origin(metrics: &ChromeMetrics) -> Option<(f64, f64)> {
     let dpr = metrics.device_pixel_ratio;
     if !dpr.is_finite() || dpr <= 0.0 {
-        return None;
-    }
-    if !rect.width.is_finite() || !rect.height.is_finite() {
         return None;
     }
     if !metrics.screen_x.is_finite()
@@ -216,36 +256,312 @@ pub fn css_rect_to_physical(metrics: &ChromeMetrics, rect: &CssRect) -> Option<R
     }
     let chrome_ui_y = (metrics.outer_height - metrics.inner_height).max(0.0);
     let chrome_ui_x = (metrics.outer_width - metrics.inner_width).max(0.0) / 2.0;
-    let css_x = metrics.screen_x + chrome_ui_x + rect.left;
-    let css_y = metrics.screen_y + chrome_ui_y + rect.top;
-    let x = round_i32(css_x * dpr)?;
-    let y = round_i32(css_y * dpr)?;
-    let w = round_i32(rect.width * dpr)?;
-    let h = round_i32(rect.height * dpr)?;
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    Some(Rect { x, y, w, h })
+    Some((
+        (metrics.screen_x + chrome_ui_x) * dpr,
+        (metrics.screen_y + chrome_ui_y) * dpr,
+    ))
 }
 
-fn round_i32(v: f64) -> Option<i32> {
-    if !v.is_finite() {
-        return None;
-    }
-    let r = v.round();
-    if r < f64::from(i32::MIN) || r > f64::from(i32::MAX) {
-        return None;
-    }
-    Some(r as i32)
+fn make_observe_id(raw: &RawSnapshot, hwnd: Option<isize>, element_count: usize) -> String {
+    let m = &raw.metrics;
+    let opt = |v: Option<f64>| v.map(|x| x.to_string()).unwrap_or_else(|| "none".into());
+    let parts = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        raw.url.as_deref().unwrap_or(""),
+        raw.title.as_deref().unwrap_or(""),
+        m.inner_width,
+        m.inner_height,
+        m.device_pixel_ratio,
+        opt(m.client_width),
+        opt(m.client_height),
+        hwnd.map(|h| h.to_string()).unwrap_or_default(),
+        next_generation(),
+        element_count,
+    );
+    observe_id(&parts)
 }
 
-pub fn try_snapshot(detail: Detail) -> SnapshotOutcome {
+/// A focused Chrome-owned window that is not the resolved Chrome window (for example an owned
+/// popup) is a `window_mismatch`; never re-root the click behind it.
+fn focused_chrome_popup_owns_foreground(target: isize) -> bool {
+    match foreground::foreground_hwnd() {
+        Some(fg) if fg != target => foreground::target_is_chrome(Some(fg)),
+        _ => false,
+    }
+}
+
+/// A focused non-Chrome window that is not the resolved Chrome window is also a `window_mismatch`:
+/// the click would otherwise land on that foreign window if `offer` cannot raise Chrome.
+fn focused_non_chrome_foreground(target: isize) -> bool {
+    match foreground::foreground_hwnd() {
+        Some(fg) if fg != target => !foreground::target_is_chrome(Some(fg)),
+        _ => false,
+    }
+}
+
+fn observe_identity(title: Option<&str>, hwnd: Option<isize>) -> crate::point::WindowIdentity {
+    let Some(hwnd) = hwnd else {
+        return crate::point::WindowIdentity::Mismatch;
+    };
+    if !foreground::target_is_chrome(Some(hwnd)) || focused_chrome_popup_owns_foreground(hwnd) {
+        return crate::point::WindowIdentity::Mismatch;
+    }
+    let caption = foreground::title(Some(hwnd));
+    let count = foreground::visible_chrome_window_count();
+    identity_from(title.unwrap_or(""), Some(&caption), count)
+}
+
+#[cfg(test)]
+type GeometryHook = fn(&ChromeMetrics, Option<&str>, isize) -> MapInputs;
+
+#[cfg(test)]
+thread_local! {
+    static GEOMETRY_HOOK: std::cell::RefCell<Option<GeometryHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_geometry_hook(hook: Option<GeometryHook>) {
+    GEOMETRY_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+type RemapGeometryHook = fn(PageMetrics, isize) -> MapInputs;
+
+#[cfg(test)]
+thread_local! {
+    static REMAP_HOOK: std::cell::RefCell<Option<RemapGeometryHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_remap_geometry_hook(hook: Option<RemapGeometryHook>) {
+    REMAP_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
+/// Test seam for the live window identity read used by [`remap_chr`] (caption, visible Chrome
+/// window count, chrome-ness). Returns `(caption, count, is_chrome)`.
+#[cfg(test)]
+type RemapIdentityHook = fn(isize) -> (Option<String>, usize, bool);
+
+#[cfg(test)]
+thread_local! {
+    static REMAP_IDENTITY_HOOK: std::cell::RefCell<Option<RemapIdentityHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_remap_identity_hook(hook: Option<RemapIdentityHook>) {
+    REMAP_IDENTITY_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESOLVE_STUB: std::cell::RefCell<Option<ChromeHit>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_resolve_stub(hit: Option<ChromeHit>) {
+    RESOLVE_STUB.with(|c| *c.borrow_mut() = hit);
+}
+
+fn live_inputs_from_page(
+    page: PageMetrics,
+    title: Option<&str>,
+    hwnd: isize,
+    observe_id: Option<String>,
+    identity: crate::point::WindowIdentity,
+) -> MapInputs {
+    let chrome = foreground::is_chrome_hwnd(hwnd);
+    let render_widgets = if chrome {
+        foreground::render_widget_host_rects(hwnd)
+    } else {
+        Vec::new()
+    };
+    let uia_document = if chrome && !crate::point::any_anchor_matches(&render_widgets, &page) {
+        crate::uia::document_rect(hwnd, std::time::Duration::from_millis(500))
+    } else {
+        None
+    };
+    MapInputs {
+        hwnd: Some(hwnd),
+        window_rect: foreground::window_rect(hwnd),
+        dpi: foreground::dpi_for_window(hwnd),
+        virtual_screen: crate::space::virtual_screen().ok().map(|s| s.as_rect()),
+        page,
+        render_widgets,
+        uia_document,
+        monitors: crate::space::monitor_dpis(),
+        observe_id,
+        page_title: title.map(str::to_string),
+        fixture: false,
+        identity,
+        fixture_origin: None,
+    }
+}
+
+fn live_map_inputs(
+    metrics: &ChromeMetrics,
+    title: Option<&str>,
+    hwnd: isize,
+    observe_id: Option<String>,
+) -> MapInputs {
+    let identity = observe_identity(title, Some(hwnd));
+    live_inputs_from_page(metrics.page(), title, hwnd, observe_id, identity)
+}
+
+fn build_live_map(
+    metrics: &ChromeMetrics,
+    title: Option<&str>,
+    hwnd: isize,
+    observe_id: Option<String>,
+) -> ViewportMap {
+    #[cfg(test)]
+    {
+        if let Some(hook) = GEOMETRY_HOOK.with(|c| *c.borrow()) {
+            return build_map(hook(metrics, title, hwnd));
+        }
+    }
+    build_map(live_map_inputs(metrics, title, hwnd, observe_id))
+}
+
+fn fixture_map(raw: &RawSnapshot, hwnd: Option<isize>, obs: String) -> ViewportMap {
+    build_map(MapInputs {
+        hwnd,
+        page: raw.metrics.page(),
+        page_title: raw.title.clone(),
+        fixture: true,
+        fixture_origin: fixture_listing_origin(&raw.metrics),
+        observe_id: Some(obs),
+        ..MapInputs::default()
+    })
+}
+
+fn no_hwnd_map(raw: &RawSnapshot, obs: String) -> ViewportMap {
+    let dpr = raw
+        .metrics
+        .device_pixel_ratio
+        .is_finite()
+        .then_some(raw.metrics.device_pixel_ratio)
+        .filter(|d| *d > 0.0);
+    ViewportMap {
+        hwnd: None,
+        origin: None,
+        scale: dpr.unwrap_or(1.0),
+        page: raw.metrics.page(),
+        page_title: raw.title.clone(),
+        anchor: None,
+        anchor_basis: None,
+        layout_basis: None,
+        report: TransformReport {
+            reason: Some("no_hwnd: chr: resolve has no Chrome HWND to anchor".into()),
+            observe_id: Some(obs),
+            dpr,
+            ..TransformReport::invalid("no_hwnd", None)
+        },
+    }
+}
+
+fn map_for_raw(raw: &RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: String) -> ViewportMap {
+    if fixture {
+        return fixture_map(raw, hwnd, obs);
+    }
+    match hwnd {
+        Some(h) => build_live_map(&raw.metrics, raw.title.as_deref(), h, Some(obs)),
+        None => no_hwnd_map(raw, obs),
+    }
+}
+
+fn remap_inputs(
+    old: &ViewportMap,
+    hwnd: isize,
+    identity: crate::point::WindowIdentity,
+) -> MapInputs {
+    #[cfg(test)]
+    {
+        if let Some(hook) = REMAP_HOOK.with(|c| *c.borrow()) {
+            let mut inputs = hook(old.page, hwnd);
+            inputs.page = old.page;
+            inputs.page_title = old.page_title.clone();
+            inputs.identity = identity;
+            return inputs;
+        }
+    }
+    let mut inputs = live_inputs_from_page(
+        old.page,
+        old.page_title.as_deref(),
+        hwnd,
+        old.report.observe_id.clone(),
+        identity,
+    );
+    inputs.page = old.page;
+    inputs.page_title = old.page_title.clone();
+    inputs
+}
+
+/// Testable remap core. `caption` is the OS window caption; `old.page_title` is the recorded
+/// page title from the snapshot/resolve reply. Identity is evaluated with the recorded title,
+/// never by substituting the caption for the page title.
+fn remap_chr_with(
+    old: &ViewportMap,
+    hwnd: isize,
+    caption: Option<&str>,
+    chrome_window_count: usize,
+    is_chrome: bool,
+) -> Result<ViewportMap, String> {
+    let identity = if is_chrome {
+        identity_from(
+            old.page_title.as_deref().unwrap_or(""),
+            caption,
+            chrome_window_count,
+        )
+    } else {
+        crate::point::WindowIdentity::Mismatch
+    };
+    let live = remap_inputs(old, hwnd, identity);
+    remap(old, live)
+}
+
+/// Remap a valid `chr:` contract at the final guard. Live geometry only; the recorded page
+/// metrics are re-used (no second page-metrics read). Page zoom between resolve and dispatch
+/// is not detectable here.
+pub fn remap_chr(old: &ViewportMap, hwnd: isize) -> Result<ViewportMap, String> {
+    if old.page.dpr.is_none() {
+        return Err("stale_viewport: recorded page metrics have no dpr".into());
+    }
+    let (caption, count, is_chrome) = remap_identity(hwnd);
+    remap_chr_with(old, hwnd, caption.as_deref(), count, is_chrome)
+}
+
+fn remap_identity(hwnd: isize) -> (Option<String>, usize, bool) {
+    #[cfg(test)]
+    {
+        if let Some(hook) = REMAP_IDENTITY_HOOK.with(|c| *c.borrow()) {
+            return hook(hwnd);
+        }
+    }
+    let is_chrome = foreground::target_is_chrome(Some(hwnd))
+        && !focused_chrome_popup_owns_foreground(hwnd)
+        && !focused_non_chrome_foreground(hwnd);
+    if is_chrome {
+        (
+            Some(foreground::title(Some(hwnd))),
+            foreground::visible_chrome_window_count(),
+            true,
+        )
+    } else {
+        (None, 0, false)
+    }
+}
+
+pub fn try_snapshot(detail: Detail, hwnd: Option<isize>) -> SnapshotOutcome {
     match snapshot_env() {
-        Some(path) => match load_fixture(&path) {
+        Some(path) => match load_fixture(&path, hwnd) {
             Ok(map) => SnapshotOutcome::Map(Box::new(map)),
             Err(_) => SnapshotOutcome::HostDown,
         },
-        None => match pipe_snapshot(detail) {
+        None => match pipe_snapshot(detail, hwnd) {
             Ok(map) => SnapshotOutcome::Map(Box::new(map)),
             Err(err) => classify_snapshot_err(&err),
         },
@@ -267,21 +583,64 @@ pub fn classify_snapshot_err(err: &HandsError) -> SnapshotOutcome {
     SnapshotOutcome::HostDown
 }
 
-pub fn try_resolve(id: &str) -> Result<ChromeHit, HandsError> {
-    let map = match snapshot_env() {
-        Some(path) => load_fixture(&path)?,
-        None => pipe_resolve(id)?,
+pub fn try_resolve(id: &str, hwnd: Option<isize>) -> Result<ChromeHit, HandsError> {
+    #[cfg(test)]
+    {
+        if let Some(hit) = RESOLVE_STUB.with(|c| c.borrow().clone()) {
+            return Ok(hit);
+        }
+    }
+    let fixture = snapshot_env().is_some();
+    let raw = match snapshot_env() {
+        Some(path) => load_fixture_raw(&path)?,
+        None => pipe_resolve_raw(id)?,
     };
-    let el = map.elements.iter().find(|e| e.id == id).ok_or_else(|| {
-        HandsError::Chrome(format!(
-            "Chrome element {id} not found in host/fixture snapshot"
-        ))
-    })?;
+    hit_from_raw(raw, id, hwnd, fixture)
+}
+
+fn hit_from_raw(
+    raw: RawSnapshot,
+    id: &str,
+    hwnd: Option<isize>,
+    fixture: bool,
+) -> Result<ChromeHit, HandsError> {
+    let index = raw
+        .elements
+        .iter()
+        .position(|n| {
+            n.id.as_deref()
+                .and_then(canonical_chr)
+                .is_some_and(|cid| cid == id)
+        })
+        .ok_or_else(|| {
+            HandsError::Chrome(format!(
+                "Chrome element {id} not found in host/fixture snapshot"
+            ))
+        })?;
+    let node = raw.elements[index].clone();
+    let obs = make_observe_id(&raw, hwnd, raw.elements.len());
+    let map = map_for_raw(&raw, hwnd, fixture, obs);
+    let contract = contract_for(&map, node.rect_css.center());
+    let rect = crate::point::map_rect(&contract, node.rect_css).unwrap_or(Rect {
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+    });
     Ok(ChromeHit {
-        id: el.id.clone(),
-        name: el.text.clone().unwrap_or_default(),
-        role: el.role.clone(),
-        rect: el.rect,
+        id: node
+            .id
+            .as_deref()
+            .and_then(canonical_chr)
+            .unwrap_or_else(|| id.to_string()),
+        name: node.text.unwrap_or_default(),
+        role: node.role.unwrap_or_else(|| "Other".into()),
+        rect,
+        css_rect: node.rect_css,
+        css_point: node.rect_css.center(),
+        contract,
+        hwnd,
+        map: Some(map),
     })
 }
 
@@ -292,29 +651,49 @@ fn snapshot_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn load_fixture(path: &str) -> Result<ChromeMap, HandsError> {
+fn load_fixture(path: &str, hwnd: Option<isize>) -> Result<ChromeMap, HandsError> {
     let bytes = fs::read(path).map_err(|_| {
         HandsError::Chrome(format!(
             "Chrome snapshot fixture is missing or unreadable ({path}); cannot resolve chr: (host/fixture)"
         ))
     })?;
-    parse_snapshot_bytes(&bytes).map_err(|_| {
+    parse_snapshot_bytes(&bytes, hwnd).map_err(|_| {
         HandsError::Chrome(format!(
             "Chrome snapshot fixture is invalid ({path}); cannot resolve chr: (host/fixture)"
         ))
     })
 }
 
-fn parse_snapshot_bytes(bytes: &[u8]) -> Result<ChromeMap, HandsError> {
-    let raw: RawSnapshot = serde_json::from_slice(bytes)
-        .map_err(|err| HandsError::Chrome(format!("Chrome snapshot JSON: {err}")))?;
-    Ok(map_from_raw(raw))
+fn load_fixture_raw(path: &str) -> Result<RawSnapshot, HandsError> {
+    let bytes = fs::read(path).map_err(|_| {
+        HandsError::Chrome(format!(
+            "Chrome snapshot fixture is missing or unreadable ({path}); cannot resolve chr: (host/fixture)"
+        ))
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| HandsError::Chrome(format!("Chrome snapshot fixture JSON: {err}")))
 }
 
-fn map_from_raw(raw: RawSnapshot) -> ChromeMap {
+fn parse_snapshot_bytes(bytes: &[u8], hwnd: Option<isize>) -> Result<ChromeMap, HandsError> {
+    let raw: RawSnapshot = serde_json::from_slice(bytes)
+        .map_err(|err| HandsError::Chrome(format!("Chrome snapshot JSON: {err}")))?;
+    let obs = make_observe_id(&raw, hwnd, raw.elements.len());
+    Ok(map_from_raw(raw, hwnd, true, obs))
+}
+
+/// Test-only bridge so `observe` tests can drive the production live-map path from a raw JSON
+/// snapshot without exposing `RawSnapshot`.
+#[cfg(test)]
+pub(crate) fn map_from_raw_json(raw_json: &str, hwnd: Option<isize>, obs: String) -> ChromeMap {
+    let raw: RawSnapshot = serde_json::from_str(raw_json).expect("raw snapshot JSON");
+    map_from_raw(raw, hwnd, false, obs)
+}
+
+fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: String) -> ChromeMap {
+    let map = map_for_raw(&raw, hwnd, fixture, obs);
     let mut elements = Vec::new();
     for (i, node) in raw.elements.into_iter().enumerate() {
-        let Some(rect) = css_rect_to_physical(&raw.metrics, &node.rect_css) else {
+        let Some(rect) = map_rect_unbounded(&map, node.rect_css) else {
             continue;
         };
         let id = node
@@ -341,7 +720,7 @@ fn map_from_raw(raw: RawSnapshot) -> ChromeMap {
         if !href_ok(&card.href) {
             continue;
         }
-        let Some(rect) = css_rect_to_physical(&raw.metrics, &card.rect_css) else {
+        let Some(rect) = map_rect_unbounded(&map, card.rect_css) else {
             continue;
         };
         let mut mapped = Card {
@@ -396,6 +775,7 @@ fn map_from_raw(raw: RawSnapshot) -> ChromeMap {
             cards_walked,
         },
         cards_walked,
+        transform: Some(map.report.clone()),
     }
 }
 
@@ -436,18 +816,18 @@ pub fn resolve_request(id: &str, detail: Detail) -> serde_json::Value {
     req
 }
 
-fn pipe_snapshot(detail: Detail) -> Result<ChromeMap, HandsError> {
+fn pipe_snapshot(detail: Detail, hwnd: Option<isize>) -> Result<ChromeMap, HandsError> {
     let mut req = serde_json::json!({"op": "snapshot"});
     if detail == Detail::Dom {
         req["detail"] = serde_json::Value::String("dom".into());
     }
     let reply = pipe_request(&req)?;
-    let map = parse_host_reply(&reply)?;
+    let map = parse_host_reply(&reply, hwnd)?;
     store_last_pipe_detail(detail);
     Ok(map)
 }
 
-fn pipe_resolve(id: &str) -> Result<ChromeMap, HandsError> {
+fn pipe_resolve_raw(id: &str) -> Result<RawSnapshot, HandsError> {
     let req = resolve_request(id, last_pipe_detail());
     let reply = pipe_request(&req).map_err(|err| {
         HandsError::Chrome(format!(
@@ -470,9 +850,15 @@ fn pipe_resolve(id: &str) -> Result<ChromeMap, HandsError> {
                 HandsError::Chrome(format!("Chrome resolve {id} missing metrics"))
             })?)
             .map_err(|err| HandsError::Chrome(format!("Chrome resolve metrics: {err}")))?;
-        return Ok(map_from_raw(RawSnapshot {
-            url: None,
-            title: None,
+        return Ok(RawSnapshot {
+            url: reply
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            title: reply
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             main_text: None,
             elements: vec![raw],
             cards: Vec::new(),
@@ -483,12 +869,17 @@ fn pipe_resolve(id: &str) -> Result<ChromeMap, HandsError> {
             zip: None,
             radius: None,
             cards_walked: None,
-        }));
+        });
     }
-    parse_host_reply(&reply)
+    let parsed: RawSnapshot = serde_json::from_value(reply.clone())
+        .map_err(|err| HandsError::Chrome(format!("Chrome resolve payload for {id}: {err}")))?;
+    Ok(parsed)
 }
 
-fn parse_host_reply(reply: &serde_json::Value) -> Result<ChromeMap, HandsError> {
+fn parse_host_reply(
+    reply: &serde_json::Value,
+    hwnd: Option<isize>,
+) -> Result<ChromeMap, HandsError> {
     if reply.get("error").is_some() && reply.get("elements").is_none() {
         return Err(HandsError::Chrome(format!(
             "Chrome host error: {}",
@@ -497,7 +888,8 @@ fn parse_host_reply(reply: &serde_json::Value) -> Result<ChromeMap, HandsError> 
     }
     let raw: RawSnapshot = serde_json::from_value(reply.clone())
         .map_err(|err| HandsError::Chrome(format!("Chrome snapshot payload: {err}")))?;
-    Ok(map_from_raw(raw))
+    let obs = make_observe_id(&raw, hwnd, raw.elements.len());
+    Ok(map_from_raw(raw, hwnd, false, obs))
 }
 
 fn pipe_request(req: &serde_json::Value) -> Result<serde_json::Value, HandsError> {
@@ -600,11 +992,10 @@ mod tests {
         ChromeMetrics {
             screen_x: 100.0,
             screen_y: 50.0,
-            outer_width: 1280.0,
-            outer_height: 800.0,
             inner_width: 1280.0,
             inner_height: 720.0,
             device_pixel_ratio: 1.0,
+            ..ChromeMetrics::default()
         }
     }
 
@@ -617,19 +1008,150 @@ mod tests {
         }
     }
 
+    fn fixture_inputs(metrics: &ChromeMetrics, anchor: Rect) -> MapInputs {
+        MapInputs {
+            hwnd: Some(0x1234),
+            window_rect: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            dpi: Some((96.0 * metrics.device_pixel_ratio).round() as u32),
+            virtual_screen: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            page: metrics.page(),
+            render_widgets: vec![anchor],
+            uia_document: None,
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: None,
+            fixture: false,
+            identity: crate::point::WindowIdentity::Confirmed,
+            fixture_origin: None,
+        }
+    }
+
+    fn valid_map(metrics: &ChromeMetrics, anchor: Rect) -> ViewportMap {
+        build_map(fixture_inputs(metrics, anchor))
+    }
+
     #[test]
-    fn geometry_dpr1_toolbar_80() {
-        let rect = css_rect_to_physical(&fixture_metrics(), &fixture_rect()).unwrap();
+    fn geometry_viewport_host_1_25() {
+        // Synthetic render-widget anchor (100,80,1500,1125) at dpr 1.25.
+        let metrics = ChromeMetrics {
+            inner_width: 1200.0,
+            inner_height: 900.0,
+            client_width: Some(1185.0),
+            client_height: Some(900.0),
+            device_pixel_ratio: 1.25,
+            ..ChromeMetrics::default()
+        };
+        let map = valid_map(
+            &metrics,
+            Rect {
+                x: 100,
+                y: 80,
+                w: 1500,
+                h: 1125,
+            },
+        );
+        assert!(map.report.valid, "{:?}", map.report.reason);
+        let contract = contract_for(&map, CssPoint::new(200.0, 70.0));
+        assert_eq!(
+            contract.physical,
+            Some(crate::point::PhysicalPoint { x: 350, y: 168 })
+        );
+        let rect = crate::point::map_rect(
+            &contract,
+            CssRect {
+                left: 100.0,
+                top: 50.0,
+                width: 200.0,
+                height: 40.0,
+            },
+        )
+        .unwrap();
         assert_eq!(
             rect,
             Rect {
-                x: 110,
-                y: 150,
-                w: 200,
-                h: 32
+                x: 225,
+                y: 143,
+                w: 250,
+                h: 50
             }
         );
-        assert_eq!(rect.center(), (210, 166));
+        assert_eq!(rect.center(), (350, 168));
+    }
+
+    #[test]
+    fn geometry_viewport_negative_origin() {
+        let metrics = ChromeMetrics {
+            inner_width: 1200.0,
+            inner_height: 900.0,
+            device_pixel_ratio: 1.0,
+            ..ChromeMetrics::default()
+        };
+        let map = valid_map(
+            &metrics,
+            Rect {
+                x: -1920,
+                y: -200,
+                w: 1200,
+                h: 900,
+            },
+        );
+        assert!(map.report.valid, "{:?}", map.report.reason);
+        let contract = contract_for(&map, CssPoint::new(0.0, 0.0));
+        assert_eq!(
+            contract.physical,
+            Some(crate::point::PhysicalPoint { x: -1920, y: -200 })
+        );
+    }
+
+    #[test]
+    fn geometry_skips_unknown_anchor() {
+        let metrics = ChromeMetrics {
+            inner_width: 1200.0,
+            inner_height: 900.0,
+            device_pixel_ratio: 1.0,
+            ..ChromeMetrics::default()
+        };
+        let mut inputs = fixture_inputs(
+            &metrics,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1200,
+                h: 900,
+            },
+        );
+        inputs.render_widgets = Vec::new();
+        inputs.uia_document = None;
+        let map = build_map(inputs);
+        assert!(!map.report.valid);
+        assert!(map.report.reason.unwrap().starts_with("no_viewport_anchor"));
+    }
+
+    #[test]
+    fn metrics_new_fields_optional() {
+        let old: ChromeMetrics = serde_json::from_str(
+            r#"{"screenX":0,"screenY":0,"outerWidth":1280,"outerHeight":800,"innerWidth":1280,"innerHeight":720,"devicePixelRatio":1.0}"#,
+        )
+        .expect("old seven fields");
+        assert!(old.client_width.is_none());
+        assert!(old.visual_viewport_scale.is_none());
+        let new: ChromeMetrics = serde_json::from_str(
+            r#"{"screenX":0,"screenY":0,"outerWidth":1280,"outerHeight":800,"innerWidth":1280,"innerHeight":720,"devicePixelRatio":1.25,"clientWidth":1265,"clientHeight":720,"visualViewportWidth":1265,"visualViewportHeight":720,"visualViewportScale":1,"visualViewportOffsetLeft":0,"visualViewportOffsetTop":0,"screenAvailLeft":0,"screenAvailTop":0,"screenWidth":1920,"screenHeight":1080}"#,
+        )
+        .expect("new fields");
+        assert_eq!(new.client_width, Some(1265.0));
+        assert_eq!(new.screen_width, Some(1920.0));
+        assert_eq!(new.device_pixel_ratio, 1.25);
     }
 
     #[test]
@@ -652,10 +1174,52 @@ mod tests {
     }
 
     #[test]
-    fn geometry_dpr_1_25() {
-        let mut metrics = fixture_metrics();
-        metrics.device_pixel_ratio = 1.25;
-        let rect = css_rect_to_physical(&metrics, &fixture_rect()).unwrap();
+    fn fixture_mode_is_listing_only() {
+        let g = EnvGuard::lock();
+        g.set_snapshot(Some(&EnvGuard::fixture_path()));
+        g.set_pipe(None);
+        let map = try_snapshot(Detail::Default, None)
+            .into_map()
+            .expect("fixture");
+        let transform = map.transform.expect("fixture transform block");
+        assert!(!transform.valid);
+        assert_eq!(transform.method, crate::point::TransformMethod::Fixture);
+        assert_eq!(transform.reason.as_deref(), Some("fixture_snapshot"));
+        // Element/card rects still list through the unbounded diagnostic map.
+        assert!(!map.elements.is_empty());
+    }
+
+    #[test]
+    fn fixture_geometry_dpr_1_25_still_lists() {
+        let metrics: ChromeMetrics = serde_json::from_value(serde_json::json!({
+            "screenX": 100.0,
+            "screenY": 50.0,
+            "outerWidth": 1280.0,
+            "outerHeight": 800.0,
+            "innerWidth": 1280.0,
+            "innerHeight": 720.0,
+            "devicePixelRatio": 1.25
+        }))
+        .expect("fixture metrics");
+        let map = fixture_map(
+            &RawSnapshot {
+                url: None,
+                title: None,
+                main_text: None,
+                elements: Vec::new(),
+                cards: Vec::new(),
+                metrics,
+                result_count: None,
+                local_matches: None,
+                empty_state: None,
+                zip: None,
+                radius: None,
+                cards_walked: None,
+            },
+            None,
+            "f3a9c1d2e4b5a607".into(),
+        );
+        let rect = map_rect_unbounded(&map, fixture_rect()).unwrap();
         assert_eq!(
             rect,
             Rect {
@@ -671,12 +1235,20 @@ mod tests {
     fn geometry_skips_bad_dpr_and_zero_size() {
         let mut metrics = fixture_metrics();
         metrics.device_pixel_ratio = 0.0;
-        assert!(css_rect_to_physical(&metrics, &fixture_rect()).is_none());
+        let mut inputs = fixture_inputs(
+            &metrics,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1280,
+                h: 720,
+            },
+        );
+        let map = build_map(inputs.clone());
+        assert!(!map.report.valid);
         metrics.device_pixel_ratio = f64::NAN;
-        assert!(css_rect_to_physical(&metrics, &fixture_rect()).is_none());
-        let mut rect = fixture_rect();
-        rect.width = 0.0;
-        assert!(css_rect_to_physical(&fixture_metrics(), &rect).is_none());
+        inputs.page = metrics.page();
+        assert!(!build_map(inputs).report.valid);
     }
 
     #[test]
@@ -684,7 +1256,9 @@ mod tests {
         let g = EnvGuard::lock();
         g.set_snapshot(Some(&EnvGuard::fixture_path()));
         g.set_pipe(None);
-        let map = try_snapshot(Detail::Default).into_map().expect("fixture");
+        let map = try_snapshot(Detail::Default, None)
+            .into_map()
+            .expect("fixture");
         assert_eq!(map.url.as_deref(), Some("https://cars.com/search"));
         assert_eq!(map.title, "Cars.com");
         assert_eq!(map.elements[0].id, "chr:0");
@@ -716,14 +1290,14 @@ mod tests {
             r"C:\dev\Helping-Hands\hands\tests\fixtures\missing-chrome.json",
         )));
         assert!(matches!(
-            try_snapshot(Detail::Default),
+            try_snapshot(Detail::Default, None),
             SnapshotOutcome::HostDown
         ));
         let bad = std::env::temp_dir().join("hands-chrome-bad.json");
         fs::write(&bad, "{not json").unwrap();
         g.set_snapshot(Some(&bad));
         assert!(matches!(
-            try_snapshot(Detail::Default),
+            try_snapshot(Detail::Default, None),
             SnapshotOutcome::HostDown
         ));
         let _ = fs::remove_file(bad);
@@ -743,7 +1317,7 @@ mod tests {
         let json = format!(
             r#"{{"url":"https://cars.com/search","title":"T","main_text":"x","metrics":{{"screenX":0,"screenY":0,"outerWidth":100,"outerHeight":100,"innerWidth":100,"innerHeight":100,"devicePixelRatio":1}},"elements":[],"cards":[{cards}]}}"#
         );
-        let map = parse_snapshot_bytes(json.as_bytes()).expect("parse");
+        let map = parse_snapshot_bytes(json.as_bytes(), None).expect("parse");
         assert_eq!(map.cards.len(), 8);
         assert!(
             map.cards
@@ -775,7 +1349,7 @@ mod tests {
             "elements":[],
             "cards":[]
         }"#;
-        let map = parse_snapshot_bytes(json.as_bytes()).expect("parse");
+        let map = parse_snapshot_bytes(json.as_bytes(), None).expect("parse");
         assert!(map.cards.is_empty());
         let extract = crate::extract::extract_fused(
             "UIA",
@@ -806,7 +1380,7 @@ mod tests {
             "elements":[],
             "cards":[]
         }"#;
-        let map_js = parse_snapshot_bytes(json_js.as_bytes()).expect("parse");
+        let map_js = parse_snapshot_bytes(json_js.as_bytes(), None).expect("parse");
         let extract_js = crate::extract::extract_fused(
             "UIA",
             &[],
@@ -845,8 +1419,18 @@ mod tests {
     fn fixture_resolve_chr0_center() {
         let g = EnvGuard::lock();
         g.set_snapshot(Some(&EnvGuard::fixture_path()));
-        let hit = try_resolve("chr:0").unwrap();
-        assert_eq!(hit.rect.center(), (210, 166));
+        let hit = try_resolve("chr:0", None).unwrap();
+        // Fixture mode is listing-only: the CSS rect lists, but the contract refuses.
+        assert_eq!(
+            hit.css_rect.center(),
+            crate::point::CssPoint::new(110.0, 36.0)
+        );
+        assert!(!hit.contract.transform.valid);
+        assert_eq!(
+            hit.contract.transform.reason.as_deref(),
+            Some("fixture_snapshot")
+        );
+        assert!(hit.contract.physical.is_none());
         assert_eq!(hit.role, "Edit");
     }
 
@@ -856,7 +1440,7 @@ mod tests {
         g.set_snapshot(Some(std::path::Path::new(
             r"C:\dev\Helping-Hands\hands\tests\fixtures\missing-chrome.json",
         )));
-        let err = try_resolve("chr:0").unwrap_err();
+        let err = try_resolve("chr:0", None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("chr:"), "{msg}");
         assert!(msg.contains("fixture") || msg.contains("host"), "{msg}");
@@ -872,7 +1456,7 @@ mod tests {
         let bad = std::env::temp_dir().join("hands-chrome-malformed.json");
         fs::write(&bad, "{\"url\":1}").unwrap();
         g.set_snapshot(Some(&bad));
-        let err = try_resolve("chr:0").unwrap_err();
+        let err = try_resolve("chr:0", None).unwrap_err();
         let msg = err.to_string();
         let _ = fs::remove_file(bad);
         assert!(msg.contains("chr:") || msg.contains("fixture"), "{msg}");
@@ -935,7 +1519,7 @@ mod tests {
         g.set_snapshot(None);
         g.set_pipe(Some(&name));
         let started = Instant::now();
-        let err = try_resolve("chr:0").unwrap_err();
+        let err = try_resolve("chr:0", None).unwrap_err();
         let elapsed = started.elapsed();
         drop(g);
         let _ = done_tx.send(());
@@ -965,7 +1549,7 @@ mod tests {
         let g = EnvGuard::lock();
         g.set_snapshot(None);
         g.set_pipe(Some(r"\\.\pipe\hands-chrome-absent-0005-test"));
-        let err = try_resolve("chr:0").unwrap_err();
+        let err = try_resolve("chr:0", None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("chr:") || msg.contains("host"), "{msg}");
         assert!(
@@ -1141,7 +1725,7 @@ mod tests {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/chrome-spa-autocomplete.json");
         let bytes = fs::read(&path).expect("spa autocomplete fixture");
-        let map = parse_snapshot_bytes(&bytes).expect("parse spa autocomplete");
+        let map = parse_snapshot_bytes(&bytes, None).expect("parse spa autocomplete");
         let options: Vec<_> = map
             .elements
             .iter()
@@ -1171,7 +1755,7 @@ mod tests {
     #[test]
     fn mixed_srp_packs_five_locals_and_walked_thirteen() {
         let bytes = fs::read(mixed_fixture_path()).expect("mixed fixture");
-        let map = parse_snapshot_bytes(&bytes).expect("parse mixed");
+        let map = parse_snapshot_bytes(&bytes, None).expect("parse mixed");
         assert_eq!(map.cards.len(), 8);
         assert_eq!(map.cards_walked, 13);
         assert_eq!(map.listing.cards_walked, 13);
@@ -1252,7 +1836,7 @@ mod tests {
                 .unwrap()
                 .contains("\"kind\": \"recommended\"")
         );
-        let civic = parse_snapshot_bytes(&fs::read(EnvGuard::fixture_path()).expect("civic"))
+        let civic = parse_snapshot_bytes(&fs::read(EnvGuard::fixture_path()).expect("civic"), None)
             .expect("civic");
         assert_eq!(civic.cards.len(), 1);
         assert_eq!(civic.cards[0].title, "2020 Honda Civic");
@@ -1270,7 +1854,7 @@ mod tests {
                 {"title":"inferred local","price":"$19,999","href":"https://cars.com/l0","rectCss":{"left":1,"top":1,"width":10,"height":10},"distance":"12 mi away"}
             ]
         }"#;
-        let map = parse_snapshot_bytes(json.as_bytes()).expect("parse");
+        let map = parse_snapshot_bytes(json.as_bytes(), None).expect("parse");
         assert_eq!(map.cards.len(), 3);
         assert_eq!(map.cards[0].title, "inferred local");
         assert_eq!(map.cards[0].kind.as_deref(), Some("local"));
@@ -1285,7 +1869,7 @@ mod tests {
             "elements":[],
             "cards":[{"title":"civic","price":"$12,345","href":"https://cars.com/c","rectCss":{"left":1,"top":1,"width":10,"height":10}}]
         }"#;
-        let map = parse_snapshot_bytes(json.as_bytes()).expect("parse");
+        let map = parse_snapshot_bytes(json.as_bytes(), None).expect("parse");
         assert_eq!(map.cards.len(), 1);
         assert!(map.cards[0].kind.is_none());
         assert!(map.cards[0].delivery.is_none());
@@ -1401,6 +1985,7 @@ mod tests {
                 cards: Vec::new(),
                 listing: ListingMeta::default(),
                 cards_walked: 0,
+                transform: None,
             }))
             .chrome_hint(),
             None
@@ -1421,5 +2006,365 @@ mod tests {
         assert!(SnapshotOutcome::Timeout.host_up());
         assert!(!SnapshotOutcome::HostDown.host_up());
         assert_eq!(CLIENT_TIMEOUT_MS, 400);
+    }
+
+    fn hook_transform(_: &ChromeMetrics, _: Option<&str>, _: isize) -> MapInputs {
+        let metrics = ChromeMetrics {
+            inner_width: 1200.0,
+            inner_height: 900.0,
+            client_width: Some(1185.0),
+            client_height: Some(900.0),
+            device_pixel_ratio: 1.25,
+            ..ChromeMetrics::default()
+        };
+        valid_inputs(
+            &metrics,
+            Rect {
+                x: 100,
+                y: 80,
+                w: 1500,
+                h: 1125,
+            },
+        )
+    }
+
+    fn valid_inputs(metrics: &ChromeMetrics, anchor: Rect) -> MapInputs {
+        fixture_inputs(metrics, anchor)
+    }
+
+    #[test]
+    fn resolve_chr_keeps_css_and_contract() {
+        set_geometry_hook(Some(hook_transform));
+        let raw = RawSnapshot {
+            url: Some("https://example.com/".into()),
+            title: Some("Example".into()),
+            main_text: None,
+            elements: vec![RawNode {
+                id: Some("chr:0".into()),
+                role: Some("Button".into()),
+                text: Some("Go".into()),
+                rect_css: CssRect {
+                    left: 100.0,
+                    top: 50.0,
+                    width: 200.0,
+                    height: 40.0,
+                },
+                _href: None,
+            }],
+            cards: Vec::new(),
+            metrics: ChromeMetrics {
+                inner_width: 1200.0,
+                inner_height: 900.0,
+                client_width: Some(1185.0),
+                client_height: Some(900.0),
+                device_pixel_ratio: 1.25,
+                ..ChromeMetrics::default()
+            },
+            result_count: None,
+            local_matches: None,
+            empty_state: None,
+            zip: None,
+            radius: None,
+            cards_walked: None,
+        };
+        let hit = hit_from_raw(raw, "chr:0", Some(0x1234), false).expect("resolve");
+        set_geometry_hook(None);
+        assert!(hit.contract.transform.valid);
+        assert_eq!(hit.css_point, CssPoint::new(200.0, 70.0));
+        assert_eq!(hit.css_rect.center(), hit.css_point);
+        assert_eq!(hit.contract.css, Some(hit.css_point));
+        let p = crate::point::map_point(&hit.contract, hit.css_point).unwrap();
+        assert_eq!(hit.contract.physical, Some(p));
+        assert_eq!(hit.rect.center(), (p.x, p.y));
+        assert_eq!(hit.hwnd, Some(0x1234));
+    }
+
+    #[test]
+    fn transform_fixtures_parse_old_and_new_metrics() {
+        let new: RawSnapshot =
+            serde_json::from_str(include_str!("../tests/fixtures/chrome-transform.json"))
+                .expect("new metrics fixture");
+        assert_eq!(new.metrics.client_width, Some(1185.0));
+        assert_eq!(new.metrics.visual_viewport_scale, Some(1.0));
+        let old: RawSnapshot = serde_json::from_str(include_str!(
+            "../tests/fixtures/chrome-transform-old-metrics.json"
+        ))
+        .expect("old metrics fixture");
+        assert!(old.metrics.client_width.is_none());
+        assert_eq!(old.metrics.device_pixel_ratio, 1.25);
+        assert_eq!(old.elements[0].rect_css.width, 200.0);
+    }
+
+    #[test]
+    fn map_from_raw_keeps_off_screen_card() {
+        // C13: ingest is unbounded; an off-screen card still lists.
+        let raw = RawSnapshot {
+            url: None,
+            title: None,
+            main_text: None,
+            elements: Vec::new(),
+            cards: vec![RawCard {
+                title: "Card".into(),
+                price: "$1".into(),
+                href: "https://example.com/card".into(),
+                rect_css: CssRect {
+                    left: 10.0,
+                    top: 11000.0,
+                    width: 100.0,
+                    height: 30.0,
+                },
+                miles: None,
+                dealer: None,
+                distance: None,
+                listing_of: None,
+                kind: String::new(),
+                delivery: String::new(),
+            }],
+            metrics: fixture_metrics(),
+            result_count: None,
+            local_matches: None,
+            empty_state: None,
+            zip: None,
+            radius: None,
+            cards_walked: None,
+        };
+        let map = map_from_raw(raw, None, true, "f3a9c1d2e4b5a607".into());
+        assert_eq!(map.cards.len(), 1);
+        assert!(map.cards[0].rect.y > 10_000);
+    }
+
+    thread_local! {
+        static REMAP_ANCHOR: std::cell::Cell<Rect> =
+            const { std::cell::Cell::new(Rect { x: 100, y: 80, w: 1500, h: 1125 }) };
+        static REMAP_DPI: std::cell::Cell<u32> = const { std::cell::Cell::new(120) };
+    }
+
+    fn remap_hook(page: PageMetrics, hwnd: isize) -> MapInputs {
+        MapInputs {
+            hwnd: Some(hwnd),
+            window_rect: Some(Rect {
+                x: -10,
+                y: -10,
+                w: 4000,
+                h: 3000,
+            }),
+            dpi: Some(REMAP_DPI.with(|c| c.get())),
+            virtual_screen: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            page,
+            render_widgets: vec![REMAP_ANCHOR.with(|c| c.get())],
+            uia_document: None,
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: Some("Owner Web Access".into()),
+            fixture: false,
+            identity: crate::point::WindowIdentity::Confirmed,
+            fixture_origin: None,
+        }
+    }
+
+    fn valid_remap_map() -> ViewportMap {
+        let metrics = ChromeMetrics {
+            inner_width: 1200.0,
+            inner_height: 900.0,
+            device_pixel_ratio: 1.25,
+            ..ChromeMetrics::default()
+        };
+        let mut inputs = fixture_inputs(&metrics, REMAP_ANCHOR.with(|c| c.get()));
+        inputs.dpi = Some(120);
+        inputs.page_title = Some("Owner Web Access".into());
+        let map = build_map(inputs);
+        assert!(map.report.valid, "{:?}", map.report.reason);
+        map
+    }
+
+    #[test]
+    fn resolve_chr_id_must_match_canonical_id() {
+        let raw = RawSnapshot {
+            url: None,
+            title: None,
+            main_text: None,
+            elements: vec![RawNode {
+                id: Some("chr:7".into()),
+                role: Some("Button".into()),
+                text: Some("Go".into()),
+                rect_css: CssRect {
+                    left: 10.0,
+                    top: 10.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                _href: None,
+            }],
+            cards: Vec::new(),
+            metrics: fixture_metrics(),
+            result_count: None,
+            local_matches: None,
+            empty_state: None,
+            zip: None,
+            radius: None,
+            cards_walked: None,
+        };
+        let err = hit_from_raw(raw.clone(), "chr:0", None, true).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        let mut unnamed = raw;
+        unnamed.elements[0].id = None;
+        let err = hit_from_raw(unnamed, "chr:0", None, true).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn remap_chr_uses_recorded_page_title_not_caption() {
+        let old = valid_remap_map();
+        REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 100,
+                y: 80,
+                w: 1500,
+                h: 1125,
+            })
+        });
+        REMAP_DPI.with(|c| c.set(120));
+        set_remap_geometry_hook(Some(remap_hook));
+
+        let ok = remap_chr_with(
+            &old,
+            0x1234,
+            Some("Owner Web Access - Google Chrome"),
+            1,
+            true,
+        )
+        .expect("same recorded page title must remap");
+        assert!(ok.report.valid);
+        assert_eq!(ok.page_title.as_deref(), Some("Owner Web Access"));
+
+        let err =
+            remap_chr_with(&old, 0x1234, Some("Other Page - Google Chrome"), 1, true).unwrap_err();
+        assert!(err.starts_with("window_mismatch"), "{err}");
+
+        let err = remap_chr_with(&old, 0x1234, None, 2, true).unwrap_err();
+        assert!(err.starts_with("window_identity_ambiguous"), "{err}");
+
+        // The pre-fix bug fed the caption in as the page title; that never matches.
+        assert_eq!(
+            identity_from(
+                "Owner Web Access - Google Chrome",
+                Some("Owner Web Access - Google Chrome"),
+                1
+            ),
+            crate::point::WindowIdentity::Mismatch
+        );
+        // The recorded-title path does match the caption.
+        assert_eq!(
+            identity_from(
+                "Owner Web Access",
+                Some("Owner Web Access - Google Chrome"),
+                1
+            ),
+            crate::point::WindowIdentity::Confirmed
+        );
+
+        set_remap_geometry_hook(None);
+    }
+
+    #[test]
+    fn remap_chr_move_only_ok_and_size_or_dpi_change_stale() {
+        let old = valid_remap_map();
+        set_remap_geometry_hook(Some(remap_hook));
+
+        REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1500,
+                h: 1125,
+            })
+        });
+        REMAP_DPI.with(|c| c.set(120));
+        let moved = remap_chr_with(
+            &old,
+            0x1234,
+            Some("Owner Web Access - Google Chrome"),
+            1,
+            true,
+        )
+        .expect("move-only remap");
+        assert_eq!(moved.anchor.map(|r| (r.x, r.y)), Some((300, 200)));
+
+        REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1400,
+                h: 1125,
+            })
+        });
+        let err = remap_chr_with(
+            &old,
+            0x1234,
+            Some("Owner Web Access - Google Chrome"),
+            1,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("stale_viewport"), "{err}");
+
+        REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1500,
+                h: 1125,
+            })
+        });
+        REMAP_DPI.with(|c| c.set(144));
+        let err = remap_chr_with(
+            &old,
+            0x1234,
+            Some("Owner Web Access - Google Chrome"),
+            1,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("stale_viewport"), "{err}");
+
+        REMAP_DPI.with(|c| c.set(120));
+        set_remap_geometry_hook(None);
+    }
+
+    fn fg_popup() -> Option<isize> {
+        Some(0x5678)
+    }
+
+    fn fg_target() -> Option<isize> {
+        Some(0x1234)
+    }
+
+    fn all_windows_chrome(_: Option<isize>) -> bool {
+        true
+    }
+
+    #[test]
+    fn focused_chrome_popup_is_window_mismatch() {
+        let target = 0x1234;
+        let _ = crate::foreground::take_offer_calls();
+        crate::foreground::set_chrome_target_hook(Some(all_windows_chrome));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_popup));
+        assert!(focused_chrome_popup_owns_foreground(target));
+        assert_eq!(
+            observe_identity(Some("Owner Web Access"), Some(target)),
+            crate::point::WindowIdentity::Mismatch
+        );
+
+        // The resolved window itself is not a popup.
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_target));
+        assert!(!focused_chrome_popup_owns_foreground(target));
+
+        crate::foreground::set_foreground_hwnd_hook(None);
+        crate::foreground::set_chrome_target_hook(None);
     }
 }

@@ -112,6 +112,8 @@ function buildResolve(id, detail) {
     text: payload.text,
     rectCss: payload.rectCss,
     href: payload.href,
+    url: location.href || "",
+    title: document.title || "",
     metrics: metrics,
   };
 }
@@ -403,6 +405,9 @@ function roleName(role) {
 }
 
 function windowMetrics() {
+  const de = document.documentElement;
+  const vv = window.visualViewport;
+  const scr = window.screen;
   return {
     screenX: window.screenX,
     screenY: window.screenY,
@@ -411,6 +416,17 @@ function windowMetrics() {
     innerWidth: window.innerWidth,
     innerHeight: window.innerHeight,
     devicePixelRatio: window.devicePixelRatio,
+    clientWidth: de ? de.clientWidth : null,
+    clientHeight: de ? de.clientHeight : null,
+    visualViewportWidth: vv ? vv.width : null,
+    visualViewportHeight: vv ? vv.height : null,
+    visualViewportScale: vv ? vv.scale : null,
+    visualViewportOffsetLeft: vv ? vv.offsetLeft : null,
+    visualViewportOffsetTop: vv ? vv.offsetTop : null,
+    screenAvailLeft: scr ? scr.availLeft : null,
+    screenAvailTop: scr ? scr.availTop : null,
+    screenWidth: scr ? scr.width : null,
+    screenHeight: scr ? scr.height : null,
   };
 }
 

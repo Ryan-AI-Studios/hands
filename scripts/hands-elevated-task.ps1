@@ -27,6 +27,11 @@ Admin-only directory that receives hands.exe. Default: $env:ProgramFiles\Hands.
 Print the task definition that would be registered (JSON) and exit. Needs no elevation,
 copies nothing, registers nothing.
 
+.PARAMETER StopHolders
+Explicitly stop other processes running the installed exe (for example a harness bridge).
+Off by default: the script normally lists them and refuses. Only use this while you accept
+that those processes (and any MCP session using them) will be terminated.
+
 .EXAMPLE
 powershell -File hands-elevated-task.ps1 -Exe C:\dev\Helping-Hands\hands\target\release\hands.exe
 
@@ -43,7 +48,9 @@ param(
 
     [string]$InstallDir = (Join-Path $env:ProgramFiles "Hands"),
 
-    [switch]$Inspect
+    [switch]$Inspect,
+
+    [switch]$StopHolders
 )
 
 $ErrorActionPreference = "Stop"
@@ -195,22 +202,59 @@ if ($wasRunning) {
 }
 
 $holders = @(Get-InstalledExeHolders)
+if ($holders.Count -gt 0 -and $StopHolders) {
+    Write-Host "Stopping processes using the installed exe (because -StopHolders was given):"
+    for ($attempt = 0; $attempt -lt 3 -and $holders.Count -gt 0; $attempt++) {
+        $holders | ForEach-Object {
+            Write-Host ("  stopping pid {0}  {1}" -f $_.ProcessId, ($_.CommandLine -replace '\s+', ' '))
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 500
+        $holders = @(Get-InstalledExeHolders)
+    }
+}
 if ($holders.Count -gt 0) {
     if ($wasRunning) { Start-ScheduledTask -TaskName $taskName | Out-Null }
     Write-Host "The installed exe is still in use by:"
     $holders | ForEach-Object { Write-Host ("  pid {0}  {1}" -f $_.ProcessId, ($_.CommandLine -replace '\s+', ' ')) }
-    Fail "Stop those processes and re-run (Stop-Process -Id <pid> -Force). The task was restarted if it had been running."
+    if ($StopHolders) {
+        Fail "Those processes survived -StopHolders. Stop them manually and re-run. The task was restarted if it had been running."
+    }
+    Fail "Stop those processes and re-run (Stop-Process -Id <pid> -Force), or re-run with -StopHolders. The task was restarted if it had been running."
 }
 
 New-Item -ItemType Directory -Force -Path $installDirFull | Out-Null
 $stagedExe = "$installedExe.new"
+$backupExe = "$installedExe.old"
 try {
     if ($sourceExe -ne $installedExe) {
         Copy-Item -LiteralPath $sourceExe -Destination $stagedExe -Force
+        # A copied or previously installed exe can be ReadOnly; File.Replace refuses those.
+        $installedWasReadOnly = $false
         if (Test-Path -LiteralPath $installedExe) {
-            [System.IO.File]::Replace($stagedExe, $installedExe, $null)
-        } else {
-            Move-Item -LiteralPath $stagedExe -Destination $installedExe
+            $installedWasReadOnly = (Get-Item -LiteralPath $installedExe).IsReadOnly
+            if ($installedWasReadOnly) {
+                Set-ItemProperty -LiteralPath $installedExe -Name IsReadOnly -Value $false
+            }
+        }
+        # A just-exited server can keep its image mapped for a moment; retry the swap.
+        $replaced = $false
+        for ($attempt = 0; -not $replaced; $attempt++) {
+            try {
+                if (Test-Path -LiteralPath $installedExe) {
+                    [System.IO.File]::Replace($stagedExe, $installedExe, $backupExe)
+                    Remove-Item -LiteralPath $backupExe -Force -ErrorAction SilentlyContinue
+                } else {
+                    Move-Item -LiteralPath $stagedExe -Destination $installedExe
+                }
+                $replaced = $true
+            } catch {
+                if ($attempt -ge 4) { throw }
+                Start-Sleep -Milliseconds 700
+            }
+        }
+        if ($installedWasReadOnly) {
+            Set-ItemProperty -LiteralPath $installedExe -Name IsReadOnly -Value $true
         }
     }
     $srcHash = (Get-FileHash -LiteralPath $sourceExe -Algorithm SHA256).Hash
@@ -218,6 +262,7 @@ try {
     if ($srcHash -ne $dstHash) { throw "Installed exe hash differs from source ($dstHash vs $srcHash)." }
 } catch {
     Remove-Item -LiteralPath $stagedExe -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $backupExe -ErrorAction SilentlyContinue
     if ($wasRunning) { Start-ScheduledTask -TaskName $taskName | Out-Null }
     Fail "Replacing the installed exe failed: $($_.Exception.Message) The task was restarted if it had been running."
 }

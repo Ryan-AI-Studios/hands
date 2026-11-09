@@ -379,7 +379,17 @@ async fn main() {
                 eprintln!("{}", err.tool_message());
             }
             if let Some(pipe) = bridge {
-                desk_pipe::run_bridge(&pipe).await
+                let code = match desk_pipe::run_bridge(&pipe).await {
+                    Ok(()) => 0,
+                    Err(err) => {
+                        eprintln!("{}", err.tool_message());
+                        1
+                    }
+                };
+                // The bridge pumps a blocking stdin handle. A normal runtime drop waits for
+                // that read to finish, so a server disconnect would leave the process (and the
+                // installed exe handle) resident. Exit explicitly (review F2).
+                std::process::exit(code);
             } else {
                 mcp_main().await
             }
@@ -957,6 +967,21 @@ mod tests {
             Command::NativeHostDoctor => {}
             _ => panic!("expected NativeHostDoctor"),
         }
+    }
+
+    #[test]
+    fn mcp_bridge_exits_explicitly_after_run_bridge() {
+        let src = include_str!("main.rs");
+        let arm = src
+            .split("Command::Mcp { bridge } =>")
+            .nth(1)
+            .expect("mcp arm");
+        let run_at = arm.find("desk_pipe::run_bridge(").expect("run_bridge");
+        let exit_at = arm.find("std::process::exit(code)").expect("explicit exit");
+        assert!(
+            exit_at > run_at,
+            "the bridge arm must exit explicitly after run_bridge"
+        );
     }
 
     #[test]

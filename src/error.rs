@@ -1,4 +1,5 @@
 use thiserror::Error;
+use windows::core::Error as WindowsError;
 
 #[derive(Debug, Error)]
 pub enum HandsError {
@@ -34,6 +35,14 @@ pub enum HandsError {
     Listen(String),
     #[error("{0}")]
     DoTask(String),
+    #[error("Windows API error: {0}")]
+    Windows(String),
+}
+
+impl From<WindowsError> for HandsError {
+    fn from(e: WindowsError) -> Self {
+        HandsError::Windows(e.to_string())
+    }
 }
 
 impl HandsError {

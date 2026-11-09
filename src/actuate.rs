@@ -791,16 +791,23 @@ fn final_live_remap(
     info: &mut ActuateTarget,
     resolved: &mut ResolvedTarget,
 ) -> Result<Option<ActuateEnvelope>, HandsError> {
-    let (Some(contract), Some(css), Some(map)) = (
-        resolved.contract.as_ref(),
-        resolved.css_point,
-        resolved.map.as_ref(),
-    ) else {
+    let Some(contract) = resolved.contract.as_ref() else {
         return Ok(None);
     };
     if contract.source != PointSource::Chr {
         return Ok(None);
     }
+    // Fail closed: a `chr:` contract without its recorded CSS point or map cannot be re-mapped.
+    let (Some(css), Some(map)) = (resolved.css_point, resolved.map.as_ref()) else {
+        let mut bad = contract.clone();
+        bad.physical = None;
+        bad.transform.valid = false;
+        bad.transform.method = TransformMethod::None;
+        bad.transform.confidence = TransformConfidence::None;
+        bad.transform.reason =
+            Some("stale_viewport: chr: target has no recorded CSS point or map".into());
+        return refuse_transform(session_id.to_string(), info.clone(), bad).map(Some);
+    };
     let Some(hwnd) = resolved.hwnd else {
         let mut bad = contract.clone();
         bad.physical = None;
@@ -3279,6 +3286,55 @@ mod tests {
         crate::challenge::reset_for_test();
     }
 
+    fn gated_buy_hit(_: i32, _: i32) -> Result<crate::uia::HitElement, HandsError> {
+        Ok(crate::uia::HitElement {
+            name: "Buy".into(),
+            role: "button".into(),
+            hwnd: Some(0x10),
+            value: None,
+        })
+    }
+
+    #[test]
+    fn confirm_gated_click_returns_fence_envelope_before_dispatch() {
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_800x600));
+        crate::uia::set_hit_test_hook(Some(gated_buy_hit));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        lease::reset_for_test();
+        let _ = crate::foreground::take_offer_calls();
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            let env = click(ActuateRequest {
+                session_id: Some("s-0129-confirm".into()),
+                x: Some(x),
+                y: Some(y),
+                ..ActuateRequest::default()
+            })
+            .expect("click envelope");
+            assert!(!env.ok, "{env:?}");
+            assert!(!env.settled, "{env:?}");
+            assert!(!env.retried, "{env:?}");
+            let fence = env.fence.as_ref().expect("confirm fence envelope");
+            assert_eq!(fence.category, "money", "{env:?}");
+            assert!(env.error.is_none(), "{env:?}");
+            assert!(
+                env.point.is_none(),
+                "confirm envelope must precede dispatch/remap: {env:?}"
+            );
+            assert!(
+                crate::foreground::take_offer_calls().is_empty(),
+                "no offer before confirm"
+            );
+        });
+    }
+
     fn sample_titled(hwnd: isize, pid: u32, title: &str) -> crate::foreground::TitledWindow {
         crate::foreground::TitledWindow {
             hwnd,
@@ -4210,65 +4266,306 @@ mod tests {
         assert!(helper.contains("stale_viewport") || helper.contains("chrome::remap_chr"));
     }
 
-    #[test]
-    fn final_remap_after_move_updates_rect_and_point() {
-        // Move-only re-map: point follows the window origin and the rect centre equals it.
-        let page = crate::point::PageMetrics {
+    thread_local! {
+        static ACT_REMAP_ANCHOR: std::cell::Cell<Rect> =
+            const { std::cell::Cell::new(Rect { x: 100, y: 80, w: 1200, h: 900 }) };
+    }
+
+    fn act_remap_page() -> crate::point::PageMetrics {
+        crate::point::PageMetrics {
             inner_width: Some(1200.0),
             inner_height: Some(900.0),
             client_width: Some(1200.0),
             client_height: Some(900.0),
             dpr: Some(1.0),
             ..crate::point::PageMetrics::default()
-        };
-        let make = |x: i32, y: i32| {
-            crate::point::build_map(crate::point::MapInputs {
-                hwnd: Some(1),
-                window_rect: Some(Rect {
-                    x: 0,
-                    y: 0,
-                    w: 4000,
-                    h: 3000,
-                }),
-                dpi: Some(96),
-                virtual_screen: Some(Rect {
-                    x: 0,
-                    y: 0,
-                    w: 4000,
-                    h: 3000,
-                }),
-                page,
-                render_widgets: vec![Rect {
-                    x,
-                    y,
-                    w: 1200,
-                    h: 900,
-                }],
-                monitors: Vec::new(),
-                observe_id: Some("f3a9c1d2e4b5a607".into()),
-                identity: crate::point::WindowIdentity::Confirmed,
-                ..crate::point::MapInputs::default()
-            })
-        };
-        let old = make(100, 80);
-        let new = make(300, 200);
+        }
+    }
+
+    fn act_remap_map(x: i32, y: i32) -> crate::point::ViewportMap {
+        crate::point::build_map(crate::point::MapInputs {
+            hwnd: Some(0x1234),
+            window_rect: Some(Rect {
+                x: -10,
+                y: -10,
+                w: 4000,
+                h: 3000,
+            }),
+            dpi: Some(96),
+            virtual_screen: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            page: act_remap_page(),
+            render_widgets: vec![Rect {
+                x,
+                y,
+                w: 1200,
+                h: 900,
+            }],
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: Some("Owner Web Access".into()),
+            identity: crate::point::WindowIdentity::Confirmed,
+            ..crate::point::MapInputs::default()
+        })
+    }
+
+    fn act_remap_geometry(page: crate::point::PageMetrics, hwnd: isize) -> crate::point::MapInputs {
+        crate::point::MapInputs {
+            hwnd: Some(hwnd),
+            window_rect: Some(Rect {
+                x: -10,
+                y: -10,
+                w: 4000,
+                h: 3000,
+            }),
+            dpi: Some(96),
+            virtual_screen: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            page,
+            render_widgets: vec![ACT_REMAP_ANCHOR.with(|c| c.get())],
+            uia_document: None,
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: Some("Owner Web Access".into()),
+            fixture: false,
+            identity: crate::point::WindowIdentity::Confirmed,
+            fixture_origin: None,
+        }
+    }
+
+    fn act_remap_identity(_: isize) -> (Option<String>, usize, bool) {
+        (Some("Owner Web Access - Google Chrome".into()), 1, true)
+    }
+
+    struct FinalRemapSeam;
+
+    impl Drop for FinalRemapSeam {
+        fn drop(&mut self) {
+            chrome::set_remap_geometry_hook(None);
+            chrome::set_remap_identity_hook(None);
+            crate::input::set_send_inputs_hook(None);
+            let _ = crate::foreground::take_offer_calls();
+        }
+    }
+
+    fn final_remap_fixture() -> (
+        ResolvedTarget,
+        ActuateTarget,
+        crate::point::CssRect,
+        Rect,
+        crate::point::PointContract,
+    ) {
+        let old = act_remap_map(100, 80);
         let css = crate::point::CssRect {
             left: 50.0,
             top: 40.0,
             width: 100.0,
             height: 20.0,
         };
-        let old_contract = crate::point::contract_for(&old, css.center());
-        let new_contract = crate::point::contract_for(&new, css.center());
+        let contract = contract_for(&old, css.center());
+        let old_rect = map_rect(&contract, css).expect("old rect");
         assert_eq!(
-            old_contract.physical,
+            contract.physical,
             Some(crate::point::PhysicalPoint { x: 200, y: 130 })
         );
-        assert_eq!(
-            new_contract.physical,
-            Some(crate::point::PhysicalPoint { x: 400, y: 250 })
+        assert_eq!(old_rect.center(), (200, 130));
+        let resolved = ResolvedTarget {
+            target: Target::ElementId("chr:5".into()),
+            kind: "element",
+            id: Some("chr:5".into()),
+            x: 200,
+            y: 130,
+            rect: old_rect,
+            hwnd: Some(0x1234),
+            name: String::new(),
+            role: String::new(),
+            css_point: Some(css.center()),
+            css_rect: Some(css),
+            contract: Some(contract.clone()),
+            map: Some(old),
+        };
+        let info = resolved_info("element", Some("chr:5".into()), 200, 130);
+        (resolved, info, css, old_rect, contract)
+    }
+
+    #[test]
+    fn final_remap_after_move_updates_rect_and_point() {
+        // Behavioural: call `final_live_remap` itself. A move-only re-map must update the
+        // point, the rect and the envelope target; deleting any of those assignments fails here.
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 100,
+                y: 80,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        let (mut resolved, mut info, css, old_rect, old_contract) = final_remap_fixture();
+        assert_eq!(old_contract.physical.map(|p| (p.x, p.y)), Some((200, 130)));
+
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1200,
+                h: 900,
+            })
+        });
+        let refusal =
+            final_live_remap("s-0129", &mut info, &mut resolved).expect("final remap result");
+        assert!(
+            refusal.is_none(),
+            "move-only remap must proceed: {refusal:?}"
         );
-        assert_eq!(map_rect(&new_contract, css).unwrap().center(), (400, 250));
+
+        let contract = resolved.contract.as_ref().expect("updated contract");
+        assert_eq!(
+            contract.physical,
+            Some(crate::point::PhysicalPoint { x: 400, y: 250 }),
+            "contract.physical must follow the moved window"
+        );
+        assert_eq!(
+            (resolved.x, resolved.y),
+            (400, 250),
+            "resolved.x/y must follow the moved window"
+        );
+        assert_eq!(
+            resolved.rect,
+            map_rect(contract, css).expect("new rect"),
+            "resolved.rect must be re-mapped"
+        );
+        assert_ne!(
+            resolved.rect, old_rect,
+            "rect must not stay at the old origin"
+        );
+        assert_eq!(resolved.rect.center(), (400, 250));
+        assert_eq!(
+            (info.x, info.y),
+            (400, 250),
+            "envelope target must follow the moved window"
+        );
+        assert_eq!(
+            resolved
+                .map
+                .as_ref()
+                .and_then(|m| m.anchor)
+                .map(|r| (r.x, r.y)),
+            Some((300, 200))
+        );
+        assert!(crate::foreground::take_offer_calls().is_empty());
+    }
+
+    #[test]
+    fn final_remap_stale_viewport_refuses_without_input_or_offer() {
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 100,
+                y: 80,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let (mut resolved, mut info, _, old_rect, _) = final_remap_fixture();
+        let _ = crate::foreground::take_offer_calls();
+
+        // Same origin, changed size: the recorded page metrics no longer match.
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1100,
+                h: 900,
+            })
+        });
+        let env = final_live_remap("s-0129", &mut info, &mut resolved)
+            .expect("final remap result")
+            .expect("stale refusal envelope");
+        assert!(!env.ok, "{env:?}");
+        assert!(!env.verified, "{env:?}");
+        assert!(env.fence.is_none(), "{env:?}");
+        assert!(
+            env.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("stale_viewport"),
+            "{env:?}"
+        );
+        let point = env.point.as_ref().expect("point contract");
+        assert_eq!(point.source, crate::point::PointSource::Chr);
+        assert!(point.physical.is_none(), "{point:?}");
+        assert!(
+            point
+                .transform
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("stale_viewport"),
+            "{point:?}"
+        );
+        // A refused re-map must not move the target or the envelope.
+        assert_eq!((resolved.x, resolved.y), (200, 130));
+        assert_eq!(resolved.rect, old_rect);
+        assert!(crate::foreground::take_offer_calls().is_empty());
+    }
+
+    #[test]
+    fn final_remap_missing_contract_point_refuses_fail_closed() {
+        let _seam = FinalRemapSeam;
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+
+        let assert_refusal = |label: &str, env: Option<ActuateEnvelope>, reason: &str| {
+            let env = env.unwrap_or_else(|| panic!("{label}: must refuse, not fail open"));
+            assert!(!env.ok, "{label}: {env:?}");
+            assert!(!env.verified, "{label}: {env:?}");
+            assert!(env.fence.is_none(), "{label}: {env:?}");
+            let point = env.point.as_ref().expect("point contract");
+            assert!(point.physical.is_none(), "{label}: {point:?}");
+            assert!(
+                point
+                    .transform
+                    .reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with(reason),
+                "{label}: {point:?}"
+            );
+        };
+
+        // Missing map.
+        let (mut resolved, mut info, _, _, _) = final_remap_fixture();
+        resolved.map = None;
+        let env = final_live_remap("s-0129", &mut info, &mut resolved).expect("remap result");
+        assert_refusal("missing map", env, "stale_viewport");
+
+        // Missing CSS point.
+        let (mut resolved, mut info, _, _, _) = final_remap_fixture();
+        resolved.css_point = None;
+        let env = final_live_remap("s-0129", &mut info, &mut resolved).expect("remap result");
+        assert_refusal("missing css point", env, "stale_viewport");
+
+        // Missing HWND still uses the existing named refusal.
+        let (mut resolved, mut info, _, _, _) = final_remap_fixture();
+        resolved.hwnd = None;
+        let env = final_live_remap("s-0129", &mut info, &mut resolved).expect("remap result");
+        assert_refusal("missing hwnd", env, "window_mismatch");
+        assert!(crate::foreground::take_offer_calls().is_empty());
     }
 
     #[test]

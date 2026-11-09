@@ -321,6 +321,22 @@ pub(crate) fn set_remap_geometry_hook(hook: Option<RemapGeometryHook>) {
     REMAP_HOOK.with(|c| *c.borrow_mut() = hook);
 }
 
+/// Test seam for the live window identity read used by [`remap_chr`] (caption, visible Chrome
+/// window count, chrome-ness). Returns `(caption, count, is_chrome)`.
+#[cfg(test)]
+type RemapIdentityHook = fn(isize) -> (Option<String>, usize, bool);
+
+#[cfg(test)]
+thread_local! {
+    static REMAP_IDENTITY_HOOK: std::cell::RefCell<Option<RemapIdentityHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_remap_identity_hook(hook: Option<RemapIdentityHook>) {
+    REMAP_IDENTITY_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
 #[cfg(test)]
 thread_local! {
     static RESOLVE_STUB: std::cell::RefCell<Option<ChromeHit>> =
@@ -496,16 +512,27 @@ pub fn remap_chr(old: &ViewportMap, hwnd: isize) -> Result<ViewportMap, String> 
     if old.page.dpr.is_none() {
         return Err("stale_viewport: recorded page metrics have no dpr".into());
     }
+    let (caption, count, is_chrome) = remap_identity(hwnd);
+    remap_chr_with(old, hwnd, caption.as_deref(), count, is_chrome)
+}
+
+fn remap_identity(hwnd: isize) -> (Option<String>, usize, bool) {
+    #[cfg(test)]
+    {
+        if let Some(hook) = REMAP_IDENTITY_HOOK.with(|c| *c.borrow()) {
+            return hook(hwnd);
+        }
+    }
     let is_chrome = foreground::is_chrome_hwnd(hwnd);
-    let (caption, count) = if is_chrome {
+    if is_chrome {
         (
             Some(foreground::title(Some(hwnd))),
             foreground::visible_chrome_window_count(),
+            true,
         )
     } else {
-        (None, 0)
-    };
-    remap_chr_with(old, hwnd, caption.as_deref(), count, is_chrome)
+        (None, 0, false)
+    }
 }
 
 pub fn try_snapshot(detail: Detail, hwnd: Option<isize>) -> SnapshotOutcome {

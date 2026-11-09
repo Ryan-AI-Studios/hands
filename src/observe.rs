@@ -1882,6 +1882,7 @@ mod tests {
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
             transform: None,
+            identity: None,
         };
         let nodes: Vec<RawNode> = (0..5).map(uia).collect();
         let (extract, els, total, connected) = fuse_maps(
@@ -2884,6 +2885,7 @@ mod tests {
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
             transform: None,
+            identity: None,
         };
         let nodes = vec![uia_node(
             42,
@@ -3021,6 +3023,7 @@ mod tests {
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
             transform: None,
+            identity: None,
         };
         let (mut extract, mut elements, _total, connected) = fuse_maps(
             Detail::Default,
@@ -3834,6 +3837,7 @@ mod tests {
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
             transform: None,
+            identity: None,
         };
         let nodes = vec![uia_node(
             9,
@@ -3881,6 +3885,7 @@ mod tests {
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
             transform: None,
+            identity: None,
         };
         let (dom_extract, dom_els, _, _) = fuse_maps(
             Detail::Dom,

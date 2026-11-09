@@ -19,6 +19,7 @@ use crate::extract::{
     take_opt_chars,
 };
 use crate::foreground;
+use crate::hittest::{Assessment, AtPoint};
 use crate::native_host::{CLIENT_TIMEOUT_MS, client_timeout, exchange_pipe_deadline, pipe_name};
 use crate::point::{
     CssPoint, CssRect, MapInputs, PageMetrics, PointContract, TransformReport, ViewportMap,
@@ -103,6 +104,21 @@ pub struct ChromeMap {
     pub cards_walked: usize,
     /// Page-level map/validity. Serialized as the observe envelope's compact `transform`.
     pub transform: Option<TransformReport>,
+    /// Snapshot page identity/capability for 0128 point mode. Never serialized on observe.
+    pub(crate) identity: Option<PageIdentity>,
+}
+
+/// Page identity captured from the same snapshot reply as the transform. Used only by
+/// `hittest` point mode; not part of the observe envelope.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PageIdentity {
+    pub url: Option<String>,
+    pub title: String,
+    pub inner_width: Option<f64>,
+    pub inner_height: Option<f64>,
+    pub dpr: Option<f64>,
+    /// `assess_v` capability marker; absent on an old extension.
+    pub assess_v: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +132,8 @@ pub struct ChromeHit {
     pub contract: PointContract,
     pub hwnd: Option<isize>,
     pub(crate) map: Option<ViewportMap>,
+    /// Optional DOM assessment returned by the same resolve reply (`assess:true`).
+    pub assessment: Option<Assessment>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -169,6 +187,20 @@ impl ChromeMetrics {
             visual_scale: self.visual_viewport_scale,
             visual_offset_left: self.visual_viewport_offset_left,
             visual_offset_top: self.visual_viewport_offset_top,
+        }
+    }
+
+    fn identity(&self) -> PageIdentity {
+        PageIdentity {
+            url: None,
+            title: String::new(),
+            inner_width: self.inner_width.is_finite().then_some(self.inner_width),
+            inner_height: self.inner_height.is_finite().then_some(self.inner_height),
+            dpr: self
+                .device_pixel_ratio
+                .is_finite()
+                .then_some(self.device_pixel_ratio),
+            assess_v: None,
         }
     }
 }
@@ -236,6 +268,12 @@ struct RawSnapshot {
     radius: Option<String>,
     #[serde(default)]
     cards_walked: Option<usize>,
+    /// Additive per-resolve DOM assessment. Never present on a snapshot.
+    #[serde(default)]
+    assessment: Option<Assessment>,
+    /// Snapshot capability marker (`assess_v: 1`) from the content script.
+    #[serde(default)]
+    assess_v: Option<u32>,
 }
 
 /// Fixture/diagnostic **listing** origin using the legacy `outer-inner` formula.
@@ -584,6 +622,17 @@ pub fn classify_snapshot_err(err: &HandsError) -> SnapshotOutcome {
 }
 
 pub fn try_resolve(id: &str, hwnd: Option<isize>) -> Result<ChromeHit, HandsError> {
+    try_resolve_assessed(id, hwnd, false, None)
+}
+
+/// `chr:` resolve with the optional DOM assessment (`assess:true`). The assessment is parsed
+/// from the same reply; an old extension simply omits it.
+pub fn try_resolve_assessed(
+    id: &str,
+    hwnd: Option<isize>,
+    assess: bool,
+    samples: Option<u32>,
+) -> Result<ChromeHit, HandsError> {
     #[cfg(test)]
     {
         if let Some(hit) = RESOLVE_STUB.with(|c| c.borrow().clone()) {
@@ -593,7 +642,7 @@ pub fn try_resolve(id: &str, hwnd: Option<isize>) -> Result<ChromeHit, HandsErro
     let fixture = snapshot_env().is_some();
     let raw = match snapshot_env() {
         Some(path) => load_fixture_raw(&path)?,
-        None => pipe_resolve_raw(id)?,
+        None => pipe_resolve_raw(id, assess, samples)?,
     };
     hit_from_raw(raw, id, hwnd, fixture)
 }
@@ -619,7 +668,7 @@ fn hit_from_raw(
         })?;
     let node = raw.elements[index].clone();
     let obs = make_observe_id(&raw, hwnd, raw.elements.len());
-    let map = map_for_raw(&raw, hwnd, fixture, obs);
+    let map = map_for_raw(&raw, hwnd, fixture, obs.clone());
     let contract = contract_for(&map, node.rect_css.center());
     let rect = crate::point::map_rect(&contract, node.rect_css).unwrap_or(Rect {
         x: 0,
@@ -627,6 +676,10 @@ fn hit_from_raw(
         w: 0,
         h: 0,
     });
+    let mut assessment = raw.assessment;
+    if let Some(a) = assessment.as_mut() {
+        a.observe_id = Some(obs);
+    }
     Ok(ChromeHit {
         id: node
             .id
@@ -641,6 +694,7 @@ fn hit_from_raw(
         contract,
         hwnd,
         map: Some(map),
+        assessment,
     })
 }
 
@@ -760,6 +814,10 @@ fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: Strin
         .filter(|n| *n > collected_len)
         .unwrap_or(collected_len);
     let cards = prefer_local_cards(cards, CARD_CAP);
+    let mut identity = raw.metrics.identity();
+    identity.url = raw.url.clone().filter(|s| !s.trim().is_empty());
+    identity.title = raw.title.clone().unwrap_or_default();
+    identity.assess_v = raw.assess_v;
     ChromeMap {
         url: raw.url.filter(|s| !s.trim().is_empty()),
         title: raw.title.unwrap_or_default(),
@@ -776,6 +834,7 @@ fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: Strin
         },
         cards_walked,
         transform: Some(map.report.clone()),
+        identity: Some(identity),
     }
 }
 
@@ -808,27 +867,82 @@ fn last_pipe_detail() -> Detail {
     *LAST_PIPE_DETAIL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub fn resolve_request(id: &str, detail: Detail) -> serde_json::Value {
+/// Walk-detail space the process last stored (`default` | `dom`). Echoed by `hittest` element
+/// mode so a caller can tell which walk space a `chr:` index came from.
+pub fn current_pipe_detail() -> &'static str {
+    match last_pipe_detail() {
+        Detail::Default => "default",
+        Detail::Dom => "dom",
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_last_pipe_detail_for_test(detail: Detail) {
+    store_last_pipe_detail(detail);
+}
+
+pub fn resolve_request(
+    id: &str,
+    detail: Detail,
+    assess: bool,
+    samples: Option<u32>,
+) -> serde_json::Value {
     let mut req = serde_json::json!({"op": "resolve", "id": id});
     if detail == Detail::Dom {
         req["detail"] = serde_json::Value::String("dom".into());
+    }
+    if assess {
+        req["assess"] = serde_json::Value::Bool(true);
+        if let Some(samples) = samples {
+            req["samples"] = serde_json::Value::from(samples);
+        }
     }
     req
 }
 
 fn pipe_snapshot(detail: Detail, hwnd: Option<isize>) -> Result<ChromeMap, HandsError> {
+    pipe_snapshot_inner(detail, hwnd, true)
+}
+
+/// Snapshot for identity/transform reads. `store=false` leaves `LAST_PIPE_DETAIL` untouched
+/// (0128 point mode must not change what a later `chr:` resolves).
+fn pipe_snapshot_inner(
+    detail: Detail,
+    hwnd: Option<isize>,
+    store: bool,
+) -> Result<ChromeMap, HandsError> {
     let mut req = serde_json::json!({"op": "snapshot"});
     if detail == Detail::Dom {
         req["detail"] = serde_json::Value::String("dom".into());
     }
     let reply = pipe_request(&req)?;
     let map = parse_host_reply(&reply, hwnd)?;
-    store_last_pipe_detail(detail);
+    if store {
+        store_last_pipe_detail(detail);
+    }
     Ok(map)
 }
 
-fn pipe_resolve_raw(id: &str) -> Result<RawSnapshot, HandsError> {
-    let req = resolve_request(id, last_pipe_detail());
+/// Non-storing snapshot used by `hittest` point mode. Same path, no walk-detail mutation.
+pub fn try_snapshot_identity(detail: Detail, hwnd: Option<isize>) -> SnapshotOutcome {
+    match snapshot_env() {
+        Some(path) => match load_fixture(&path, hwnd) {
+            Ok(map) => SnapshotOutcome::Map(Box::new(map)),
+            Err(_) => SnapshotOutcome::HostDown,
+        },
+        None => match pipe_snapshot_inner(detail, hwnd, false) {
+            Ok(map) => SnapshotOutcome::Map(Box::new(map)),
+            Err(err) => classify_snapshot_err(&err),
+        },
+    }
+}
+
+fn pipe_resolve_raw(
+    id: &str,
+    assess: bool,
+    samples: Option<u32>,
+) -> Result<RawSnapshot, HandsError> {
+    let req = resolve_request(id, last_pipe_detail(), assess, samples);
     let reply = pipe_request(&req).map_err(|err| {
         HandsError::Chrome(format!(
             "Chrome host is not connected (pipe); cannot resolve {id}: {err}"
@@ -850,6 +964,13 @@ fn pipe_resolve_raw(id: &str) -> Result<RawSnapshot, HandsError> {
                 HandsError::Chrome(format!("Chrome resolve {id} missing metrics"))
             })?)
             .map_err(|err| HandsError::Chrome(format!("Chrome resolve metrics: {err}")))?;
+        let assessment = reply
+            .get("assessment")
+            .cloned()
+            .filter(|v| !v.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|err| HandsError::Chrome(format!("Chrome resolve assessment: {err}")))?;
         return Ok(RawSnapshot {
             url: reply
                 .get("url")
@@ -869,6 +990,11 @@ fn pipe_resolve_raw(id: &str) -> Result<RawSnapshot, HandsError> {
             zip: None,
             radius: None,
             cards_walked: None,
+            assessment,
+            assess_v: reply
+                .get("assess_v")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok()),
         });
     }
     let parsed: RawSnapshot = serde_json::from_value(reply.clone())
@@ -922,6 +1048,85 @@ fn pipe_request(req: &serde_json::Value) -> Result<serde_json::Value, HandsError
     let result = exchange_pipe_deadline(handle, req, deadline);
     let _ = unsafe { CloseHandle(handle) };
     result
+}
+
+/// Point-mode `assess` reply: the topmost box plus the page identity echoed for a staleness
+/// check. A closed shadow/iframe answer is still a successful query.
+#[derive(Debug, Clone)]
+pub struct AssessReply {
+    pub at_point: AtPoint,
+    pub css: Option<CssPoint>,
+    pub identity: PageIdentity,
+}
+
+#[cfg(test)]
+static ASSESS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn assess_calls() -> usize {
+    ASSESS_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_assess_calls() {
+    ASSESS_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `{op:"assess", css, mode:"point", samples}`. Only called after the snapshot advertises
+/// `assess_v >= 1`; an old service worker would silently drop the op and stall the host.
+pub fn assess_at(css: CssPoint, samples: u32) -> Result<AssessReply, HandsError> {
+    #[cfg(test)]
+    ASSESS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let req = serde_json::json!({
+        "op": "assess",
+        "css": {"x": css.x, "y": css.y},
+        "mode": "point",
+        "samples": samples,
+    });
+    let reply = pipe_request(&req).map_err(|err| {
+        HandsError::Chrome(format!(
+            "Chrome host is not connected (pipe); assess failed: {err}"
+        ))
+    })?;
+    if let Some(err) = reply.get("error") {
+        return Err(HandsError::Chrome(format!("Chrome assess error: {err}")));
+    }
+    let at_point: AtPoint = serde_json::from_value(
+        reply
+            .get("at_point")
+            .cloned()
+            .ok_or_else(|| HandsError::Chrome("Chrome assess reply has no at_point".into()))?,
+    )
+    .map_err(|err| HandsError::Chrome(format!("Chrome assess at_point: {err}")))?;
+    let css = reply
+        .get("css")
+        .cloned()
+        .filter(|v| !v.is_null())
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|err| HandsError::Chrome(format!("Chrome assess css echo: {err}")))?;
+    let metrics: ChromeMetrics = reply
+        .get("metrics")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|err| HandsError::Chrome(format!("Chrome assess metrics: {err}")))?
+        .unwrap_or_default();
+    let mut identity = metrics.identity();
+    identity.url = reply
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    identity.title = reply
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(AssessReply {
+        at_point,
+        css,
+        identity,
+    })
 }
 
 fn remaining_client_ms(deadline: Instant) -> Result<u32, HandsError> {
@@ -1215,6 +1420,8 @@ mod tests {
                 zip: None,
                 radius: None,
                 cards_walked: None,
+                assessment: None,
+                assess_v: None,
             },
             None,
             "f3a9c1d2e4b5a607".into(),
@@ -1401,17 +1608,21 @@ mod tests {
         let g = EnvGuard::lock();
         g.set_snapshot(None);
         store_last_pipe_detail(Detail::Default);
-        let default = resolve_request("chr:0", Detail::Default);
+        let default = resolve_request("chr:0", Detail::Default, false, None);
         assert_eq!(default["op"], "resolve");
         assert_eq!(default["id"], "chr:0");
         assert!(default.get("detail").is_none());
-        let dom = resolve_request("chr:0", Detail::Dom);
+        assert!(default.get("assess").is_none());
+        let dom = resolve_request("chr:0", Detail::Dom, false, None);
         assert_eq!(dom["detail"], "dom");
+        let assessed = resolve_request("chr:0", Detail::Default, true, Some(25));
+        assert_eq!(assessed["assess"], true);
+        assert_eq!(assessed["samples"], 25);
         store_last_pipe_detail(Detail::Dom);
-        let replay = resolve_request("chr:1", last_pipe_detail());
+        let replay = resolve_request("chr:1", last_pipe_detail(), false, None);
         assert_eq!(replay["detail"], "dom");
         store_last_pipe_detail(Detail::Default);
-        let after_reset = resolve_request("chr:0", last_pipe_detail());
+        let after_reset = resolve_request("chr:0", last_pipe_detail(), false, None);
         assert!(after_reset.get("detail").is_none());
     }
 
@@ -1986,6 +2197,7 @@ mod tests {
                 listing: ListingMeta::default(),
                 cards_walked: 0,
                 transform: None,
+                identity: None,
             }))
             .chrome_hint(),
             None
@@ -2066,6 +2278,8 @@ mod tests {
             zip: None,
             radius: None,
             cards_walked: None,
+            assessment: None,
+            assess_v: None,
         };
         let hit = hit_from_raw(raw, "chr:0", Some(0x1234), false).expect("resolve");
         set_geometry_hook(None);
@@ -2127,6 +2341,8 @@ mod tests {
             zip: None,
             radius: None,
             cards_walked: None,
+            assessment: None,
+            assess_v: None,
         };
         let map = map_from_raw(raw, None, true, "f3a9c1d2e4b5a607".into());
         assert_eq!(map.cards.len(), 1);
@@ -2208,6 +2424,8 @@ mod tests {
             zip: None,
             radius: None,
             cards_walked: None,
+            assessment: None,
+            assess_v: None,
         };
         let err = hit_from_raw(raw.clone(), "chr:0", None, true).unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");

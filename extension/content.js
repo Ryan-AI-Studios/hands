@@ -46,14 +46,16 @@ const DOM_SELECTOR =
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const op = msg && msg.op;
-  if (op !== "snapshot" && op !== "resolve") {
+  if (op !== "snapshot" && op !== "resolve" && op !== "assess") {
     return false;
   }
   try {
     if (op === "snapshot") {
       sendResponse(buildSnapshot(msg.detail));
+    } else if (op === "assess") {
+      sendResponse(buildAssess(msg));
     } else {
-      sendResponse(buildResolve(msg.id, msg.detail));
+      sendResponse(buildResolve(msg.id, msg.detail, msg.assess === true, msg.samples));
     }
   } catch (_err) {
     sendResponse({ error: "walk-failed" });
@@ -79,6 +81,7 @@ function buildSnapshot(detail) {
     elements: elements,
     cards: collected.cards,
     metrics: metrics,
+    assess_v: 1,
   };
   if (collected.cards_walked > 0) {
     snap.cards_walked = collected.cards_walked;
@@ -92,7 +95,7 @@ function buildSnapshot(detail) {
   return snap;
 }
 
-function buildResolve(id, detail) {
+function buildResolve(id, detail, assess, samples) {
   const index = parseChrId(id);
   const metrics = windowMetrics();
   if (index == null) {
@@ -106,7 +109,7 @@ function buildResolve(id, detail) {
   if (!payload) {
     return { error: "not-found", metrics: metrics };
   }
-  return {
+  const reply = {
     id: payload.id,
     role: payload.role,
     text: payload.text,
@@ -116,6 +119,10 @@ function buildResolve(id, detail) {
     title: document.title || "",
     metrics: metrics,
   };
+  if (assess === true) {
+    reply.assessment = assessAt(nodes[index], payload.rectCss, samples);
+  }
+  return reply;
 }
 
 function parseChrId(id) {
@@ -1061,6 +1068,608 @@ function cardTitle(el, text, price) {
     return text.replace(price, "").replace(/\s+/g, " ").trim();
   }
   return text;
+}
+
+// ---------------------------------------------------------------- 0128 assessment
+// Read-only. No synthetic input, no mutation, no timers.
+
+const ASSESS_MIN_SAMPLES = 5;
+const ASSESS_MAX_SAMPLES = 49;
+const ASSESS_ANCESTORS = 64;
+const ASSESS_BLOCKERS = 3;
+const ASSESS_NOTES = 3;
+const ASSESS_SHADOW_PATH = 8;
+
+function clampSamples(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) {
+    return 25;
+  }
+  return Math.max(ASSESS_MIN_SAMPLES, Math.min(ASSESS_MAX_SAMPLES, Math.round(v)));
+}
+
+function assessViewport() {
+  const de = document.documentElement;
+  return {
+    left: 0,
+    top: 0,
+    width: de ? de.clientWidth || window.innerWidth : window.innerWidth,
+    height: de ? de.clientHeight || window.innerHeight : window.innerHeight,
+  };
+}
+
+function rectArea(r) {
+  if (!r) return 0;
+  const w = Math.max(0, r.width || 0);
+  const h = Math.max(0, r.height || 0);
+  return w * h;
+}
+
+function intersectRects(a, b) {
+  if (!a || !b) return null;
+  const left = Math.max(a.left, b.left);
+  const top = Math.max(a.top, b.top);
+  const right = Math.min(a.left + a.width, b.left + b.width);
+  const bottom = Math.min(a.top + a.height, b.top + b.height);
+  if (right <= left || bottom <= top) {
+    return { left: left, top: top, width: 0, height: 0 };
+  }
+  return { left: left, top: top, width: right - left, height: bottom - top };
+}
+
+function pointInRect(p, r) {
+  return (
+    !!r &&
+    p.x >= r.left &&
+    p.x < r.left + r.width &&
+    p.y >= r.top &&
+    p.y < r.top + r.height
+  );
+}
+
+function cssRectOf(el) {
+  const r = el.getBoundingClientRect();
+  if (!r || r.width <= 0 || r.height <= 0) {
+    return null;
+  }
+  return { left: r.left, top: r.top, width: r.width, height: r.height };
+}
+
+function parentOf(node) {
+  if (!node) return null;
+  if (node.parentElement) return node.parentElement;
+  const root = node.getRootNode ? node.getRootNode() : null;
+  return root && root.host ? root.host : null;
+}
+
+function ancestorsOf(el) {
+  const out = [];
+  let node = parentOf(el);
+  while (node && out.length < ASSESS_ANCESTORS) {
+    out.push(node);
+    node = parentOf(node);
+  }
+  return out;
+}
+
+function establishesFixedContainingBlock(style) {
+  if (!style) return false;
+  if (style.transform && style.transform !== "none") return true;
+  if (style.perspective && style.perspective !== "none") return true;
+  if (style.filter && style.filter !== "none") return true;
+  if (style.backdropFilter && style.backdropFilter !== "none") return true;
+  if (style.translate && style.translate !== "none") return true;
+  if (style.scale && style.scale !== "none") return true;
+  if (style.rotate && style.rotate !== "none") return true;
+  const contain = String(style.contain || "");
+  if (/(paint|layout|strict|content)/.test(contain)) return true;
+  const will = String(style.willChange || "");
+  return /(transform|perspective|filter|translate|scale|rotate)/.test(will);
+}
+
+function clipsOverflow(el) {
+  const style = window.getComputedStyle(el);
+  if (!style) return false;
+  const display = String(style.display || "");
+  if (display === "inline" || display === "contents") return false;
+  const values = [style.overflowX, style.overflowY, style.overflow];
+  for (let i = 0; i < values.length; i += 1) {
+    if (/(hidden|clip|scroll|auto)/.test(String(values[i] || ""))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasOverflowClip(el) {
+  const style = window.getComputedStyle(el);
+  if (!style) return false;
+  return /(hidden|clip|scroll|auto)/.test(String(style.overflowX || style.overflow || ""));
+}
+
+function paddingBox(el) {
+  const rect = el.getBoundingClientRect();
+  const style = window.getComputedStyle(el);
+  if (!rect || !style) return null;
+  const pl = parseFloat(style.borderLeftWidth) || 0;
+  const pt = parseFloat(style.borderTopWidth) || 0;
+  const pr = parseFloat(style.borderRightWidth) || 0;
+  const pb = parseFloat(style.borderBottomWidth) || 0;
+  const width = rect.width - pl - pr;
+  const height = rect.height - pt - pb;
+  if (width <= 0 || height <= 0) return null;
+  return {
+    left: rect.left + pl,
+    top: rect.top + pt,
+    width: width,
+    height: height,
+  };
+}
+
+function clipRectsFor(target) {
+  const ancestors = ancestorsOf(target);
+  const style = window.getComputedStyle(target);
+  const position = style ? String(style.position || "static") : "static";
+  let limit = ancestors.length;
+  if (position === "fixed") {
+    for (let i = 0; i < ancestors.length; i += 1) {
+      if (establishesFixedContainingBlock(window.getComputedStyle(ancestors[i]))) {
+        limit = i;
+        break;
+      }
+    }
+  } else if (position === "absolute") {
+    for (let i = 0; i < ancestors.length; i += 1) {
+      const s = window.getComputedStyle(ancestors[i]);
+      if ((s && s.position && s.position !== "static") || establishesFixedContainingBlock(s)) {
+        limit = i;
+        break;
+      }
+    }
+  } else {
+    limit = 0;
+  }
+  const rects = [];
+  const elements = [];
+  const notes = [];
+  for (let i = 0; i < ancestors.length; i += 1) {
+    const el = ancestors[i];
+    const tag = String(el.tagName || "").toLowerCase();
+    if (tag === "html" || tag === "body") {
+      if (hasOverflowClip(el)) {
+        notes.push("containing_block_skip");
+      }
+      continue;
+    }
+    if (i < limit) {
+      continue;
+    }
+    if (!clipsOverflow(el)) {
+      continue;
+    }
+    const box = paddingBox(el);
+    if (box) {
+      rects.push(box);
+      elements.push(el);
+    }
+  }
+  return { rects: rects, elements: elements, notes: notes };
+}
+
+function samplePoints(rect, samples) {
+  const n = clampSamples(samples);
+  const side = Math.ceil(Math.sqrt(n));
+  const insetX = rect.width > 2 ? Math.min(1, rect.width / 4) : 0;
+  const insetY = rect.height > 2 ? Math.min(1, rect.height / 4) : 0;
+  const innerLeft = rect.left + insetX;
+  const innerTop = rect.top + insetY;
+  const innerWidth = Math.max(0, rect.width - insetX * 2);
+  const innerHeight = Math.max(0, rect.height - insetY * 2);
+  const out = [];
+  for (let row = 0; row < side && out.length < n; row += 1) {
+    for (let col = 0; col < side && out.length < n; col += 1) {
+      out.push({
+        x: innerLeft + (innerWidth * (col + 0.5)) / side,
+        y: innerTop + (innerHeight * (row + 0.5)) / side,
+      });
+    }
+  }
+  return out;
+}
+
+function composedContains(target, hit) {
+  let node = hit;
+  let depth = 0;
+  while (node && depth < ASSESS_ANCESTORS) {
+    if (node === target) return true;
+    node = parentOf(node);
+    depth += 1;
+  }
+  return false;
+}
+
+function pierce(x, y) {
+  const out = {
+    el: null,
+    shadowPath: [],
+    notes: [],
+    iframe: false,
+    shadowUninspectable: false,
+  };
+  let el = document.elementFromPoint(x, y);
+  if (!el) return out;
+  for (let depth = 0; depth < ASSESS_SHADOW_PATH; depth += 1) {
+    out.el = el;
+    if (el.tagName === "IFRAME" || el.tagName === "FRAME") {
+      out.iframe = true;
+      return out;
+    }
+    let root = null;
+    let closed = false;
+    try {
+      root = el.shadowRoot || null;
+      if (!root && chrome.dom && chrome.dom.openOrClosedShadowRoot) {
+        root = chrome.dom.openOrClosedShadowRoot(el);
+        closed = !!root;
+      }
+    } catch (_err) {
+      root = null;
+    }
+    if (!root) {
+      return out;
+    }
+    if (typeof root.elementFromPoint !== "function") {
+      out.shadowUninspectable = true;
+      return out;
+    }
+    let inner = null;
+    try {
+      inner = root.elementFromPoint(x, y);
+    } catch (_err) {
+      inner = null;
+    }
+    if (!inner || inner === el) {
+      return out;
+    }
+    if (out.shadowPath.length < ASSESS_SHADOW_PATH) {
+      out.shadowPath.push(cap(String(el.tagName || "").toLowerCase(), 16));
+    }
+    if (closed && out.notes.indexOf("shadow_pierced_closed") === -1) {
+      out.notes.push("shadow_pierced_closed");
+    }
+    el = inner;
+  }
+  if (out.shadowPath.length >= ASSESS_SHADOW_PATH) {
+    out.shadowUninspectable = true;
+  }
+  return out;
+}
+
+function describeElement(el, reason) {
+  if (!el || el.nodeType !== 1) return null;
+  const style = window.getComputedStyle(el);
+  if (style && style.pointerEvents === "none") {
+    return null;
+  }
+  const tag = String(el.tagName || "").toLowerCase();
+  const role = attr(el, "role");
+  const name = attr(el, "aria-label") || (el.innerText || "").replace(/\s+/g, " ").trim();
+  const out = {
+    kind: tag === "iframe" ? "iframe" : "element",
+    tag: cap(tag, 16),
+  };
+  if (role) out.role = cap(role, 32);
+  if (name) out.name = cap(name, 80);
+  const rect = cssRectOf(el);
+  if (rect) out.rect_css = rect;
+  if (reason) out.reason = reason;
+  return out;
+}
+
+function describeBlockers(misses) {
+  const counts = {};
+  const rows = {};
+  for (let i = 0; i < misses.length; i += 1) {
+    const miss = misses[i];
+    let blocker = null;
+    if (!miss || !miss.el) {
+      blocker = { kind: "viewport", reason: "outside_viewport" };
+    } else if (miss.iframe) {
+      const named = describeElement(miss.el, "cross_frame");
+      blocker = named || { kind: "iframe", reason: "cross_frame" };
+      blocker.kind = "iframe";
+      blocker.reason = "cross_frame";
+    } else if (miss.shadowUninspectable) {
+      blocker = { kind: "shadow", tag: cap(String(miss.el.tagName || "").toLowerCase(), 16), reason: "shadow_closed" };
+    } else {
+      const tag = String(miss.el.tagName || "").toLowerCase();
+      if (tag === "html" || tag === "body") {
+        blocker = { kind: "background", tag: cap(tag, 16), reason: "not_target" };
+      } else {
+        let candidates = [];
+        try {
+          candidates = document.elementsFromPoint(miss.x, miss.y) || [];
+        } catch (_err) {
+          candidates = [];
+        }
+        const top = candidates.slice(0, 3);
+        for (let j = 0; j < top.length; j += 1) {
+          const named = describeElement(top[j], "overlay");
+          if (named) {
+            blocker = named;
+            break;
+          }
+        }
+        if (!blocker) {
+          blocker = describeElement(miss.el, "overlay");
+        }
+        if (!blocker) {
+          blocker = { kind: "element", tag: cap(tag, 16), reason: "not_target" };
+        }
+      }
+    }
+    const key = [
+      blocker.kind || "",
+      blocker.tag || "",
+      blocker.role || "",
+      blocker.rect_css ? Math.round(blocker.rect_css.left) + ":" + Math.round(blocker.rect_css.top) : "",
+    ].join("|");
+    rows[key] = blocker;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  const keys = Object.keys(rows).sort((a, b) => counts[b] - counts[a]);
+  return keys.slice(0, ASSESS_BLOCKERS).map((k) => rows[k]);
+}
+
+function isRendered(el) {
+  if (!el) return false;
+  if (typeof el.checkVisibility === "function") {
+    const visible = el.checkVisibility({
+      contentVisibilityAuto: true,
+      opacityProperty: false,
+    });
+    if (visible === false) return false;
+  }
+  const style = window.getComputedStyle(el);
+  if (!style) return true;
+  return style.display !== "none" && style.visibility !== "hidden";
+}
+
+function notesFor(target, clipNotes, center) {
+  const out = [];
+  const push = (token) => {
+    if (token && out.indexOf(token) === -1 && out.length < ASSESS_NOTES) {
+      out.push(token);
+    }
+  };
+  if (
+    (target.getAttribute && target.getAttribute("aria-disabled") === "true") ||
+    (target.closest && target.closest('[aria-disabled="true"]'))
+  ) {
+    push("aria_disabled");
+  }
+  if (
+    (target.hasAttribute && target.hasAttribute("inert")) ||
+    (target.closest && target.closest("[inert]"))
+  ) {
+    push("inert");
+  }
+  for (let i = 0; i < clipNotes.length; i += 1) {
+    push(clipNotes[i]);
+  }
+  for (let i = 0; i < center.notes.length; i += 1) {
+    push(center.notes[i]);
+  }
+  const style = window.getComputedStyle(target);
+  if (style) {
+    if (style.clipPath && style.clipPath !== "none") push("clip_path");
+    if (style.maskImage && style.maskImage !== "none") push("mask");
+    if (style.filter && style.filter !== "none") push("filter");
+  }
+  return out;
+}
+
+function confidenceFor(verdict, samples, samplesHit, area, notes, center) {
+  if (verdict === null) {
+    return "none";
+  }
+  if (samples < 9 || center.shadowUninspectable) {
+    return "low";
+  }
+  const caveat = notes.length > 0;
+  const allAgree =
+    verdict === true ? samplesHit === samples : samplesHit === 0;
+  if (samples >= 25 && allAgree && area >= 100 && !caveat) {
+    return "high";
+  }
+  return "medium";
+}
+
+function clippedByFor(candidate, targetRect, clip, viewport) {
+  if (!candidate) return null;
+  const shrunk =
+    candidate.width + 0.5 < targetRect.width ||
+    candidate.height + 0.5 < targetRect.height;
+  if (!shrunk) return null;
+  for (let i = 0; i < clip.elements.length; i += 1) {
+    const box = clip.rects[i];
+    if (!box) continue;
+    const edgeMatches =
+      Math.abs(box.left - candidate.left) <= 0.5 ||
+      Math.abs(box.top - candidate.top) <= 0.5 ||
+      Math.abs(box.left + box.width - (candidate.left + candidate.width)) <= 0.5 ||
+      Math.abs(box.top + box.height - (candidate.top + candidate.height)) <= 0.5;
+    if (edgeMatches) {
+      const named = describeElement(clip.elements[i], "clipped");
+      if (named) return named;
+    }
+  }
+  if (
+    Math.abs(viewport.left - candidate.left) <= 0.5 ||
+    Math.abs(viewport.top - candidate.top) <= 0.5 ||
+    Math.abs(viewport.left + viewport.width - (candidate.left + candidate.width)) <= 0.5 ||
+    Math.abs(viewport.top + viewport.height - (candidate.top + candidate.height)) <= 0.5
+  ) {
+    return { kind: "viewport", reason: "clipped" };
+  }
+  return { kind: "viewport", reason: "clipped" };
+}
+
+function assessAt(target, rectCss, samples) {
+  const started = performance.now();
+  const startSamples = clampSamples(samples);
+  const targetRect = rectCss;
+  const viewport = assessViewport();
+  const clip = clipRectsFor(target);
+  let candidate = intersectRects(targetRect, viewport);
+  for (let i = 0; i < clip.rects.length; i += 1) {
+    candidate = intersectRects(candidate, clip.rects[i]);
+  }
+  const area = rectArea(targetRect);
+  const onscreen =
+    area > 0 ? rectArea(intersectRects(targetRect, viewport)) / area : null;
+  const selected = {
+    x: targetRect.left + targetRect.width / 2,
+    y: targetRect.top + targetRect.height / 2,
+  };
+  const points = samplePoints(targetRect, startSamples);
+  let samplesHit = 0;
+  const misses = [];
+  for (let i = 0; i < points.length; i += 1) {
+    const p = points[i];
+    if (!pointInRect(p, viewport)) {
+      misses.push(null);
+      continue;
+    }
+    const hit = pierce(p.x, p.y);
+    if (hit.el && !hit.iframe && !hit.shadowUninspectable && composedContains(target, hit.el)) {
+      samplesHit += 1;
+    } else {
+      misses.push({ el: hit.el, x: p.x, y: p.y, iframe: hit.iframe, shadowUninspectable: hit.shadowUninspectable });
+    }
+  }
+  const visible = points.length > 0 ? samplesHit / points.length : null;
+  const center = pierce(selected.x, selected.y);
+  const notes = notesFor(target, clip.notes, center);
+  let interactable = null;
+  let reason = null;
+  if (!pointInRect(selected, viewport)) {
+    interactable = false;
+    reason = "center_outside_viewport";
+  } else if (center.el && !center.iframe && !center.shadowUninspectable && composedContains(target, center.el)) {
+    interactable = true;
+    const style = window.getComputedStyle(target);
+    if (style && style.pointerEvents === "none") {
+      const inner = describeElement(center.el, null);
+      if (inner && center.el !== target) {
+        notes.push("pointer_events_none");
+      }
+    }
+  } else {
+    interactable = false;
+    if (!isRendered(target)) {
+      reason = "not_rendered";
+    } else {
+      const style = window.getComputedStyle(target);
+      if (style && style.pointerEvents === "none") {
+        reason = "pointer_events_none";
+      } else if (!pointInRect(selected, candidate)) {
+        reason = "clipped_out";
+      } else if (center.shadowUninspectable) {
+        reason = "shadow_closed";
+      } else if (center.iframe) {
+        reason = "cross_frame";
+      } else {
+        reason = "blocked";
+      }
+    }
+  }
+  const blocked = describeBlockers(misses);
+  const clipped = clippedByFor(candidate, targetRect, clip, viewport);
+  const confidence = confidenceFor(
+    interactable,
+    points.length,
+    samplesHit,
+    area,
+    notes,
+    center
+  );
+  return {
+    interactable: interactable,
+    selected_point: selected,
+    target_rect_css: {
+      left: targetRect.left,
+      top: targetRect.top,
+      width: targetRect.width,
+      height: targetRect.height,
+    },
+    visible_fraction: visible,
+    onscreen_fraction: onscreen,
+    samples: points.length,
+    samples_hit: samplesHit,
+    blocked_by: blocked,
+    clipped_by: clipped,
+    notes: notes.slice(0, ASSESS_NOTES),
+    reason: reason,
+    confidence: confidence,
+    elapsed_ms: Math.max(0, performance.now() - started),
+  };
+}
+
+function buildAssess(msg) {
+  const started = performance.now();
+  const metrics = windowMetrics();
+  const css = msg && msg.css ? { x: Number(msg.css.x), y: Number(msg.css.y) } : null;
+  const base = {
+    url: location.href || "",
+    title: document.title || "",
+    metrics: metrics,
+  };
+  if (!css || !Number.isFinite(css.x) || !Number.isFinite(css.y)) {
+    base.css = null;
+    base.at_point = unknownAtPoint("point_mismatch");
+    return base;
+  }
+  base.css = css;
+  const viewport = assessViewport();
+  if (!pointInRect(css, viewport)) {
+    base.at_point = unknownAtPoint("outside_viewport");
+    return base;
+  }
+  const hit = pierce(css.x, css.y);
+  if (hit.shadowUninspectable) {
+    base.at_point = unknownAtPoint("shadow_closed", hit);
+    return base;
+  }
+  if (hit.iframe) {
+    base.at_point = unknownAtPoint("cross_frame", hit);
+    return base;
+  }
+  if (!hit.el) {
+    base.at_point = unknownAtPoint("outside_viewport", hit);
+    return base;
+  }
+  const element = describeElement(hit.el, null);
+  base.at_point = {
+    element: element || undefined,
+    shadow_path: hit.shadowPath.slice(0, ASSESS_SHADOW_PATH),
+    interactable: true,
+    reason: null,
+    notes: hit.notes.slice(0, ASSESS_NOTES),
+    confidence: hit.shadowPath.length > 0 ? "medium" : "high",
+    elapsed_ms: Math.max(0, performance.now() - started),
+  };
+  return base;
+}
+
+function unknownAtPoint(reason, hit) {
+  return {
+    shadow_path: hit ? hit.shadowPath.slice(0, ASSESS_SHADOW_PATH) : [],
+    interactable: null,
+    reason: reason,
+    notes: hit ? hit.notes.slice(0, ASSESS_NOTES) : [],
+    confidence: "none",
+  };
 }
 
 function cap(s, n) {

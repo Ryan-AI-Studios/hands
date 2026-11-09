@@ -59,6 +59,28 @@ pub struct ClickParams {
     /// Skip target verification (click/type only). Hover with blind:true is refused. Does not verify effect and does not reach elevated windows.
     #[serde(default)]
     pub blind: bool,
+    /// `chr:` only: refuse a blocked/unknown target before fence/offer/SendInput.
+    #[serde(default)]
+    pub require_interactable: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct HittestParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Chrome page-local `chr:` walk index (dies on navigation; re-observe).
+    #[serde(default)]
+    pub element_id: Option<String>,
+    /// Grid cell `g:col:row`; asks what is under its center.
+    #[serde(default)]
+    pub grid: Option<String>,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+    /// Sample count 5..49 (default 25; clamped).
+    #[serde(default)]
+    pub samples: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -279,7 +301,17 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. Point must be inside the intended window's true client or an owned popup (no --window on click; activate first). Out-of-client is ok:false (named refusal, cooldown), not SendInput. ok:true means delivered; miss (no_change / focus_lost) is the effect signal. navigated:true is a Chrome caption change or loading interstitial, or a non-Chrome http(s) UIA Document URL change — miss is omitted, no retry; chr: ids died, re-observe. Chrome soft-routes with the same caption stay no_change. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on focus_lost. Honor loop_suspected / cooldown_ms; frozen means yield the task. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default. Opt-in blind:true skips hit_test for a same-IL UIA-opaque surface (explicit x/y or grid only); ok:true then serializes verified:false (dispatch only, not effect); does not reach elevated windows; lower-assurance (no Money/Messages classifier); activate first; confirm category blind on desktop (once/session recommended). The `point` object carries the shared PointContract; a transform-invalid `chr:` refuses ok:false with `verified:false`, `physical:null`, and a named `reason`, and never calls offer/SendInput. `verified` semantics: on ok:true, dispatch delivered and effect unproven; pre-dispatch refusals carry the target reason and send nothing (the verified key is omitted); a post-dispatch freeze or post-dispatch failure sets verified:false because input may already have been sent."
+        description = "Read-only DOM hit-test / interactivity assessment over the 0129 point contract. element_id=chr:N asks whether a real press at that element's validated CSS point would reach it (blocked by an overlay, clipped, iframe, closed shadow, or unknown); x/y or grid asks what is under that physical point (top frame only, foreground Chrome). ok:true means the query ran; interactable:null is an honest unknown, never a guessed false. interactable:true means the topmost hit is the target/composed descendant under the validated map — not that the control is enabled or wired. The centre hit is authoritative; visible_fraction/onscreen_fraction/clipped_by/notes are advisory estimates, not security/performance claims. This reports click interception, not visual occlusion: a pointer-events:none overlay is not a blocker. Native-window occlusion (separate HWNDs/always-on-top) is not modelled. Page names/roles are untrusted and never logged. No input, no lease, no cooldown, no JSONL row. Advisory unless click opts in with require_interactable. An old extension may answer assessment_unavailable/assessment_missing; an old installed server may not expose this tool or the flag — refresh the installed/elevated exe before relying on it."
+    )]
+    fn hittest(
+        &self,
+        Parameters(params): Parameters<HittestParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_hittest(params))
+    }
+
+    #[tool(
+        description = "Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. uia: is RuntimeId; chr: is a page-local walk index (dies on navigation; re-observe). Prefer chr: for Chrome page content. Point must be inside the intended window's true client or an owned popup (no --window on click; activate first). Out-of-client is ok:false (named refusal, cooldown), not SendInput. ok:true means delivered; miss (no_change / focus_lost) is the effect signal. navigated:true is a Chrome caption change or loading interstitial, or a non-Chrome http(s) UIA Document URL change — miss is omitted, no retry; chr: ids died, re-observe. Chrome soft-routes with the same caption stay no_change. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on focus_lost. Honor loop_suspected / cooldown_ms; frozen means yield the task. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default. Opt-in blind:true skips hit_test for a same-IL UIA-opaque surface (explicit x/y or grid only); ok:true then serializes verified:false (dispatch only, not effect); does not reach elevated windows; lower-assurance (no Money/Messages classifier); activate first; confirm category blind on desktop (once/session recommended). require_interactable is chr: only and refuses a blocked/unknown target before fence/offer/SendInput; interactable_checked:true marks that this binary honoured the flag (an old server may silently ignore it). The `point` object carries the shared PointContract; a transform-invalid `chr:` refuses ok:false with `verified:false`, `physical:null`, and a named `reason`, and never calls offer/SendInput. `verified` semantics: on ok:true, dispatch delivered and effect unproven; pre-dispatch refusals carry the target reason and send nothing (the verified key is omitted); a post-dispatch freeze or post-dispatch failure sets verified:false because input may already have been sent."
     )]
     fn click(
         &self,
@@ -523,7 +555,26 @@ fn click_req(params: ClickParams) -> ActuateRequest {
         x: params.x,
         y: params.y,
         blind: params.blind,
+        require_interactable: params.require_interactable,
         ..ActuateRequest::default()
+    }
+}
+
+fn run_hittest(params: HittestParams) -> CallToolResult {
+    let req = crate::hittest::HittestRequest {
+        session_id: params.session_id,
+        element_id: params.element_id,
+        grid: params.grid,
+        x: params.x,
+        y: params.y,
+        samples: params.samples,
+    };
+    match crate::hittest::run(req)
+        .and_then(|env| crate::hittest::serialize(&env).map(|json| (env.ok, json)))
+    {
+        Ok((true, json)) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Ok((false, json)) => CallToolResult::error(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
     }
 }
 

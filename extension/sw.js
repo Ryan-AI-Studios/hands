@@ -52,7 +52,10 @@ function sendToContent(port, tabId, msg) {
 
 function forward(port, msg) {
   const op = msg && msg.op;
-  if (op !== "snapshot" && op !== "resolve") {
+  if (op !== "snapshot" && op !== "resolve" && op !== "assess") {
+    try {
+      port.postMessage({ error: "unsupported-op" });
+    } catch (_err) {}
     return;
   }
   chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {

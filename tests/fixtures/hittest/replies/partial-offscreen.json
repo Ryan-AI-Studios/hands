@@ -1,0 +1,15 @@
+{
+  "interactable": true,
+  "selected_point": {"x": 200.0, "y": 20.0},
+  "target_rect_css": {"left": 100.0, "top": -10.0, "width": 200.0, "height": 60.0},
+  "visible_fraction": 0.5,
+  "onscreen_fraction": 0.6666667,
+  "samples": 25,
+  "samples_hit": 12,
+  "blocked_by": [],
+  "clipped_by": {"kind": "viewport", "reason": "clipped"},
+  "notes": [],
+  "reason": null,
+  "confidence": "medium",
+  "elapsed_ms": 1.2
+}

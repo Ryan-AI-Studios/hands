@@ -1,0 +1,13 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>hittest modal backdrop</title>
+<style>
+body{margin:0;font:16px system-ui}
+#target{position:absolute;left:100px;top:50px;width:200px;height:40px}
+.backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:3}
+dialog{position:fixed;left:300px;top:120px;width:400px;height:240px;z-index:4}
+</style>
+</head><body>
+<button id="target" data-fixture="modal-backdrop">Sign in</button>
+<div class="backdrop"></div>
+<dialog open role="dialog" aria-label="Modal">Modal</dialog>
+</body></html>

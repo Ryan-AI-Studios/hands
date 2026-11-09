@@ -1,10 +1,10 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><title>hittest open shadow pointer-events none</title>
 </head><body>
-<button id="target" data-fixture="open-shadow-pointer-events-none" style="position:absolute;left:100px;top:50px;width:200px;height:40px">Sign in</button>
-<div id="host"></div>
+<div id="target" role="button" tabindex="0" data-fixture="open-shadow-pointer-events-none"
+     style="position:absolute;left:100px;top:50px;width:200px;height:40px;background:#eee">Sign in</div>
 <script>
-const host = document.getElementById("host");
+const host = document.getElementById("target");
 const root = host.attachShadow({ mode: "open" });
 const overlay = document.createElement("div");
 overlay.setAttribute("aria-label", "Visual shadow overlay");

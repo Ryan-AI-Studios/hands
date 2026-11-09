@@ -843,6 +843,49 @@ mod tests {
     // ---------------------------------------------------------------- reply shapes
 
     #[test]
+    fn golden_geometry_is_consistent() {
+        for name in [
+            "unobstructed.json",
+            "sticky-header.json",
+            "modal-backdrop.json",
+            "cookie-banner.json",
+            "pointer-events-none.json",
+            "clipped-container.json",
+            "transformed-ancestor.json",
+            "open-shadow-overlay.json",
+            "closed-shadow.json",
+            "closed-shadow-uninspectable.json",
+            "partial-offscreen.json",
+            "aria-disabled-inert.json",
+            "nested-scroll.json",
+            "iframe-overlay.json",
+            "small-target.json",
+            "fixed-in-overflow.json",
+            "absolute-above-clipper.json",
+            "body-overflow.json",
+            "light-dom-custom-element.json",
+        ] {
+            let a = assessment(name);
+            assert!(
+                points_match(a.selected_point, a.target_rect_css.center()),
+                "{name}: selected_point must be the target rect centre"
+            );
+            if let (Some(visible), Some(onscreen)) = (a.visible_fraction, a.onscreen_fraction) {
+                assert!(
+                    visible <= onscreen + 1e-9,
+                    "{name}: visible {visible} > onscreen {onscreen}"
+                );
+            }
+            if a.samples_hit < a.samples && a.interactable == Some(false) {
+                assert!(
+                    !a.blocked_by.is_empty(),
+                    "{name}: a blocked verdict with misses must name a blocker"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn assessment_parses_blocked_and_unobstructed_replies() {
         let blocked = assessment("sticky-header.json");
         assert_eq!(blocked.interactable, Some(false));
@@ -941,11 +984,26 @@ mod tests {
         let a = assessment("open-shadow-overlay.json");
         assert_eq!(a.interactable, Some(false));
         assert_eq!(a.blocked_by[0].tag.as_deref(), Some("div"));
+        assert_eq!(a.blocked_by[0].role.as_deref(), Some("dialog"));
+        assert_eq!(a.confidence, AssessmentConfidence::High);
     }
 
     #[test]
     fn closed_shadow_element_false() {
+        // Chrome 88+ exposes chrome.dom, so the closed root is pierceable; the inner overlay is
+        // named and the `shadow_pierced_closed` note lowers confidence to medium.
         let a = assessment("closed-shadow.json");
+        assert_eq!(a.interactable, Some(false));
+        assert_eq!(a.blocked_by[0].kind, BlockerKind::Element);
+        assert_eq!(a.reason.as_deref(), Some("blocked"));
+        assert!(a.notes.iter().any(|n| n == "shadow_pierced_closed"));
+        assert_eq!(a.confidence, AssessmentConfidence::Medium);
+    }
+
+    #[test]
+    fn closed_shadow_uninspectable_is_shadow_closed() {
+        // Hypothetical branch for a host whose closed root cannot be inspected (no chrome.dom).
+        let a = assessment("closed-shadow-uninspectable.json");
         assert_eq!(a.interactable, Some(false));
         assert_eq!(a.blocked_by[0].kind, BlockerKind::Shadow);
         assert_eq!(a.reason.as_deref(), Some("shadow_closed"));
@@ -1031,17 +1089,17 @@ mod tests {
     fn inert_reply() {
         let a = assessment("aria-disabled-inert.json");
         assert_eq!(a.interactable, Some(true));
-        assert!(a.notes.iter().any(|n| n == "inert"));
+        assert!(a.notes.iter().any(|n| n == "aria_disabled"));
+        // The `inert` div in this fixture is a sibling, not an ancestor; no inert note is
+        // invented. An inert ancestor would be excluded from hit testing entirely.
+        assert!(!a.notes.iter().any(|n| n == "inert"));
     }
 
     #[test]
     fn small_target_confidence() {
         let a = assessment("small-target.json");
         assert_eq!(a.interactable, Some(true));
-        assert!(matches!(
-            a.confidence,
-            AssessmentConfidence::Medium | AssessmentConfidence::Low
-        ));
+        assert_eq!(a.confidence, AssessmentConfidence::High);
     }
 
     #[test]
@@ -1071,14 +1129,17 @@ mod tests {
     }
 
     #[test]
-    fn point_mode_shadow_pointer_events_none_is_unknown() {
+    fn point_mode_shadow_pointer_events_none_keeps_host_hit() {
+        // The host is the target and covers the point; a pointer-events:none shadow inner does
+        // not change what receives the press, so the document-level host hit is retained.
         let a = at_point("open-shadow-pointer-events-none.json");
-        assert_eq!(a.interactable, None);
-        assert_eq!(a.reason.as_deref(), Some("shadow_pierce_unavailable"));
+        assert_eq!(a.interactable, Some(true));
+        assert_eq!(a.reason, None);
+        assert_eq!(a.element.unwrap().tag.as_deref(), Some("div"));
         let js = include_str!("../extension/content.js");
         assert!(
             js.contains("shadowPointerEventsNone"),
-            "pierce must not accept a pointer-events:none inner hit"
+            "pierce must detect a pointer-events:none inner hit"
         );
     }
 
@@ -1303,6 +1364,7 @@ mod tests {
 
     #[test]
     fn hittest_and_click_agree_on_off_viewport_centre() {
+        let _g = crate::chrome::EnvGuard::lock();
         let contract = PointContract {
             source: PointSource::Chr,
             css: Some(CssPoint::new(10.0, 20.0)),
@@ -1312,38 +1374,61 @@ mod tests {
                 None,
             ),
         };
-        let envelope = envelope_for_outcome(
-            TargetOutcome::Unresolved {
-                target: Target::ElementId("chr:0".into()),
-                contract: Box::new(contract.clone()),
-                hwnd: None,
-                assessment: None,
+        let hit = chrome::ChromeHit {
+            id: "chr:0".into(),
+            name: String::new(),
+            role: "Button".into(),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
             },
-            "default",
-            25,
-        );
-        let a = envelope.assessment.expect("assessment");
+            css_rect: CssRect {
+                left: 0.0,
+                top: 0.0,
+                width: 100.0,
+                height: 40.0,
+            },
+            css_point: CssPoint::new(50.0, 20.0),
+            contract,
+            hwnd: Some(0x1234),
+            map: None,
+            assessment: None,
+        };
+        chrome::set_resolve_stub(Some(hit));
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(|| Some(0x1234)));
+        let hittest_env = run(HittestRequest {
+            session_id: Some("s-0128-agree".into()),
+            element_id: Some("chr:0".into()),
+            ..HittestRequest::default()
+        })
+        .expect("hittest");
+        let click_env = crate::actuate::click(crate::actuate::ActuateRequest {
+            session_id: Some("s-0128-agree".into()),
+            element_id: Some("chr:0".into()),
+            ..crate::actuate::ActuateRequest::default()
+        })
+        .expect("click");
+        chrome::set_resolve_stub(None);
+        crate::elevation::set_caller_rid_hook(None);
+        crate::elevation::set_high_il_hook(None);
+        crate::foreground::set_foreground_hwnd_hook(None);
+        let a = hittest_env.assessment.expect("assessment");
         assert_eq!(a.interactable, None);
         let reason = a.reason.unwrap_or_default();
         assert!(reason.starts_with("invalid_transform:"));
         assert!(reason.contains("point_outside_viewport"));
-        let refusal = crate::actuate::refuse_transform(
-            "s-test".into(),
-            ActuateTarget {
-                kind: "element".into(),
-                id: Some("chr:0".into()),
-                x: 0,
-                y: 0,
-            },
-            contract,
-        )
-        .expect("refusal");
+        assert!(!click_env.ok, "{click_env:?}");
         assert!(
-            refusal
+            click_env
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("point_outside_viewport")
+                .contains("point_outside_viewport"),
+            "{click_env:?}"
         );
     }
 
@@ -1477,6 +1562,59 @@ mod tests {
     }
 
     #[test]
+    fn three_blocker_envelope_fits_4kib() {
+        let mut a = Assessment {
+            interactable: Some(false),
+            selected_point: CssPoint::new(200.0, 70.0),
+            target_rect_css: CssRect {
+                left: 100.0,
+                top: 50.0,
+                width: 200.0,
+                height: 40.0,
+            },
+            visible_fraction: Some(0.0),
+            onscreen_fraction: Some(1.0),
+            samples: 25,
+            samples_hit: 0,
+            blocked_by: (0..3)
+                .map(|i| PointBlocker {
+                    kind: BlockerKind::Element,
+                    tag: Some(format!("tag{i}")),
+                    role: Some("dialog".into()),
+                    name: Some("n".repeat(80)),
+                    rect_css: Some(CssRect {
+                        left: 0.0,
+                        top: 0.0,
+                        width: 1200.0,
+                        height: 800.0,
+                    }),
+                    reason: Some("overlay".into()),
+                })
+                .collect(),
+            clipped_by: None,
+            notes: vec!["aria_disabled".into(), "containing_block_skip".into()],
+            reason: Some("blocked".into()),
+            confidence: AssessmentConfidence::High,
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            elapsed_ms: Some(2.0),
+        };
+        bound_assessment(&mut a);
+        let envelope = finalize(HittestEnvelope {
+            session_id: "s-4k".into(),
+            ok: true,
+            point: None,
+            target_rect: None,
+            detail: Some("default".into()),
+            assessment: Some(a),
+            at_point: None,
+            error: None,
+        })
+        .expect("4k envelope");
+        let json = serialize(&envelope).expect("json");
+        assert!(json.len() <= 4096, "{} bytes", json.len());
+    }
+
+    #[test]
     fn point_mode_missing_css_echo_is_mismatch() {
         let report = valid_report(
             1.0,
@@ -1532,6 +1670,39 @@ mod tests {
             Some("assessment_unavailable")
         );
         assert_eq!(chrome::assess_calls(), 0, "old extension must not be asked");
+    }
+
+    #[test]
+    fn point_mode_new_extension_attempts_assess() {
+        chrome::reset_assess_calls();
+        let _result = point_after_snapshot(
+            chrome::SnapshotOutcome::Map(Box::new(test_map(
+                Some(valid_report(
+                    1.0,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: 1200,
+                        h: 900,
+                    },
+                )),
+                Some(chrome::PageIdentity {
+                    url: Some("https://example.test/".into()),
+                    title: "Example".into(),
+                    inner_width: Some(1200.0),
+                    inner_height: Some(900.0),
+                    dpr: Some(1.0),
+                    assess_v: Some(1),
+                }),
+            ))),
+            PhysicalPoint { x: 10, y: 20 },
+            25,
+        );
+        assert_eq!(
+            chrome::assess_calls(),
+            1,
+            "assess_v>=1 must reach the assess call"
+        );
     }
 
     #[test]

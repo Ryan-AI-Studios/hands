@@ -1395,18 +1395,23 @@ function describeBlockers(misses) {
       if (tag === "html" || tag === "body") {
         blocker = { kind: "background", tag: cap(tag, 16), reason: "not_target" };
       } else {
-        let candidates = [];
-        try {
-          candidates = document.elementsFromPoint(miss.x, miss.y) || [];
-        } catch (_err) {
-          candidates = [];
+        if (miss.shadowPath && miss.shadowPath.length > 0) {
+          blocker = describeElement(miss.el, "overlay");
         }
-        const top = candidates.slice(0, 3);
-        for (let j = 0; j < top.length; j += 1) {
-          const named = describeElement(top[j], "overlay");
-          if (named) {
-            blocker = named;
-            break;
+        let candidates = [];
+        if (!blocker) {
+          try {
+            candidates = document.elementsFromPoint(miss.x, miss.y) || [];
+          } catch (_err) {
+            candidates = [];
+          }
+          const top = candidates.slice(0, 3);
+          for (let j = 0; j < top.length; j += 1) {
+            const named = describeElement(top[j], "overlay");
+            if (named) {
+              blocker = named;
+              break;
+            }
           }
         }
         if (!blocker) {
@@ -1554,7 +1559,15 @@ function assessAt(target, rectCss, samples) {
     if (hit.el && !hit.iframe && !hit.shadowUninspectable && composedContains(target, hit.el)) {
       samplesHit += 1;
     } else {
-      misses.push({ el: hit.el, x: p.x, y: p.y, iframe: hit.iframe, shadowUninspectable: hit.shadowUninspectable });
+      misses.push({
+        el: hit.el,
+        x: p.x,
+        y: p.y,
+        iframe: hit.iframe,
+        shadowUninspectable: hit.shadowUninspectable,
+        shadowPointerEventsNone: hit.shadowPointerEventsNone,
+        shadowPath: hit.shadowPath,
+      });
     }
   }
   const visibleBase = points.length > 0 ? samplesHit / points.length : null;
@@ -1569,9 +1582,6 @@ function assessAt(target, rectCss, samples) {
   if (!pointInRect(selected, viewport)) {
     interactable = false;
     reason = "center_outside_viewport";
-  } else if (center.shadowPointerEventsNone) {
-    interactable = null;
-    reason = "shadow_pierce_unavailable";
   } else if (center.el && !center.iframe && !center.shadowUninspectable && composedContains(target, center.el)) {
     interactable = true;
     const style = window.getComputedStyle(target);
@@ -1581,6 +1591,11 @@ function assessAt(target, rectCss, samples) {
         notes.push("pointer_events_none");
       }
     }
+  } else if (center.shadowPointerEventsNone) {
+    // The document-level hit is the shadow host; a pointer-events:none inner cannot
+    // receive the press. Unknown rather than a false negative.
+    interactable = null;
+    reason = "shadow_pierce_unavailable";
   } else {
     interactable = false;
     if (!isRendered(target)) {
@@ -1691,10 +1706,6 @@ function buildAssess(msg) {
   const hit = pierce(css.x, css.y);
   if (hit.shadowUninspectable) {
     base.at_point = unknownAtPoint("shadow_closed", hit);
-    return base;
-  }
-  if (hit.shadowPointerEventsNone) {
-    base.at_point = unknownAtPoint("shadow_pierce_unavailable", hit);
     return base;
   }
   if (hit.iframe) {

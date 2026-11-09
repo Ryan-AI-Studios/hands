@@ -5202,6 +5202,58 @@ mod tests {
     }
 
     #[test]
+    fn require_interactable_true_dispatches_and_marks() {
+        let _g = elevation_lock();
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        let (mut hit, css) = chr_hit(100, 80);
+        let mut assessment: crate::hittest::Assessment = serde_json::from_str(include_str!(
+            "../tests/fixtures/hittest/replies/unobstructed.json"
+        ))
+        .expect("assessment");
+        assessment.selected_point = hit.contract.css.expect("css");
+        assessment.target_rect_css = css;
+        hit.assessment = Some(assessment);
+        chrome::set_resolve_stub(Some(hit));
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(noop_sends));
+        crate::capture::set_capture_roi_hook(Some(fake_capture));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        let _ = crate::foreground::take_offer_calls();
+
+        let env = click(ActuateRequest {
+            session_id: Some("s-0128-true".into()),
+            element_id: Some("chr:5".into()),
+            require_interactable: true,
+            ..ActuateRequest::default()
+        })
+        .expect("click");
+        chrome::set_resolve_stub(None);
+        assert!(env.ok, "{env:?}");
+        assert_eq!(env.interactable_checked, Some(true), "{env:?}");
+        assert!(env.assessment.is_some(), "{env:?}");
+        let offers = crate::foreground::take_offer_calls();
+        assert!(
+            offers.iter().any(|(hwnd, _)| *hwnd == Some(0x1234)),
+            "unobstructed opted-in click must dispatch: {offers:?}"
+        );
+        lease::reset_for_test();
+    }
+
+    #[test]
     fn chr_click_stale_remap_refuses_before_offer_and_input() {
         let _g = elevation_lock();
         let _seam = FinalRemapSeam;
@@ -5971,7 +6023,7 @@ mod tests {
     }
 
     #[test]
-    fn require_interactable_allows_unobstructed_and_dispatches() {
+    fn require_interactable_true_guard_allows() {
         // Positive control at the guard seam: true is not a refusal. Dispatch wiring is the
         // existing click path; this test pins that the guard returns None for a true verdict.
         let report = crate::point::TransformReport {
@@ -6057,5 +6109,14 @@ mod tests {
                 .expect("guard")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn no_process_global_offset_cache() {
+        // The map is rebuilt per observe/resolve/guard; no calibrated-once constant.
+        let src = include_str!("actuate.rs");
+        assert!(src.contains("final_live_remap"));
+        assert!(!src.contains(&["OFFSET", "_CACHE"].join("")));
+        assert!(!src.contains(&["static ", "OFFSET"].join("")));
     }
 }

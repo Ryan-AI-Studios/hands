@@ -7,11 +7,12 @@
   "samples": 25,
   "samples_hit": 0,
   "blocked_by": [
-    {"kind": "shadow", "tag": "div", "reason": "shadow_closed"}
+    {"kind": "element", "tag": "div", "role": "dialog",
+     "rect_css": {"left": 0.0, "top": 0.0, "width": 1200.0, "height": 800.0}, "reason": "overlay"}
   ],
   "clipped_by": null,
-  "notes": [],
-  "reason": "shadow_closed",
-  "confidence": "low",
+  "notes": ["shadow_pierced_closed"],
+  "reason": "blocked",
+  "confidence": "medium",
   "elapsed_ms": 1.6
 }

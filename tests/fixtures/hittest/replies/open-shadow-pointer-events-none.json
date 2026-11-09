@@ -1,8 +1,9 @@
 {
-  "shadow_path": ["div"],
-  "interactable": null,
-  "reason": "shadow_pierce_unavailable",
+  "element": {"kind": "element", "tag": "div", "role": "button"},
+  "shadow_path": [],
+  "interactable": true,
+  "reason": null,
   "notes": [],
-  "confidence": "none",
-  "elapsed_ms": 1.1
+  "confidence": "high",
+  "elapsed_ms": 1.2
 }

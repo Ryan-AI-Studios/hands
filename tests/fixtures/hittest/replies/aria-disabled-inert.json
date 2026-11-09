@@ -8,7 +8,7 @@
   "samples_hit": 25,
   "blocked_by": [],
   "clipped_by": null,
-  "notes": ["aria_disabled", "inert"],
+  "notes": ["aria_disabled"],
   "reason": null,
   "confidence": "high",
   "elapsed_ms": 1.1

@@ -1451,6 +1451,7 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         req.element_id.is_some() || req.grid.is_some() || req.x.is_some() || req.y.is_some();
     let foregrounded;
     let mut info = none_target();
+    let mut point = None;
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
@@ -1475,6 +1476,7 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
                 }
                 foregrounded = env.foregrounded;
                 info = env.target;
+                point = env.point;
             }
             Err(err) => return fail(session_id, info, err, false, false, false),
         }
@@ -1518,16 +1520,20 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     }
     challenge::note_actuation();
     match input::scroll_wheel(dy, req.dx) {
-        Ok(()) => base(
-            session_id,
-            info,
-            true,
-            false,
-            false,
-            false,
-            foregrounded,
-            None,
-        ),
+        Ok(()) => {
+            let mut env = base(
+                session_id,
+                info,
+                true,
+                false,
+                false,
+                false,
+                foregrounded,
+                None,
+            )?;
+            env.point = point;
+            finalize_envelope(env)
+        }
         Err(err) => fail(session_id, info, err, foregrounded, false, false),
     }
 }
@@ -4200,6 +4206,8 @@ mod tests {
         let transform = hover.find("refuse_transform").unwrap();
         let move_to = hover.find("input::move_to").unwrap();
         assert!(transform < move_to);
+        assert!(body.contains("point = env.point"));
+        assert!(body.contains("env.point = point"));
     }
 
     #[test]

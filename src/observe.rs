@@ -1023,6 +1023,10 @@ fn cap_default_envelope_with_client(
         }
     }
     refresh_card_omitted(&mut envelope);
+    envelope.elements_truncated = envelope.elements.len() < envelope.elements_total;
+    if serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
+        shrink_main_text_to_fit(&mut envelope, DEFAULT_ENVELOPE_MAX_BYTES);
+    }
     envelope
 }
 
@@ -2210,6 +2214,7 @@ mod tests {
 
     fn dense_ref_envelope() -> ObserveEnvelope {
         let mut raw = fat_envelope(20);
+        raw.extract.main_text = "M".repeat(3000);
         raw.viewport = Some(Rect {
             x: 0,
             y: 0,
@@ -2221,7 +2226,16 @@ mod tests {
             el.role = "Button".into();
             el.text = Some("Search".into());
             el.unnamed = None;
-            el.sref = Some(format!("sref1:c.12.0.9f3a.a1b2c3d4.{i}"));
+            el.sref = Some(
+                SnapshotRef::Chrome {
+                    tab: 12,
+                    frame: 0,
+                    doc: "9f3a".into(),
+                    snap: "a1b2c3d4".into(),
+                    idx: i as u32,
+                }
+                .to_string(),
+            );
         }
         raw.snapshot = Some(SnapshotBinding {
             tab: Some(12),
@@ -2240,8 +2254,14 @@ mod tests {
 
     #[test]
     fn default_envelope_with_sref_fits_4kib_and_keeps_reserved() {
-        let capped = cap_default_envelope(dense_ref_envelope());
+        let raw = dense_ref_envelope();
+        let original_main_len = raw.extract.main_text.len();
+        let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            capped.extract.main_text.len() < original_main_len,
+            "fixture must exercise main-text shrink"
+        );
         assert!(
             json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
             "len {}",

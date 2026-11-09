@@ -184,7 +184,7 @@ fn sta_resolve(want: &[i32]) -> Result<ResolvedElement, HandsError> {
     }
     let _sta = StaGuard::enter()?;
     let automation = create_automation()?;
-    Ok(resolve_on(&automation, want)?.resolved)
+    Ok(resolve_on(&automation, want, None)?.resolved)
 }
 
 /// A resolved element plus the live COM element it came from. Both stay on the
@@ -199,15 +199,28 @@ pub(crate) struct ResolvedComElement {
 pub(crate) fn resolve_on(
     automation: &IUIAutomation,
     want: &[i32],
+    root_hwnd: Option<isize>,
 ) -> Result<ResolvedComElement, HandsError> {
     if want.is_empty() {
         return Err(HandsError::Target("empty RuntimeId".into()));
     }
     let walker = unsafe { automation.ControlViewWalker() }
         .map_err(|err| HandsError::Uia(format!("ControlViewWalker: {err}")))?;
-    let root = unsafe { automation.GetRootElement() }
-        .map_err(|err| HandsError::Uia(format!("GetRootElement: {err}")))?;
-    let Some(element) = find_runtime_id(&walker, &root, want) else {
+    let root = match root_hwnd {
+        Some(hwnd) => unsafe { automation.ElementFromHandle(crate::foreground::raw_hwnd(hwnd)) }
+            .map_err(|_| {
+                HandsError::Target("window_unreadable: UIA root handle is unavailable".into())
+            })?,
+        None => unsafe { automation.GetRootElement() }
+            .map_err(|err| HandsError::Uia(format!("GetRootElement: {err}")))?,
+    };
+    let (mut matches, cap_hit) = find_runtime_ids(&walker, &root, want, SCOPED_NODE_CAP);
+    if cap_hit {
+        return Err(HandsError::Target(
+            "UIA walk cap reached before the RuntimeId was resolved; unknown".into(),
+        ));
+    }
+    if matches.is_empty() {
         return Err(HandsError::Target(format!(
             "no UIA element with RuntimeId {}; RuntimeId does not survive navigation / a destroyed control; re-observe",
             want.iter()
@@ -215,7 +228,17 @@ pub(crate) fn resolve_on(
                 .collect::<Vec<_>>()
                 .join(".")
         )));
-    };
+    }
+    if matches.len() > 1 {
+        return Err(HandsError::Target(format!(
+            "multiple UIA elements with RuntimeId {}; ambiguous; re-observe",
+            want.iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(".")
+        )));
+    }
+    let element = matches.remove(0);
     let rect = unsafe {
         element
             .CurrentBoundingRectangle()
@@ -500,21 +523,31 @@ fn value_walk(walker: &IUIAutomationTreeWalker, element: &IUIAutomationElement) 
     None
 }
 
-fn find_runtime_id(
+fn find_runtime_ids(
     walker: &IUIAutomationTreeWalker,
     root: &IUIAutomationElement,
     want: &[i32],
-) -> Option<IUIAutomationElement> {
+    cap: usize,
+) -> (Vec<IUIAutomationElement>, bool) {
     let mut stack = vec![root.clone()];
+    let mut matches = Vec::new();
+    let mut visited = 0usize;
     while let Some(element) = stack.pop() {
+        visited += 1;
+        if visited > cap {
+            return (matches, true);
+        }
         if let Some(id) = runtime_id(&element)
             && id == want
         {
-            return Some(element);
+            matches.push(element.clone());
+            if matches.len() > 1 {
+                break;
+            }
         }
         push_children(walker, &element, &mut stack);
     }
-    None
+    (matches, false)
 }
 
 fn native_hwnd(walker: &IUIAutomationTreeWalker, element: &IUIAutomationElement) -> Option<isize> {
@@ -535,6 +568,31 @@ fn native_hwnd(walker: &IUIAutomationTreeWalker, element: &IUIAutomationElement)
 
 pub(crate) const SCOPED_NODE_CAP: usize = 4096;
 const SCOPED_MATCH_CAP: usize = 16;
+const MAX_IN_FLIGHT_WORKERS: usize = 4;
+
+static IN_FLIGHT_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Bounds detached UIA workers across scoped resolve and `uia-action` dispatch. A timed-out
+/// worker keeps its slot until it actually exits, so a hung provider cannot accumulate
+/// unbounded threads.
+pub(crate) struct WorkerSlot;
+
+impl WorkerSlot {
+    pub(crate) fn acquire() -> Option<Self> {
+        let current = IN_FLIGHT_WORKERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if current >= MAX_IN_FLIGHT_WORKERS {
+            IN_FLIGHT_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return None;
+        }
+        Some(Self)
+    }
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        IN_FLIGHT_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 #[cfg(test)]
 type ScopedUiaHook = fn(isize, &str, &str) -> Result<ResolvedElement, ScopedFailure>;
@@ -566,10 +624,14 @@ pub fn resolve_scoped(
     }
     let ridh = ridh.to_string();
     let fp = fp.to_string();
+    let Some(slot) = WorkerSlot::acquire() else {
+        return Err(ScopedFailure::unknown("provider_timeout"));
+    };
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("hands-uia-scoped".into())
         .spawn(move || {
+            let _slot = slot;
             let _ = tx.send(sta_resolve_scoped(hwnd, &ridh, &fp));
         })
         .map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
@@ -649,12 +711,13 @@ pub(crate) fn scoped_matches_outcome(
     hwnd: isize,
     fp: &str,
 ) -> Result<ResolvedElement, ScopedFailure> {
+    // A cap hit means the walk is incomplete even if a candidate was already collected.
+    // Never accept a partial first match (DoD-7).
+    if cap_hit {
+        return Err(ScopedFailure::unknown("provider_timeout"));
+    }
     if matches.is_empty() {
-        return Err(if cap_hit {
-            ScopedFailure::unknown("provider_timeout")
-        } else {
-            ScopedFailure::stale("stale_element")
-        });
+        return Err(ScopedFailure::stale("stale_element"));
     }
     let mut within = Vec::new();
     for candidate in matches {
@@ -1209,9 +1272,37 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_resolve_on_roots_at_hwnd_and_bounds_walk() {
+        let src = include_str!("uia.rs");
+        let start = src.find("pub(crate) fn resolve_on(").expect("resolve_on");
+        let end = src.find("fn pick_named(").expect("pick_named");
+        let body = &src[start..end];
+        assert!(body.contains("ElementFromHandle"));
+        assert!(body.contains("find_runtime_ids"));
+        assert!(body.contains("SCOPED_NODE_CAP"));
+        assert!(body.contains("ambiguous"));
+        let actions = include_str!("uia_actions.rs");
+        assert!(actions.contains("resolve_on(&automation, &want, outer_hwnd)"));
+    }
+
+    #[test]
+    fn uia_workers_are_bounded() {
+        let src = include_str!("uia.rs");
+        assert!(src.contains("MAX_IN_FLIGHT_WORKERS"));
+        assert!(src.contains("WorkerSlot::acquire"));
+        let actions = include_str!("uia_actions.rs");
+        assert!(actions.contains("uia::WorkerSlot::acquire"));
+    }
+
+    #[test]
     fn scoped_walk_cap_is_unknown_not_first_match() {
         let err =
             scoped_matches_outcome(Vec::new(), true, 0x1234, "00000000").expect_err("cap hit");
+        assert_eq!(err.state, IdentityState::Unknown);
+        assert_eq!(err.reason, "provider_timeout");
+
+        let err = scoped_matches_outcome(vec![found("Send", "Button")], true, 0x1234, "00000000")
+            .expect_err("cap hit after one match");
         assert_eq!(err.state, IdentityState::Unknown);
         assert_eq!(err.reason, "provider_timeout");
     }

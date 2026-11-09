@@ -104,10 +104,13 @@ function buildSnapshot(detail, store) {
   const elements = [];
   const keys = [];
   for (let i = 0; i < nodes.length; i += 1) {
-    const payload = nodePayload(nodes[i], i);
-    if (payload) {
+    const payload = keyPayload(nodes[i], i);
+    const key = snapshotKey(nodes[i], payload);
+    const rect = cssRect(nodes[i]);
+    if (rect) {
+      payload.rectCss = rect;
       elements.push(payload);
-      keys.push(snapshotKey(nodes[i], keyPayload(nodes[i], i)));
+      keys.push(key);
     } else {
       keys.push(null);
     }
@@ -439,7 +442,10 @@ function nonChurningName(el, payload) {
 function fnv1a32(str) {
   let hash = 0x811c9dc5;
   for (let i = 0; i < str.length; i += 1) {
-    hash ^= str.charCodeAt(i) & 0xff;
+    const code = str.charCodeAt(i);
+    hash ^= code & 0xff;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+    hash ^= (code >>> 8) & 0xff;
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   return hash >>> 0;

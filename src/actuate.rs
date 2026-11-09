@@ -731,14 +731,19 @@ pub(crate) fn settle_cooldown(tool: &str, env: &mut ActuateEnvelope) {
         return;
     }
     if let Some(report) = env.identity.as_ref() {
-        // Nothing was sent for a stale/ambiguous ref or a binding precondition; the fix is
-        // re-observe/activate, not a session cooldown. Transport/provider `unknown` arms it.
+        // DoD-5 exemption: only stale/ambiguous refs and the three binding preconditions
+        // skipped a send. Every other refusal (including an exact-state transform refusal)
+        // arms the session cooldown exactly as `origin/main` did.
+        let exempt_state = matches!(
+            report.state,
+            IdentityState::Stale | IdentityState::Ambiguous
+        );
         let binding_precondition = report.state == IdentityState::Unknown
             && matches!(
                 report.reason.as_deref(),
                 Some("tab_not_active" | "window_not_focused" | "tab_hidden")
             );
-        if report.state != IdentityState::Unknown || binding_precondition {
+        if exempt_state || binding_precondition {
             return;
         }
     }
@@ -795,6 +800,10 @@ pub(crate) fn refuse_transform(
     contract: PointContract,
     identity: Option<IdentityReport>,
 ) -> Result<ActuateEnvelope, HandsError> {
+    // Spec §3.7: the identity resolves, but the 0129 transform refuses. Keep `state` as the
+    // resolved identity (exact/legacy) and put the named transform reason in `error`; the
+    // envelope is `ok:false` + `verified:false` + `point.transform.valid=false`, so 0124 must
+    // gate on those, not on `identity.state` alone.
     let reason = contract
         .transform
         .reason
@@ -978,27 +987,8 @@ fn final_live_remap(
             resolved.map = Some(new_map);
             info.x = p.x;
             info.y = p.y;
-            if let Target::Scoped(r @ SnapshotRef::Chrome { tab, .. }) = &resolved.target {
-                match chrome::verify_binding(*tab) {
-                    Ok(evidence) if evidence.active && evidence.focused => {}
-                    Ok(evidence) => {
-                        let reason = if !evidence.active {
-                            "tab_not_active"
-                        } else {
-                            "window_not_focused"
-                        };
-                        return refuse_identity(
-                            session_id.to_string(),
-                            info.clone(),
-                            IdentityReport::chrome_failure(r, IdentityState::Unknown, reason),
-                        )
-                        .map(Some);
-                    }
-                    Err(report) => {
-                        return refuse_identity(session_id.to_string(), info.clone(), report)
-                            .map(Some);
-                    }
-                }
+            if let Some(env) = scoped_binding_refusal(session_id, info, resolved)? {
+                return Ok(Some(env));
             }
             Ok(None)
         }
@@ -1022,6 +1012,37 @@ fn final_live_remap(
 
 fn point_for_dispatch(resolved: &ResolvedTarget) -> Option<PointContract> {
     resolved.contract.clone()
+}
+
+/// Final binding gate for scoped Chrome refs. Used after the 0129 remap and again immediately
+/// before `left_click` (narrowing the resolve→dispatch residual; still not a content read).
+fn scoped_binding_refusal(
+    session_id: &str,
+    info: &ActuateTarget,
+    resolved: &ResolvedTarget,
+) -> Result<Option<ActuateEnvelope>, HandsError> {
+    let Target::Scoped(r @ SnapshotRef::Chrome { tab, .. }) = &resolved.target else {
+        return Ok(None);
+    };
+    // `evidence.window` is corroboration only: a window drag/move keeps the tab-id binding
+    // valid (spec §3.3), so only active/focused gate the dispatch.
+    match chrome::verify_binding(*tab) {
+        Ok(evidence) if evidence.active && evidence.focused => Ok(None),
+        Ok(evidence) => {
+            let reason = if !evidence.active {
+                "tab_not_active"
+            } else {
+                "window_not_focused"
+            };
+            refuse_identity(
+                session_id.to_string(),
+                info.clone(),
+                IdentityReport::chrome_failure(r, IdentityState::Unknown, reason),
+            )
+            .map(Some)
+        }
+        Err(report) => refuse_identity(session_id.to_string(), info.clone(), report).map(Some),
+    }
 }
 
 pub fn click(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -1267,6 +1288,12 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             );
         }
     };
+    // Narrow R7: re-probe tabs/windows immediately before the click. A tab switch during
+    // offer/move/capture is still refused with no input; the probe→click microseconds remain
+    // the named residual.
+    if let Some(env) = scoped_binding_refusal(&session_id, &info, &resolved)? {
+        return Ok(env);
+    }
     if let Err(err) = input::left_click(&mut rng) {
         return fail_with_point_unverified(
             session_id,
@@ -6388,6 +6415,61 @@ mod tests {
     }
 
     #[test]
+    fn exact_identity_transform_refusal_arms_cooldown() {
+        let _g = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        let r = SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 7,
+        };
+        let mut env = refuse_transform(
+            "s-exact-transform".into(),
+            none_target(),
+            invalid_chr_contract("no_viewport_anchor"),
+            Some(IdentityReport::exact_chrome(&r)),
+        )
+        .unwrap();
+        assert_eq!(
+            env.identity.as_ref().map(|i| i.state),
+            Some(IdentityState::Exact)
+        );
+        settle_cooldown("click", &mut env);
+        assert_eq!(crate::cooldown::snapshot("s-exact-transform").attempt, 1);
+    }
+
+    #[test]
+    fn transform_refusal_identity_is_exact_but_error_names_reason() {
+        let r = SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 7,
+        };
+        let env = refuse_transform(
+            "s-transform-identity".into(),
+            none_target(),
+            invalid_chr_contract("no_viewport_anchor"),
+            Some(IdentityReport::exact_chrome(&r)),
+        )
+        .unwrap();
+        assert!(!env.ok);
+        assert!(!env.verified);
+        assert_eq!(env.error.as_deref(), Some("no_viewport_anchor"));
+        assert_eq!(
+            env.identity.as_ref().map(|i| i.state),
+            Some(IdentityState::Exact)
+        );
+        let point = env.point.as_ref().expect("point contract");
+        assert!(!point.transform.valid);
+    }
+
+    #[test]
     fn click_stale_scoped_ref_refuses_after_yield_and_before_offer() {
         let src = include_str!("actuate.rs");
         let start = src.find("fn click_inner(").expect("click_inner");
@@ -6435,10 +6517,33 @@ mod tests {
             .expect("point_for_dispatch");
         let body = &src[start..end];
         let remap = body.find("chrome::remap_chr").expect("remap");
-        let probe = body.find("chrome::verify_binding").expect("binding probe");
+        let probe = body.find("scoped_binding_refusal").expect("binding probe");
         assert!(remap < probe);
-        assert!(body.contains("tab_not_active"));
-        assert!(body.contains("window_not_focused"));
+        let helper_start = src
+            .find("fn scoped_binding_refusal(")
+            .expect("scoped_binding_refusal");
+        let helper_end = src.find("pub fn click(").expect("click");
+        let helper = &src[helper_start..helper_end];
+        assert!(helper.contains("tab_not_active"));
+        assert!(helper.contains("window_not_focused"));
+    }
+
+    #[test]
+    fn click_reprobes_before_left_click() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner(").expect("click_inner");
+        let end = src
+            .find("fn dispatch_blind_click(")
+            .expect("dispatch_blind_click");
+        let body = &src[start..end];
+        let capture = body.find("capture_roi").expect("capture_roi");
+        let probe = body
+            .find("scoped_binding_refusal(&session_id, &info, &resolved)")
+            .expect("pre-click binding probe");
+        let click = body.find("input::left_click").expect("left_click");
+        assert!(capture < probe);
+        assert!(probe < click);
+        assert!(body.contains("Narrow R7"));
     }
 
     #[test]

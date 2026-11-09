@@ -295,12 +295,6 @@ struct RawSnapshot {
     #[serde(default)]
     stored: Option<bool>,
     #[serde(default)]
-    active: Option<bool>,
-    #[serde(default)]
-    focused: Option<bool>,
-    #[serde(default, rename = "visibilityState")]
-    visibility_state: Option<String>,
-    #[serde(default)]
     fallback: Option<bool>,
 }
 
@@ -1279,13 +1273,9 @@ pub(crate) fn hit_from_scoped_reply(
         doc: Some(doc.to_string()),
         snap: Some(snap.to_string()),
         retained: Some(idx as usize + 1),
-        stored: Some(true),
-        active: Some(true),
-        focused: Some(true),
-        visibility_state: Some("visible".into()),
-        fallback: Some(false),
+        stored: None,
+        fallback: reply.get("fallback").and_then(|v| v.as_bool()),
     };
-    let _binding_evidence = (raw.active, raw.focused, raw.visibility_state.as_deref());
     let node = raw.elements[0].clone();
     let obs = make_observe_id(&raw, hwnd, 1);
     let map = map_for_raw(&raw, hwnd, fixture, obs.clone());
@@ -3635,5 +3625,25 @@ mod tests {
         for needle in ["walk(", "collect(", "buildResolve(", "buildSnapshot("] {
             assert!(!body.contains(needle), "scoped resolve contains {needle}");
         }
+    }
+
+    #[test]
+    fn content_js_hashes_full_code_units_and_computes_payload_once() {
+        let src = include_str!("../extension/content.js");
+        let fnv_start = src.find("function fnv1a32").expect("fnv1a32");
+        let fnv_end = src[fnv_start..]
+            .find("function snapshotKey")
+            .map(|i| fnv_start + i)
+            .expect("snapshotKey");
+        assert!(src[fnv_start..fnv_end].contains("code >>> 8"));
+        let start = src.find("function buildSnapshot").expect("buildSnapshot");
+        let end = src[start..]
+            .find("function buildResolve")
+            .map(|i| start + i)
+            .expect("buildResolve");
+        let body = &src[start..end];
+        assert!(!body.contains("nodePayload("));
+        assert!(body.contains("keyPayload("));
+        assert!(body.contains("snapshotKey("));
     }
 }

@@ -479,14 +479,15 @@ fn fnv1a32(bytes: &[u8]) -> u32 {
 /// Own-role/name shape fingerprint. Values, rects and ancestor display names are excluded.
 /// `(None, None)` is the password shape; `(None, Some(true))` is the unnamed shape.
 pub fn element_fingerprint(role: &str, text: Option<&str>, unnamed: Option<bool>) -> u32 {
-    let name = match (text, unnamed) {
-        (_, Some(true)) => "unnamed",
-        (None, None) => "password",
-        (None, Some(false)) => "empty",
-        (Some(""), _) => "empty",
-        (Some(value), _) => value,
+    let (marker, name) = match (text, unnamed) {
+        (_, Some(true)) => ('u', ""),
+        (None, None) => ('p', ""),
+        (None, Some(false)) | (Some(""), _) => ('e', ""),
+        (Some(value), _) => ('n', value),
     };
-    let mut input = String::with_capacity(role.len() + name.len() + 2);
+    let mut input = String::with_capacity(role.len() + name.len() + 4);
+    input.push(marker);
+    input.push('\u{1f}');
     input.push_str(role);
     input.push('\u{1f}');
     input.push_str(name);
@@ -616,6 +617,14 @@ mod tests {
             element_fingerprint("Edit", None, None),
             element_fingerprint("Edit", None, Some(true))
         );
+        assert_ne!(
+            element_fingerprint("Edit", Some("unnamed"), None),
+            element_fingerprint("Edit", None, Some(true))
+        );
+        assert_ne!(
+            element_fingerprint("Edit", Some("password"), None),
+            element_fingerprint("Edit", None, None)
+        );
         assert_eq!(format!("{a:08x}").len(), 8);
     }
 
@@ -644,5 +653,23 @@ mod tests {
                     || b == b'.')
             );
         }
+    }
+
+    #[test]
+    fn maximal_ref_json_length_is_bounded() {
+        let r = SnapshotRef::Chrome {
+            tab: u32::MAX,
+            frame: u32::MAX,
+            doc: "ffff".into(),
+            snap: "ffffffff".into(),
+            idx: 1_679_615,
+        };
+        let canonical = r.to_string();
+        assert!(canonical.len() <= 64, "{canonical}");
+        let json_key_len = "\"ref\":".len() + serde_json::to_string(&canonical).unwrap().len();
+        assert!(
+            json_key_len <= 52,
+            "maximal ref key+value is {json_key_len} bytes ({canonical})"
+        );
     }
 }

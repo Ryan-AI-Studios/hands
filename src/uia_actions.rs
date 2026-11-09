@@ -788,10 +788,14 @@ fn bounded_dispatch<F>(timeout: Duration, work: F) -> SemanticResult
 where
     F: FnOnce() -> SemanticResult + Send + 'static,
 {
+    let Some(slot) = uia::WorkerSlot::acquire() else {
+        return SemanticResult::unknown("provider_timeout");
+    };
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("hands-uia-action".to_string())
         .spawn(move || {
+            let _slot = slot;
             let _ = tx.send(work());
         });
     if spawned.is_err() {
@@ -819,7 +823,7 @@ fn worker_run(
         Ok(automation) => automation,
         Err(err) => return SemanticResult::refusal(resolve_code(&err)),
     };
-    let com = match uia::resolve_on(&automation, &want) {
+    let com = match uia::resolve_on(&automation, &want, outer_hwnd) {
         Ok(com) => com,
         Err(err) => return SemanticResult::refusal(resolve_code(&err)),
     };

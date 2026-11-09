@@ -88,6 +88,10 @@ function forward(port, msg) {
     post(port, { error: "unsupported-op" });
     return;
   }
+  if (op === "binding" && msg.tab == null) {
+    post(port, { error: "protocol_error" });
+    return;
+  }
   if (msg.tab != null) {
     // Named/scoped request: route by tab id and never fall back to the active tab.
     const want = Number(msg.tab);

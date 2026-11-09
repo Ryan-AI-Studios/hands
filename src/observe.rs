@@ -5991,11 +5991,13 @@ mod tests {
         );
         assert!(src.contains("chrome::try_snapshot(req.detail, snap_hwnd)"));
         let chrome = include_str!("chrome.rs");
-        let start = chrome.find("fn live_map_inputs(").expect("live_map_inputs");
+        let start = chrome
+            .find("fn live_inputs_from_page(")
+            .expect("live_inputs_from_page");
         let end = chrome.find("fn build_live_map(").expect("build_live_map");
         let slice = &chrome[start..end];
         assert!(slice.contains("render_widget_host_rects"));
-        assert!(!slice.contains("outer_width - metrics.inner_width"));
+        assert!(!slice.contains("outer_width") && !slice.contains("outer_height"));
     }
 
     #[test]
@@ -6022,11 +6024,14 @@ mod tests {
     fn non_chrome_walk_skips_enumeration() {
         // `chrome::live_map_inputs` checks is_chrome_hwnd before EnumChildWindows/UIA.
         let chrome = include_str!("chrome.rs");
-        let start = chrome.find("fn live_map_inputs(").expect("live_map_inputs");
+        let start = chrome
+            .find("fn live_inputs_from_page(")
+            .expect("live_inputs_from_page");
         let end = chrome.find("fn build_live_map(").expect("build_live_map");
         let slice = &chrome[start..end];
         assert!(slice.contains("foreground::is_chrome_hwnd(hwnd)"));
         assert!(slice.contains("if chrome"));
+        assert!(!slice.contains("outer_width") && !slice.contains("outer_height"));
         // No transform block for a non-Chrome walk.
         let obs = include_str!("observe.rs");
         assert!(obs.contains("if skip_walk || !chrome_walk {\n        None"));

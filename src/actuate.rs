@@ -4411,50 +4411,187 @@ mod tests {
         assert!(body.contains("resolved.as_ref().and_then(|r| r.hwnd)"));
     }
 
-    #[test]
-    fn click_hover_scroll_paths_have_no_outer_inner_transform() {
-        fn production(src: &str) -> &str {
-            src.split_once("mod tests {")
-                .map(|(prod, _)| prod)
-                .unwrap_or(src)
-        }
-        fn compact(src: &str) -> String {
-            src.chars().filter(|c| !c.is_whitespace()).collect()
-        }
-        fn legacy_subtraction(src: &str) -> bool {
-            let text = compact(src);
-            for (a, b) in [
-                ("outer_height", "inner_height"),
-                ("outer_width", "inner_width"),
-            ] {
-                for (pos, _) in text.match_indices(a) {
-                    let rest = &text[pos + a.len()..];
-                    if let Some(rel) = rest.find(b)
-                        && rel <= 64
-                        && rest[..rel].contains('-')
-                    {
-                        return true;
-                    }
+    fn production(src: &str) -> &str {
+        src.split_once("mod tests {")
+            .map(|(prod, _)| prod)
+            .unwrap_or(src)
+    }
+
+    fn compact(src: &str) -> String {
+        src.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Whitespace-normalized legacy subtraction detector: does any `outer_*` token have a
+    /// `-` and its `inner_*` counterpart within a short operand window?
+    fn legacy_subtraction(src: &str) -> bool {
+        let text = compact(src);
+        for (a, b) in [
+            ("outer_height", "inner_height"),
+            ("outer_width", "inner_width"),
+        ] {
+            for (pos, _) in text.match_indices(a) {
+                let rest = &text[pos + a.len()..];
+                if let Some(rel) = rest.find(b)
+                    && rel <= 64
+                    && rest[..rel].contains('-')
+                {
+                    return true;
                 }
             }
-            false
         }
-        fn function_spans(src: &str) -> Vec<(&str, &str)> {
-            let positions: Vec<usize> = src.match_indices("fn ").map(|(i, _)| i).collect();
-            let mut out = Vec::new();
-            for (n, &start) in positions.iter().enumerate() {
-                let name_start = start + 3;
-                let name_end = src[name_start..]
-                    .find('(')
-                    .map(|i| name_start + i)
-                    .unwrap_or(name_start);
-                let name = src[name_start..name_end].trim();
-                let end = positions.get(n + 1).copied().unwrap_or(src.len());
-                out.push((name, &src[start..end]));
-            }
-            out
+        false
+    }
+
+    fn function_spans(src: &str) -> Vec<(&str, &str)> {
+        let positions: Vec<usize> = src.match_indices("fn ").map(|(i, _)| i).collect();
+        let mut out = Vec::new();
+        for (n, &start) in positions.iter().enumerate() {
+            let name_start = start + 3;
+            let name_end = src[name_start..]
+                .find('(')
+                .map(|i| name_start + i)
+                .unwrap_or(name_start);
+            let name = src[name_start..name_end].trim();
+            let end = positions.get(n + 1).copied().unwrap_or(src.len());
+            out.push((name, &src[start..end]));
+        }
+        out
+    }
+
+    fn span_of<'a>(spans: &'a [(&str, &str)], name: &str) -> Option<&'a str> {
+        spans
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, body)| *body)
+    }
+
+    fn inject_after_open_brace(src: &str, fname: &str, code: &str) -> String {
+        let needle = format!("fn {fname}(");
+        let start = src.find(&needle).expect("function to mutate");
+        let brace = src[start..]
+            .find('{')
+            .map(|i| start + i)
+            .expect("function body");
+        let mut out = String::with_capacity(src.len() + code.len());
+        out.push_str(&src[..=brace]);
+        out.push_str(code);
+        out.push_str(&src[brace + 1..]);
+        out
+    }
+
+    /// Pure source-lock predicate. Returns human-readable violations (empty = clean).
+    fn transform_lock_violations(chrome: &str, target: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let prod = production(chrome);
+        let norm = prod.split_whitespace().collect::<Vec<_>>().join(" ");
+        let spans = function_spans(&norm);
+
+        let legacy_fns: Vec<&str> = spans
+            .iter()
+            .filter(|(_, body)| legacy_subtraction(body))
+            .map(|(name, _)| *name)
+            .collect();
+        if legacy_fns != vec!["fixture_listing_origin"] {
+            out.push(format!(
+                "only fixture_listing_origin may contain outer-inner subtraction: {legacy_fns:?}"
+            ));
         }
 
+        let calls: Vec<usize> = norm
+            .match_indices("fixture_listing_origin(")
+            .map(|(i, _)| i)
+            .collect();
+        if calls.len() != 2 {
+            out.push(format!(
+                "fixture_listing_origin must have exactly one call site: {calls:?}"
+            ));
+        } else if let (Some(def_start), Some(def_end), Some(fixture), Some(fixture_start)) = (
+            norm.find("fn fixture_listing_origin("),
+            norm.find("fn fixture_listing_origin(")
+                .and_then(|s| norm[s..].find("fn make_observe_id(").map(|i| s + i)),
+            span_of(&spans, "fixture_map"),
+            norm.find("fn fixture_map("),
+        ) {
+            let call = *calls.iter().find(|i| **i > def_end).unwrap_or(&def_start);
+            if !(call > fixture_start && call < fixture_start + fixture.len()) {
+                out.push("fixture_listing_origin must be called only from fixture_map".into());
+            }
+            if !fixture.contains("fixture: true") {
+                out.push("fixture_map must set fixture: true".into());
+            }
+            if !fixture.contains("fixture_origin: fixture_listing_origin(") {
+                out.push(
+                    "fixture_map must use fixture_listing_origin for its listing origin".into(),
+                );
+            }
+        } else {
+            out.push("fixture_listing_origin / fixture_map structure is missing".into());
+        }
+
+        // Live mapping functions must not even name the outer metrics, so aliasing a local
+        // and subtracting it later is rejected as well.
+        for required in [
+            "live_map_inputs",
+            "live_inputs_from_page",
+            "build_live_map",
+            "hit_from_raw",
+            "map_from_raw",
+            "map_for_raw",
+            "remap_chr",
+        ] {
+            match span_of(&spans, required) {
+                Some(body) => {
+                    for ident in ["outer_width", "outer_height"] {
+                        if body.contains(ident) {
+                            out.push(format!("{required} references {ident}"));
+                        }
+                    }
+                    if body.contains("fixture_listing_origin") {
+                        out.push(format!("{required} uses the fixture listing helper"));
+                    }
+                    if legacy_subtraction(body) {
+                        out.push(format!("{required} uses outer-inner subtraction"));
+                    }
+                }
+                None => out.push(format!("missing live mapping function {required}")),
+            }
+        }
+
+        match span_of(&spans, "hit_from_raw") {
+            Some(hit) if hit.contains("contract_for(") => {}
+            Some(_) => {
+                out.push("hit_from_raw must build the live contract via contract_for".into())
+            }
+            None => {}
+        }
+
+        let target_norm = production(target)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        match span_of(&function_spans(&target_norm), "finish_chr") {
+            Some(finish) => {
+                let finish = compact(finish);
+                if !finish.contains("contract_for(") {
+                    out.push("finish_chr must call contract_for".into());
+                }
+                if !finish.contains("map_point(&contract,css_rect.center())") {
+                    out.push("finish_chr must map the contract point".into());
+                }
+                if !finish.contains("map_rect(&contract,css_rect)") {
+                    out.push("finish_chr must map the contract rect".into());
+                }
+                if finish.contains("found.rect.center()") {
+                    out.push("finish_chr must not use a raw rect centre".into());
+                }
+            }
+            None => out.push("missing target::finish_chr".into()),
+        }
+        out
+    }
+
+    #[test]
+    fn click_hover_scroll_paths_have_no_outer_inner_transform() {
         // Production code outside the test module must have no legacy subtraction at all.
         for src in [
             production(include_str!("actuate.rs")),
@@ -4467,104 +4604,49 @@ mod tests {
             );
         }
 
-        // chrome.rs production code: normalize whitespace, then prove the only function with
-        // outer-inner subtraction is fixture_listing_origin.
+        // Positive control: the current tree must satisfy every structural lock.
+        let violations =
+            transform_lock_violations(include_str!("chrome.rs"), include_str!("target.rs"));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn transform_lock_rejects_alias_and_whitespace_mutations() {
         let chrome = include_str!("chrome.rs");
-        let prod = production(chrome);
-        let norm = prod.split_whitespace().collect::<Vec<_>>().join(" ");
-        let spans = function_spans(&norm);
-        let legacy_fns: Vec<&str> = spans
-            .iter()
-            .filter(|(_, body)| legacy_subtraction(body))
-            .map(|(name, _)| *name)
-            .collect();
-        assert_eq!(
-            legacy_fns,
-            vec!["fixture_listing_origin"],
-            "only fixture_listing_origin may contain outer-inner subtraction: {legacy_fns:?}"
-        );
-
-        // The helper has exactly one call site, inside `fixture_map` with `fixture: true`.
-        let calls: Vec<usize> = norm
-            .match_indices("fixture_listing_origin(")
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(
-            calls.len(),
-            2,
-            "expected the definition and one fixture call site: {calls:?}"
-        );
-        let def_start = norm
-            .find("fn fixture_listing_origin(")
-            .expect("fixture_listing_origin definition");
-        let def_end = norm[def_start..]
-            .find("fn make_observe_id(")
-            .map(|i| def_start + i)
-            .expect("fixture_listing_origin end");
-        let call = *calls
-            .iter()
-            .find(|i| **i > def_end)
-            .expect("fixture_listing_origin call site");
-        let fixture = spans
-            .iter()
-            .find(|(name, _)| *name == "fixture_map")
-            .map(|(_, body)| *body)
-            .expect("fixture_map span");
-        let fixture_start = norm.find("fn fixture_map(").expect("fixture_map");
-        let fixture_end = fixture_start + fixture.len();
-        assert!(
-            call > fixture_start && call < fixture_end,
-            "fixture_listing_origin must be called only from fixture_map"
-        );
-        assert!(fixture.contains("fixture: true"));
-        assert!(fixture.contains("fixture_origin: fixture_listing_origin("));
-
-        // The live map builders/hit path contain neither the fixture helper nor subtraction.
-        for required in [
-            "live_map_inputs",
-            "build_live_map",
-            "hit_from_raw",
-            "map_from_raw",
-            "map_for_raw",
-            "remap_chr",
-        ] {
-            let body = spans
-                .iter()
-                .find(|(name, _)| *name == required)
-                .map(|(_, body)| *body)
-                .unwrap_or_else(|| panic!("missing function {required}"));
-            assert!(
-                !body.contains("fixture_listing_origin"),
-                "{required} must not use the fixture listing helper"
-            );
-            assert!(
-                !legacy_subtraction(body),
-                "{required} must not use outer-inner subtraction"
-            );
-        }
-        let hit = spans
-            .iter()
-            .find(|(name, _)| *name == "hit_from_raw")
-            .map(|(_, body)| *body)
-            .expect("hit_from_raw");
-        assert!(hit.contains("contract_for(&map,"));
-
-        // The click-time `chr:` finishing path maps the contract point/rect, never a raw centre.
         let target = include_str!("target.rs");
-        let target_norm = production(target)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let finish = function_spans(&target_norm)
-            .into_iter()
-            .find(|(name, _)| *name == "finish_chr")
-            .map(|(_, body)| body)
-            .expect("finish_chr");
-        let finish = compact(finish);
-        assert!(finish.contains("contract_for("));
-        assert!(finish.contains("map_point(&contract,css_rect.center())"));
-        assert!(finish.contains("map_rect(&contract,css_rect)"));
-        assert!(!finish.contains("found.rect.center()"));
+        assert!(transform_lock_violations(chrome, target).is_empty());
+
+        // Negative 1: alias the outer metric into a local inside a live function, then subtract.
+        let alias = inject_after_open_brace(
+            chrome,
+            "live_map_inputs",
+            " let oh = metrics.outer_height; let _offset = oh - metrics.inner_height;",
+        );
+        let violations = transform_lock_violations(&alias, target);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("live_map_inputs") && v.contains("outer_height")),
+            "alias mutation must be rejected: {violations:?}"
+        );
+
+        // Negative 2: whitespace/formatting variant of the legacy subtraction in a live function.
+        let weird = inject_after_open_brace(
+            chrome,
+            "map_from_raw",
+            " let _ = metrics.outer_width\n\t\t-\n metrics.inner_width;",
+        );
+        let violations = transform_lock_violations(&weird, target);
+        assert!(
+            violations.iter().any(|v| v.contains("map_from_raw")),
+            "whitespace mutation must be rejected: {violations:?}"
+        );
+        assert!(legacy_subtraction(
+            "metrics.outer_height\n\t-\nmetrics.inner_height"
+        ));
+        assert!(legacy_subtraction(
+            "metrics . outer_width  -  metrics . inner_width"
+        ));
     }
 
     #[test]

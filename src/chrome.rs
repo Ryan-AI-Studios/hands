@@ -318,13 +318,12 @@ pub(crate) fn set_resolve_stub(hit: Option<ChromeHit>) {
     RESOLVE_STUB.with(|c| *c.borrow_mut() = hit);
 }
 
-fn live_map_inputs(
-    metrics: &ChromeMetrics,
+fn live_inputs_from_page(
+    page: PageMetrics,
     title: Option<&str>,
     hwnd: isize,
     observe_id: Option<String>,
 ) -> MapInputs {
-    let page = metrics.page();
     let chrome = foreground::is_chrome_hwnd(hwnd);
     let render_widgets = if chrome {
         foreground::render_widget_host_rects(hwnd)
@@ -350,6 +349,15 @@ fn live_map_inputs(
         identity: observe_identity(title, Some(hwnd)),
         fixture_origin: None,
     }
+}
+
+fn live_map_inputs(
+    metrics: &ChromeMetrics,
+    title: Option<&str>,
+    hwnd: isize,
+    observe_id: Option<String>,
+) -> MapInputs {
+    live_inputs_from_page(metrics.page(), title, hwnd, observe_id)
 }
 
 fn build_live_map(
@@ -417,31 +425,11 @@ fn map_for_raw(raw: &RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: Strin
 /// is not detectable here.
 pub fn remap_chr(old: &ViewportMap, hwnd: isize) -> Result<ViewportMap, String> {
     let page = old.page;
-    let Some(dpr) = page.dpr else {
+    if page.dpr.is_none() {
         return Err("stale_viewport: recorded page metrics have no dpr".into());
-    };
-    let metrics = ChromeMetrics {
-        screen_x: 0.0,
-        screen_y: 0.0,
-        outer_width: 0.0,
-        outer_height: 0.0,
-        inner_width: page.inner_width.unwrap_or(0.0),
-        inner_height: page.inner_height.unwrap_or(0.0),
-        device_pixel_ratio: dpr,
-        client_width: page.client_width,
-        client_height: page.client_height,
-        visual_viewport_width: None,
-        visual_viewport_height: None,
-        visual_viewport_scale: page.visual_scale,
-        visual_viewport_offset_left: page.visual_offset_left,
-        visual_viewport_offset_top: page.visual_offset_top,
-        screen_avail_left: None,
-        screen_avail_top: None,
-        screen_width: None,
-        screen_height: None,
-    };
-    let mut live = live_map_inputs(
-        &metrics,
+    }
+    let mut live = live_inputs_from_page(
+        page,
         Some(foreground::title(Some(hwnd)).as_str()),
         hwnd,
         old.report.observe_id.clone(),

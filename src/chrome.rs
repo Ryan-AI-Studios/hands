@@ -397,11 +397,25 @@ pub(crate) fn set_remap_identity_hook(hook: Option<RemapIdentityHook>) {
 thread_local! {
     static RESOLVE_STUB: std::cell::RefCell<Option<ChromeHit>> =
         const { std::cell::RefCell::new(None) };
+    static SNAPSHOT_IDENTITY_STUB: std::cell::RefCell<Option<SnapshotOutcome>> =
+        const { std::cell::RefCell::new(None) };
+    static PIPE_SNAPSHOT_STUB: std::cell::RefCell<Option<ChromeMap>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 pub(crate) fn set_resolve_stub(hit: Option<ChromeHit>) {
     RESOLVE_STUB.with(|c| *c.borrow_mut() = hit);
+}
+
+#[cfg(test)]
+pub(crate) fn set_snapshot_identity_stub(outcome: Option<SnapshotOutcome>) {
+    SNAPSHOT_IDENTITY_STUB.with(|c| *c.borrow_mut() = outcome);
+}
+
+#[cfg(test)]
+pub(crate) fn set_pipe_snapshot_stub(map: Option<ChromeMap>) {
+    PIPE_SNAPSHOT_STUB.with(|c| *c.borrow_mut() = map);
 }
 
 fn live_inputs_from_page(
@@ -919,6 +933,15 @@ fn pipe_snapshot_inner(
     if detail == Detail::Dom {
         req["detail"] = serde_json::Value::String("dom".into());
     }
+    #[cfg(test)]
+    {
+        if let Some(map) = PIPE_SNAPSHOT_STUB.with(|c| c.borrow().clone()) {
+            if store {
+                store_last_pipe_detail(detail);
+            }
+            return Ok(map);
+        }
+    }
     let reply = pipe_request(&req)?;
     let map = parse_host_reply(&reply, hwnd)?;
     if store {
@@ -929,6 +952,12 @@ fn pipe_snapshot_inner(
 
 /// Non-storing snapshot used by `hittest` point mode. Same path, no walk-detail mutation.
 pub fn try_snapshot_identity(detail: Detail, hwnd: Option<isize>) -> SnapshotOutcome {
+    #[cfg(test)]
+    {
+        if let Some(outcome) = SNAPSHOT_IDENTITY_STUB.with(|c| c.borrow().clone()) {
+            return outcome;
+        }
+    }
     match snapshot_env() {
         Some(path) => match load_fixture(&path, hwnd) {
             Ok(map) => SnapshotOutcome::Map(Box::new(map)),
@@ -964,9 +993,14 @@ fn pipe_resolve_raw(
 ) -> Result<RawSnapshot, HandsError> {
     let req = resolve_request(id, last_pipe_detail(), assess, samples);
     let reply = pipe_request(&req).map_err(|err| {
-        HandsError::Chrome(format!(
-            "Chrome host is not connected (pipe); cannot resolve {id}: {err}"
-        ))
+        let text = err.to_string();
+        if text.contains("client timed out after") {
+            HandsError::Chrome(format!("Chrome resolve timed out for {id}: {err}"))
+        } else {
+            HandsError::Chrome(format!(
+                "Chrome host is not connected (pipe); cannot resolve {id}: {err}"
+            ))
+        }
     })?;
     if reply.get("error").is_some()
         && reply.get("elements").is_none()

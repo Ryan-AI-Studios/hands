@@ -1,7 +1,7 @@
 {
   "interactable": true,
-  "selected_point": {"x": 220.0, "y": 60.0},
-  "target_rect_css": {"left": 120.0, "top": 40.0, "width": 200.0, "height": 40.0},
+  "selected_point": {"x": 220.0, "y": 80.0},
+  "target_rect_css": {"left": 120.0, "top": 60.0, "width": 200.0, "height": 40.0},
   "visible_fraction": 1.0,
   "onscreen_fraction": 1.0,
   "samples": 25,

@@ -254,7 +254,7 @@ fn bounded_reason(s: &str) -> String {
 }
 
 /// Build a valid-or-refusal assessment from an element-mode outcome.
-pub fn envelope_for_outcome(outcome: TargetOutcome, detail: &str, samples: u32) -> HittestEnvelope {
+pub fn envelope_for_outcome(outcome: TargetOutcome, detail: &str) -> HittestEnvelope {
     match outcome {
         TargetOutcome::Resolved(resolved) => {
             let contract = resolved.contract.clone().unwrap_or_else(|| PointContract {
@@ -289,7 +289,6 @@ pub fn envelope_for_outcome(outcome: TargetOutcome, detail: &str, samples: u32) 
                     assessment
                 }
             });
-            let _ = samples;
             HittestEnvelope {
                 session_id: String::new(),
                 ok: true,
@@ -378,11 +377,7 @@ fn run_element(target: &Target, samples: u32) -> Result<HittestEnvelope, HandsEr
     let space = crate::space::ensure_dpi().and_then(|_| crate::space::virtual_screen())?;
     let hwnd = foreground::foreground_hwnd();
     let outcome = target.resolve_with_opts_samples(space, hwnd, true, Some(samples))?;
-    Ok(envelope_for_outcome(
-        outcome,
-        chrome::current_pipe_detail(),
-        samples,
-    ))
+    Ok(envelope_for_outcome(outcome, chrome::current_pipe_detail()))
 }
 
 fn run_point(target: &Target, samples: u32) -> Result<HittestEnvelope, HandsError> {
@@ -649,7 +644,15 @@ pub fn guard_require_interactable(
             .as_deref()
             .is_some_and(|id| id.starts_with("chr:"));
     if !is_chr {
-        return refusal(session_id, info, None, None, None, "unavailable").map(Some);
+        return refusal(
+            session_id,
+            info,
+            resolved.contract.clone(),
+            resolved.assessment.clone(),
+            None,
+            "unavailable",
+        )
+        .map(Some);
     }
     let Some(contract) = resolved.contract.clone() else {
         return refusal(session_id, info, None, None, None, "missing").map(Some);
@@ -955,8 +958,20 @@ mod tests {
     fn clipped_reply_names_ancestor() {
         let a = assessment("clipped-container.json");
         assert_eq!(a.interactable, Some(true));
+        assert_eq!(a.selected_point, CssPoint::new(201.0, 61.0));
+        assert_eq!(
+            a.target_rect_css,
+            CssRect {
+                left: 101.0,
+                top: 41.0,
+                width: 200.0,
+                height: 40.0,
+            }
+        );
         let clipped = a.clipped_by.expect("clipped_by");
         assert_eq!(clipped.tag.as_deref(), Some("section"));
+        assert_eq!(clipped.name.as_deref(), Some("Sign in"));
+        assert_eq!(a.blocked_by[0].tag.as_deref(), Some("html"));
         assert!(a.visible_fraction.unwrap_or(1.0) < a.onscreen_fraction.unwrap_or(1.0));
     }
 
@@ -973,9 +988,17 @@ mod tests {
 
     #[test]
     fn transformed_reply_passes() {
+        let a = assessment("transformed-ancestor.json");
+        assert_eq!(a.interactable, Some(true));
+        assert_eq!(a.selected_point, CssPoint::new(220.0, 80.0));
         assert_eq!(
-            assessment("transformed-ancestor.json").interactable,
-            Some(true)
+            a.target_rect_css,
+            CssRect {
+                left: 120.0,
+                top: 60.0,
+                width: 200.0,
+                height: 40.0,
+            }
         );
     }
 
@@ -1062,6 +1085,7 @@ mod tests {
         assert_eq!(a.interactable, Some(false));
         assert_eq!(a.reason.as_deref(), Some("cross_frame"));
         assert_eq!(a.blocked_by[0].kind, BlockerKind::Iframe);
+        assert_eq!(a.blocked_by[0].name.as_deref(), Some("Opaque frame"));
     }
 
     #[test]
@@ -1083,6 +1107,8 @@ mod tests {
         let a = assessment("aria-disabled-inert.json");
         assert_eq!(a.interactable, Some(true));
         assert!(a.notes.iter().any(|n| n == "aria_disabled"));
+        // Any advisory note lowers confidence from high to medium.
+        assert_eq!(a.confidence, AssessmentConfidence::Medium);
     }
 
     #[test]
@@ -1106,7 +1132,9 @@ mod tests {
     fn point_mode_topmost_element_and_shadow_path() {
         let a = at_point("point-topmost.json");
         assert_eq!(a.interactable, Some(true));
-        assert_eq!(a.element.unwrap().tag.as_deref(), Some("button"));
+        let element = a.element.unwrap();
+        assert_eq!(element.tag.as_deref(), Some("button"));
+        assert_eq!(element.role.as_deref(), Some("button"));
         assert_eq!(a.shadow_path, vec!["app-shell"]);
     }
 
@@ -1116,6 +1144,33 @@ mod tests {
         assert_eq!(a.interactable, None);
         assert_eq!(a.reason.as_deref(), Some("not_interactive"));
         assert!(a.element.is_none());
+    }
+
+    #[test]
+    fn fixture_golden_table_is_documented() {
+        let readme = include_str!("../tests/fixtures/hittest/README.md");
+        for name in [
+            "clipped-container.json",
+            "transformed-ancestor.json",
+            "aria-disabled-inert.json",
+            "iframe-overlay.json",
+            "point-topmost.json",
+            "open-shadow-pointer-events-none.json",
+        ] {
+            assert!(readme.contains(name), "README missing {name}");
+        }
+    }
+
+    #[test]
+    fn point_topmost_fixture_declares_role_and_shadow() {
+        let html = include_str!("../tests/fixtures/hittest/point-topmost.html");
+        assert!(html.contains("attachShadow"));
+        assert!(html.contains("role"));
+        assert!(html.contains("button"));
+        assert!(html.contains("aria-label"));
+        let a = at_point("point-topmost.json");
+        assert_eq!(a.element.unwrap().role.as_deref(), Some("button"));
+        assert_eq!(a.shadow_path, vec!["app-shell"]);
     }
 
     #[test]
@@ -1245,11 +1300,6 @@ mod tests {
     }
 
     #[test]
-    fn assessor_same_point() {
-        assessor_same_point_from_payload_rect();
-    }
-
-    #[test]
     fn assessment_point_mismatch_refuses() {
         let report = valid_report(
             1.0,
@@ -1349,7 +1399,6 @@ mod tests {
                 assessment: Some(Box::new(js)),
             },
             "default",
-            25,
         );
         let a = envelope.assessment.expect("assessment");
         assert_eq!(a.interactable, None);
@@ -1483,8 +1532,7 @@ mod tests {
                 elapsed_ms: None,
             }),
         };
-        let envelope =
-            envelope_for_outcome(TargetOutcome::Resolved(Box::new(resolved)), "default", 25);
+        let envelope = envelope_for_outcome(TargetOutcome::Resolved(Box::new(resolved)), "default");
         assert_eq!(envelope.target_rect, Some(expected));
         assert_eq!(envelope.detail.as_deref(), Some("default"));
     }
@@ -1729,64 +1777,108 @@ mod tests {
 
     #[test]
     fn point_mode_window_moved_is_unknown() {
-        let a = Rect {
-            x: 0,
-            y: 0,
-            w: 100,
-            h: 100,
-        };
-        let b = Rect {
-            x: 1,
-            y: 0,
-            w: 100,
-            h: 100,
-        };
-        assert!(!window_moved(Some(a), Some(a)));
-        assert!(window_moved(Some(a), Some(b)));
-        assert!(window_moved(Some(a), None));
+        let space = crate::space::ensure_dpi()
+            .and_then(|_| crate::space::virtual_screen())
+            .expect("space");
+        let x = space.origin_x + space.width / 2;
+        let y = space.origin_y + space.height / 2;
+        crate::foreground::set_foreground_hwnd_hook(Some(|| Some(0x1234)));
+        crate::foreground::set_chrome_target_hook(Some(|_| true));
+        WRECT_CALLS.with(|c| c.set(0));
+        crate::foreground::set_window_rect_hook(Some(moving_window_rect));
+        chrome::set_snapshot_identity_stub(Some(chrome::SnapshotOutcome::Map(Box::new(test_map(
+            Some(TransformReport::invalid("no_viewport_anchor", None)),
+            None,
+        )))));
+        let envelope = run_point(&Target::Pixel { x, y }, 25).expect("run_point");
+        crate::foreground::set_window_rect_hook(None);
+        crate::foreground::set_foreground_hwnd_hook(None);
+        crate::foreground::set_chrome_target_hook(None);
+        chrome::set_snapshot_identity_stub(None);
+        assert_eq!(
+            envelope.at_point.expect("at_point").reason.as_deref(),
+            Some("window_moved")
+        );
+    }
+
+    thread_local! {
+        static WRECT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn moving_window_rect(_: isize) -> Option<Rect> {
+        let n = WRECT_CALLS.with(|c| {
+            let n = c.get();
+            c.set(n + 1);
+            n
+        });
+        Some(if n == 0 {
+            Rect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            }
+        } else {
+            Rect {
+                x: 1,
+                y: 0,
+                w: 100,
+                h: 100,
+            }
+        })
     }
 
     #[test]
     fn point_mode_not_foreground_is_unknown() {
+        let space = crate::space::ensure_dpi()
+            .and_then(|_| crate::space::virtual_screen())
+            .expect("space");
+        let x = space.origin_x + space.width / 2;
+        let y = space.origin_y + space.height / 2;
+        crate::foreground::set_foreground_hwnd_hook(Some(|| None));
+        let envelope = run_point(&Target::Pixel { x, y }, 25).expect("run_point");
+        crate::foreground::set_foreground_hwnd_hook(None);
         assert_eq!(
-            point_unknown("not_foreground")
-                .at_point
-                .unwrap()
-                .reason
-                .as_deref(),
+            envelope.at_point.expect("at_point").reason.as_deref(),
             Some("not_foreground")
         );
+    }
+
+    #[test]
+    fn point_mode_not_chrome_is_unknown() {
+        let space = crate::space::ensure_dpi()
+            .and_then(|_| crate::space::virtual_screen())
+            .expect("space");
+        let x = space.origin_x + space.width / 2;
+        let y = space.origin_y + space.height / 2;
+        crate::foreground::set_foreground_hwnd_hook(Some(|| Some(0x1234)));
+        crate::foreground::set_chrome_target_hook(Some(|_| false));
+        let envelope = run_point(&Target::Pixel { x, y }, 25).expect("run_point");
+        crate::foreground::set_foreground_hwnd_hook(None);
+        crate::foreground::set_chrome_target_hook(None);
         assert_eq!(
-            point_unknown("not_chrome")
-                .at_point
-                .unwrap()
-                .reason
-                .as_deref(),
+            envelope.at_point.expect("at_point").reason.as_deref(),
             Some("not_chrome")
         );
     }
 
     #[test]
     fn point_mode_does_not_mutate_walk_detail() {
-        // The fixture snapshot path never stores; the live path uses the non-storing inner.
+        // Drives the real `pipe_snapshot_inner` store flag: point mode uses store=false, the
+        // ordinary snapshot path stores. A regression that flips the flag fails this test.
         let g = chrome::EnvGuard::lock();
-        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        g.set_snapshot(None);
+        chrome::set_snapshot_identity_stub(None);
+        chrome::set_pipe_snapshot_stub(Some(test_map(
+            Some(TransformReport::invalid("no_viewport_anchor", None)),
+            None,
+        )));
         chrome::set_last_pipe_detail_for_test(Detail::Dom);
         let _ = chrome::try_snapshot_identity(Detail::Default, None);
         assert_eq!(chrome::current_pipe_detail(), "dom");
-        g.set_snapshot(None);
-        let src = include_str!("chrome.rs");
-        let start = src.find("pub fn try_snapshot_identity").expect("identity");
-        let end = src[start..]
-            .find("fn pipe_resolve_raw")
-            .map(|i| start + i)
-            .expect("pipe_resolve_raw");
-        let body = &src[start..end];
-        assert!(
-            body.contains("pipe_snapshot_inner(detail, hwnd, false)"),
-            "{body}"
-        );
-        assert!(!body.contains("store_last_pipe_detail"), "{body}");
+        let _ = chrome::try_snapshot(Detail::Default, None);
+        assert_eq!(chrome::current_pipe_detail(), "default");
+        chrome::set_pipe_snapshot_stub(None);
     }
 
     // ---------------------------------------------------------------- refusal / markers

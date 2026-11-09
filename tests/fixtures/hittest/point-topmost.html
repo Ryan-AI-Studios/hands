@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>hittest point topmost</title>
+</head><body>
+<app-shell id="host"></app-shell>
+<script>
+const host = document.getElementById("host");
+const root = host.attachShadow({ mode: "open" });
+const button = document.createElement("button");
+button.setAttribute("role", "button");
+button.setAttribute("aria-label", "Sign in");
+button.textContent = "Sign in";
+button.style.cssText = "position:absolute;left:100px;top:50px;width:200px;height:40px";
+root.appendChild(button);
+</script>
+</body></html>

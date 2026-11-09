@@ -24,6 +24,8 @@ type ClientRectHook = fn(isize) -> Option<Rect>;
 #[cfg(test)]
 type WindowTitleHook = fn(Option<isize>) -> String;
 #[cfg(test)]
+type WindowRectHook = fn(isize) -> Option<Rect>;
+#[cfg(test)]
 type ChromeTargetHook = fn(Option<isize>) -> bool;
 #[cfg(test)]
 type DescribeHwndHook = fn(isize) -> Option<TitledWindow>;
@@ -35,6 +37,8 @@ thread_local! {
     static CLIENT_RECT_HOOK: std::cell::RefCell<Option<ClientRectHook>> =
         const { std::cell::RefCell::new(None) };
     static TITLE_HOOK: std::cell::RefCell<Option<WindowTitleHook>> =
+        const { std::cell::RefCell::new(None) };
+    static WINDOW_RECT_HOOK: std::cell::RefCell<Option<WindowRectHook>> =
         const { std::cell::RefCell::new(None) };
     static CHROME_HOOK: std::cell::RefCell<Option<ChromeTargetHook>> =
         const { std::cell::RefCell::new(None) };
@@ -53,6 +57,11 @@ pub(crate) fn set_client_rect_hook(hook: Option<fn(isize) -> Option<Rect>>) {
 #[cfg(test)]
 pub(crate) fn set_window_title_hook(hook: Option<fn(Option<isize>) -> String>) {
     TITLE_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+pub(crate) fn set_window_rect_hook(hook: Option<WindowRectHook>) {
+    WINDOW_RECT_HOOK.with(|c| *c.borrow_mut() = hook);
 }
 
 #[cfg(test)]
@@ -500,6 +509,12 @@ pub fn point_in_allowed_client(
 
 /// Outer rect via `GetWindowRect`. Invalid / fail / non-positive → `None`.
 pub fn window_rect(hwnd: isize) -> Option<Rect> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = WINDOW_RECT_HOOK.with(|c| *c.borrow()) {
+            return hook(hwnd);
+        }
+    }
     let hwnd = raw_hwnd(hwnd);
     hwnd_raw(hwnd)?;
     let mut rect = RECT::default();

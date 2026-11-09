@@ -1459,7 +1459,7 @@ pub fn verify_binding(tab: u32) -> Result<BindingEvidence, IdentityReport> {
         } else {
             "host_down"
         };
-        IdentityReport::unknown(None, reason)
+        binding_report(tab, IdentityState::Unknown, reason)
     })?;
     if let Some(token) = error_token(&reply) {
         let (state, reason) = classify_ref_error(&token);

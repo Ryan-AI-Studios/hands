@@ -607,6 +607,22 @@ fn fail(
     )
 }
 
+/// Failure after a point contract existed (dispatch/attempt path). `point` is retained.
+#[allow(clippy::too_many_arguments)]
+fn fail_with_point(
+    session_id: String,
+    target: ActuateTarget,
+    err: HandsError,
+    foregrounded: bool,
+    retried: bool,
+    settled: bool,
+    point: Option<PointContract>,
+) -> Result<ActuateEnvelope, HandsError> {
+    let mut env = fail(session_id, target, err, foregrounded, retried, settled)?;
+    env.point = point;
+    finalize_envelope(env)
+}
+
 fn none_target() -> ActuateTarget {
     let (x, y) = input::cursor_pos().unwrap_or((0, 0));
     ActuateTarget {
@@ -1012,18 +1028,54 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let roi = settle::default_roi(space, Some(resolved.rect), (resolved.x, resolved.y));
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point(
+            session_id,
+            info,
+            err,
+            foregrounded,
+            false,
+            false,
+            point_for_dispatch(&resolved),
+        );
     }
     let snapshot = match crate::capture::capture_roi(space, roi) {
         Ok(f) => f,
-        Err(err) => return fail(session_id, info, err, foregrounded, false, false),
+        Err(err) => {
+            return fail_with_point(
+                session_id,
+                info,
+                err,
+                foregrounded,
+                false,
+                false,
+                point_for_dispatch(&resolved),
+            );
+        }
     };
     if let Err(err) = input::left_click(&mut rng) {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point(
+            session_id,
+            info,
+            err,
+            foregrounded,
+            false,
+            false,
+            point_for_dispatch(&resolved),
+        );
     }
     let (mut settled, after) = match settle::wait_settle(space, roi) {
         Ok(v) => v,
-        Err(err) => return fail(session_id, info, err, foregrounded, false, false),
+        Err(err) => {
+            return fail_with_point(
+                session_id,
+                info,
+                err,
+                foregrounded,
+                false,
+                false,
+                point_for_dispatch(&resolved),
+            );
+        }
     };
     let same = settle::roi_unchanged(&snapshot, &after);
     let focus_lost = foregrounded
@@ -1044,11 +1096,29 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             let _ = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
         }
         if let Err(err) = input::left_click(&mut rng) {
-            return fail(session_id, info, err, foregrounded, true, settled);
+            return fail_with_point(
+                session_id,
+                info,
+                err,
+                foregrounded,
+                true,
+                settled,
+                point_for_dispatch(&resolved),
+            );
         }
         let (settled2, after2) = match settle::wait_settle(space, roi) {
             Ok(v) => v,
-            Err(err) => return fail(session_id, info, err, foregrounded, true, settled),
+            Err(err) => {
+                return fail_with_point(
+                    session_id,
+                    info,
+                    err,
+                    foregrounded,
+                    true,
+                    settled,
+                    point_for_dispatch(&resolved),
+                );
+            }
         };
         settled = settled2;
         let same = settle::roi_unchanged(&snapshot, &after2);
@@ -1065,7 +1135,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         );
     }
     if lease::is_frozen() {
-        return base(
+        let mut env = base(
             session_id,
             info,
             false,
@@ -1074,7 +1144,9 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             settled,
             foregrounded,
             Some("desk lease frozen (physical input or Pause/Break)".into()),
-        );
+        )?;
+        env.point = point_for_dispatch(&resolved);
+        return finalize_envelope(env);
     }
     let mut env = base(
         session_id,
@@ -1100,13 +1172,20 @@ fn dispatch_blind_click(
 ) -> Result<ActuateEnvelope, HandsError> {
     challenge::note_actuation_if_proceeding(false);
     remember_target(resolved.rect);
+    let point = Some(crate::point::explicit_contract(
+        PointSource::Blind,
+        crate::point::PhysicalPoint {
+            x: resolved.x,
+            y: resolved.y,
+        },
+    ));
     let mut rng = Rng::from_time();
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point(session_id, info, err, foregrounded, false, false, point);
     }
     if let Err(err) = input::left_click(&mut rng) {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point(session_id, info, err, foregrounded, false, false, point);
     }
     if lease::is_frozen() {
         return base(
@@ -1210,10 +1289,26 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let mut rng = Rng::from_time();
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point(
+            session_id,
+            info,
+            err,
+            foregrounded,
+            false,
+            false,
+            point_for_dispatch(&resolved),
+        );
     }
     if let Err(err) = hover_dwell() {
-        return fail(session_id, info, err, foregrounded, false, false);
+        return fail_with_point(
+            session_id,
+            info,
+            err,
+            foregrounded,
+            false,
+            false,
+            point_for_dispatch(&resolved),
+        );
     }
     let mut env = base(
         session_id,

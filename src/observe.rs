@@ -675,7 +675,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let (mut extract, mut elements, elements_total, _) =
         fuse_maps(req.detail, &snap.title, &snap.nodes, chrome, opts);
     crate::dialogs::promote(&mut extract, &mut elements);
-    stamp_grid(space, &mut elements);
+    stamp_grid_if_clickable(space, &mut elements, transform.as_ref());
     let fusion_ms = fusion_t.elapsed().as_millis() as u64;
     crate::fence::note_last_url(extract.url.as_deref());
     let cards_walked = extract.cards_walked;
@@ -788,6 +788,19 @@ fn stamp_grid(space: Space, elements: &mut [Element]) {
     for el in elements {
         el.grid = Some(space.cell_id_of_center(el.rect));
     }
+}
+
+/// Fixture-mode rects come from the legacy listing origin and are not a click contract; do not
+/// stamp them as grid cells, so `click --grid` cannot inherit a fixture listing coordinate.
+fn stamp_grid_if_clickable(
+    space: Space,
+    elements: &mut [Element],
+    transform: Option<&crate::point::TransformReport>,
+) {
+    if transform.is_some_and(|t| t.method == crate::point::TransformMethod::Fixture) {
+        return;
+    }
+    stamp_grid(space, elements);
 }
 
 fn write_sidecar(
@@ -3145,6 +3158,31 @@ mod tests {
         assert_eq!(chr0.rect.center(), (210, 166));
         assert_eq!(chr0.grid.as_deref(), Some("g:21:16"));
         assert_eq!(chr0.grid.as_ref().unwrap(), &space.cell_id(210, 166));
+    }
+
+    #[test]
+    fn fixture_transform_does_not_stamp_grid() {
+        let g = chrome::EnvGuard::lock();
+        g.set_snapshot(Some(&chrome::EnvGuard::fixture_path()));
+        let map = chrome::try_snapshot(Detail::Default, None)
+            .into_map()
+            .expect("fixture");
+        let transform = map.transform.clone();
+        assert!(
+            transform
+                .as_ref()
+                .is_some_and(|t| t.method == crate::point::TransformMethod::Fixture),
+            "{transform:?}"
+        );
+        let (_extract, mut elements, _total, _connected) =
+            fuse_maps(Detail::Default, "UIA", &[], Some(map), fixture_opts(true));
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        stamp_grid_if_clickable(space, &mut elements, transform.as_ref());
+        assert!(
+            elements.iter().all(|e| e.grid.is_none()),
+            "{:?}",
+            elements.iter().find(|e| e.grid.is_some())
+        );
     }
 
     #[test]

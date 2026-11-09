@@ -506,26 +506,6 @@ pub fn build_map(inputs: MapInputs) -> ViewportMap {
         },
     };
 
-    let anchor_css_w = anchor.w as f64 / dpr;
-    let anchor_css_h = anchor.h as f64 / dpr;
-    let ratio_w = anchor_css_w
-        / match anchor_basis {
-            CssBasis::Inner => inputs.page.inner_width.unwrap_or(anchor_css_w),
-            CssBasis::Client => inputs.page.client_width.unwrap_or(anchor_css_w),
-        };
-    let ratio_h = anchor_css_h
-        / match anchor_basis {
-            CssBasis::Inner => inputs.page.inner_height.unwrap_or(anchor_css_h),
-            CssBasis::Client => inputs.page.client_height.unwrap_or(anchor_css_h),
-        };
-    if ((ratio_w - ratio_h).abs() * anchor_css_w) > 0.5 {
-        return invalid_map(
-            &inputs,
-            format!("anchor_size_mismatch: width ratio {ratio_w:.5} vs height ratio {ratio_h:.5}"),
-            TransformMethod::None,
-        );
-    }
-
     if let Some(window) = inputs.window_rect {
         let last_x = anchor.x.saturating_add(anchor.w).saturating_sub(1);
         let last_y = anchor.y.saturating_add(anchor.h).saturating_sub(1);
@@ -986,6 +966,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fractional_dpr_rounding_height_cases_are_valid() {
+        // C1/C14: per-dimension CSS-space residuals stay within 0.5 even when the rounded height
+        // differs from the exact scale product; the old asymmetric ratio guard refused these.
+        for (w, h, dpr) in [
+            (800.0_f64, 602.0_f64, 1.25_f64),
+            (902.0_f64, 601.0_f64, 1.5_f64),
+        ] {
+            let anchor = Rect {
+                x: 100,
+                y: 80,
+                w: (w * dpr).round() as i32,
+                h: (h * dpr).round() as i32,
+            };
+            let map = build_map(inputs(anchor, page(dpr, (w, h), None)));
+            assert!(
+                map.report.valid,
+                "{w}x{h} @{dpr} anchor {anchor:?}: {:?}",
+                map.report.reason
+            );
+        }
+
+        // A genuine size mismatch still refuses (the anchor size does not match either basis).
+        let bad = build_map(inputs(
+            Rect {
+                x: 100,
+                y: 80,
+                w: 1000,
+                h: 700,
+            },
+            page(1.25, (800.0, 602.0), None),
+        ));
+        assert!(!bad.report.valid, "{bad:?}");
+        assert!(bad.report.reason.is_some());
     }
 
     #[test]

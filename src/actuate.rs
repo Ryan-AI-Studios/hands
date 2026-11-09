@@ -1080,7 +1080,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         }
     };
     if let Err(err) = input::left_click(&mut rng) {
-        return fail_with_point(
+        return fail_with_point_unverified(
             session_id,
             info,
             err,
@@ -1093,7 +1093,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let (mut settled, after) = match settle::wait_settle(space, roi) {
         Ok(v) => v,
         Err(err) => {
-            return fail_with_point(
+            return fail_with_point_unverified(
                 session_id,
                 info,
                 err,
@@ -1123,7 +1123,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             let _ = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
         }
         if let Err(err) = input::left_click(&mut rng) {
-            return fail_with_point(
+            return fail_with_point_unverified(
                 session_id,
                 info,
                 err,
@@ -1136,7 +1136,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         let (settled2, after2) = match settle::wait_settle(space, roi) {
             Ok(v) => v,
             Err(err) => {
-                return fail_with_point(
+                return fail_with_point_unverified(
                     session_id,
                     info,
                     err,
@@ -1173,6 +1173,8 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             Some("desk lease frozen (physical input or Pause/Break)".into()),
         )?;
         env.point = point_for_dispatch(&resolved);
+        // The click may already have landed at the now-frozen desk.
+        env.verified = false;
         return finalize_envelope(env);
     }
     let mut env = base(
@@ -1339,7 +1341,7 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         );
     }
     if let Err(err) = hover_dwell() {
-        return fail_with_point(
+        return fail_with_point_unverified(
             session_id,
             info,
             err,
@@ -1668,7 +1670,9 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             env.point = point;
             finalize_envelope(env)
         }
-        Err(err) => fail_with_point(session_id, info, err, foregrounded, false, false, point),
+        Err(err) => {
+            fail_with_point_unverified(session_id, info, err, foregrounded, false, false, point)
+        }
     }
 }
 
@@ -1746,7 +1750,22 @@ pub fn hover_dwell_slice_count() -> u64 {
     HOVER_DWELL_MS.div_ceil(HOVER_DWELL_SLICE_MS)
 }
 
+#[cfg(test)]
+type HoverDwellHook = fn() -> Result<(), HandsError>;
+
+#[cfg(test)]
+thread_local! {
+    static HOVER_DWELL_HOOK: std::cell::RefCell<Option<HoverDwellHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn hover_dwell() -> Result<(), HandsError> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = HOVER_DWELL_HOOK.with(|c| *c.borrow()) {
+            return hook();
+        }
+    }
     let mut left = HOVER_DWELL_MS;
     while left > 0 {
         let step = left.min(HOVER_DWELL_SLICE_MS);
@@ -2809,6 +2828,8 @@ mod tests {
             crate::foreground::set_client_rect_hook(None);
             crate::uia::set_focused_leaf_hook(None);
             crate::uia::set_hit_test_hook(None);
+            crate::capture::set_capture_roi_hook(None);
+            HOVER_DWELL_HOOK.with(|c| *c.borrow_mut() = None);
         }
     }
 
@@ -4208,6 +4229,153 @@ mod tests {
         lease::reset_for_test();
     }
 
+    fn free_hit(_: i32, _: i32) -> Result<crate::uia::HitElement, HandsError> {
+        Ok(crate::uia::HitElement {
+            name: String::new(),
+            role: "Other".into(),
+            hwnd: Some(0x10),
+            value: None,
+        })
+    }
+
+    fn fake_capture(space: Space, rect: Rect) -> Result<crate::capture::RoiFrame, HandsError> {
+        let clipped = space.clip_rect(rect);
+        let w = clipped.w.max(1);
+        let h = clipped.h.max(1);
+        Ok(crate::capture::RoiFrame {
+            width: w,
+            height: h,
+            pixels: vec![0; (w * h * 4) as usize],
+        })
+    }
+
+    #[test]
+    fn non_blind_click_frozen_after_dispatch_is_unverified() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::uia::set_hit_test_hook(Some(free_hit));
+        crate::input::set_send_inputs_hook(Some(freeze_on_click_release));
+        crate::capture::set_capture_roi_hook(Some(fake_capture));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            let env = click(ActuateRequest {
+                session_id: Some("s-0129-nonblind-frozen".into()),
+                x: Some(x),
+                y: Some(y),
+                ..ActuateRequest::default()
+            })
+            .expect("click");
+            assert!(!env.ok, "{env:?}");
+            assert!(env.frozen, "{env:?}");
+            assert!(
+                !env.verified,
+                "post-dispatch freeze must be unverified: {env:?}"
+            );
+            let point = env.point.as_ref().expect("point contract");
+            assert_eq!(point.source, crate::point::PointSource::Pixel);
+            assert_eq!(point.physical, Some(crate::point::PhysicalPoint { x, y }));
+            let json = serialize_envelope(&env).expect("json");
+            assert!(json.contains("\"verified\":false"), "{json}");
+            assert!(json.contains("\"point\""), "{json}");
+        });
+        lease::reset_for_test();
+    }
+
+    fn freeze_on_wheel(
+        inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+    ) -> Result<(), HandsError> {
+        if inputs.iter().any(|input| {
+            unsafe { input.Anonymous.mi.dwFlags }
+                .contains(windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_WHEEL)
+        }) {
+            lease::freeze_now_with(lease::FreezeCause::Physical);
+        }
+        Ok(())
+    }
+
+    fn noop_sends(
+        _: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+    ) -> Result<(), HandsError> {
+        Ok(())
+    }
+
+    fn dwell_fails() -> Result<(), HandsError> {
+        Err(HandsError::Input("hover dwell failed".into()))
+    }
+
+    #[test]
+    fn non_blind_scroll_frozen_after_dispatch_is_unverified() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(freeze_on_wheel));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        let env = scroll(ActuateRequest {
+            session_id: Some("s-0129-nonblind-scroll".into()),
+            dy: Some(1),
+            ..ActuateRequest::default()
+        })
+        .expect("scroll");
+        assert!(!env.ok, "{env:?}");
+        assert!(
+            !env.verified,
+            "post-dispatch scroll must be unverified: {env:?}"
+        );
+        let json = serialize_envelope(&env).expect("json");
+        assert!(json.contains("\"verified\":false"), "{json}");
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn non_blind_hover_failure_after_dispatch_is_unverified() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(noop_sends));
+        HOVER_DWELL_HOOK.with(|c| *c.borrow_mut() = Some(dwell_fails));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            let env = hover(ActuateRequest {
+                session_id: Some("s-0129-nonblind-hover".into()),
+                x: Some(x),
+                y: Some(y),
+                ..ActuateRequest::default()
+            })
+            .expect("hover");
+            assert!(!env.ok, "{env:?}");
+            assert!(
+                !env.verified,
+                "post-dispatch hover must be unverified: {env:?}"
+            );
+            let point = env.point.as_ref().expect("point contract");
+            assert_eq!(point.source, crate::point::PointSource::Pixel);
+            let json = serialize_envelope(&env).expect("json");
+            assert!(json.contains("\"verified\":false"), "{json}");
+        });
+        lease::reset_for_test();
+    }
+
     #[test]
     fn blind_paths_consult_req_blind_before_guards() {
         let src = include_str!("actuate.rs");
@@ -4807,7 +4975,7 @@ mod tests {
         )
         .unwrap();
         success.point = Some(contract.clone());
-        let failure = fail_with_point(
+        let failure = fail_with_point_unverified(
             "s-scroll".into(),
             target,
             HandsError::Input("scroll blocked".into()),
@@ -4818,6 +4986,7 @@ mod tests {
         )
         .unwrap();
         assert!(!failure.ok);
+        assert!(!failure.verified, "post-dispatch failure is unverified");
         assert_eq!(failure.point, success.point);
         let success_point = success.point.expect("success point");
         let failure_point = failure.point.as_ref().expect("failure point");
@@ -4843,9 +5012,9 @@ mod tests {
         let body = &src[start..end];
         assert!(
             body.contains(
-                "Err(err) => fail_with_point(session_id, info, err, foregrounded, false, false, point)"
+                "fail_with_point_unverified(session_id, info, err, foregrounded, false, false, point)"
             ),
-            "scroll_wheel failure must retain the point:\n{body}"
+            "scroll_wheel failure must retain the point and be unverified:\n{body}"
         );
     }
 

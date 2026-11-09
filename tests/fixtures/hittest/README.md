@@ -12,8 +12,10 @@ DOM test: CI cannot execute extension JS.
   `absolute-above-clipper`, `body-overflow`, `light-dom-custom-element`, `nested-scroll` verdict.
 - **Live-field corrections from that run:** `aria-disabled-inert` confidence `medium`;
   `clipped-container` target `(101,41,200,40)` / centre `(201,61)` / clipped name `Sign in` /
-  blocker `html`; `transformed-ancestor` target `(120,60,200,40)` / centre `(220,80)`;
-  `iframe-overlay` name from the fixture's `aria-label`.
+  clipped rect `(100,40,122,62)` / blocker `html`; `transformed-ancestor` target
+  `(120,60,200,40)` / centre `(220,80)`; `nested-scroll` blocker `html` / clipped name `Sign in`;
+  `point-topmost` confidence `medium` (non-empty `shadow_path`); `iframe-overlay` name from the
+  fixture's `aria-label`.
 - **Hand-derived (documented geometry + algorithm):** the remaining fields in the above pages and
   the point-mode shapes. `point-topmost` now has `point-topmost.html` (open shadow host with a
   `role=button` button), so its `role` and `shadow_path` are producible.
@@ -38,21 +40,21 @@ The gate's summary is in `conductor/0128-DomHitTestOcclusion/review.codex.md`.
 | `modal-backdrop.json` | `modal-backdrop.html` | false/blocked, `div[role=dialog]` “Modal backdrop”, high |
 | `cookie-banner.json` | `cookie-banner.html` | false/blocked, `div[role=dialog]` “Cookie banner”, high |
 | `pointer-events-none.json` | `pointer-events-none.html` | true, high, no blockers |
-| `clipped-container.json` | `clipped-container.html` | true/medium, target `(101,41,200,40)`, clipped_by `section` name `Sign in`, blocker `html` |
+| `clipped-container.json` | `clipped-container.html` | true/medium, target `(101,41,200,40)`, clipped_by `section` name `Sign in` rect `(100,40,122,62)`, blocker `html` |
 | `transformed-ancestor.json` | `transformed-ancestor.html` | true/high, target `(120,60,200,40)`, centre `(220,80)` |
-| `open-shadow-overlay.json` | `open-shadow-overlay.html` | false/blocked, inner `div[role=dialog]` “Shadow overlay”, high |
+| `open-shadow-overlay.json` | `open-shadow-overlay.html` | false/blocked, inner `div[role=dialog]` "Shadow overlay", high |
 | `closed-shadow.json` | `closed-shadow.html` | false/blocked, inner `div[role=dialog]`, `shadow_pierced_closed`, medium |
 | `closed-shadow-uninspectable.json` | (hypothetical no-`chrome.dom`) | false/shadow_closed, kind shadow, low |
 | `partial-offscreen.json` | `partial-offscreen.html` | true/medium, onscreen 0.833, visible 0.8 |
 | `aria-disabled-inert.json` | `aria-disabled-inert.html` | true/medium, note `aria_disabled` only |
-| `nested-scroll.json` | `nested-scroll.html` | false/clipped_out, visible 0.2 |
+| `nested-scroll.json` | `nested-scroll.html` | false/clipped_out, visible 0.2, blocker `html`, clipped name `Sign in` |
 | `iframe-overlay.json` | `iframe-overlay.html` | false/cross_frame, iframe name “Opaque frame” |
 | `small-target.json` | `small-target.html` | true/high |
 | `fixed-in-overflow.json` | `fixed-in-overflow.html` | true/high |
 | `absolute-above-clipper.json` | `absolute-above-clipper.html` | true/high |
 | `body-overflow.json` | `body-overflow.html` | true/medium, note `containing_block_skip` |
 | `light-dom-custom-element.json` | `light-dom-custom-element.html` | true/high |
-| `point-topmost.json` | `point-topmost.html` | point true/high, role button, shadow_path `app-shell` |
+| `point-topmost.json` | `point-topmost.html` | point true/medium, role button, shadow_path `app-shell` |
 | `point-body.json` | `blank-page.html` | point null/not_interactive |
 | `point-closed-shadow.json` | `closed-shadow.html` | point null/shadow_closed (shape-only) |
 | `point-iframe.json` | `iframe-overlay.html` | point null/cross_frame (shape-only) |

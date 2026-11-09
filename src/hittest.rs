@@ -268,16 +268,20 @@ pub fn envelope_for_outcome(outcome: TargetOutcome, detail: &str) -> HittestEnve
                 .css_rect
                 .and_then(|css_rect| map_rect(&contract, css_rect).ok());
             assessment = Some(match assessment {
-                None => Assessment::unknown(
-                    resolved.css_point.unwrap_or(CssPoint::new(0.0, 0.0)),
-                    resolved.css_rect.unwrap_or(CssRect {
-                        left: 0.0,
-                        top: 0.0,
-                        width: 0.0,
-                        height: 0.0,
-                    }),
-                    "assessment_missing",
-                ),
+                None => {
+                    let mut assessment = Assessment::unknown(
+                        resolved.css_point.unwrap_or(CssPoint::new(0.0, 0.0)),
+                        resolved.css_rect.unwrap_or(CssRect {
+                            left: 0.0,
+                            top: 0.0,
+                            width: 0.0,
+                            height: 0.0,
+                        }),
+                        "assessment_missing",
+                    );
+                    assessment.observe_id = contract.transform.observe_id.clone();
+                    assessment
+                }
                 Some(mut assessment) => {
                     if let Err(reason) = validate_assessment(&contract, &assessment) {
                         let css = resolved.css_point.unwrap_or(assessment.selected_point);
@@ -418,7 +422,21 @@ fn run_point(target: &Target, samples: u32) -> Result<HittestEnvelope, HandsErro
     }
     let window_before = foreground::window_rect(hwnd);
     let snapshot = chrome::try_snapshot_identity(Detail::Default, Some(hwnd));
-    let mut envelope = point_after_snapshot(snapshot, physical, samples)?;
+    let mut envelope = match point_after_snapshot(snapshot, physical, samples) {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            return Ok(HittestEnvelope {
+                session_id: String::new(),
+                ok: false,
+                point: None,
+                target_rect: None,
+                detail: None,
+                assessment: None,
+                at_point: None,
+                error: Some(err.tool_message()),
+            });
+        }
+    };
     if envelope.ok && envelope.at_point.is_some() {
         let window_after = foreground::window_rect(hwnd);
         if window_moved(window_before, window_after) {
@@ -971,6 +989,16 @@ mod tests {
         let clipped = a.clipped_by.expect("clipped_by");
         assert_eq!(clipped.tag.as_deref(), Some("section"));
         assert_eq!(clipped.name.as_deref(), Some("Sign in"));
+        assert_eq!(clipped.role, None);
+        assert_eq!(
+            clipped.rect_css,
+            Some(CssRect {
+                left: 100.0,
+                top: 40.0,
+                width: 122.0,
+                height: 62.0,
+            })
+        );
         assert_eq!(a.blocked_by[0].tag.as_deref(), Some("html"));
         assert!(a.visible_fraction.unwrap_or(1.0) < a.onscreen_fraction.unwrap_or(1.0));
     }
@@ -980,9 +1008,19 @@ mod tests {
         let a = assessment("nested-scroll.json");
         assert_eq!(a.interactable, Some(false));
         assert_eq!(a.reason.as_deref(), Some("clipped_out"));
+        assert_eq!(a.blocked_by[0].tag.as_deref(), Some("html"));
+        let clipped = a.clipped_by.expect("clipped_by");
+        assert_eq!(clipped.tag.as_deref(), Some("div"));
+        assert_eq!(clipped.name.as_deref(), Some("Sign in"));
+        assert_eq!(clipped.role, None);
         assert_eq!(
-            a.clipped_by.expect("clipped_by").tag.as_deref(),
-            Some("div")
+            clipped.rect_css,
+            Some(CssRect {
+                left: 80.0,
+                top: 40.0,
+                width: 240.0,
+                height: 120.0,
+            })
         );
     }
 
@@ -1136,6 +1174,7 @@ mod tests {
         assert_eq!(element.tag.as_deref(), Some("button"));
         assert_eq!(element.role.as_deref(), Some("button"));
         assert_eq!(a.shadow_path, vec!["app-shell"]);
+        assert_eq!(a.confidence, AssessmentConfidence::Medium);
     }
 
     #[test]
@@ -1171,6 +1210,7 @@ mod tests {
         let a = at_point("point-topmost.json");
         assert_eq!(a.element.unwrap().role.as_deref(), Some("button"));
         assert_eq!(a.shadow_path, vec!["app-shell"]);
+        assert_eq!(a.confidence, AssessmentConfidence::Medium);
     }
 
     #[test]
@@ -1535,6 +1575,20 @@ mod tests {
         let envelope = envelope_for_outcome(TargetOutcome::Resolved(Box::new(resolved)), "default");
         assert_eq!(envelope.target_rect, Some(expected));
         assert_eq!(envelope.detail.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn assessment_missing_carries_observe_id() {
+        let mut resolved = blocked_resolved();
+        resolved.assessment = None;
+        let expected = resolved
+            .contract
+            .as_ref()
+            .and_then(|c| c.transform.observe_id.clone());
+        let envelope = envelope_for_outcome(TargetOutcome::Resolved(Box::new(resolved)), "default");
+        let a = envelope.assessment.expect("assessment");
+        assert_eq!(a.reason.as_deref(), Some("assessment_missing"));
+        assert_eq!(a.observe_id, expected);
     }
 
     // ---------------------------------------------------------------- inverse / point mode

@@ -191,7 +191,7 @@ function Get-InstalledExeHolders {
 }
 
 # The task's own server is `serve --pipe ...`; anything else (a harness bridge) is foreign.
-$foreign = @(Get-InstalledExeHolders | Where-Object { $_.CommandLine -notmatch [regex]::Escape($pipeArgs) })
+$foreign = @(Get-InstalledExeHolders | Where-Object { $_.CommandLine -notmatch ([regex]::Escape($pipeArgs) + '(\s|$)') })
 if ($foreign.Count -gt 0 -and -not $StopHolders) {
     Write-Host "The installed exe is in use by processes other than the task:"
     $foreign | ForEach-Object { Write-Host ("  pid {0}  {1}" -f $_.ProcessId, ($_.CommandLine -replace '\s+', ' ')) }
@@ -226,6 +226,7 @@ $failure = $null
 $rollbackFailed = $false
 $rolledBack = $false
 $rollbackError = ""
+$restarted = $false
 try {
     if ($wasRunning) {
         Write-Host "Stopping running $taskName before replacing its exe."
@@ -305,8 +306,12 @@ try {
         catch { Write-Warning "Could not restore the ReadOnly attribute: $($_.Exception.Message)" }
     }
     if ($null -ne $failure -and $wasRunning -and -not $rollbackFailed) {
-        try { Start-ScheduledTask -TaskName $taskName | Out-Null }
-        catch { Write-Warning "Could not restart $($taskName): $($_.Exception.Message)" }
+        try {
+            Start-ScheduledTask -TaskName $taskName | Out-Null
+            $restarted = $true
+        } catch {
+            Write-Warning "Could not restart $($taskName): $($_.Exception.Message)"
+        }
     }
     if (-not $rollbackFailed) {
         Remove-Item -LiteralPath $backupExe -ErrorAction SilentlyContinue
@@ -315,12 +320,15 @@ try {
 
 if ($null -ne $failure) {
     if ($rollbackFailed) {
-        Fail "Replacing the installed exe failed ($($failure.Exception.Message)) and rollback also failed ($rollbackError). The previous exe is kept at $backupExe and the task is stopped; restore it manually."
+        Fail "Replacing the installed exe failed ($($failure.Exception.Message)) and rollback also failed ($rollbackError). The previous exe is kept at $backupExe and the task was not restarted; restore it manually and run schtasks /Run /TN HandsElevated."
     }
+    $tail = if (-not $wasRunning) { "The task was not running before and remains stopped." }
+    elseif ($restarted) { "The task was restarted." }
+    else { "The task could NOT be restarted; run schtasks /Run /TN HandsElevated." }
     if ($rolledBack) {
-        Fail "Replacing the installed exe failed: $($failure.Exception.Message) The previous exe was restored and the task restarted."
+        Fail "Replacing the installed exe failed: $($failure.Exception.Message) The previous exe was restored. $tail"
     }
-    Fail "Replacing the installed exe failed: $($failure.Exception.Message) The task was restarted if it had been running."
+    Fail "Replacing the installed exe failed: $($failure.Exception.Message) $tail"
 }
 
 # --- Registration: a failure restarts the task rather than leaving it stopped ----------
@@ -347,11 +355,19 @@ try {
         throw "the on-demand task has $triggerCount trigger(s)"
     }
 } catch {
+    $restarted = $false
     if ($wasRunning) {
-        try { Start-ScheduledTask -TaskName $taskName | Out-Null }
-        catch { Write-Warning "Could not restart $($taskName): $($_.Exception.Message)" }
+        try {
+            Start-ScheduledTask -TaskName $taskName | Out-Null
+            $restarted = $true
+        } catch {
+            Write-Warning "Could not restart $($taskName): $($_.Exception.Message)"
+        }
     }
-    Fail "Registering the task failed: $($_.Exception.Message) The task was restarted if it had been running."
+    $tail = if (-not $wasRunning) { "The task was not running before and remains stopped." }
+    elseif ($restarted) { "The task was restarted." }
+    else { "The task could NOT be restarted; run schtasks /Run /TN HandsElevated." }
+    Fail "Registering the task failed: $($_.Exception.Message) $tail"
 }
 
 Write-Host "Installed exe : $installedExe (sha256 $dstHash)"

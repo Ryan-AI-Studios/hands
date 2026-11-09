@@ -780,6 +780,7 @@ pub fn refusal(
         assessment,
         interactable_checked: Some(true),
         identity: None,
+        post_dispatch: false,
     })
 }
 
@@ -2166,6 +2167,7 @@ mod tests {
             assessment: None,
             interactable_checked: None,
             identity: None,
+            post_dispatch: false,
         }
     }
 

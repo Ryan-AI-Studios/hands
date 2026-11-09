@@ -1451,14 +1451,13 @@ pub fn verify_binding(tab: u32) -> Result<BindingEvidence, IdentityReport> {
         }
     }
     if snapshot_env().is_some() {
-        // Fixture mode is diagnostic only. The transform still refuses (`fixture_snapshot`);
-        // a fixture is not live binding proof.
-        return Ok(BindingEvidence {
+        // Fixture mode has no live tab/window evidence; fail closed so a future valid
+        // fixture transform can never dispatch through a synthesized binding proof.
+        return Err(binding_report(
             tab,
-            window: None,
-            active: true,
-            focused: true,
-        });
+            IdentityState::Unknown,
+            "fixture_snapshot",
+        ));
     }
     let reply = pipe_request(&serde_json::json!({"op": "binding", "tab": tab})).map_err(|err| {
         let text = err.to_string();
@@ -3511,6 +3510,20 @@ mod tests {
         set_binding_stub(None);
         assert_eq!(report.state, IdentityState::Unknown);
         assert_eq!(report.reason.as_deref(), Some("protocol_error"));
+    }
+
+    #[test]
+    fn fixture_binding_probe_is_unknown() {
+        let g = EnvGuard::lock();
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chrome-scoped.json");
+        g.set_snapshot(Some(&path));
+        set_binding_stub(None);
+        set_binding_sequence(Vec::new());
+        let report = verify_binding(12).expect_err("fixture has no live binding proof");
+        g.set_snapshot(None);
+        assert_eq!(report.state, IdentityState::Unknown);
+        assert_eq!(report.reason.as_deref(), Some("fixture_snapshot"));
     }
 
     #[test]

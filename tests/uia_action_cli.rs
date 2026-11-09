@@ -111,6 +111,7 @@ fn uia_action_json_envelope_has_flat_semantic_fields() {
             foreground_changed: false,
             pointer_moved: false,
         }),
+        post_dispatch: false,
     };
     env.ok = true;
     let json = hands::actuate::serialize_envelope(&env).expect("serialize");

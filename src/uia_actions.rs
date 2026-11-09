@@ -385,6 +385,7 @@ fn base_envelope(
             foreground_changed: false,
             pointer_moved: false,
         }),
+        post_dispatch: false,
     }
 }
 
@@ -800,10 +801,21 @@ impl SemanticBackend for LiveBackend {
         let action = req.action;
         let value = req.value.clone();
         let outer_hwnd = resolved.hwnd;
+        let resolve_root = dispatch_resolve_root(resolved);
         let expected_fp = req.expected_fp;
         bounded_dispatch(req.timeout, move || {
-            worker_run(want, action, value, outer_hwnd, expected_fp)
+            worker_run(want, action, value, outer_hwnd, resolve_root, expected_fp)
         })
+    }
+}
+
+/// Only scoped refs root the dispatch walk at the resolved window and use the 4096 cap.
+/// Legacy `uia:` keeps the unbounded desktop-root first-match walk.
+fn dispatch_resolve_root(resolved: &ResolvedTarget) -> Option<isize> {
+    if matches!(resolved.target, Target::Scoped(_)) {
+        resolved.hwnd
+    } else {
+        None
     }
 }
 
@@ -839,6 +851,7 @@ fn worker_run(
     action: SemanticAction,
     value: Option<String>,
     outer_hwnd: Option<isize>,
+    resolve_root: Option<isize>,
     expected_fp: Option<u32>,
 ) -> SemanticResult {
     let _sta = match uia::StaGuard::enter() {
@@ -849,7 +862,7 @@ fn worker_run(
         Ok(automation) => automation,
         Err(err) => return SemanticResult::refusal(resolve_code(&err)),
     };
-    let com = match uia::resolve_on(&automation, &want, outer_hwnd) {
+    let com = match uia::resolve_on(&automation, &want, resolve_root) {
         Ok(com) => com,
         Err(err) => return SemanticResult::refusal(resolve_code(&err)),
     };
@@ -2229,5 +2242,20 @@ mod tests {
             )),
             "stale_target"
         );
+    }
+
+    #[test]
+    fn legacy_uia_action_passes_none_dispatch_root() {
+        let legacy = resolved_target("Send", "button", Some(0x1a2b3c));
+        assert_eq!(dispatch_resolve_root(&legacy), None);
+        let mut scoped = legacy;
+        scoped.target = Target::Scoped(crate::identity::SnapshotRef::Uia {
+            hwnd: 0x1a2b3c,
+            fp: "7d0e1f22".into(),
+            ridh: "42a1b2c3".into(),
+        });
+        assert_eq!(dispatch_resolve_root(&scoped), Some(0x1a2b3c));
+        let src = include_str!("uia_actions.rs");
+        assert!(src.contains("uia::resolve_on(&automation, &want, resolve_root)"));
     }
 }

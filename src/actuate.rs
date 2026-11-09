@@ -77,6 +77,10 @@ pub struct ActuateEnvelope {
     /// Snapshot-bound identity evidence/refusal. Absent for grid/pixel and pre-resolve fails.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityReport>,
+    /// True only when a first physical dispatch may already have been sent. 0124 must not
+    /// treat `identity` alone as "nothing sent" when this is set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub post_dispatch: bool,
     #[serde(flatten, default)]
     pub semantic: Option<crate::uia_actions::SemanticInfo>,
 }
@@ -262,6 +266,7 @@ pub(crate) fn refuse_if_blocked(
         interactable_checked: None,
         semantic: None,
         identity: None,
+        post_dispatch: false,
     })
     .map(Some)
 }
@@ -464,6 +469,7 @@ fn base(
         interactable_checked: None,
         semantic: None,
         identity: None,
+        post_dispatch: false,
     })
 }
 
@@ -492,6 +498,7 @@ fn refuse_yield(session_id: String, target: ActuateTarget) -> Result<ActuateEnve
         interactable_checked: None,
         semantic: None,
         identity: None,
+        post_dispatch: false,
     })
 }
 
@@ -604,6 +611,7 @@ pub(crate) fn refuse_fence(
         interactable_checked: None,
         semantic: None,
         identity: None,
+        post_dispatch: false,
     })
 }
 
@@ -741,7 +749,12 @@ pub(crate) fn settle_cooldown(tool: &str, env: &mut ActuateEnvelope) {
         let binding_precondition = report.state == IdentityState::Unknown
             && matches!(
                 report.reason.as_deref(),
-                Some("tab_not_active" | "window_not_focused" | "tab_hidden")
+                Some(
+                    "tab_not_active"
+                        | "window_not_focused"
+                        | "tab_hidden"
+                        | "binding_changed_after_dispatch"
+                )
             );
         if exempt_state || binding_precondition {
             return;
@@ -810,9 +823,8 @@ pub(crate) fn refuse_transform(
         .clone()
         .unwrap_or_else(|| "transform is not valid".into());
     let identity = identity.map(|mut report| {
-        // Name the 0129 transform reason in the identity block too; `state` stays exact
-        // because the ref resolved, while `ok:false`/`verified:false` mark "nothing sent".
-        report.reason = Some(reason.clone());
+        // Closed post-transform identity token; the 0129 detail stays in top-level `error`.
+        report.reason = Some("transform_invalid".into());
         report
     });
     finalize_envelope(ActuateEnvelope {
@@ -838,6 +850,7 @@ pub(crate) fn refuse_transform(
         assessment: None,
         interactable_checked: None,
         identity,
+        post_dispatch: false,
         semantic: None,
     })
 }
@@ -1067,6 +1080,8 @@ fn post_dispatch_binding_refusal(
     foregrounded: bool,
     report: IdentityReport,
 ) -> Result<ActuateEnvelope, HandsError> {
+    let mut report = report;
+    report.reason = Some("binding_changed_after_dispatch".into());
     let reason = report
         .reason
         .clone()
@@ -1083,6 +1098,7 @@ fn post_dispatch_binding_refusal(
     )?;
     env.point = point_for_dispatch(resolved);
     env.verified = false;
+    env.post_dispatch = true;
     env.identity = Some(report);
     finalize_envelope(env)
 }
@@ -2163,6 +2179,7 @@ mod tests {
             interactable_checked: None,
             semantic: None,
             identity: None,
+            post_dispatch: false,
         };
         let err = finalize_envelope(env).expect_err("must not emit oversize");
         assert!(err.to_string().contains("16384"), "{err}");
@@ -2208,6 +2225,7 @@ mod tests {
             interactable_checked: None,
             semantic: None,
             identity: None,
+            post_dispatch: false,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"roi\""), "{json}");
@@ -2249,6 +2267,7 @@ mod tests {
             interactable_checked: None,
             semantic: None,
             identity: None,
+            post_dispatch: false,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(!json.contains("\"roi\""), "{json}");
@@ -2288,6 +2307,7 @@ mod tests {
             interactable_checked: None,
             semantic: None,
             identity: None,
+            post_dispatch: false,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"navigated\":true"), "{json}");
@@ -2325,6 +2345,7 @@ mod tests {
             interactable_checked: None,
             semantic: None,
             identity: None,
+            post_dispatch: false,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"miss\":\"no_change\""), "{json}");
@@ -2361,6 +2382,7 @@ mod tests {
             interactable_checked: None,
             semantic: None,
             identity: None,
+            post_dispatch: false,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(!json.contains("\"miss\""), "{json}");
@@ -6534,7 +6556,7 @@ mod tests {
         );
         assert_eq!(
             env.identity.as_ref().and_then(|i| i.reason.as_deref()),
-            Some("no_viewport_anchor")
+            Some("transform_invalid")
         );
         let point = env.point.as_ref().expect("point contract");
         assert!(!point.transform.valid);
@@ -6711,6 +6733,47 @@ mod tests {
     }
 
     #[test]
+    fn hover_and_scroll_stale_scoped_ref_refuse() {
+        let r = SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 7,
+        };
+        let report = IdentityReport::chrome_failure(&r, IdentityState::Stale, "stale_element");
+        chrome::set_scoped_resolve_stub(Some(Err(report)));
+        let hover_env = hover(ActuateRequest {
+            session_id: Some("s-hover-stale".into()),
+            element_id: Some(r.to_string()),
+            ..ActuateRequest::default()
+        })
+        .expect("hover refusal");
+        assert!(!hover_env.ok);
+        assert!(hover_env.point.is_none());
+        assert_eq!(hover_env.error.as_deref(), Some("stale_element"));
+        assert_eq!(
+            hover_env.identity.as_ref().map(|i| i.state),
+            Some(IdentityState::Stale)
+        );
+
+        let scroll_env = scroll(ActuateRequest {
+            session_id: Some("s-scroll-stale".into()),
+            element_id: Some(r.to_string()),
+            dy: Some(1),
+            ..ActuateRequest::default()
+        })
+        .expect("scroll refusal");
+        chrome::set_scoped_resolve_stub(None);
+        assert!(!scroll_env.ok);
+        assert_eq!(scroll_env.error.as_deref(), Some("stale_element"));
+        assert_eq!(
+            scroll_env.identity.as_ref().map(|i| i.state),
+            Some(IdentityState::Stale)
+        );
+    }
+
+    #[test]
     fn post_dispatch_binding_refusal_keeps_point_and_unverified() {
         let map = act_remap_map(0, 0);
         let css = CssPoint::new(60.0, 60.0);
@@ -6763,11 +6826,39 @@ mod tests {
         .expect("post-dispatch refusal");
         assert!(!env.ok);
         assert!(!env.verified);
+        assert!(env.post_dispatch);
         assert!(env.point.is_some());
-        assert_eq!(env.error.as_deref(), Some("tab_not_active"));
+        assert_eq!(env.error.as_deref(), Some("binding_changed_after_dispatch"));
         assert_eq!(
             env.identity.as_ref().and_then(|i| i.reason.as_deref()),
+            Some("binding_changed_after_dispatch")
+        );
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"post_dispatch\":true"));
+        assert!(json.contains("\"verified\":false"));
+
+        let pre = refuse_identity(
+            "s-pre".into(),
+            none_target(),
+            IdentityReport::chrome_failure(&r, IdentityState::Unknown, "tab_not_active"),
+        )
+        .expect("pre-dispatch refusal");
+        assert!(!pre.post_dispatch);
+        assert_eq!(
+            pre.identity.as_ref().and_then(|i| i.reason.as_deref()),
             Some("tab_not_active")
+        );
+
+        let _g = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        let mut post = env;
+        crate::actuate::settle_cooldown("click", &mut post);
+        assert_eq!(
+            crate::cooldown::snapshot("s-retry").attempt,
+            0,
+            "post-dispatch binding change is exempt from cooldown"
         );
     }
 

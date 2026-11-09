@@ -1314,7 +1314,8 @@ mod tests {
         assert!(body.contains("SCOPED_NODE_CAP"));
         assert!(body.contains("ambiguous"));
         let actions = include_str!("uia_actions.rs");
-        assert!(actions.contains("resolve_on(&automation, &want, outer_hwnd)"));
+        assert!(actions.contains("resolve_on(&automation, &want, resolve_root)"));
+        assert!(actions.contains("dispatch_resolve_root"));
     }
 
     #[test]

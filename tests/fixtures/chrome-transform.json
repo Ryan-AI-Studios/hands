@@ -1,0 +1,34 @@
+{
+  "url": "https://example.com/transform",
+  "title": "Transform fixture",
+  "main_text": "transform fixture",
+  "elements": [
+    {
+      "id": "chr:0",
+      "role": "Button",
+      "text": "Go",
+      "rectCss": { "left": 100, "top": 50, "width": 200, "height": 40 }
+    }
+  ],
+  "cards": [],
+  "metrics": {
+    "screenX": 0,
+    "screenY": 0,
+    "outerWidth": 1200,
+    "outerHeight": 980,
+    "innerWidth": 1200,
+    "innerHeight": 900,
+    "devicePixelRatio": 1.25,
+    "clientWidth": 1185,
+    "clientHeight": 900,
+    "visualViewportWidth": 1185,
+    "visualViewportHeight": 900,
+    "visualViewportScale": 1,
+    "visualViewportOffsetLeft": 0,
+    "visualViewportOffsetTop": 0,
+    "screenAvailLeft": 0,
+    "screenAvailTop": 0,
+    "screenWidth": 1920,
+    "screenHeight": 1080
+  }
+}

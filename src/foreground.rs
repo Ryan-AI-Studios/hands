@@ -6,11 +6,13 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GA_ROOT, GW_ENABLEDPOPUP, GW_OWNER, GWL_EXSTYLE, GetAncestor,
-    GetClassNameW, GetClientRect, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    SW_RESTORE, SetForegroundWindow, ShowWindow, WS_EX_TOOLWINDOW, WindowFromPoint,
+    BringWindowToTop, EnumChildWindows, EnumWindows, GA_ROOT, GW_ENABLEDPOPUP, GW_OWNER,
+    GWL_EXSTYLE, GetAncestor, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, IsZoomed, SW_RESTORE, SetForegroundWindow, ShowWindow, WS_EX_TOOLWINDOW,
+    WindowFromPoint,
 };
 
 use crate::space::Rect;
@@ -326,6 +328,104 @@ fn client_rect_live(hwnd: isize) -> Option<Rect> {
         w,
         h,
     })
+}
+
+/// Effective DPI of the window's monitor (`GetDpiForWindow`, PMv2). Read-only.
+pub fn dpi_for_window(hwnd: isize) -> Option<u32> {
+    let h = raw_hwnd(hwnd);
+    hwnd_raw(h)?;
+    let dpi = unsafe { GetDpiForWindow(h) };
+    (dpi > 0).then_some(dpi)
+}
+
+/// Child window description used by the render-widget filter (pure/testable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildWindowInfo {
+    pub class: String,
+    pub visible: bool,
+    pub client: Rect,
+}
+
+/// Keep visible, non-zero `Chrome_RenderWidgetHostHWND` children. Returns all candidates;
+/// the map builder decides uniqueness (`anchor_ambiguous` on >1 match).
+pub(crate) fn render_widget_rects_from(children: Vec<ChildWindowInfo>) -> Vec<Rect> {
+    children
+        .into_iter()
+        .filter(|c| {
+            c.visible
+                && c.class.eq_ignore_ascii_case("Chrome_RenderWidgetHostHWND")
+                && c.client.w > 0
+                && c.client.h > 0
+        })
+        .map(|c| c.client)
+        .collect()
+}
+
+/// Visible `Chrome_RenderWidgetHostHWND` descendants of `hwnd`, as physical client rects.
+/// Uses `GetClientRect` + `ClientToScreen` (the content area), never `GetWindowRect`.
+pub fn render_widget_host_rects(hwnd: isize) -> Vec<Rect> {
+    if !is_live_hwnd(hwnd) {
+        return Vec::new();
+    }
+    let mut children: Vec<ChildWindowInfo> = Vec::new();
+    unsafe {
+        let _ = EnumChildWindows(
+            Some(raw_hwnd(hwnd)),
+            Some(enum_child_window),
+            LPARAM(&raw mut children as isize),
+        );
+    }
+    render_widget_rects_from(children)
+}
+
+unsafe extern "system" fn enum_child_window(hwnd: HWND, data: LPARAM) -> windows::core::BOOL {
+    let Some(out) = (unsafe { (data.0 as *mut Vec<ChildWindowInfo>).as_mut() }) else {
+        return windows::core::BOOL(0);
+    };
+    let mut rect = RECT::default();
+    if unsafe { GetClientRect(hwnd, &raw mut rect) }.is_err() {
+        return windows::core::BOOL(1);
+    }
+    let mut origin = POINT { x: 0, y: 0 };
+    if !unsafe { ClientToScreen(hwnd, &raw mut origin) }.as_bool() {
+        return windows::core::BOOL(1);
+    }
+    out.push(ChildWindowInfo {
+        class: class_name(hwnd),
+        visible: unsafe { IsWindowVisible(hwnd) }.as_bool(),
+        client: Rect {
+            x: origin.x,
+            y: origin.y,
+            w: rect.right.saturating_sub(rect.left),
+            h: rect.bottom.saturating_sub(rect.top),
+        },
+    });
+    windows::core::BOOL(1)
+}
+
+/// Count visible top-level daily-Chrome windows (class + `chrome.exe`), for the identity rule.
+pub fn visible_chrome_window_count() -> usize {
+    let mut hwnds: Vec<isize> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(enum_top_level), LPARAM(&raw mut hwnds as isize));
+    }
+    hwnds
+        .into_iter()
+        .filter(|raw| {
+            let h = raw_hwnd(*raw);
+            unsafe { IsWindowVisible(h) }.as_bool() && is_chrome_hwnd(*raw)
+        })
+        .count()
+}
+
+unsafe extern "system" fn enum_top_level(hwnd: HWND, data: LPARAM) -> windows::core::BOOL {
+    let Some(out) = (unsafe { (data.0 as *mut Vec<isize>).as_mut() }) else {
+        return windows::core::BOOL(0);
+    };
+    if let Some(raw) = hwnd_raw(hwnd) {
+        out.push(raw);
+    }
+    windows::core::BOOL(1)
 }
 
 pub fn root_hwnd(hwnd: isize) -> Option<isize> {
@@ -922,7 +1022,7 @@ mod tests {
     fn client_rect_live_uses_getclientrect_not_outer() {
         let src = include_str!("foreground.rs");
         let start = src.find("fn client_rect_live(").expect("client_rect_live");
-        let end = src.find("pub fn root_hwnd(").expect("root_hwnd");
+        let end = src.find("pub fn dpi_for_window(").expect("dpi_for_window");
         let slice = &src[start..end];
         assert!(
             slice.contains("GetClientRect") && slice.contains("ClientToScreen"),
@@ -999,5 +1099,124 @@ mod tests {
             "{slice}"
         );
         assert!(slice.contains("is_helper_class"), "{slice}");
+    }
+
+    #[test]
+    fn render_widget_host_rects_filter_class_visible_size() {
+        let children = vec![
+            ChildWindowInfo {
+                class: "Chrome_RenderWidgetHostHWND".into(),
+                visible: true,
+                client: Rect {
+                    x: 100,
+                    y: 80,
+                    w: 1200,
+                    h: 900,
+                },
+            },
+            ChildWindowInfo {
+                class: "Intermediate D3D Window".into(),
+                visible: true,
+                client: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1920,
+                    h: 1032,
+                },
+            },
+            ChildWindowInfo {
+                class: "Chrome_RenderWidgetHostHWND".into(),
+                visible: false,
+                client: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1200,
+                    h: 900,
+                },
+            },
+            ChildWindowInfo {
+                class: "Chrome_RenderWidgetHostHWND".into(),
+                visible: true,
+                client: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                },
+            },
+        ];
+        let rects = render_widget_rects_from(children);
+        assert_eq!(
+            rects,
+            vec![Rect {
+                x: 100,
+                y: 80,
+                w: 1200,
+                h: 900
+            }]
+        );
+    }
+
+    #[test]
+    fn render_widget_host_rects_ambiguous_is_none() {
+        let rects = vec![
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1200,
+                h: 900,
+            },
+            Rect {
+                x: 1300,
+                y: 0,
+                w: 1200,
+                h: 900,
+            },
+        ];
+        let page = crate::point::PageMetrics {
+            inner_width: Some(1200.0),
+            inner_height: Some(900.0),
+            dpr: Some(1.0),
+            ..crate::point::PageMetrics::default()
+        };
+        let inputs = crate::point::MapInputs {
+            hwnd: Some(1),
+            window_rect: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 4000,
+                h: 3000,
+            }),
+            dpi: Some(96),
+            virtual_screen: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 4000,
+                h: 3000,
+            }),
+            page,
+            render_widgets: rects,
+            monitors: Vec::new(),
+            identity: crate::point::WindowIdentity::Confirmed,
+            ..crate::point::MapInputs::default()
+        };
+        let map = crate::point::build_map(inputs);
+        assert!(!map.report.valid);
+        assert!(map.report.reason.unwrap().starts_with("anchor_ambiguous"));
+    }
+
+    #[test]
+    fn render_widget_host_rects_uses_client_to_screen() {
+        let src = include_str!("foreground.rs");
+        let start = src
+            .find("pub fn render_widget_host_rects(")
+            .expect("render_widget_host_rects");
+        let end = src
+            .find("pub fn visible_chrome_window_count(")
+            .expect("visible_chrome_window_count");
+        let slice = &src[start..end];
+        assert!(slice.contains("GetClientRect"));
+        assert!(slice.contains("ClientToScreen"));
+        assert!(!slice.contains("GetWindowRect("));
     }
 }

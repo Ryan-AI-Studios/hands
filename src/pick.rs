@@ -1388,6 +1388,7 @@ mod tests {
             windows_inventory: Vec::new(),
             fg_window: None,
             target_window: None,
+            transform: None,
             view: crate::observe::ObserveView::Auto,
             observe_source: crate::observe::ObserveSource::Live,
             card_offset: 0,

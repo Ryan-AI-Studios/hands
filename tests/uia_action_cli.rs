@@ -99,6 +99,7 @@ fn uia_action_json_envelope_has_flat_semantic_fields() {
         cooldown_ms: None,
         loop_suspected: false,
         guidance: None,
+        point: None,
         verified: false,
         semantic: Some(hands::uia_actions::SemanticInfo {
             action: "toggle".into(),

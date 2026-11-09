@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bezier::Rng;
 use crate::challenge::{self, ChallengeInfo, YIELD_ERROR};
+use crate::chrome;
 use crate::cooldown::{self, Snapshot};
 use crate::error::HandsError;
 use crate::extract::ControlKind;
@@ -16,10 +17,13 @@ use crate::input;
 use crate::lease;
 use crate::logs::{self, LogFence, LogTarget};
 use crate::observe::ENVELOPE_MAX_BYTES;
+use crate::point::{
+    PointContract, PointSource, TransformConfidence, TransformMethod, contract_for, map_rect,
+};
 use crate::session::resolve_session_id_from_os;
 use crate::settle;
 use crate::space::{Rect, Space, ensure_dpi, virtual_screen};
-use crate::target::Target;
+use crate::target::{ResolvedTarget, Target, TargetOutcome};
 use crate::uia;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +64,9 @@ pub struct ActuateEnvelope {
     pub loop_suspected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guidance: Option<String>,
+    /// Full point contract for `chr:` and explicit targets. Absent on pre-contract refusals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point: Option<crate::point::PointContract>,
     #[serde(default = "verified_default", skip_serializing_if = "verified_is_true")]
     pub verified: bool,
     #[serde(flatten, default)]
@@ -240,6 +247,7 @@ pub(crate) fn refuse_if_blocked(
         cooldown_ms: None,
         loop_suspected: false,
         guidance: None,
+        point: None,
         verified: true,
         semantic: None,
     })
@@ -438,6 +446,7 @@ fn base(
         cooldown_ms: None,
         loop_suspected: false,
         guidance: None,
+        point: None,
         verified: true,
         semantic: None,
     })
@@ -462,6 +471,7 @@ fn refuse_yield(session_id: String, target: ActuateTarget) -> Result<ActuateEnve
         cooldown_ms: None,
         loop_suspected: false,
         guidance: None,
+        point: None,
         verified: true,
         semantic: None,
     })
@@ -570,6 +580,7 @@ pub(crate) fn refuse_fence(
         cooldown_ms: None,
         loop_suspected: false,
         guidance: None,
+        point: None,
         verified: true,
         semantic: None,
     })
@@ -700,12 +711,122 @@ fn after_actuate(
     result
 }
 
-fn resolve_req(
-    req: &ActuateRequest,
-    space: Space,
-) -> Result<crate::target::ResolvedTarget, HandsError> {
+fn resolve_req(req: &ActuateRequest, space: Space) -> Result<TargetOutcome, HandsError> {
     let target = Target::parse(req.element_id.as_deref(), req.grid.as_deref(), req.x, req.y)?;
-    target.resolve(space)
+    target.resolve_with(space, foreground::foreground_hwnd())
+}
+
+/// Transform-invalid refusal: `ok:false`, `verified:false`, full `point` contract, no
+/// `offer`, no `SendInput`, and no fence prompt (this runs before `ensure_installed`).
+pub(crate) fn refuse_transform(
+    session_id: String,
+    target: ActuateTarget,
+    contract: PointContract,
+) -> Result<ActuateEnvelope, HandsError> {
+    let reason = contract
+        .transform
+        .reason
+        .clone()
+        .unwrap_or_else(|| "transform is not valid".into());
+    finalize_envelope(ActuateEnvelope {
+        session_id,
+        ok: false,
+        frozen: lease::is_frozen(),
+        target,
+        retried: false,
+        settled: false,
+        foregrounded: false,
+        error: Some(reason),
+        fence: None,
+        challenge: None,
+        roi: None,
+        miss: None,
+        navigated: false,
+        attempt: None,
+        cooldown_ms: None,
+        loop_suspected: false,
+        guidance: None,
+        point: Some(contract),
+        verified: false,
+        semantic: None,
+    })
+}
+
+fn unresolved_info(target: &Target, contract: &PointContract) -> ActuateTarget {
+    let id = match target {
+        Target::ElementId(id) => Some(id.clone()),
+        Target::Grid { col, row } => Some(format!("g:{col}:{row}")),
+        Target::Pixel { .. } => None,
+    };
+    let (x, y) = contract.physical.map(|p| (p.x, p.y)).unwrap_or((0, 0));
+    ActuateTarget {
+        kind: "element".into(),
+        id,
+        x,
+        y,
+    }
+}
+
+/// Final live re-map: live Win32 geometry + recorded page metrics, before the outside-client
+/// guard and any side effect. Move-only updates the point; a size/basis/DPI/monitor change
+/// returns a `stale_viewport` refusal.
+fn final_live_remap(
+    session_id: &str,
+    info: &ActuateTarget,
+    resolved: &mut ResolvedTarget,
+) -> Result<Option<ActuateEnvelope>, HandsError> {
+    let (Some(contract), Some(css), Some(map)) = (
+        resolved.contract.as_ref(),
+        resolved.css_point,
+        resolved.map.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    if contract.source != PointSource::Chr {
+        return Ok(None);
+    }
+    let Some(hwnd) = resolved.hwnd else {
+        let mut bad = contract.clone();
+        bad.physical = None;
+        bad.transform.valid = false;
+        bad.transform.method = TransformMethod::None;
+        bad.transform.confidence = TransformConfidence::None;
+        bad.transform.reason = Some("window_mismatch: chr: target has no Chrome HWND".into());
+        return refuse_transform(session_id.to_string(), info.clone(), bad).map(Some);
+    };
+    match chrome::remap_chr(map, hwnd) {
+        Ok(new_map) => {
+            let new_contract = contract_for(&new_map, css);
+            let Some(p) = new_contract.physical else {
+                let mut bad = new_contract;
+                bad.transform.reason = Some("stale_viewport: point left the viewport".into());
+                return refuse_transform(session_id.to_string(), info.clone(), bad).map(Some);
+            };
+            let rect = resolved
+                .css_rect
+                .and_then(|r| map_rect(&new_contract, r).ok())
+                .unwrap_or(resolved.rect);
+            resolved.x = p.x;
+            resolved.y = p.y;
+            resolved.rect = rect;
+            resolved.contract = Some(new_contract);
+            resolved.map = Some(new_map);
+            Ok(None)
+        }
+        Err(reason) => {
+            let mut bad = contract.clone();
+            bad.physical = None;
+            bad.transform.valid = false;
+            bad.transform.method = TransformMethod::None;
+            bad.transform.confidence = TransformConfidence::None;
+            bad.transform.reason = Some(reason);
+            refuse_transform(session_id.to_string(), info.clone(), bad).map(Some)
+        }
+    }
+}
+
+fn point_for_dispatch(resolved: &ResolvedTarget) -> Option<PointContract> {
+    resolved.contract.clone()
 }
 
 pub fn click(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -818,25 +939,40 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             false,
         );
     }
-    let resolved = match resolve_req(&req, space) {
+    let outcome = match resolve_req(&req, space) {
         Ok(r) => r,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
-    let info = resolved_info(resolved.kind, resolved.id.clone(), resolved.x, resolved.y);
+    let (mut resolved, contract_refusal, info, guard_hwnd, guard_point) = match outcome {
+        TargetOutcome::Resolved(r) => {
+            let info = resolved_info(r.kind, r.id.clone(), r.x, r.y);
+            (Some(*r), None, info, None, None)
+        }
+        TargetOutcome::Unresolved {
+            target,
+            contract,
+            hwnd,
+        } => {
+            let info = unresolved_info(&target, &contract);
+            let point = contract.physical.map(|p| (p.x, p.y));
+            (None, Some(contract), info, hwnd, point)
+        }
+    };
+    let guard_hwnd = guard_hwnd.or_else(|| resolved.as_ref().and_then(|r| r.hwnd));
+    let guard_point = guard_point.or_else(|| resolved.as_ref().map(|r| (r.x, r.y)));
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
-    if let Some(env) = refuse_if_high_il(
-        &session_id,
-        &info,
-        resolved.hwnd,
-        Some((resolved.x, resolved.y)),
-    )? {
+    if let Some(env) = refuse_if_high_il(&session_id, &info, guard_hwnd, guard_point)? {
         return Ok(env);
     }
+    if let Some(contract) = contract_refusal {
+        return refuse_transform(session_id, info, *contract);
+    }
+    let resolved_ref = resolved.as_mut().expect("resolved outcome");
     fence::ensure_installed();
     if req.blind {
         match fence::gate_blind(&session_id) {
@@ -845,12 +981,18 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             Err(err) => return fail(session_id, info, err, false, false, false),
         }
     } else {
-        match fence::gate_click(&session_id, &resolved) {
+        match fence::gate_click(&session_id, resolved_ref) {
             Ok(None) => {}
             Ok(Some(info_fence)) => return refuse_fence(session_id, info, info_fence),
             Err(err) => return fail(session_id, info, err, false, false, false),
         }
     }
+    if !req.blind
+        && let Some(env) = final_live_remap(&session_id, &info, resolved_ref)?
+    {
+        return Ok(env);
+    }
+    let resolved = resolved.expect("resolved outcome");
     if let Some(env) = refuse_if_outside_client(&session_id, &info, &resolved)? {
         return Ok(env);
     }
@@ -944,6 +1086,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         foregrounded,
         None,
     )?;
+    env.point = point_for_dispatch(&resolved);
     env.miss = effect.miss.map(str::to_string);
     env.navigated = effect.navigated;
     finalize_envelope(env)
@@ -988,6 +1131,13 @@ fn dispatch_blind_click(
         None,
     )?;
     env.verified = false;
+    env.point = Some(crate::point::explicit_contract(
+        PointSource::Blind,
+        crate::point::PhysicalPoint {
+            x: resolved.x,
+            y: resolved.y,
+        },
+    ));
     finalize_envelope(env)
 }
 
@@ -1015,25 +1165,44 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         Ok(s) => s,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
-    let resolved = match resolve_req(&req, space) {
+    let outcome = match resolve_req(&req, space) {
         Ok(r) => r,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
-    let info = resolved_info(resolved.kind, resolved.id.clone(), resolved.x, resolved.y);
+    let (mut resolved, contract_refusal, info, guard_hwnd, guard_point) = match outcome {
+        TargetOutcome::Resolved(r) => {
+            let info = resolved_info(r.kind, r.id.clone(), r.x, r.y);
+            (Some(*r), None, info, None, None)
+        }
+        TargetOutcome::Unresolved {
+            target,
+            contract,
+            hwnd,
+        } => {
+            let info = unresolved_info(&target, &contract);
+            let point = contract.physical.map(|p| (p.x, p.y));
+            (None, Some(contract), info, hwnd, point)
+        }
+    };
+    let guard_hwnd = guard_hwnd.or_else(|| resolved.as_ref().and_then(|r| r.hwnd));
+    let guard_point = guard_point.or_else(|| resolved.as_ref().map(|r| (r.x, r.y)));
     if let Some(env) = refuse_if_yielded(&session_id, info.clone())? {
         return Ok(env);
     }
     if let Some(env) = refuse_if_blocked(&session_id, info.clone())? {
         return Ok(env);
     }
-    if let Some(env) = refuse_if_high_il(
-        &session_id,
-        &info,
-        resolved.hwnd,
-        Some((resolved.x, resolved.y)),
-    )? {
+    if let Some(env) = refuse_if_high_il(&session_id, &info, guard_hwnd, guard_point)? {
         return Ok(env);
     }
+    if let Some(contract) = contract_refusal {
+        return refuse_transform(session_id, info, *contract);
+    }
+    let resolved_ref = resolved.as_mut().expect("resolved outcome");
+    if let Some(env) = final_live_remap(&session_id, &info, resolved_ref)? {
+        return Ok(env);
+    }
+    let resolved = resolved.expect("resolved outcome");
     if let Some(env) = refuse_if_outside_client(&session_id, &info, &resolved)? {
         return Ok(env);
     }
@@ -1046,7 +1215,7 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     if let Err(err) = hover_dwell() {
         return fail(session_id, info, err, foregrounded, false, false);
     }
-    base(
+    let mut env = base(
         session_id,
         info,
         true,
@@ -1055,7 +1224,9 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         false,
         foregrounded,
         None,
-    )
+    )?;
+    env.point = point_for_dispatch(&resolved);
+    finalize_envelope(env)
 }
 
 pub fn type_text(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -1521,6 +1692,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1562,6 +1734,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1599,6 +1772,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1634,6 +1808,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1667,6 +1842,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1699,6 +1875,7 @@ mod tests {
             cooldown_ms: None,
             loop_suspected: false,
             guidance: None,
+            point: None,
             verified: true,
             semantic: None,
         };
@@ -1969,6 +2146,10 @@ mod tests {
             hwnd: None,
             name: String::new(),
             role: String::new(),
+            css_point: None,
+            css_rect: None,
+            contract: None,
+            map: None,
         }
     }
 
@@ -3835,5 +4016,253 @@ mod tests {
         let contract = include_str!("../docs/AGENT-CONTRACT.md");
         assert!(contract.contains("Blind actuation"), "{contract}");
         assert!(contract.contains("lower-assurance"), "{contract}");
+    }
+
+    fn invalid_chr_contract(reason: &str) -> crate::point::PointContract {
+        crate::point::PointContract {
+            source: crate::point::PointSource::Chr,
+            css: Some(crate::point::CssPoint::new(312.5, 208.25)),
+            physical: None,
+            transform: crate::point::TransformReport::invalid(
+                reason,
+                Some("f3a9c1d2e4b5a607".into()),
+            ),
+        }
+    }
+
+    #[test]
+    fn transform_refusal_verified_false() {
+        let env = refuse_transform(
+            "s-0129".into(),
+            none_target(),
+            invalid_chr_contract("no_viewport_anchor"),
+        )
+        .unwrap();
+        assert!(!env.ok);
+        assert!(!env.verified);
+        let point = env.point.as_ref().expect("point contract");
+        assert_eq!(point.source, crate::point::PointSource::Chr);
+        assert!(point.physical.is_none());
+        let json = serialize_envelope(&env).unwrap();
+        assert!(json.contains("\"verified\":false"), "{json}");
+        assert!(json.contains("\"reason\":\"no_viewport_anchor"), "{json}");
+    }
+
+    #[test]
+    fn unknown_transform_refuses_before_fence_without_offer() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let end = src[..src.len()]
+            .find("fn dispatch_blind_click")
+            .expect("blind");
+        let body = &src[start..end];
+        let transform = body
+            .find("refuse_transform(session_id, info, *contract)")
+            .expect("transform refusal");
+        let fence = body.find("fence::ensure_installed").expect("fence");
+        assert!(
+            transform < fence,
+            "transform refusal must precede fence::ensure_installed:\n{body}"
+        );
+        let helper_start = src.find("pub(crate) fn refuse_transform").unwrap();
+        let helper_end = src[helper_start..]
+            .find("fn unresolved_info")
+            .map(|i| helper_start + i)
+            .expect("unresolved_info");
+        let helper = &src[helper_start..helper_end];
+        for forbidden in [
+            "foreground::offer",
+            "input::left_click",
+            "input::move_to",
+            "ensure_installed",
+        ] {
+            assert!(
+                !helper.contains(forbidden),
+                "refuse_transform must not call {forbidden}:\n{helper}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_viewport_refuses_before_outside_client_and_remember() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let end = src.find("fn dispatch_blind_click").expect("blind");
+        let body = &src[start..end];
+        let remap = body.find("final_live_remap").expect("final_live_remap");
+        let client = body
+            .find("refuse_if_outside_client")
+            .expect("outside client");
+        let remember = body.find("remember_target").expect("remember");
+        assert!(
+            remap < client && client < remember,
+            "click order must be remap -> outside_client -> remember:\n{body}"
+        );
+        let helper_start = src.find("fn final_live_remap").unwrap();
+        let helper_end = src.find("fn point_for_dispatch").unwrap();
+        let helper = &src[helper_start..helper_end];
+        assert!(!helper.contains("remember_target"));
+        assert!(!helper.contains("challenge::note_actuation"));
+        assert!(helper.contains("stale_viewport") || helper.contains("chrome::remap_chr"));
+    }
+
+    #[test]
+    fn final_remap_after_move_updates_rect_and_point() {
+        // Move-only re-map: point follows the window origin and the rect centre equals it.
+        let page = crate::point::PageMetrics {
+            inner_width: Some(1200.0),
+            inner_height: Some(900.0),
+            client_width: Some(1200.0),
+            client_height: Some(900.0),
+            dpr: Some(1.0),
+            ..crate::point::PageMetrics::default()
+        };
+        let make = |x: i32, y: i32| {
+            crate::point::build_map(crate::point::MapInputs {
+                hwnd: Some(1),
+                window_rect: Some(Rect {
+                    x: 0,
+                    y: 0,
+                    w: 4000,
+                    h: 3000,
+                }),
+                dpi: Some(96),
+                virtual_screen: Some(Rect {
+                    x: 0,
+                    y: 0,
+                    w: 4000,
+                    h: 3000,
+                }),
+                page,
+                render_widgets: vec![Rect {
+                    x,
+                    y,
+                    w: 1200,
+                    h: 900,
+                }],
+                monitors: Vec::new(),
+                observe_id: Some("f3a9c1d2e4b5a607".into()),
+                identity: crate::point::WindowIdentity::Confirmed,
+                ..crate::point::MapInputs::default()
+            })
+        };
+        let old = make(100, 80);
+        let new = make(300, 200);
+        let css = crate::point::CssRect {
+            left: 50.0,
+            top: 40.0,
+            width: 100.0,
+            height: 20.0,
+        };
+        let old_contract = crate::point::contract_for(&old, css.center());
+        let new_contract = crate::point::contract_for(&new, css.center());
+        assert_eq!(
+            old_contract.physical,
+            Some(crate::point::PhysicalPoint { x: 200, y: 130 })
+        );
+        assert_eq!(
+            new_contract.physical,
+            Some(crate::point::PhysicalPoint { x: 400, y: 250 })
+        );
+        assert_eq!(map_rect(&new_contract, css).unwrap().center(), (400, 250));
+    }
+
+    #[test]
+    fn hover_transform_guard_before_remember_and_offer() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn hover_inner").expect("hover_inner");
+        let end = src.find("pub fn type_text").expect("type_text");
+        let body = &src[start..end];
+        let transform = body.find("refuse_transform").expect("refuse_transform");
+        let remap = body.find("final_live_remap").expect("final_live_remap");
+        let client = body
+            .find("refuse_if_outside_client")
+            .expect("outside_client");
+        let remember = body.find("remember_target").expect("remember");
+        let offer = body.find("foreground::offer").expect("offer");
+        assert!(
+            transform < remap && remap < client && client < remember && remember < offer,
+            "hover order: transform -> remap -> outside_client -> remember -> offer:\n{body}"
+        );
+        assert!(!body.contains("note_actuation"));
+    }
+
+    #[test]
+    fn scroll_target_refuses_invalid_transform_without_move() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn scroll_inner").expect("scroll_inner");
+        let end = src.find("pub fn wait_settle").expect("wait_settle");
+        let body = &src[start..end];
+        assert!(body.contains("hover_inner"));
+        let hover =
+            &src[src.find("fn hover_inner").unwrap()..src.find("pub fn type_text").unwrap()];
+        let transform = hover.find("refuse_transform").unwrap();
+        let move_to = hover.find("input::move_to").unwrap();
+        assert!(transform < move_to);
+    }
+
+    #[test]
+    fn no_send_input_on_transform_unknown_source_lock() {
+        let src = include_str!("actuate.rs");
+        let helper = &src[src.find("pub(crate) fn refuse_transform").unwrap()
+            ..src.find("fn unresolved_info").unwrap()];
+        assert!(!helper.contains("SendInput"));
+        assert!(!helper.contains("left_click"));
+        assert!(!helper.contains("move_to"));
+        assert!(!helper.contains("offer"));
+    }
+
+    #[test]
+    fn chr_high_il_probe_uses_resolved_hwnd() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let end = src.find("fn dispatch_blind_click").expect("blind");
+        let body = &src[start..end];
+        let high = body.find("refuse_if_high_il").expect("high_il");
+        let resolve = body.find("resolve_req").expect("resolve");
+        assert!(resolve < high);
+        assert!(body.contains("guard_hwnd"));
+        assert!(body.contains("resolved.as_ref().and_then(|r| r.hwnd)"));
+    }
+
+    #[test]
+    fn click_hover_scroll_paths_have_no_outer_inner_transform() {
+        for src in [
+            include_str!("actuate.rs"),
+            include_str!("target.rs"),
+            include_str!("point.rs"),
+        ] {
+            assert!(!src.contains(&["outer_height", "-", "inner_height"].join(" ")));
+            assert!(!src.contains(&["outer_width", "-", "inner_width"].join(" ")));
+        }
+    }
+
+    #[test]
+    fn no_cdp_or_synthetic_dom_input() {
+        for src in [
+            include_str!("actuate.rs"),
+            include_str!("target.rs"),
+            include_str!("point.rs"),
+            include_str!("observe.rs"),
+        ] {
+            assert!(!src.contains(&["--remote", "debugging", "port"].join("-")));
+            assert!(!src.contains(&["--enable", "automation"].join("-")));
+            assert!(!src.contains(&["Play", "wright"].join("")));
+            assert!(!src.contains(&["element", ".click("].join("")));
+            assert!(!src.contains(&["dispatch", "Event("].join("")));
+        }
+        let ext = include_str!("../extension/content.js");
+        assert!(!ext.contains(&["element", ".click("].join("")));
+        assert!(!ext.contains(&["dispatch", "Event("].join("")));
+        assert!(!ext.contains(&["all_frames", ": true"].join("")));
+    }
+
+    #[test]
+    fn no_process_global_offset_cache() {
+        // The map is rebuilt per observe/resolve/guard; no calibrated-once constant.
+        let src = include_str!("actuate.rs");
+        assert!(src.contains("final_live_remap"));
+        assert!(!src.contains(&["OFFSET", "_CACHE"].join("")));
+        assert!(!src.contains(&["static ", "OFFSET"].join("")));
     }
 }

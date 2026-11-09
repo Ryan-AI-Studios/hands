@@ -2,6 +2,10 @@
 
 use crate::chrome;
 use crate::error::HandsError;
+use crate::point::{
+    CssPoint, CssRect, PointContract, PointSource, ViewportMap, contract_for, explicit_contract,
+    map_point, map_rect,
+};
 use crate::space::{Rect, Space};
 use crate::uia::{self, ResolvedElement};
 
@@ -23,6 +27,38 @@ pub struct ResolvedTarget {
     pub hwnd: Option<isize>,
     pub name: String,
     pub role: String,
+    pub css_point: Option<CssPoint>,
+    pub css_rect: Option<CssRect>,
+    pub contract: Option<PointContract>,
+    pub(crate) map: Option<ViewportMap>,
+}
+
+/// Resolve outcome. A transform-invalid `chr:` is an explicit unresolved refusal carrying
+/// its contract, never a fabricated zero-area `ResolvedTarget`.
+#[derive(Debug, Clone)]
+pub enum TargetOutcome {
+    Resolved(Box<ResolvedTarget>),
+    Unresolved {
+        target: Target,
+        contract: Box<PointContract>,
+        hwnd: Option<isize>,
+    },
+}
+
+impl TargetOutcome {
+    pub fn contract(&self) -> Option<&PointContract> {
+        match self {
+            Self::Resolved(r) => r.contract.as_ref(),
+            Self::Unresolved { contract, .. } => Some(contract.as_ref()),
+        }
+    }
+
+    pub fn hwnd(&self) -> Option<isize> {
+        match self {
+            Self::Resolved(r) => r.hwnd,
+            Self::Unresolved { hwnd, .. } => *hwnd,
+        }
+    }
 }
 
 impl Target {
@@ -60,22 +96,49 @@ impl Target {
         }
     }
 
+    /// Compatibility wrapper for tests: foreground Chrome HWND, unresolved -> error.
     pub fn resolve(&self, space: Space) -> Result<ResolvedTarget, HandsError> {
+        match self.resolve_with(space, crate::foreground::foreground_hwnd())? {
+            TargetOutcome::Resolved(resolved) => Ok(*resolved),
+            TargetOutcome::Unresolved { contract, .. } => Err(HandsError::Target(
+                contract
+                    .transform
+                    .reason
+                    .unwrap_or_else(|| "transform is not valid".into()),
+            )),
+        }
+    }
+
+    /// Resolve with an explicit Chrome walk/foreground HWND. `None` refuses `chr:` with
+    /// `no_hwnd`; it never falls back to a guessed window.
+    pub fn resolve_with(
+        &self,
+        space: Space,
+        hwnd: Option<isize>,
+    ) -> Result<TargetOutcome, HandsError> {
         match self {
             Self::ElementId(id) => {
                 if id.starts_with("chr:") {
-                    let hit = chrome::try_resolve(id)?;
-                    let found = ResolvedElement {
-                        rect: hit.rect,
-                        name: hit.name,
-                        role: hit.role,
-                        hwnd: None,
-                    };
-                    return finish_element(id, found, space);
+                    let mut hit = chrome::try_resolve(id, hwnd)?;
+                    if hit.contract.transform.valid {
+                        if finish_chr(id, &mut hit, space)?.is_some() {
+                            return Ok(TargetOutcome::Unresolved {
+                                target: self.clone(),
+                                contract: Box::new(hit.contract),
+                                hwnd: hit.hwnd,
+                            });
+                        }
+                        return Ok(TargetOutcome::Resolved(Box::new(hit.into_resolved())));
+                    }
+                    return Ok(TargetOutcome::Unresolved {
+                        target: self.clone(),
+                        contract: Box::new(hit.contract),
+                        hwnd: hit.hwnd,
+                    });
                 }
                 let runtime_id = parse_runtime_id(id)?;
                 let found = uia::resolve_runtime_id(&runtime_id)?;
-                finish_element(id, found, space)
+                finish_element(id, found, space).map(|r| TargetOutcome::Resolved(Box::new(r)))
             }
             Self::Grid { col, row } => {
                 let rect = space.cell_rect(*col, *row);
@@ -90,7 +153,7 @@ impl Target {
                         "grid cell g:{col}:{row} center is outside the virtual screen"
                     )));
                 }
-                Ok(ResolvedTarget {
+                Ok(TargetOutcome::Resolved(Box::new(ResolvedTarget {
                     target: self.clone(),
                     kind: "grid",
                     id: Some(format!("g:{col}:{row}")),
@@ -100,7 +163,14 @@ impl Target {
                     hwnd: None,
                     name: String::new(),
                     role: String::new(),
-                })
+                    css_point: None,
+                    css_rect: None,
+                    contract: Some(explicit_contract(
+                        PointSource::Grid,
+                        crate::point::PhysicalPoint { x, y },
+                    )),
+                    map: None,
+                })))
             }
             Self::Pixel { x, y } => {
                 if !space.contains_point(*x, *y) {
@@ -117,7 +187,7 @@ impl Target {
                 if rect.area() == 0 {
                     return Err(HandsError::Target("pixel target has zero area".into()));
                 }
-                Ok(ResolvedTarget {
+                Ok(TargetOutcome::Resolved(Box::new(ResolvedTarget {
                     target: self.clone(),
                     kind: "pixel",
                     id: None,
@@ -127,10 +197,91 @@ impl Target {
                     hwnd: None,
                     name: String::new(),
                     role: String::new(),
-                })
+                    css_point: None,
+                    css_rect: None,
+                    contract: Some(explicit_contract(
+                        PointSource::Pixel,
+                        crate::point::PhysicalPoint { x: *x, y: *y },
+                    )),
+                    map: None,
+                })))
             }
         }
     }
+}
+
+impl chrome::ChromeHit {
+    fn into_resolved(self) -> ResolvedTarget {
+        ResolvedTarget {
+            target: Target::ElementId(self.id.clone()),
+            kind: "element",
+            id: Some(self.id),
+            x: self.rect.center().0,
+            y: self.rect.center().1,
+            rect: self.rect,
+            hwnd: self.hwnd,
+            name: self.name,
+            role: self.role,
+            css_point: Some(self.css_point),
+            css_rect: Some(self.css_rect),
+            contract: Some(self.contract),
+            map: self.map,
+        }
+    }
+}
+
+/// Finish a valid `chr:` hit. Returns `Some(reason)` when the CSS point or rect is outside
+/// the layout viewport (the hit's contract is rewritten to the named refusal).
+fn finish_chr(
+    id: &str,
+    hit: &mut chrome::ChromeHit,
+    space: Space,
+) -> Result<Option<String>, HandsError> {
+    let css_rect = hit.css_rect;
+    if !css_rect.is_positive() {
+        return Ok(Some(
+            "point_outside_viewport: element has a zero-area CSS rect".into(),
+        ));
+    }
+    let contract = contract_for(
+        hit.map
+            .as_ref()
+            .ok_or_else(|| HandsError::Target("chr: contract has no map".into()))?,
+        css_rect.center(),
+    );
+    let p = match map_point(&contract, css_rect.center()) {
+        Ok(p) => p,
+        Err(err) => {
+            hit.contract = invalid_from(&contract, &format!("point_outside_viewport: {err}"));
+            return Ok(Some(format!("point_outside_viewport: {err}")));
+        }
+    };
+    let rect = match map_rect(&contract, css_rect) {
+        Ok(rect) => rect,
+        Err(err) => {
+            hit.contract = invalid_from(&contract, &format!("point_outside_viewport: {err}"));
+            return Ok(Some(format!("point_outside_viewport: {err}")));
+        }
+    };
+    if !space.contains_point(p.x, p.y) {
+        return Err(HandsError::Target(format!(
+            "element {id} center is outside the virtual screen"
+        )));
+    }
+    hit.contract = contract;
+    hit.css_point = css_rect.center();
+    hit.rect = rect;
+    Ok(None)
+}
+
+fn invalid_from(contract: &PointContract, reason: &str) -> PointContract {
+    let mut out = contract.clone();
+    out.physical = None;
+    out.transform.valid = false;
+    out.transform.method = crate::point::TransformMethod::None;
+    out.transform.confidence = crate::point::TransformConfidence::None;
+    out.transform.reason = Some(reason.to_string());
+    out
 }
 
 fn finish_element(
@@ -159,6 +310,13 @@ fn finish_element(
         hwnd: found.hwnd,
         name: found.name,
         role: found.role,
+        css_point: None,
+        css_rect: None,
+        contract: Some(explicit_contract(
+            PointSource::Uia,
+            crate::point::PhysicalPoint { x, y },
+        )),
+        map: None,
     })
 }
 
@@ -311,12 +469,21 @@ mod tests {
         let g = crate::chrome::EnvGuard::lock();
         g.set_snapshot(Some(&crate::chrome::EnvGuard::fixture_path()));
         let space = Space::new(0, 0, 1920, 1080).unwrap();
-        let hit = Target::ElementId("chr:0".into()).resolve(space).unwrap();
-        assert_eq!(hit.kind, "element");
-        assert_eq!(hit.id.as_deref(), Some("chr:0"));
-        assert_eq!((hit.x, hit.y), (210, 166));
-        assert!(hit.hwnd.is_none());
-        assert_eq!(hit.role, "Edit");
+        let outcome = Target::ElementId("chr:0".into())
+            .resolve_with(space, None)
+            .unwrap();
+        match outcome {
+            TargetOutcome::Unresolved { contract, hwnd, .. } => {
+                assert!(hwnd.is_none());
+                assert_eq!(
+                    contract.transform.reason.as_deref(),
+                    Some("fixture_snapshot")
+                );
+                assert!(contract.physical.is_none());
+                assert_eq!(contract.css, Some(CssPoint::new(110.0, 36.0)));
+            }
+            TargetOutcome::Resolved(_) => panic!("fixture must never be a click contract"),
+        }
     }
 
     #[test]
@@ -422,5 +589,156 @@ mod tests {
             && miss.y >= rect.y
             && miss.y < rect.y + rect.h;
         assert!(!inside);
+    }
+
+    fn valid_map() -> crate::point::ViewportMap {
+        crate::point::build_map(crate::point::MapInputs {
+            hwnd: Some(0x1234),
+            window_rect: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            }),
+            dpi: Some(96),
+            virtual_screen: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            }),
+            page: crate::point::PageMetrics {
+                inner_width: Some(500.0),
+                inner_height: Some(400.0),
+                client_width: Some(500.0),
+                client_height: Some(400.0),
+                dpr: Some(1.0),
+                ..crate::point::PageMetrics::default()
+            },
+            render_widgets: vec![Rect {
+                x: 100,
+                y: 100,
+                w: 500,
+                h: 400,
+            }],
+            uia_document: None,
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            fixture: false,
+            identity: crate::point::WindowIdentity::Confirmed,
+            fixture_origin: None,
+        })
+    }
+
+    fn stub_chr(id: &str, contract: PointContract, hwnd: Option<isize>) -> chrome::ChromeHit {
+        chrome::ChromeHit {
+            id: id.into(),
+            name: String::new(),
+            role: "Button".into(),
+            rect: Rect {
+                x: 100,
+                y: 100,
+                w: 100,
+                h: 100,
+            },
+            css_rect: CssRect {
+                left: 10.0,
+                top: 10.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            css_point: CssPoint::new(60.0, 60.0),
+            contract,
+            hwnd,
+            map: None,
+        }
+    }
+
+    #[test]
+    fn chr_point_is_contract_point_not_rect_center() {
+        let map = valid_map();
+        let contract = crate::point::contract_for(&map, CssPoint::new(60.0, 60.0));
+        let expected = crate::point::map_point(&contract, CssPoint::new(60.0, 60.0)).unwrap();
+        let hit = stub_chr("chr:5", contract, Some(0x1234));
+        let mut hit = chrome::ChromeHit {
+            map: Some(map),
+            ..hit
+        };
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        assert!(finish_chr("chr:5", &mut hit, space).unwrap().is_none());
+        let resolved = hit.into_resolved();
+        assert_eq!((resolved.x, resolved.y), (expected.x, expected.y));
+        assert_eq!(resolved.rect.center(), (expected.x, expected.y));
+        assert_eq!(resolved.hwnd, Some(0x1234));
+        assert_eq!(resolved.contract.unwrap().physical, Some(expected));
+    }
+
+    #[test]
+    fn chr_invalid_contract_is_unresolved_with_reason() {
+        let contract = PointContract {
+            source: PointSource::Chr,
+            css: Some(CssPoint::new(10.0, 20.0)),
+            physical: None,
+            transform: crate::point::TransformReport::invalid("fixture_snapshot", None),
+        };
+        chrome::set_resolve_stub(Some(stub_chr("chr:5", contract, None)));
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let outcome = Target::ElementId("chr:5".into())
+            .resolve_with(space, None)
+            .unwrap();
+        chrome::set_resolve_stub(None);
+        match outcome {
+            TargetOutcome::Unresolved { contract, .. } => {
+                assert_eq!(
+                    contract.transform.reason.as_deref(),
+                    Some("fixture_snapshot")
+                );
+                assert!(contract.physical.is_none());
+            }
+            TargetOutcome::Resolved(_) => panic!("invalid chr: must not fabricate geometry"),
+        }
+    }
+
+    #[test]
+    fn chr_without_hwnd_refuses() {
+        let contract = PointContract {
+            source: PointSource::Chr,
+            css: Some(CssPoint::new(1.0, 1.0)),
+            physical: None,
+            transform: crate::point::TransformReport::invalid("no_hwnd", None),
+        };
+        chrome::set_resolve_stub(Some(stub_chr("chr:0", contract, None)));
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let outcome = Target::ElementId("chr:0".into())
+            .resolve_with(space, None)
+            .unwrap();
+        chrome::set_resolve_stub(None);
+        assert!(matches!(
+            outcome,
+            TargetOutcome::Unresolved { hwnd: None, .. }
+        ));
+    }
+
+    #[test]
+    fn grid_and_pixel_are_explicit() {
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        for (target, source) in [
+            (Target::Grid { col: 2, row: 1 }, PointSource::Grid),
+            (Target::Pixel { x: 10, y: 20 }, PointSource::Pixel),
+        ] {
+            let resolved = target.resolve(space).unwrap();
+            let contract = resolved.contract.expect("explicit contract");
+            assert_eq!(contract.source, source);
+            assert_eq!(
+                contract.transform.method,
+                crate::point::TransformMethod::Explicit
+            );
+            assert!(contract.transform.valid);
+            assert!(contract.css.is_none());
+            assert_eq!(
+                contract.physical.map(|p| (p.x, p.y)),
+                Some((resolved.x, resolved.y))
+            );
+        }
     }
 }

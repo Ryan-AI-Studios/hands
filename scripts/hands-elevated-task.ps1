@@ -176,9 +176,7 @@ if (-not $isAdmin) {
     Fail "This script must be run from an elevated (Administrator) shell. It does not raise UAC and does not self-elevate."
 }
 
-# The installed exe can be held open by any process running that image (for example a
-# `hands mcp --bridge` started from a WSL session). `schtasks /End` stops only the task,
-# so detect holders, stop only this task, and restore it if the replacement fails.
+# --- Preflight: nothing is stopped until holders and destination are known -------------
 $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 $wasRunning = [bool]($existing -and $existing.State -eq "Running")
 
@@ -192,112 +190,148 @@ function Get-InstalledExeHolders {
         })
 }
 
-if ($wasRunning) {
-    Write-Host "Stopping running $taskName before replacing its exe."
-    Stop-ScheduledTask -TaskName $taskName
-    $deadline = (Get-Date).AddSeconds(10)
-    while ((Get-Date) -lt $deadline -and (Get-InstalledExeHolders).Count -gt 0) {
-        Start-Sleep -Milliseconds 250
-    }
-}
-
-$holders = @(Get-InstalledExeHolders)
-if ($holders.Count -gt 0 -and $StopHolders) {
-    Write-Host "Stopping processes using the installed exe (because -StopHolders was given):"
-    for ($attempt = 0; $attempt -lt 3 -and $holders.Count -gt 0; $attempt++) {
-        $holders | ForEach-Object {
-            Write-Host ("  stopping pid {0}  {1}" -f $_.ProcessId, ($_.CommandLine -replace '\s+', ' '))
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-        }
-        Start-Sleep -Milliseconds 500
-        $holders = @(Get-InstalledExeHolders)
-    }
-}
-if ($holders.Count -gt 0) {
-    if ($wasRunning) { Start-ScheduledTask -TaskName $taskName | Out-Null }
-    Write-Host "The installed exe is still in use by:"
-    $holders | ForEach-Object { Write-Host ("  pid {0}  {1}" -f $_.ProcessId, ($_.CommandLine -replace '\s+', ' ')) }
-    if ($StopHolders) {
-        Fail "Those processes survived -StopHolders. Stop them manually and re-run. The task was restarted if it had been running."
-    }
-    Fail "Stop those processes and re-run (Stop-Process -Id <pid> -Force), or re-run with -StopHolders. The task was restarted if it had been running."
+# The task's own server is `serve --pipe ...`; anything else (a harness bridge) is foreign.
+$foreign = @(Get-InstalledExeHolders | Where-Object { $_.CommandLine -notmatch 'serve --pipe' })
+if ($foreign.Count -gt 0 -and -not $StopHolders) {
+    Write-Host "The installed exe is in use by processes other than the task:"
+    $foreign | ForEach-Object { Write-Host ("  pid {0}  {1}" -f $_.ProcessId, ($_.CommandLine -replace '\s+', ' ')) }
+    Fail "Stop those processes and re-run (Stop-Process -Id <pid> -Force), or re-run with -StopHolders. The task was not stopped."
 }
 
 New-Item -ItemType Directory -Force -Path $installDirFull | Out-Null
+$problems = @(Get-WritableByUntrusted $installDirFull)
+if ($problems.Count -gt 0) {
+    Write-Host "Refusing to register: the install directory is modifiable by non-administrators:"
+    $problems | ForEach-Object { Write-Host "  $_" }
+    Fail "Choose an admin-only -InstallDir (default: $env:ProgramFiles\Hands). The task was not stopped."
+}
+
+# Stage and verify the source before touching the installed exe or the task.
 $stagedExe = "$installedExe.new"
 $backupExe = "$installedExe.old"
+$srcHash = (Get-FileHash -LiteralPath $sourceExe -Algorithm SHA256).Hash
+if ($sourceExe -ne $installedExe) {
+    Copy-Item -LiteralPath $sourceExe -Destination $stagedExe -Force
+    $stagedHash = (Get-FileHash -LiteralPath $stagedExe -Algorithm SHA256).Hash
+    if ($stagedHash -ne $srcHash) {
+        Remove-Item -LiteralPath $stagedExe -ErrorAction SilentlyContinue
+        Fail "Staged copy does not match the source ($stagedHash vs $srcHash). The task was not stopped."
+    }
+}
+
+# --- Stopped interval: any failure here restores the exe and the task ------------------
+$installedWasReadOnly = $false
+$swapped = $false
 try {
+    if ($wasRunning) {
+        Write-Host "Stopping running $taskName before replacing its exe."
+        Stop-ScheduledTask -TaskName $taskName
+        $deadline = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $deadline -and (Get-InstalledExeHolders).Count -gt 0) {
+            Start-Sleep -Milliseconds 250
+        }
+    }
+
+    $holders = @(Get-InstalledExeHolders)
+    if ($holders.Count -gt 0 -and $StopHolders) {
+        Write-Host "Stopping processes using the installed exe (because -StopHolders was given):"
+        for ($attempt = 0; $attempt -lt 3 -and $holders.Count -gt 0; $attempt++) {
+            $holders | ForEach-Object {
+                Write-Host ("  stopping pid {0}  {1}" -f $_.ProcessId, ($_.CommandLine -replace '\s+', ' '))
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+            Start-Sleep -Milliseconds 500
+            $holders = @(Get-InstalledExeHolders)
+        }
+    }
+    if ($holders.Count -gt 0) {
+        $holders | ForEach-Object { Write-Host ("  pid {0}  {1}" -f $_.ProcessId, ($_.CommandLine -replace '\s+', ' ')) }
+        throw "the installed exe is still in use"
+    }
+
     if ($sourceExe -ne $installedExe) {
-        Copy-Item -LiteralPath $sourceExe -Destination $stagedExe -Force
-        # A copied or previously installed exe can be ReadOnly; File.Replace refuses those.
-        $installedWasReadOnly = $false
         if (Test-Path -LiteralPath $installedExe) {
             $installedWasReadOnly = (Get-Item -LiteralPath $installedExe).IsReadOnly
             if ($installedWasReadOnly) {
                 Set-ItemProperty -LiteralPath $installedExe -Name IsReadOnly -Value $false
             }
-        }
-        # A just-exited server can keep its image mapped for a moment; retry the swap.
-        $replaced = $false
-        for ($attempt = 0; -not $replaced; $attempt++) {
-            try {
-                if (Test-Path -LiteralPath $installedExe) {
+            # A just-exited server can keep its image mapped for a moment; retry the swap.
+            $replaced = $false
+            for ($attempt = 0; -not $replaced; $attempt++) {
+                try {
                     [System.IO.File]::Replace($stagedExe, $installedExe, $backupExe)
-                    Remove-Item -LiteralPath $backupExe -Force -ErrorAction SilentlyContinue
-                } else {
-                    Move-Item -LiteralPath $stagedExe -Destination $installedExe
+                    $replaced = $true
+                } catch {
+                    if ($attempt -ge 4) { throw }
+                    Start-Sleep -Milliseconds 700
                 }
-                $replaced = $true
-            } catch {
-                if ($attempt -ge 4) { throw }
-                Start-Sleep -Milliseconds 700
             }
+            $swapped = $true
+        } else {
+            Move-Item -LiteralPath $stagedExe -Destination $installedExe
+            $swapped = $true
         }
-        if ($installedWasReadOnly) {
-            Set-ItemProperty -LiteralPath $installedExe -Name IsReadOnly -Value $true
-        }
+        $dstHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
+        if ($dstHash -ne $srcHash) { throw "installed exe hash differs from source ($dstHash vs $srcHash)" }
+    } else {
+        $dstHash = $srcHash
     }
-    $srcHash = (Get-FileHash -LiteralPath $sourceExe -Algorithm SHA256).Hash
-    $dstHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
-    if ($srcHash -ne $dstHash) { throw "Installed exe hash differs from source ($dstHash vs $srcHash)." }
+
+    $problems = @(Get-WritableByUntrusted $installedExe)
+    if ($problems.Count -gt 0) {
+        Write-Host "Refusing to register: the exe would be modifiable by non-administrators:"
+        $problems | ForEach-Object { Write-Host "  $_" }
+        throw "the installed exe would be modifiable by non-administrators"
+    }
 } catch {
+    if ($swapped -and (Test-Path -LiteralPath $backupExe)) {
+        try { Copy-Item -LiteralPath $backupExe -Destination $installedExe -Force } catch {}
+    }
     Remove-Item -LiteralPath $stagedExe -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $backupExe -ErrorAction SilentlyContinue
+    if ($installedWasReadOnly -and (Test-Path -LiteralPath $installedExe)) {
+        Set-ItemProperty -LiteralPath $installedExe -Name IsReadOnly -Value $true
+    }
     if ($wasRunning) { Start-ScheduledTask -TaskName $taskName | Out-Null }
-    Fail "Replacing the installed exe failed: $($_.Exception.Message) The task was restarted if it had been running."
+    Fail "Replacing the installed exe failed: $($_.Exception.Message) The previous exe and task state were restored."
 }
 
-$problems = @(Get-WritableByUntrusted $installedExe)
-if ($problems.Count -gt 0) {
-    Write-Host "Refusing to register: the exe would be modifiable by non-administrators:"
-    $problems | ForEach-Object { Write-Host "  $_" }
-    Fail "Choose an admin-only -InstallDir (default: $env:ProgramFiles\Hands). A Highest task must not run a user-writable file."
+Remove-Item -LiteralPath $backupExe -ErrorAction SilentlyContinue
+if ($installedWasReadOnly) {
+    Set-ItemProperty -LiteralPath $installedExe -Name IsReadOnly -Value $true
 }
 
-if ($Trigger -eq "AtLogOn") {
-    Register-ScheduledTask -TaskName $taskName -Action $definition.Action -Principal $definition.Principal `
-        -Settings $definition.Settings -Trigger $definition.Triggers -Force | Out-Null
-    Write-Host "Registered $taskName with AtLogOn trigger."
-    Write-Warning "A High-IL server will start at EVERY logon for this user."
-} else {
-    # OnDemand: no -Trigger, so -Force replaces any existing logon trigger.
-    Register-ScheduledTask -TaskName $taskName -Action $definition.Action -Principal $definition.Principal `
-        -Settings $definition.Settings -Force | Out-Null
-    Write-Host "Registered $taskName ON-DEMAND (no trigger)."
+# --- Registration: a failure restarts the task rather than leaving it stopped ----------
+try {
+    if ($Trigger -eq "AtLogOn") {
+        Register-ScheduledTask -TaskName $taskName -Action $definition.Action -Principal $definition.Principal `
+            -Settings $definition.Settings -Trigger $definition.Triggers -Force | Out-Null
+        Write-Host "Registered $taskName with AtLogOn trigger."
+        Write-Warning "A High-IL server will start at EVERY logon for this user."
+    } else {
+        # OnDemand: no -Trigger, so -Force replaces any existing logon trigger.
+        Register-ScheduledTask -TaskName $taskName -Action $definition.Action -Principal $definition.Principal `
+            -Settings $definition.Settings -Force | Out-Null
+        Write-Host "Registered $taskName ON-DEMAND (no trigger)."
+    }
+
+    # Read back what Task Scheduler actually stored.
+    $task = Get-ScheduledTask -TaskName $taskName
+    # Count <Triggers> children in the stored XML. `@($null).Count` is 1 in Windows PowerShell 5.1,
+    # so counting the Triggers property directly reports a phantom trigger.
+    $storedXml = [xml](Export-ScheduledTask -TaskName $taskName)
+    $triggerCount = $storedXml.Task.Triggers.ChildNodes.Count
+    if ($Trigger -eq "OnDemand" -and $triggerCount -ne 0) {
+        throw "the on-demand task has $triggerCount trigger(s)"
+    }
+} catch {
+    if ($wasRunning) { Start-ScheduledTask -TaskName $taskName | Out-Null }
+    Fail "Registering the task failed: $($_.Exception.Message) The task was restarted if it had been running."
 }
 
-# Read back what Task Scheduler actually stored.
-$task = Get-ScheduledTask -TaskName $taskName
-# Count <Triggers> children in the stored XML. `@($null).Count` is 1 in Windows PowerShell 5.1,
-# so counting the Triggers property directly reports a phantom trigger.
-$storedXml = [xml](Export-ScheduledTask -TaskName $taskName)
-$triggerCount = $storedXml.Task.Triggers.ChildNodes.Count
 Write-Host "Installed exe : $installedExe (sha256 $dstHash)"
 Write-Host "Action        : $($task.Actions[0].Execute) $($task.Actions[0].Arguments)"
 Write-Host "Principal     : $($task.Principal.UserId) / $($task.Principal.LogonType) / $($task.Principal.RunLevel)"
 Write-Host "Trigger count : $triggerCount"
-if ($Trigger -eq "OnDemand" -and $triggerCount -ne 0) {
-    Fail "On-demand task still has $triggerCount trigger(s). Unregister-ScheduledTask -TaskName 'HandsElevated' -Confirm:`$false and re-run."
-}
 
 Write-PrivilegeNotice

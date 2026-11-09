@@ -1629,7 +1629,7 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             env.point = point;
             finalize_envelope(env)
         }
-        Err(err) => fail(session_id, info, err, foregrounded, false, false),
+        Err(err) => fail_with_point(session_id, info, err, foregrounded, false, false, point),
     }
 }
 
@@ -4306,6 +4306,88 @@ mod tests {
     }
 
     #[test]
+    fn scroll_dispatch_failure_retains_point() {
+        // F2: a targeted scroll's scroll_wheel failure must keep the same point contract.
+        let contract = crate::point::PointContract {
+            source: PointSource::Chr,
+            css: Some(crate::point::CssPoint::new(10.0, 20.0)),
+            physical: Some(crate::point::PhysicalPoint { x: 110, y: 120 }),
+            transform: crate::point::TransformReport {
+                valid: true,
+                method: TransformMethod::RenderWidgetHost,
+                confidence: TransformConfidence::High,
+                scale: Some(1.0),
+                dpr: Some(1.0),
+                dpi: Some(96),
+                page_zoom: Some(1.0),
+                page_viewport: Some(Rect {
+                    x: 100,
+                    y: 100,
+                    w: 500,
+                    h: 400,
+                }),
+                anchor_basis: Some(crate::point::CssBasis::Inner),
+                layout_basis: Some(crate::point::CssBasis::Inner),
+                reason: None,
+                observe_id: Some("f3a9c1d2e4b5a607".into()),
+            },
+        };
+        let target = none_target();
+        let mut success = base(
+            "s-scroll".into(),
+            target.clone(),
+            true,
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        success.point = Some(contract.clone());
+        let failure = fail_with_point(
+            "s-scroll".into(),
+            target,
+            HandsError::Input("scroll blocked".into()),
+            false,
+            false,
+            false,
+            Some(contract),
+        )
+        .unwrap();
+        assert!(!failure.ok);
+        assert_eq!(failure.point, success.point);
+        let success_point = success.point.expect("success point");
+        let failure_point = failure.point.as_ref().expect("failure point");
+        assert_eq!(failure_point.source, success_point.source);
+        assert_eq!(failure_point.css, success_point.css);
+        assert_eq!(failure_point.physical, success_point.physical);
+        assert_eq!(failure_point.transform, success_point.transform);
+        let json = serialize_envelope(&failure).unwrap();
+        assert!(json.contains("\"point\""), "{json}");
+        assert!(
+            json.contains("\"physical\":{\"x\":110,\"y\":120}"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"observe_id\":\"f3a9c1d2e4b5a607\""),
+            "{json}"
+        );
+
+        // The scroll error branch uses the point-retaining failure helper.
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn scroll_inner").expect("scroll_inner");
+        let end = src.find("pub fn wait_settle").expect("wait_settle");
+        let body = &src[start..end];
+        assert!(
+            body.contains(
+                "Err(err) => fail_with_point(session_id, info, err, foregrounded, false, false, point)"
+            ),
+            "scroll_wheel failure must retain the point:\n{body}"
+        );
+    }
+
+    #[test]
     fn no_send_input_on_transform_unknown_source_lock() {
         let src = include_str!("actuate.rs");
         let helper = &src[src.find("pub(crate) fn refuse_transform").unwrap()
@@ -4331,45 +4413,79 @@ mod tests {
 
     #[test]
     fn click_hover_scroll_paths_have_no_outer_inner_transform() {
-        for src in [
-            include_str!("actuate.rs"),
-            include_str!("target.rs"),
-            include_str!("point.rs"),
-        ] {
-            assert!(
-                !src.contains(&["metrics.outer_height", "-", "metrics.inner_height"].join(" "))
-            );
-            assert!(!src.contains(&["metrics.outer_width", "-", "metrics.inner_width"].join(" ")));
+        fn production(src: &str) -> &str {
+            src.split_once("mod tests {")
+                .map(|(prod, _)| prod)
+                .unwrap_or(src)
+        }
+        fn compact(src: &str) -> String {
+            src.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+        fn legacy_subtraction(src: &str) -> bool {
+            let text = compact(src);
+            for (a, b) in [
+                ("outer_height", "inner_height"),
+                ("outer_width", "inner_width"),
+            ] {
+                for (pos, _) in text.match_indices(a) {
+                    let rest = &text[pos + a.len()..];
+                    if let Some(rel) = rest.find(b)
+                        && rel <= 64
+                        && rest[..rel].contains('-')
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        fn function_spans(src: &str) -> Vec<(&str, &str)> {
+            let positions: Vec<usize> = src.match_indices("fn ").map(|(i, _)| i).collect();
+            let mut out = Vec::new();
+            for (n, &start) in positions.iter().enumerate() {
+                let name_start = start + 3;
+                let name_end = src[name_start..]
+                    .find('(')
+                    .map(|i| name_start + i)
+                    .unwrap_or(name_start);
+                let name = src[name_start..name_end].trim();
+                let end = positions.get(n + 1).copied().unwrap_or(src.len());
+                out.push((name, &src[start..end]));
+            }
+            out
         }
 
-        // chrome.rs: the legacy formula may exist only inside the fixture-listing helper.
+        // Production code outside the test module must have no legacy subtraction at all.
+        for src in [
+            production(include_str!("actuate.rs")),
+            production(include_str!("target.rs")),
+            production(include_str!("point.rs")),
+        ] {
+            assert!(
+                !legacy_subtraction(src),
+                "legacy outer-inner arithmetic leaked outside chrome's fixture helper"
+            );
+        }
+
+        // chrome.rs production code: normalize whitespace, then prove the only function with
+        // outer-inner subtraction is fixture_listing_origin.
         let chrome = include_str!("chrome.rs");
-        let legacy_y = ["metrics.outer_height", "-", "metrics.inner_height"].join(" ");
-        let legacy_x = ["metrics.outer_width", "-", "metrics.inner_width"].join(" ");
-        let def_start = chrome
-            .find("fn fixture_listing_origin(")
-            .expect("fixture_listing_origin definition");
-        let def_end = chrome[def_start..]
-            .find("\n}\n")
-            .map(|i| def_start + i)
-            .expect("fixture_listing_origin body end");
-        let occurrences: Vec<usize> = chrome.match_indices(&legacy_y).map(|(i, _)| i).collect();
+        let prod = production(chrome);
+        let norm = prod.split_whitespace().collect::<Vec<_>>().join(" ");
+        let spans = function_spans(&norm);
+        let legacy_fns: Vec<&str> = spans
+            .iter()
+            .filter(|(_, body)| legacy_subtraction(body))
+            .map(|(name, _)| *name)
+            .collect();
         assert_eq!(
-            occurrences.len(),
-            1,
-            "outer-inner height arithmetic must exist only in fixture_listing_origin"
+            legacy_fns,
+            vec!["fixture_listing_origin"],
+            "only fixture_listing_origin may contain outer-inner subtraction: {legacy_fns:?}"
         );
-        assert!(occurrences[0] > def_start && occurrences[0] < def_end);
-        let x_occurrences: Vec<usize> = chrome.match_indices(&legacy_x).map(|(i, _)| i).collect();
-        assert_eq!(
-            x_occurrences.len(),
-            1,
-            "outer-inner width arithmetic must exist only in fixture_listing_origin"
-        );
-        assert!(x_occurrences[0] > def_start && x_occurrences[0] < def_end);
 
         // The helper has exactly one call site, inside `fixture_map` with `fixture: true`.
-        let calls: Vec<usize> = chrome
+        let calls: Vec<usize> = norm
             .match_indices("fixture_listing_origin(")
             .map(|(i, _)| i)
             .collect();
@@ -4378,43 +4494,76 @@ mod tests {
             2,
             "expected the definition and one fixture call site: {calls:?}"
         );
+        let def_start = norm
+            .find("fn fixture_listing_origin(")
+            .expect("fixture_listing_origin definition");
+        let def_end = norm[def_start..]
+            .find("fn make_observe_id(")
+            .map(|i| def_start + i)
+            .expect("fixture_listing_origin end");
         let call = *calls
             .iter()
             .find(|i| **i > def_end)
             .expect("fixture_listing_origin call site");
-        let map_start = chrome.find("fn fixture_map(").expect("fixture_map");
-        let map_end = chrome.find("fn no_hwnd_map(").expect("no_hwnd_map");
+        let fixture = spans
+            .iter()
+            .find(|(name, _)| *name == "fixture_map")
+            .map(|(_, body)| *body)
+            .expect("fixture_map span");
+        let fixture_start = norm.find("fn fixture_map(").expect("fixture_map");
+        let fixture_end = fixture_start + fixture.len();
         assert!(
-            call > map_start && call < map_end,
+            call > fixture_start && call < fixture_end,
             "fixture_listing_origin must be called only from fixture_map"
         );
-        let fixture = &chrome[map_start..map_end];
         assert!(fixture.contains("fixture: true"));
         assert!(fixture.contains("fixture_origin: fixture_listing_origin("));
 
-        // The live map builder never uses the fixture helper or the legacy arithmetic.
-        let live_start = chrome.find("fn live_map_inputs(").expect("live_map_inputs");
-        let live_end = chrome.find("fn build_live_map(").expect("build_live_map");
-        let live = &chrome[live_start..live_end];
-        assert!(!live.contains("fixture_listing_origin"));
-        assert!(!live.contains(&legacy_y));
-        assert!(!live.contains(&legacy_x));
-
-        // A live `chr:` hit builds its contract from the validated map, not the legacy helper.
-        let hit_start = chrome.find("fn hit_from_raw(").expect("hit_from_raw");
-        let hit_end = chrome.find("fn snapshot_env(").expect("snapshot_env");
-        let hit = &chrome[hit_start..hit_end];
+        // The live map builders/hit path contain neither the fixture helper nor subtraction.
+        for required in [
+            "live_map_inputs",
+            "build_live_map",
+            "hit_from_raw",
+            "map_from_raw",
+            "map_for_raw",
+            "remap_chr",
+        ] {
+            let body = spans
+                .iter()
+                .find(|(name, _)| *name == required)
+                .map(|(_, body)| *body)
+                .unwrap_or_else(|| panic!("missing function {required}"));
+            assert!(
+                !body.contains("fixture_listing_origin"),
+                "{required} must not use the fixture listing helper"
+            );
+            assert!(
+                !legacy_subtraction(body),
+                "{required} must not use outer-inner subtraction"
+            );
+        }
+        let hit = spans
+            .iter()
+            .find(|(name, _)| *name == "hit_from_raw")
+            .map(|(_, body)| *body)
+            .expect("hit_from_raw");
         assert!(hit.contains("contract_for(&map,"));
-        assert!(!hit.contains("fixture_listing_origin"));
 
         // The click-time `chr:` finishing path maps the contract point/rect, never a raw centre.
         let target = include_str!("target.rs");
-        let finish_start = target.find("fn finish_chr(").expect("finish_chr");
-        let finish_end = target.find("fn invalid_from(").expect("invalid_from");
-        let finish = &target[finish_start..finish_end];
+        let target_norm = production(target)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let finish = function_spans(&target_norm)
+            .into_iter()
+            .find(|(name, _)| *name == "finish_chr")
+            .map(|(_, body)| body)
+            .expect("finish_chr");
+        let finish = compact(finish);
         assert!(finish.contains("contract_for("));
-        assert!(finish.contains("map_point(&contract, css_rect.center())"));
-        assert!(finish.contains("map_rect(&contract, css_rect)"));
+        assert!(finish.contains("map_point(&contract,css_rect.center())"));
+        assert!(finish.contains("map_rect(&contract,css_rect)"));
         assert!(!finish.contains("found.rect.center()"));
     }
 

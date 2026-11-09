@@ -191,7 +191,7 @@ function Get-InstalledExeHolders {
 }
 
 # The task's own server is `serve --pipe ...`; anything else (a harness bridge) is foreign.
-$foreign = @(Get-InstalledExeHolders | Where-Object { $_.CommandLine -notmatch 'serve --pipe' })
+$foreign = @(Get-InstalledExeHolders | Where-Object { $_.CommandLine -notmatch [regex]::Escape($pipeArgs) })
 if ($foreign.Count -gt 0 -and -not $StopHolders) {
     Write-Host "The installed exe is in use by processes other than the task:"
     $foreign | ForEach-Object { Write-Host ("  pid {0}  {1}" -f $_.ProcessId, ($_.CommandLine -replace '\s+', ' ')) }
@@ -222,6 +222,10 @@ if ($sourceExe -ne $installedExe) {
 # --- Stopped interval: any failure here restores the exe and the task ------------------
 $installedWasReadOnly = $false
 $swapped = $false
+$failure = $null
+$rollbackFailed = $false
+$rolledBack = $false
+$rollbackError = ""
 try {
     if ($wasRunning) {
         Write-Host "Stopping running $taskName before replacing its exe."
@@ -284,21 +288,39 @@ try {
         throw "the installed exe would be modifiable by non-administrators"
     }
 } catch {
+    $failure = $_
     if ($swapped -and (Test-Path -LiteralPath $backupExe)) {
-        try { Copy-Item -LiteralPath $backupExe -Destination $installedExe -Force } catch {}
+        try {
+            Copy-Item -LiteralPath $backupExe -Destination $installedExe -Force
+            $rolledBack = $true
+        } catch {
+            $rollbackFailed = $true
+            $rollbackError = $_.Exception.Message
+        }
     }
+} finally {
     Remove-Item -LiteralPath $stagedExe -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $backupExe -ErrorAction SilentlyContinue
     if ($installedWasReadOnly -and (Test-Path -LiteralPath $installedExe)) {
-        Set-ItemProperty -LiteralPath $installedExe -Name IsReadOnly -Value $true
+        try { Set-ItemProperty -LiteralPath $installedExe -Name IsReadOnly -Value $true }
+        catch { Write-Warning "Could not restore the ReadOnly attribute: $($_.Exception.Message)" }
     }
-    if ($wasRunning) { Start-ScheduledTask -TaskName $taskName | Out-Null }
-    Fail "Replacing the installed exe failed: $($_.Exception.Message) The previous exe and task state were restored."
+    if ($null -ne $failure -and $wasRunning -and -not $rollbackFailed) {
+        try { Start-ScheduledTask -TaskName $taskName | Out-Null }
+        catch { Write-Warning "Could not restart $($taskName): $($_.Exception.Message)" }
+    }
+    if (-not $rollbackFailed) {
+        Remove-Item -LiteralPath $backupExe -ErrorAction SilentlyContinue
+    }
 }
 
-Remove-Item -LiteralPath $backupExe -ErrorAction SilentlyContinue
-if ($installedWasReadOnly) {
-    Set-ItemProperty -LiteralPath $installedExe -Name IsReadOnly -Value $true
+if ($null -ne $failure) {
+    if ($rollbackFailed) {
+        Fail "Replacing the installed exe failed ($($failure.Exception.Message)) and rollback also failed ($rollbackError). The previous exe is kept at $backupExe and the task is stopped; restore it manually."
+    }
+    if ($rolledBack) {
+        Fail "Replacing the installed exe failed: $($failure.Exception.Message) The previous exe was restored and the task restarted."
+    }
+    Fail "Replacing the installed exe failed: $($failure.Exception.Message) The task was restarted if it had been running."
 }
 
 # --- Registration: a failure restarts the task rather than leaving it stopped ----------
@@ -325,7 +347,10 @@ try {
         throw "the on-demand task has $triggerCount trigger(s)"
     }
 } catch {
-    if ($wasRunning) { Start-ScheduledTask -TaskName $taskName | Out-Null }
+    if ($wasRunning) {
+        try { Start-ScheduledTask -TaskName $taskName | Out-Null }
+        catch { Write-Warning "Could not restart $($taskName): $($_.Exception.Message)" }
+    }
     Fail "Registering the task failed: $($_.Exception.Message) The task was restarted if it had been running."
 }
 

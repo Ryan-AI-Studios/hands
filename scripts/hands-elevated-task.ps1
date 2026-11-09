@@ -55,7 +55,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $taskName = "HandsElevated"
-$pipeArgs = 'serve --pipe \\.\pipe\hands-elev'
+$pipeName = '\\.\pipe\hands-elev'
+$pipeArgs = "serve --pipe $pipeName"
 
 function Fail([string]$Message) {
     [Console]::Error.WriteLine($Message)
@@ -204,7 +205,7 @@ function Start-TaskAndConfirm([string]$Name) {
 # The task's own server is `serve --pipe ...`; anything else (a harness bridge) is foreign.
 # Match the whole command line (exe + exact action args) so a `do-task --goal "... serve --pipe ..."`
 # invocation cannot be mistaken for the task's server.
-$taskCommandRe = '^\s*"?' + [regex]::Escape($installedExe) + '"?\s+' + [regex]::Escape($pipeArgs) + '\s*$'
+$taskCommandRe = '^\s*"?' + [regex]::Escape($installedExe) + '"?\s+serve\s+--pipe\s+"?' + [regex]::Escape($pipeName) + '"?\s*$'
 $foreign = @(Get-InstalledExeHolders | Where-Object { $_.CommandLine -notmatch $taskCommandRe })
 if ($foreign.Count -gt 0 -and -not $StopHolders) {
     Write-Host "The installed exe is in use by processes other than the task:"

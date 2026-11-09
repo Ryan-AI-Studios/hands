@@ -223,6 +223,9 @@ pub struct MapInputs {
     pub uia_document: Option<Rect>,
     pub monitors: Vec<MonitorDpi>,
     pub observe_id: Option<String>,
+    /// Page title carried by this snapshot/resolve reply. Used by remap identity checks; never
+    /// the OS window caption (which includes the browser suffix).
+    pub page_title: Option<String>,
     pub fixture: bool,
     pub identity: WindowIdentity,
     /// Fixture/diagnostic listing origin (physical float), legacy `outer-inner` only.
@@ -238,6 +241,8 @@ pub struct ViewportMap {
     pub origin: Option<(f64, f64)>,
     pub scale: f64,
     pub page: PageMetrics,
+    /// Recorded page title from the snapshot/resolve reply (not the OS caption).
+    pub page_title: Option<String>,
     pub anchor: Option<Rect>,
     pub anchor_basis: Option<CssBasis>,
     pub layout_basis: Option<CssBasis>,
@@ -251,6 +256,7 @@ impl Default for ViewportMap {
             origin: None,
             scale: 1.0,
             page: PageMetrics::default(),
+            page_title: None,
             anchor: None,
             anchor_basis: None,
             layout_basis: None,
@@ -357,6 +363,7 @@ fn invalid_map(inputs: &MapInputs, reason: String, method: TransformMethod) -> V
         origin: None,
         scale: dpr.unwrap_or(1.0),
         page: inputs.page,
+        page_title: inputs.page_title.clone(),
         anchor: None,
         anchor_basis: None,
         layout_basis: None,
@@ -393,6 +400,7 @@ pub fn build_map(inputs: MapInputs) -> ViewportMap {
             origin: inputs.fixture_origin,
             scale,
             page: inputs.page,
+            page_title: inputs.page_title.clone(),
             anchor: None,
             anchor_basis: None,
             layout_basis: None,
@@ -582,6 +590,7 @@ pub fn build_map(inputs: MapInputs) -> ViewportMap {
         origin: Some((anchor.x as f64, anchor.y as f64)),
         scale: dpr,
         page: inputs.page,
+        page_title: inputs.page_title.clone(),
         anchor: Some(anchor),
         anchor_basis: Some(anchor_basis),
         layout_basis: Some(layout_basis),
@@ -903,6 +912,7 @@ mod tests {
             uia_document: None,
             monitors: Vec::new(),
             observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: None,
             fixture: false,
             identity: WindowIdentity::Confirmed,
             fixture_origin: None,

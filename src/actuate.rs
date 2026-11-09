@@ -788,7 +788,7 @@ fn unresolved_info(target: &Target, contract: &PointContract) -> ActuateTarget {
 /// returns a `stale_viewport` refusal.
 fn final_live_remap(
     session_id: &str,
-    info: &ActuateTarget,
+    info: &mut ActuateTarget,
     resolved: &mut ResolvedTarget,
 ) -> Result<Option<ActuateEnvelope>, HandsError> {
     let (Some(contract), Some(css), Some(map)) = (
@@ -827,6 +827,8 @@ fn final_live_remap(
             resolved.rect = rect;
             resolved.contract = Some(new_contract);
             resolved.map = Some(new_map);
+            info.x = p.x;
+            info.y = p.y;
             Ok(None)
         }
         Err(reason) => {
@@ -959,7 +961,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         Ok(r) => r,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
-    let (mut resolved, contract_refusal, info, guard_hwnd, guard_point) = match outcome {
+    let (mut resolved, contract_refusal, mut info, guard_hwnd, guard_point) = match outcome {
         TargetOutcome::Resolved(r) => {
             let info = resolved_info(r.kind, r.id.clone(), r.x, r.y);
             (Some(*r), None, info, None, None)
@@ -1004,7 +1006,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         }
     }
     if !req.blind
-        && let Some(env) = final_live_remap(&session_id, &info, resolved_ref)?
+        && let Some(env) = final_live_remap(&session_id, &mut info, resolved_ref)?
     {
         return Ok(env);
     }
@@ -1248,7 +1250,7 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         Ok(r) => r,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
     };
-    let (mut resolved, contract_refusal, info, guard_hwnd, guard_point) = match outcome {
+    let (mut resolved, contract_refusal, mut info, guard_hwnd, guard_point) = match outcome {
         TargetOutcome::Resolved(r) => {
             let info = resolved_info(r.kind, r.id.clone(), r.x, r.y);
             (Some(*r), None, info, None, None)
@@ -1278,7 +1280,7 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         return refuse_transform(session_id, info, *contract);
     }
     let resolved_ref = resolved.as_mut().expect("resolved outcome");
-    if let Some(env) = final_live_remap(&session_id, &info, resolved_ref)? {
+    if let Some(env) = final_live_remap(&session_id, &mut info, resolved_ref)? {
         return Ok(env);
     }
     let resolved = resolved.expect("resolved outcome");
@@ -4270,6 +4272,21 @@ mod tests {
     }
 
     #[test]
+    fn final_remap_updates_envelope_target() {
+        let src = include_str!("actuate.rs");
+        let helper = &src
+            [src.find("fn final_live_remap").unwrap()..src.find("fn point_for_dispatch").unwrap()];
+        assert!(helper.contains("info.x = p.x"));
+        assert!(helper.contains("info.y = p.y"));
+        let click =
+            &src[src.find("fn click_inner").unwrap()..src.find("fn dispatch_blind_click").unwrap()];
+        assert!(click.contains("final_live_remap(&session_id, &mut info, resolved_ref)"));
+        let hover =
+            &src[src.find("fn hover_inner").unwrap()..src.find("pub fn type_text").unwrap()];
+        assert!(hover.contains("final_live_remap(&session_id, &mut info, resolved_ref)"));
+    }
+
+    #[test]
     fn hover_transform_guard_before_remember_and_offer() {
         let src = include_str!("actuate.rs");
         let start = src.find("fn hover_inner").expect("hover_inner");
@@ -4528,33 +4545,35 @@ mod tests {
             out.push("fixture_listing_origin / fixture_map structure is missing".into());
         }
 
-        // Live mapping functions must not even name the outer metrics, so aliasing a local
-        // and subtracting it later is rejected as well.
-        for required in [
-            "live_map_inputs",
-            "live_inputs_from_page",
-            "build_live_map",
-            "hit_from_raw",
-            "map_from_raw",
-            "map_for_raw",
-            "remap_chr",
-        ] {
-            match span_of(&spans, required) {
-                Some(body) => {
-                    for ident in ["outer_width", "outer_height"] {
-                        if body.contains(ident) {
-                            out.push(format!("{required} references {ident}"));
-                        }
-                    }
-                    if body.contains("fixture_listing_origin") {
-                        out.push(format!("{required} uses the fixture listing helper"));
-                    }
-                    if legacy_subtraction(body) {
-                        out.push(format!("{required} uses outer-inner subtraction"));
-                    }
+        // Global rule: `outer_width` / `outer_height` may appear only in the ChromeMetrics
+        // definition/serde or inside the single fixture_listing_origin function span. This is
+        // stronger than a proximity matcher: aliasing a local and subtracting it later, reversed
+        // subtraction, or an unnamed helper all fail.
+        let cm_start = chrome.find("pub struct ChromeMetrics {");
+        let cm_end = cm_start.and_then(|s| chrome[s..].find("\n}").map(|i| s + i + 2));
+        let fixture_start = chrome.find("fn fixture_listing_origin(");
+        let fixture_end = fixture_start.and_then(|s| chrome[s..].find("\n}").map(|i| s + i + 2));
+        let (Some(cm_start), Some(cm_end), Some(fixture_start), Some(fixture_end)) =
+            (cm_start, cm_end, fixture_start, fixture_end)
+        else {
+            out.push("ChromeMetrics/fixture_listing_origin allowed spans are missing".into());
+            return out;
+        };
+        for ident in ["outer_width", "outer_height"] {
+            for (pos, _) in chrome.match_indices(ident) {
+                let in_metrics = pos >= cm_start && pos < cm_end;
+                let in_fixture = pos >= fixture_start && pos < fixture_end;
+                if !in_metrics && !in_fixture {
+                    out.push(format!(
+                        "{ident} appears outside ChromeMetrics/fixture_listing_origin at byte {pos}"
+                    ));
                 }
-                None => out.push(format!("missing live mapping function {required}")),
             }
+        }
+
+        // Keep explicit proof that the single fixture helper still owns the legacy subtraction.
+        if !legacy_subtraction(&chrome[fixture_start..fixture_end]) {
+            out.push("fixture_listing_origin no longer contains the legacy subtraction".into());
         }
 
         match span_of(&spans, "hit_from_raw") {
@@ -4626,7 +4645,7 @@ mod tests {
         assert!(
             violations
                 .iter()
-                .any(|v| v.contains("live_map_inputs") && v.contains("outer_height")),
+                .any(|v| v.contains("outer_height") && v.contains("outside")),
             "alias mutation must be rejected: {violations:?}"
         );
 
@@ -4638,9 +4657,26 @@ mod tests {
         );
         let violations = transform_lock_violations(&weird, target);
         assert!(
-            violations.iter().any(|v| v.contains("map_from_raw")),
+            violations
+                .iter()
+                .any(|v| v.contains("outer_width") && v.contains("outside")),
             "whitespace mutation must be rejected: {violations:?}"
         );
+
+        // Negative 3: split alias in an unnamed helper, even outside the named live spans.
+        let hidden = inject_after_open_brace(
+            chrome,
+            "fixture_map",
+            " fn hidden_helper(metrics: &ChromeMetrics) -> f64 { let oh = metrics.outer_height; let ih = metrics.inner_height; oh - ih }",
+        );
+        let violations = transform_lock_violations(&hidden, target);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("outer_height") && v.contains("outside")),
+            "unnamed-helper alias must be rejected: {violations:?}"
+        );
+
         assert!(legacy_subtraction(
             "metrics.outer_height\n\t-\nmetrics.inner_height"
         ));

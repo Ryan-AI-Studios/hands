@@ -308,6 +308,20 @@ pub(crate) fn set_geometry_hook(hook: Option<GeometryHook>) {
 }
 
 #[cfg(test)]
+type RemapGeometryHook = fn(PageMetrics, isize) -> MapInputs;
+
+#[cfg(test)]
+thread_local! {
+    static REMAP_HOOK: std::cell::RefCell<Option<RemapGeometryHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_remap_geometry_hook(hook: Option<RemapGeometryHook>) {
+    REMAP_HOOK.with(|c| *c.borrow_mut() = hook);
+}
+
+#[cfg(test)]
 thread_local! {
     static RESOLVE_STUB: std::cell::RefCell<Option<ChromeHit>> =
         const { std::cell::RefCell::new(None) };
@@ -323,6 +337,7 @@ fn live_inputs_from_page(
     title: Option<&str>,
     hwnd: isize,
     observe_id: Option<String>,
+    identity: crate::point::WindowIdentity,
 ) -> MapInputs {
     let chrome = foreground::is_chrome_hwnd(hwnd);
     let render_widgets = if chrome {
@@ -345,8 +360,9 @@ fn live_inputs_from_page(
         uia_document,
         monitors: crate::space::monitor_dpis(),
         observe_id,
+        page_title: title.map(str::to_string),
         fixture: false,
-        identity: observe_identity(title, Some(hwnd)),
+        identity,
         fixture_origin: None,
     }
 }
@@ -357,7 +373,8 @@ fn live_map_inputs(
     hwnd: isize,
     observe_id: Option<String>,
 ) -> MapInputs {
-    live_inputs_from_page(metrics.page(), title, hwnd, observe_id)
+    let identity = observe_identity(title, Some(hwnd));
+    live_inputs_from_page(metrics.page(), title, hwnd, observe_id, identity)
 }
 
 fn build_live_map(
@@ -379,6 +396,7 @@ fn fixture_map(raw: &RawSnapshot, hwnd: Option<isize>, obs: String) -> ViewportM
     build_map(MapInputs {
         hwnd,
         page: raw.metrics.page(),
+        page_title: raw.title.clone(),
         fixture: true,
         fixture_origin: fixture_listing_origin(&raw.metrics),
         observe_id: Some(obs),
@@ -398,6 +416,7 @@ fn no_hwnd_map(raw: &RawSnapshot, obs: String) -> ViewportMap {
         origin: None,
         scale: dpr.unwrap_or(1.0),
         page: raw.metrics.page(),
+        page_title: raw.title.clone(),
         anchor: None,
         anchor_basis: None,
         layout_basis: None,
@@ -420,22 +439,73 @@ fn map_for_raw(raw: &RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: Strin
     }
 }
 
+fn remap_inputs(
+    old: &ViewportMap,
+    hwnd: isize,
+    identity: crate::point::WindowIdentity,
+) -> MapInputs {
+    #[cfg(test)]
+    {
+        if let Some(hook) = REMAP_HOOK.with(|c| *c.borrow()) {
+            let mut inputs = hook(old.page, hwnd);
+            inputs.page = old.page;
+            inputs.page_title = old.page_title.clone();
+            inputs.identity = identity;
+            return inputs;
+        }
+    }
+    let mut inputs = live_inputs_from_page(
+        old.page,
+        old.page_title.as_deref(),
+        hwnd,
+        old.report.observe_id.clone(),
+        identity,
+    );
+    inputs.page = old.page;
+    inputs.page_title = old.page_title.clone();
+    inputs
+}
+
+/// Testable remap core. `caption` is the OS window caption; `old.page_title` is the recorded
+/// page title from the snapshot/resolve reply. Identity is evaluated with the recorded title,
+/// never by substituting the caption for the page title.
+fn remap_chr_with(
+    old: &ViewportMap,
+    hwnd: isize,
+    caption: Option<&str>,
+    chrome_window_count: usize,
+    is_chrome: bool,
+) -> Result<ViewportMap, String> {
+    let identity = if is_chrome {
+        identity_from(
+            old.page_title.as_deref().unwrap_or(""),
+            caption,
+            chrome_window_count,
+        )
+    } else {
+        crate::point::WindowIdentity::Mismatch
+    };
+    let live = remap_inputs(old, hwnd, identity);
+    remap(old, live)
+}
+
 /// Remap a valid `chr:` contract at the final guard. Live geometry only; the recorded page
 /// metrics are re-used (no second page-metrics read). Page zoom between resolve and dispatch
 /// is not detectable here.
 pub fn remap_chr(old: &ViewportMap, hwnd: isize) -> Result<ViewportMap, String> {
-    let page = old.page;
-    if page.dpr.is_none() {
+    if old.page.dpr.is_none() {
         return Err("stale_viewport: recorded page metrics have no dpr".into());
     }
-    let mut live = live_inputs_from_page(
-        page,
-        Some(foreground::title(Some(hwnd)).as_str()),
-        hwnd,
-        old.report.observe_id.clone(),
-    );
-    live.page = page;
-    remap(old, live)
+    let is_chrome = foreground::is_chrome_hwnd(hwnd);
+    let (caption, count) = if is_chrome {
+        (
+            Some(foreground::title(Some(hwnd))),
+            foreground::visible_chrome_window_count(),
+        )
+    } else {
+        (None, 0)
+    };
+    remap_chr_with(old, hwnd, caption.as_deref(), count, is_chrome)
 }
 
 pub fn try_snapshot(detail: Detail, hwnd: Option<isize>) -> SnapshotOutcome {
@@ -495,12 +565,6 @@ fn hit_from_raw(
                 .and_then(canonical_chr)
                 .is_some_and(|cid| cid == id)
         })
-        .or_else(|| {
-            id.strip_prefix("chr:")
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|i| *i < raw.elements.len())
-        })
-        .or_else(|| (raw.elements.len() == 1).then_some(0))
         .ok_or_else(|| {
             HandsError::Chrome(format!(
                 "Chrome element {id} not found in host/fixture snapshot"
@@ -873,8 +937,6 @@ mod tests {
         ChromeMetrics {
             screen_x: 100.0,
             screen_y: 50.0,
-            outer_width: 1280.0,
-            outer_height: 800.0,
             inner_width: 1280.0,
             inner_height: 720.0,
             device_pixel_ratio: 1.0,
@@ -912,6 +974,7 @@ mod tests {
             uia_document: None,
             monitors: Vec::new(),
             observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: None,
             fixture: false,
             identity: crate::point::WindowIdentity::Confirmed,
             fixture_origin: None,
@@ -1073,8 +1136,16 @@ mod tests {
 
     #[test]
     fn fixture_geometry_dpr_1_25_still_lists() {
-        let mut metrics = fixture_metrics();
-        metrics.device_pixel_ratio = 1.25;
+        let metrics: ChromeMetrics = serde_json::from_value(serde_json::json!({
+            "screenX": 100.0,
+            "screenY": 50.0,
+            "outerWidth": 1280.0,
+            "outerHeight": 800.0,
+            "innerWidth": 1280.0,
+            "innerHeight": 720.0,
+            "devicePixelRatio": 1.25
+        }))
+        .expect("fixture metrics");
         let map = fixture_map(
             &RawSnapshot {
                 url: None,
@@ -2005,5 +2076,208 @@ mod tests {
         let map = map_from_raw(raw, None, true, "f3a9c1d2e4b5a607".into());
         assert_eq!(map.cards.len(), 1);
         assert!(map.cards[0].rect.y > 10_000);
+    }
+
+    thread_local! {
+        static REMAP_ANCHOR: std::cell::Cell<Rect> =
+            const { std::cell::Cell::new(Rect { x: 100, y: 80, w: 1500, h: 1125 }) };
+        static REMAP_DPI: std::cell::Cell<u32> = const { std::cell::Cell::new(120) };
+    }
+
+    fn remap_hook(page: PageMetrics, hwnd: isize) -> MapInputs {
+        MapInputs {
+            hwnd: Some(hwnd),
+            window_rect: Some(Rect {
+                x: -10,
+                y: -10,
+                w: 4000,
+                h: 3000,
+            }),
+            dpi: Some(REMAP_DPI.with(|c| c.get())),
+            virtual_screen: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            page,
+            render_widgets: vec![REMAP_ANCHOR.with(|c| c.get())],
+            uia_document: None,
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: Some("Owner Web Access".into()),
+            fixture: false,
+            identity: crate::point::WindowIdentity::Confirmed,
+            fixture_origin: None,
+        }
+    }
+
+    fn valid_remap_map() -> ViewportMap {
+        let metrics = ChromeMetrics {
+            inner_width: 1200.0,
+            inner_height: 900.0,
+            device_pixel_ratio: 1.25,
+            ..ChromeMetrics::default()
+        };
+        let mut inputs = fixture_inputs(&metrics, REMAP_ANCHOR.with(|c| c.get()));
+        inputs.dpi = Some(120);
+        inputs.page_title = Some("Owner Web Access".into());
+        let map = build_map(inputs);
+        assert!(map.report.valid, "{:?}", map.report.reason);
+        map
+    }
+
+    #[test]
+    fn resolve_chr_id_must_match_canonical_id() {
+        let raw = RawSnapshot {
+            url: None,
+            title: None,
+            main_text: None,
+            elements: vec![RawNode {
+                id: Some("chr:7".into()),
+                role: Some("Button".into()),
+                text: Some("Go".into()),
+                rect_css: CssRect {
+                    left: 10.0,
+                    top: 10.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                _href: None,
+            }],
+            cards: Vec::new(),
+            metrics: fixture_metrics(),
+            result_count: None,
+            local_matches: None,
+            empty_state: None,
+            zip: None,
+            radius: None,
+            cards_walked: None,
+        };
+        let err = hit_from_raw(raw.clone(), "chr:0", None, true).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        let mut unnamed = raw;
+        unnamed.elements[0].id = None;
+        let err = hit_from_raw(unnamed, "chr:0", None, true).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn remap_chr_uses_recorded_page_title_not_caption() {
+        let old = valid_remap_map();
+        REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 100,
+                y: 80,
+                w: 1500,
+                h: 1125,
+            })
+        });
+        REMAP_DPI.with(|c| c.set(120));
+        set_remap_geometry_hook(Some(remap_hook));
+
+        let ok = remap_chr_with(
+            &old,
+            0x1234,
+            Some("Owner Web Access - Google Chrome"),
+            1,
+            true,
+        )
+        .expect("same recorded page title must remap");
+        assert!(ok.report.valid);
+        assert_eq!(ok.page_title.as_deref(), Some("Owner Web Access"));
+
+        let err =
+            remap_chr_with(&old, 0x1234, Some("Other Page - Google Chrome"), 1, true).unwrap_err();
+        assert!(err.starts_with("window_mismatch"), "{err}");
+
+        let err = remap_chr_with(&old, 0x1234, None, 2, true).unwrap_err();
+        assert!(err.starts_with("window_identity_ambiguous"), "{err}");
+
+        // The pre-fix bug fed the caption in as the page title; that never matches.
+        assert_eq!(
+            identity_from(
+                "Owner Web Access - Google Chrome",
+                Some("Owner Web Access - Google Chrome"),
+                1
+            ),
+            crate::point::WindowIdentity::Mismatch
+        );
+        // The recorded-title path does match the caption.
+        assert_eq!(
+            identity_from(
+                "Owner Web Access",
+                Some("Owner Web Access - Google Chrome"),
+                1
+            ),
+            crate::point::WindowIdentity::Confirmed
+        );
+
+        set_remap_geometry_hook(None);
+    }
+
+    #[test]
+    fn remap_chr_move_only_ok_and_size_or_dpi_change_stale() {
+        let old = valid_remap_map();
+        set_remap_geometry_hook(Some(remap_hook));
+
+        REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1500,
+                h: 1125,
+            })
+        });
+        REMAP_DPI.with(|c| c.set(120));
+        let moved = remap_chr_with(
+            &old,
+            0x1234,
+            Some("Owner Web Access - Google Chrome"),
+            1,
+            true,
+        )
+        .expect("move-only remap");
+        assert_eq!(moved.anchor.map(|r| (r.x, r.y)), Some((300, 200)));
+
+        REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1400,
+                h: 1125,
+            })
+        });
+        let err = remap_chr_with(
+            &old,
+            0x1234,
+            Some("Owner Web Access - Google Chrome"),
+            1,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("stale_viewport"), "{err}");
+
+        REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1500,
+                h: 1125,
+            })
+        });
+        REMAP_DPI.with(|c| c.set(144));
+        let err = remap_chr_with(
+            &old,
+            0x1234,
+            Some("Owner Web Access - Google Chrome"),
+            1,
+            true,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("stale_viewport"), "{err}");
+
+        REMAP_DPI.with(|c| c.set(120));
+        set_remap_geometry_hook(None);
     }
 }

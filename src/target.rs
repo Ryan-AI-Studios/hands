@@ -239,9 +239,8 @@ fn finish_chr(
 ) -> Result<Option<String>, HandsError> {
     let css_rect = hit.css_rect;
     if !css_rect.is_positive() {
-        return Ok(Some(
-            "point_outside_viewport: element has a zero-area CSS rect".into(),
-        ));
+        hit.contract = invalid_from(&hit.contract, "zero_area: element has a zero-area CSS rect");
+        return Ok(Some("zero_area: element has a zero-area CSS rect".into()));
     }
     let contract = contract_for(
         hit.map
@@ -624,6 +623,7 @@ mod tests {
             uia_document: None,
             monitors: Vec::new(),
             observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: None,
             fixture: false,
             identity: crate::point::WindowIdentity::Confirmed,
             fixture_origin: None,
@@ -717,6 +717,35 @@ mod tests {
             outcome,
             TargetOutcome::Unresolved { hwnd: None, .. }
         ));
+    }
+
+    #[test]
+    fn chr_zero_area_contract_is_invalid() {
+        let map = valid_map();
+        let contract = crate::point::contract_for(&map, CssPoint::new(60.0, 60.0));
+        let mut hit = stub_chr("chr:5", contract, Some(0x1234));
+        hit.map = Some(map);
+        hit.css_rect = CssRect {
+            left: 10.0,
+            top: 10.0,
+            width: 0.0,
+            height: 0.0,
+        };
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let reason = finish_chr("chr:5", &mut hit, space)
+            .unwrap()
+            .expect("zero-area refusal");
+        assert!(reason.starts_with("zero_area"), "{reason}");
+        assert!(!hit.contract.transform.valid);
+        assert!(hit.contract.physical.is_none());
+        assert!(
+            hit.contract
+                .transform
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("zero_area")
+        );
     }
 
     #[test]

@@ -810,7 +810,17 @@ fn final_live_remap(
     resolved: &mut ResolvedTarget,
 ) -> Result<Option<ActuateEnvelope>, HandsError> {
     let Some(contract) = resolved.contract.as_ref() else {
-        return Ok(None);
+        // No contract at all: fail closed rather than dispatching at the resolve-time point.
+        let bad = crate::point::PointContract {
+            source: PointSource::Chr,
+            css: None,
+            physical: None,
+            transform: crate::point::TransformReport::invalid(
+                "window_mismatch: target has no point contract to re-map",
+                None,
+            ),
+        };
+        return refuse_transform(session_id.to_string(), info.clone(), bad).map(Some);
     };
     if contract.source != PointSource::Chr {
         return Ok(None);
@@ -4606,11 +4616,43 @@ mod tests {
         fn drop(&mut self) {
             chrome::set_remap_geometry_hook(None);
             chrome::set_remap_identity_hook(None);
+            chrome::set_resolve_stub(None);
             crate::foreground::set_foreground_hwnd_hook(None);
             crate::foreground::set_chrome_target_hook(None);
             crate::input::set_send_inputs_hook(None);
+            HOVER_DWELL_HOOK.with(|c| *c.borrow_mut() = None);
             let _ = crate::foreground::take_offer_calls();
         }
+    }
+
+    fn chr_hit(anchor_x: i32, anchor_y: i32) -> (chrome::ChromeHit, crate::point::CssRect) {
+        let map = act_remap_map(anchor_x, anchor_y);
+        let css = crate::point::CssRect {
+            left: 50.0,
+            top: 40.0,
+            width: 100.0,
+            height: 20.0,
+        };
+        let contract = contract_for(&map, css.center());
+        let rect = map_rect(&contract, css).expect("chr rect");
+        (
+            chrome::ChromeHit {
+                id: "chr:5".into(),
+                name: "Continue".into(),
+                role: "button".into(),
+                rect,
+                css_rect: css,
+                css_point: css.center(),
+                contract,
+                hwnd: Some(0x1234),
+                map: Some(map),
+            },
+            css,
+        )
+    }
+
+    fn hover_ok() -> Result<(), HandsError> {
+        Ok(())
     }
 
     fn final_remap_fixture() -> (
@@ -4820,6 +4862,12 @@ mod tests {
         let env = final_live_remap("s-0129", &mut info, &mut resolved).expect("remap result");
         assert_refusal("missing css point", env, "stale_viewport");
 
+        // Missing contract fails closed rather than returning Ok(None).
+        let (mut resolved, mut info, _, _, _) = final_remap_fixture();
+        resolved.contract = None;
+        let env = final_live_remap("s-0129", &mut info, &mut resolved).expect("remap result");
+        assert_refusal("missing contract", env, "window_mismatch");
+
         // Missing HWND still uses the existing named refusal.
         let (mut resolved, mut info, _, _, _) = final_remap_fixture();
         resolved.hwnd = None;
@@ -4882,6 +4930,157 @@ mod tests {
         assert_eq!((resolved.x, resolved.y), (200, 130));
         assert_eq!(resolved.rect, old_rect);
         assert!(crate::foreground::take_offer_calls().is_empty());
+    }
+
+    #[test]
+    fn chr_click_dispatches_the_final_remap_point_and_rect() {
+        let _g = elevation_lock();
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        let (hit, css) = chr_hit(100, 80);
+        chrome::set_resolve_stub(Some(hit));
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(noop_sends));
+        crate::capture::set_capture_roi_hook(Some(fake_capture));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        let _ = crate::foreground::take_offer_calls();
+
+        let env = click(ActuateRequest {
+            session_id: Some("s-0129-chr-remap".into()),
+            element_id: Some("chr:5".into()),
+            ..ActuateRequest::default()
+        })
+        .expect("click");
+        assert!(env.ok, "{env:?}");
+        let expected = (400, 250);
+        assert_eq!((env.target.x, env.target.y), expected, "{env:?}");
+        let contract = env.point.as_ref().expect("point contract");
+        assert_eq!(
+            contract.physical,
+            Some(crate::point::PhysicalPoint {
+                x: expected.0,
+                y: expected.1
+            })
+        );
+        assert_eq!(
+            last_target(),
+            Some(map_rect(contract, css).expect("remapped rect"))
+        );
+        let offers = crate::foreground::take_offer_calls();
+        assert!(
+            offers
+                .iter()
+                .any(|(hwnd, point)| *hwnd == Some(0x1234) && *point == expected),
+            "offer must use the re-mapped point: {offers:?}"
+        );
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn chr_click_stale_remap_refuses_before_offer_and_input() {
+        let _g = elevation_lock();
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1100,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        let (hit, _) = chr_hit(100, 80);
+        chrome::set_resolve_stub(Some(hit));
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        let seed = distinctive_seed_rect();
+        remember_target(seed);
+        let _ = crate::foreground::take_offer_calls();
+
+        let env = click(ActuateRequest {
+            session_id: Some("s-0129-chr-stale".into()),
+            element_id: Some("chr:5".into()),
+            ..ActuateRequest::default()
+        })
+        .expect("click");
+        assert!(!env.ok, "{env:?}");
+        assert!(!env.verified, "{env:?}");
+        assert!(
+            env.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("stale_viewport"),
+            "{env:?}"
+        );
+        let point = env.point.as_ref().expect("point contract");
+        assert!(point.physical.is_none(), "{point:?}");
+        assert_eq!((env.target.x, env.target.y), (200, 130), "{env:?}");
+        assert_eq!(last_target(), Some(seed));
+        assert!(crate::foreground::take_offer_calls().is_empty());
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn chr_hover_dispatches_the_final_remap_point() {
+        let _g = elevation_lock();
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        let (hit, _) = chr_hit(100, 80);
+        chrome::set_resolve_stub(Some(hit));
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(noop_sends));
+        HOVER_DWELL_HOOK.with(|c| *c.borrow_mut() = Some(hover_ok));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        let _ = crate::foreground::take_offer_calls();
+
+        let env = hover(ActuateRequest {
+            session_id: Some("s-0129-chr-hover".into()),
+            element_id: Some("chr:5".into()),
+            ..ActuateRequest::default()
+        })
+        .expect("hover");
+        assert!(env.ok, "{env:?}");
+        assert_eq!((env.target.x, env.target.y), (400, 250), "{env:?}");
+        let offers = crate::foreground::take_offer_calls();
+        assert!(
+            offers
+                .iter()
+                .any(|(hwnd, point)| *hwnd == Some(0x1234) && *point == (400, 250)),
+            "{offers:?}"
+        );
+        lease::reset_for_test();
     }
 
     #[test]
@@ -5015,6 +5214,68 @@ mod tests {
                 "fail_with_point_unverified(session_id, info, err, foregrounded, false, false, point)"
             ),
             "scroll_wheel failure must retain the point and be unverified:\n{body}"
+        );
+    }
+
+    #[test]
+    fn post_dispatch_error_sites_use_unverified_helper() {
+        let src = include_str!("actuate.rs");
+        let click_start = src.find("fn click_inner").expect("click_inner");
+        let click_end = src.find("fn dispatch_blind_click").expect("blind");
+        let click = &src[click_start..click_end];
+        let first_click = click.find("input::left_click").expect("click left_click");
+        let after_click = &click[first_click..];
+        assert!(
+            after_click.contains("fail_with_point_unverified("),
+            "post-dispatch click failures must use the unverified helper:\n{after_click}"
+        );
+        assert!(
+            !after_click.contains("fail_with_point("),
+            "post-dispatch click failure still uses the verified helper:\n{after_click}"
+        );
+        assert!(
+            click.contains("env.verified = false;"),
+            "click freeze branch must clear verified"
+        );
+
+        let blind_start = src.find("fn dispatch_blind_click").expect("blind");
+        let blind_end = src.find("pub fn hover(").expect("hover");
+        let blind = &src[blind_start..blind_end];
+        let blind_click = blind.find("input::left_click").expect("blind left_click");
+        assert!(
+            blind[blind_click..].contains("fail_with_point_unverified("),
+            "post-dispatch blind click failure must be unverified"
+        );
+        assert!(
+            !blind[blind_click..].contains("fail_with_point("),
+            "post-dispatch blind click failure still uses the verified helper"
+        );
+        assert!(blind.contains("env.verified = false;"));
+
+        let hover_start = src.find("fn hover_inner").expect("hover_inner");
+        let hover_end = src.find("pub fn type_text").expect("type_text");
+        let hover = &src[hover_start..hover_end];
+        let hover_dwell = hover.find("hover_dwell()").expect("hover_dwell");
+        assert!(
+            hover[hover_dwell..].contains("fail_with_point_unverified("),
+            "post-dispatch hover failure must be unverified"
+        );
+        assert!(
+            !hover[hover_dwell..].contains("fail_with_point("),
+            "post-dispatch hover failure still uses the verified helper"
+        );
+
+        let scroll_start = src.find("fn scroll_inner").expect("scroll_inner");
+        let scroll_end = src.find("pub fn wait_settle").expect("wait_settle");
+        let scroll = &src[scroll_start..scroll_end];
+        let wheel = scroll.find("input::scroll_wheel").expect("scroll_wheel");
+        assert!(
+            scroll[wheel..].contains("fail_with_point_unverified("),
+            "scroll dispatch failure must be unverified"
+        );
+        assert!(
+            !scroll[wheel..].contains("fail_with_point("),
+            "scroll dispatch failure still uses the verified helper"
         );
     }
 

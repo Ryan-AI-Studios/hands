@@ -340,6 +340,21 @@ pub fn envelope_for_outcome(outcome: TargetOutcome, detail: &str) -> HittestEnve
                 error: None,
             }
         }
+        TargetOutcome::Identity { report, .. } => HittestEnvelope {
+            session_id: String::new(),
+            ok: false,
+            point: None,
+            target_rect: None,
+            detail: Some(detail.to_string()),
+            assessment: None,
+            at_point: None,
+            error: Some(
+                report
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| report.state_token().to_string()),
+            ),
+        },
     }
 }
 
@@ -366,10 +381,19 @@ pub fn run(req: HittestRequest) -> Result<HittestEnvelope, HandsError> {
         Target::ElementId(id) => {
             if !id.starts_with("chr:") {
                 return Err(HandsError::Target(
-                    "interactable_unavailable: hittest element mode supports chr: only".into(),
+                    "interactable_unavailable: hittest element mode supports chr: or sref1:c only"
+                        .into(),
                 ));
             }
             run_element(&target, samples)?
+        }
+        Target::Scoped(crate::identity::SnapshotRef::Chrome { .. }) => {
+            run_element(&target, samples)?
+        }
+        Target::Scoped(crate::identity::SnapshotRef::Uia { .. }) => {
+            return Err(HandsError::Target(
+                "interactable_unavailable: DOM hit-test is Chrome-only (sref1:u is UIA)".into(),
+            ));
         }
         Target::Grid { .. } | Target::Pixel { .. } => run_point(&target, samples)?,
     };
@@ -404,7 +428,7 @@ fn run_point(target: &Target, samples: u32) -> Result<HittestEnvelope, HandsErro
             }
             PhysicalPoint { x, y }
         }
-        Target::ElementId(_) => {
+        Target::ElementId(_) | Target::Scoped(_) => {
             return Err(HandsError::Target(
                 "interactable_unavailable: point mode takes --x/--y or --grid".into(),
             ));
@@ -660,7 +684,7 @@ pub fn guard_require_interactable(
         && resolved
             .id
             .as_deref()
-            .is_some_and(|id| id.starts_with("chr:"));
+            .is_some_and(|id| id.starts_with("chr:") || id.starts_with("sref1:c."));
     if !is_chr {
         return refusal(
             session_id,
@@ -728,7 +752,7 @@ pub fn refusal(
         "blocked" => blocked_error(&reason, assessment.as_ref()),
         "unknown" => format!("interactable_unknown: {reason}"),
         "missing" => "assessment_missing: extension did not return an assessment".into(),
-        "unavailable" => "interactable_unavailable: click on chr: only".into(),
+        "unavailable" => "interactable_unavailable: click on chr: or sref1:c only".into(),
         "mismatch" => "assessment_point_mismatch: selected_point != point.css".into(),
         other => format!("interactable_{other}: {reason}"),
     };
@@ -755,6 +779,7 @@ pub fn refusal(
         semantic: None,
         assessment,
         interactable_checked: Some(true),
+        identity: None,
     })
 }
 
@@ -801,6 +826,7 @@ mod tests {
     use super::*;
     use crate::actuate::{ActuateEnvelope, serialize_envelope};
     use crate::extract::ListingMeta;
+    use crate::identity::IdentityState;
     use crate::point::{TransformConfidence, TransformMethod};
     use crate::space::Rect;
 
@@ -1437,6 +1463,7 @@ mod tests {
                 contract: Box::new(contract),
                 hwnd: None,
                 assessment: Some(Box::new(js)),
+                identity: None,
             },
             "default",
         );
@@ -1484,6 +1511,7 @@ mod tests {
             hwnd: Some(0x1234),
             map: None,
             assessment: None,
+            identity: None,
         };
         chrome::set_resolve_stub(Some(hit));
         crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
@@ -1571,6 +1599,9 @@ mod tests {
                 observe_id: None,
                 elapsed_ms: None,
             }),
+            identity: None,
+            uia_runtime_id: None,
+            uia_expected_fp: None,
         };
         let envelope = envelope_for_outcome(TargetOutcome::Resolved(Box::new(resolved)), "default");
         assert_eq!(envelope.target_rect, Some(expected));
@@ -1983,6 +2014,9 @@ mod tests {
             contract: Some(contract),
             map: None,
             assessment: Some(assessment("cookie-banner.json")),
+            identity: None,
+            uia_runtime_id: None,
+            uia_expected_fp: None,
         }
     }
 
@@ -2041,7 +2075,7 @@ mod tests {
             .expect("refusal");
         assert_eq!(
             env.error.as_deref(),
-            Some("interactable_unavailable: click on chr: only")
+            Some("interactable_unavailable: click on chr: or sref1:c only")
         );
     }
 
@@ -2131,6 +2165,7 @@ mod tests {
             semantic: None,
             assessment: None,
             interactable_checked: None,
+            identity: None,
         }
     }
 
@@ -2323,6 +2358,89 @@ mod tests {
         assert!(body.contains("innerHeight"), "{body}");
     }
 
+    #[test]
+    fn element_mode_accepts_scoped_chrome_ref() {
+        let src = include_str!("hittest.rs");
+        let start = src.find("pub fn run(").expect("run");
+        let end = src.find("fn run_element(").expect("run_element");
+        let body = &src[start..end];
+        assert!(body.contains("Target::Scoped(crate::identity::SnapshotRef::Chrome"));
+        assert!(body.contains("run_element(&target, samples)"));
+    }
+
+    #[test]
+    fn envelope_for_identity_has_no_point_or_assessment() {
+        let r = crate::identity::SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 7,
+        };
+        let report = crate::identity::IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Stale,
+            "stale_element",
+        );
+        let envelope = envelope_for_outcome(
+            TargetOutcome::Identity {
+                target: Target::Scoped(r),
+                report,
+            },
+            "default",
+        );
+        assert!(!envelope.ok);
+        assert!(envelope.point.is_none());
+        assert!(envelope.target_rect.is_none());
+        assert!(envelope.assessment.is_none());
+        assert_eq!(envelope.error.as_deref(), Some("stale_element"));
+    }
+
+    #[test]
+    fn guard_accepts_scoped_ref_with_assessment() {
+        let r = crate::identity::SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 7,
+        };
+        let css = CssPoint::new(200.0, 70.0);
+        let report = valid_report(
+            1.0,
+            Rect {
+                x: 100,
+                y: 50,
+                w: 800,
+                h: 600,
+            },
+        );
+        let mut resolved = blocked_resolved();
+        resolved.target = Target::Scoped(r.clone());
+        resolved.id = Some(r.to_string());
+        resolved.css_point = Some(css);
+        resolved.css_rect = Some(CssRect {
+            left: 100.0,
+            top: 50.0,
+            width: 200.0,
+            height: 40.0,
+        });
+        resolved.contract = Some(contract(Some(css), report));
+        resolved.assessment = Some(assessment("unobstructed.json"));
+        resolved.identity = Some(crate::identity::IdentityReport::exact_chrome(&r));
+        let info = ActuateTarget {
+            kind: "element".into(),
+            id: Some(r.to_string()),
+            x: 350,
+            y: 167,
+        };
+        assert!(
+            guard_require_interactable("s-test", &info, &resolved)
+                .expect("guard")
+                .is_none()
+        );
+    }
+
     fn test_map(
         report: Option<TransformReport>,
         identity: Option<chrome::PageIdentity>,
@@ -2344,6 +2462,7 @@ mod tests {
             cards_walked: 0,
             transform: report,
             identity,
+            snapshot: None,
         }
     }
 }

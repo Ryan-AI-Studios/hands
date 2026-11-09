@@ -264,6 +264,7 @@ pub fn challenge_present(observe_path: Option<&str>) -> Result<bool, HandsError>
                 card_offset: 0,
                 scope: crate::observe::ObserveScope::Fg,
                 fg_preview: false,
+                chrome_store: Some(false),
             })?;
             Ok(env.challenge.present)
         }
@@ -1035,6 +1036,7 @@ fn write_sidecar(path: &Path, kind: &str, present: bool) {
                 },
                 grid: None,
                 unnamed: None,
+                sref: None,
             }],
         ),
     };
@@ -1081,6 +1083,7 @@ fn write_sidecar(path: &Path, kind: &str, present: bool) {
         client: None,
         timing: None,
         fg_preview_path: None,
+        snapshot: None,
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1256,6 +1259,7 @@ mod tests {
                 client: None,
                 timing: None,
                 fg_preview_path: None,
+                snapshot: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1330,6 +1334,7 @@ mod tests {
                 client: None,
                 timing: None,
                 fg_preview_path: None,
+                snapshot: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1398,6 +1403,7 @@ mod tests {
                 client: None,
                 timing: None,
                 fg_preview_path: None,
+                snapshot: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }
@@ -1458,6 +1464,7 @@ mod tests {
                 client: None,
                 timing: None,
                 fg_preview_path: None,
+                snapshot: None,
             };
             std::fs::write(&path, serde_json::to_string_pretty(&side).unwrap()).unwrap();
         }

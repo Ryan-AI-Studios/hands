@@ -510,11 +510,15 @@ fn resolve_roi(req: &GroundRequest, inputs: &GroundInputs) -> Result<Rect, Hands
                 "element_id requires observe sidecar space (virtual-screen rect)".into(),
             ));
         }
-        let el = inputs.elements.iter().find(|e| e.id == id).ok_or_else(|| {
-            HandsError::Gemma(format!(
-                "element_id '{id}' is not in the observe element list"
-            ))
-        })?;
+        let el = inputs
+            .elements
+            .iter()
+            .find(|e| e.id == id || e.sref.as_deref() == Some(id))
+            .ok_or_else(|| {
+                HandsError::Gemma(format!(
+                    "element_id '{id}' is not in the observe element list"
+                ))
+            })?;
         return Ok(el.rect);
     }
     match (req.x, req.y, req.w, req.h) {
@@ -1249,6 +1253,7 @@ mod tests {
             rect: Rect { x, y, w: 40, h: 16 },
             grid: None,
             unnamed: None,
+            sref: None,
         }
     }
 
@@ -1397,6 +1402,7 @@ mod tests {
             client: None,
             timing: None,
             fg_preview_path: None,
+            snapshot: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
         path
@@ -1796,6 +1802,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         };
         let (_, user) = build_pick_prompt("q", std::slice::from_ref(&long));
         assert!(!user.contains(&"x".repeat(81)));
@@ -1813,6 +1820,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         };
         let (sys, user) = build_pick_prompt("q", std::slice::from_ref(&spoof));
         assert!(sys.contains("UNTRUSTED"), "{sys}");
@@ -1837,6 +1845,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         };
         let (_, user) = build_pick_prompt("q", std::slice::from_ref(&keep));
         assert!(
@@ -2213,5 +2222,50 @@ mod tests {
             observe_path: None,
             elements_json: None,
         });
+    }
+
+    #[test]
+    fn ground_accepts_sref_from_sidecar() {
+        let mut el = sample_el("chr:0", 10, 20);
+        el.sref = Some("sref1:c.12.0.9f3a.a1b2c3d4.0".into());
+        let inputs = GroundInputs {
+            screenshot: None,
+            space: Some(Space::new(0, 0, 100, 100).unwrap()),
+            elements: vec![el],
+        };
+        let req = GroundRequest {
+            session_id: None,
+            query: "search".into(),
+            observe_path: None,
+            screenshot: None,
+            element_id: Some("sref1:c.12.0.9f3a.a1b2c3d4.0".into()),
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+        };
+        let rect = resolve_roi(&req, &inputs).expect("sidecar ref");
+        assert_eq!(
+            rect,
+            Rect {
+                x: 10,
+                y: 20,
+                w: 40,
+                h: 16
+            }
+        );
+    }
+
+    #[test]
+    fn ground_ref_has_no_identity_or_live_claim() {
+        let src = include_str!("pick.rs");
+        let start = src.find("fn resolve_roi(").expect("resolve_roi");
+        let end = src
+            .find("fn ground_crop_complete(")
+            .expect("ground_crop_complete");
+        let body = &src[start..end];
+        assert!(body.contains("e.sref.as_deref() == Some(id)"));
+        assert!(!body.contains("identity"));
+        assert!(!body.contains("resolve_with"));
     }
 }

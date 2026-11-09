@@ -16,6 +16,7 @@ const LOCAL_MATCHES_CAP = 24;
 const EMPTY_STATE_CAP = 120;
 const ZIP_CAP = 10;
 const RADIUS_CAP = 16;
+const SNAPSHOT_NODE_CAP = 4000;
 const PRICE_RE = /\$|€|£|\d[\d,]*\.\d{2}/;
 
 const DEFAULT_SELECTOR = [
@@ -44,6 +45,33 @@ const DOM_SELECTOR =
   DEFAULT_SELECTOR +
   ",[role],summary,label,[tabindex]:not([tabindex=\"-1\"])";
 
+// ---------------------------------------------------------------- snapshot identity
+// One stored snapshot record per content-script document. Only an agent-facing observe
+// (`store !== false`) replaces it; internal callers ask for a read without retiring refs.
+
+function randomU32() {
+  try {
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    return buf[0] >>> 0;
+  } catch (_err) {
+    return (Date.now() >>> 0) ^ (Math.floor(Math.random() * 0xffffffff) >>> 0);
+  }
+}
+
+function hex32(n) {
+  return (n >>> 0).toString(16).padStart(8, "0");
+}
+
+const DOC_NONCE = (randomU32() & 0xffff).toString(16).padStart(4, "0");
+let snapCounter = randomU32();
+let lastSnapshot = null;
+
+function nextSnap() {
+  snapCounter = (snapCounter + 1) >>> 0;
+  return hex32(snapCounter);
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const op = msg && msg.op;
   if (op !== "snapshot" && op !== "resolve" && op !== "assess") {
@@ -51,9 +79,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   try {
     if (op === "snapshot") {
-      sendResponse(buildSnapshot(msg.detail));
+      sendResponse(buildSnapshot(msg.detail, msg.store));
     } else if (op === "assess") {
       sendResponse(buildAssess(msg));
+    } else if (
+      msg.v === 1 &&
+      msg.doc &&
+      msg.snap &&
+      Number.isInteger(msg.idx)
+    ) {
+      sendResponse(resolveScoped(msg));
     } else {
       sendResponse(buildResolve(msg.id, msg.detail, msg.assess === true, msg.samples));
     }
@@ -63,18 +98,39 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return false;
 });
 
-function buildSnapshot(detail) {
+function buildSnapshot(detail, store) {
   const metrics = windowMetrics();
-  const nodes = walk(detail);
+  const nodes = walk(detail).slice(0, SNAPSHOT_NODE_CAP);
   const elements = [];
+  const keys = [];
   for (let i = 0; i < nodes.length; i += 1) {
     const payload = nodePayload(nodes[i], i);
     if (payload) {
       elements.push(payload);
+      keys.push(snapshotKey(nodes[i], keyPayload(nodes[i], i)));
+    } else {
+      keys.push(null);
     }
   }
+  const stored = store !== false;
+  let doc = null;
+  let snap = null;
+  let retained = nodes.length;
+  if (stored) {
+    doc = DOC_NONCE;
+    snap = nextSnap();
+    lastSnapshot = {
+      doc: doc,
+      snap: snap,
+      nodes: nodes,
+      keys: keys,
+      retained: nodes.length,
+    };
+  } else {
+    retained = 0;
+  }
   const collected = collectCards();
-  const snap = {
+  const out = {
     url: location.href || "",
     title: document.title || "",
     main_text: mainText(),
@@ -82,17 +138,23 @@ function buildSnapshot(detail) {
     cards: collected.cards,
     metrics: metrics,
     assess_v: 1,
+    stored: stored,
   };
+  if (stored) {
+    out.doc = doc;
+    out.snap = snap;
+    out.retained = retained;
+  }
   if (collected.cards_walked > 0) {
-    snap.cards_walked = collected.cards_walked;
+    out.cards_walked = collected.cards_walked;
   }
   const listing = collectListingMeta();
-  if (listing.result_count) snap.result_count = listing.result_count;
-  if (listing.local_matches) snap.local_matches = listing.local_matches;
-  if (listing.empty_state) snap.empty_state = listing.empty_state;
-  if (listing.zip) snap.zip = listing.zip;
-  if (listing.radius) snap.radius = listing.radius;
-  return snap;
+  if (listing.result_count) out.result_count = listing.result_count;
+  if (listing.local_matches) out.local_matches = listing.local_matches;
+  if (listing.empty_state) out.empty_state = listing.empty_state;
+  if (listing.zip) out.zip = listing.zip;
+  if (listing.radius) out.radius = listing.radius;
+  return out;
 }
 
 function buildResolve(id, detail, assess, samples) {
@@ -121,6 +183,65 @@ function buildResolve(id, detail, assess, samples) {
   };
   if (assess === true) {
     reply.assessment = assessAt(nodes[index], payload.rectCss, samples);
+  }
+  return reply;
+}
+
+function resolveScoped(msg) {
+  if (Number(msg.frame) !== 0) {
+    return { error: "frame_unsupported" };
+  }
+  const record = lastSnapshot;
+  if (!record) {
+    return { error: "stale_document", doc: DOC_NONCE, snap: null };
+  }
+  if (msg.doc !== record.doc) {
+    return { error: "stale_document", doc: record.doc, snap: record.snap };
+  }
+  if (msg.snap !== record.snap) {
+    return { error: "stale_snapshot", doc: record.doc, snap: record.snap };
+  }
+  const idx = Number(msg.idx);
+  if (
+    !Number.isInteger(idx) ||
+    idx < 0 ||
+    idx >= record.nodes.length ||
+    idx >= record.retained
+  ) {
+    return { error: "stale_element", doc: record.doc, snap: record.snap };
+  }
+  const node = record.nodes[idx];
+  if (!node || !node.isConnected) {
+    return { error: "stale_element", doc: record.doc, snap: record.snap };
+  }
+  const payload = keyPayload(node, idx);
+  if (snapshotKey(node, payload) !== record.keys[idx]) {
+    return { error: "stale_identity", doc: record.doc, snap: record.snap };
+  }
+  const rect = cssRect(node);
+  if (!rect) {
+    return { error: "not_visible", doc: record.doc, snap: record.snap };
+  }
+  payload.rectCss = rect;
+  const reply = {
+    id: payload.id,
+    role: payload.role,
+    text: payload.text,
+    rectCss: rect,
+    url: location.href || "",
+    title: document.title || "",
+    metrics: windowMetrics(),
+    visibilityState: document.visibilityState,
+    doc: record.doc,
+    snap: record.snap,
+    idx: idx,
+    frame: 0,
+  };
+  if (payload.href) {
+    reply.href = payload.href;
+  }
+  if (msg.assess === true) {
+    reply.assessment = assessAt(node, rect, msg.samples);
   }
   return reply;
 }
@@ -253,23 +374,85 @@ function findPopupController(id) {
   }
 }
 
-function nodePayload(el, index) {
-  const rect = cssRect(el);
-  if (!rect) {
-    return null;
-  }
+function keyPayload(el, index) {
   const password = isPassword(el);
   const href = hrefOf(el);
   const payload = {
     id: "chr:" + String(index),
     role: mapRole(el),
     text: password ? null : nodeText(el),
-    rectCss: rect,
   };
   if (href) {
     payload.href = href;
   }
   return payload;
+}
+
+function nodePayload(el, index) {
+  const rect = cssRect(el);
+  if (!rect) {
+    return null;
+  }
+  const payload = keyPayload(el, index);
+  payload.rectCss = rect;
+  return payload;
+}
+
+function isEditableSurface(el) {
+  const tag = String(el.tagName || "");
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+    return true;
+  }
+  if (el.isContentEditable) {
+    return true;
+  }
+  const role = (el.getAttribute("role") || "").toLowerCase();
+  return role === "textbox" || role === "combobox";
+}
+
+function nonChurningName(el, payload) {
+  if (isPassword(el)) {
+    return "";
+  }
+  const aria = attr(el, "aria-label");
+  if (aria) {
+    return cap(aria, TEXT_CAP);
+  }
+  const placeholder = attr(el, "placeholder");
+  if (placeholder) {
+    return cap(placeholder, TEXT_CAP);
+  }
+  const alt = attr(el, "alt");
+  if (alt) {
+    return cap(alt, TEXT_CAP);
+  }
+  const name = attr(el, "name");
+  if (name) {
+    return cap(name, TEXT_CAP);
+  }
+  if (isEditableSurface(el)) {
+    return "";
+  }
+  return payload && payload.text ? payload.text : "";
+}
+
+function fnv1a32(str) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i += 1) {
+    hash ^= str.charCodeAt(i) & 0xff;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+function snapshotKey(el, payload) {
+  const tag = String(el.tagName || "").toLowerCase();
+  const role = payload && payload.role ? payload.role : "";
+  const name = nonChurningName(el, payload);
+  const href = payload && payload.href ? payload.href : "";
+  const type =
+    el.tagName === "INPUT" ? String(el.type || "").toLowerCase() : "";
+  return fnv1a32([tag, role, name, href, type].join("\u0001"));
 }
 
 function cssRect(el) {

@@ -103,6 +103,7 @@ fn uia_action_json_envelope_has_flat_semantic_fields() {
         verified: false,
         assessment: None,
         interactable_checked: None,
+        identity: None,
         semantic: Some(hands::uia_actions::SemanticInfo {
             action: "toggle".into(),
             delivery: hands::uia_actions::Delivery::Delivered,

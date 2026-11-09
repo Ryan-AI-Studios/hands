@@ -24,7 +24,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::error::HandsError;
-use crate::extract::{ControlKind, Detail, MAIN_TEXT_MAX_CHARS, RawNode};
+use crate::extract::{ControlKind, Detail, MAIN_TEXT_MAX_CHARS, RawNode, name_fields};
+use crate::identity::{IdentityState, element_fingerprint, runtime_id_hash};
 use crate::space::Rect;
 
 pub struct UiaSnapshot {
@@ -39,6 +40,50 @@ pub struct ResolvedElement {
     pub name: String,
     pub role: String,
     pub hwnd: Option<isize>,
+    /// Live RuntimeId (kept for the semantic worker dispatch).
+    pub runtime_id: Vec<i32>,
+    /// The element's own `CurrentName`, never an ancestor-picked display name.
+    pub own_name: String,
+    /// The element's own localized control type (fallback: control-kind type name).
+    pub own_role: String,
+    pub is_password: bool,
+}
+
+impl ResolvedElement {
+    pub fn own_fingerprint(&self) -> u32 {
+        let (text, unnamed) = name_fields(&self.own_name, self.is_password);
+        element_fingerprint(&self.own_role, text.as_deref(), unnamed)
+    }
+}
+
+/// Scoped UIA failure carrying a closed state/reason pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedFailure {
+    pub state: IdentityState,
+    pub reason: &'static str,
+}
+
+impl ScopedFailure {
+    fn stale(reason: &'static str) -> Self {
+        Self {
+            state: IdentityState::Stale,
+            reason,
+        }
+    }
+
+    fn ambiguous(reason: &'static str) -> Self {
+        Self {
+            state: IdentityState::Ambiguous,
+            reason,
+        }
+    }
+
+    fn unknown(reason: &'static str) -> Self {
+        Self {
+            state: IdentityState::Unknown,
+            reason,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -179,6 +224,15 @@ pub(crate) fn resolve_on(
     };
     let (name, role) = name_and_role(&walker, &element);
     let hwnd = native_hwnd(&walker, &element);
+    let runtime_id = runtime_id(&element).unwrap_or_default();
+    let own_name = unsafe { element.CurrentName() }
+        .ok()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let own_role = fingerprint_role(&element);
+    let is_password = unsafe { element.CurrentIsPassword() }
+        .map(|v| v.as_bool())
+        .unwrap_or(false);
     Ok(ResolvedComElement {
         element,
         resolved: ResolvedElement {
@@ -186,6 +240,10 @@ pub(crate) fn resolve_on(
             name,
             role,
             hwnd,
+            runtime_id,
+            own_name,
+            own_role,
+            is_password,
         },
     })
 }
@@ -365,6 +423,26 @@ fn role_of(element: &IUIAutomationElement) -> String {
     }
 }
 
+/// Own-role fingerprint input, mirroring `map_element`'s observe fallback. Do **not** replace
+/// `role_of`: its `"element"` fallback feeds the 0122 set-value role gate.
+pub(crate) fn fingerprint_role(element: &IUIAutomationElement) -> String {
+    unsafe {
+        let localized = element
+            .CurrentLocalizedControlType()
+            .ok()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if !localized.is_empty() {
+            return localized;
+        }
+        element
+            .CurrentControlType()
+            .ok()
+            .map(|id| ControlKind::from_uia_id(id.0).type_name().to_string())
+            .unwrap_or_else(|| "Other".into())
+    }
+}
+
 /// First non-empty name wins, paired with **that** node's role (not the leaf).
 /// A Submit button's inner `text` child must stay gated as a button.
 fn pick_named(chain: &[(&str, &str)]) -> (String, String) {
@@ -453,6 +531,155 @@ fn native_hwnd(walker: &IUIAutomationTreeWalker, element: &IUIAutomationElement)
         }
     }
     None
+}
+
+pub(crate) const SCOPED_NODE_CAP: usize = 4096;
+const SCOPED_MATCH_CAP: usize = 16;
+
+#[cfg(test)]
+type ScopedUiaHook = fn(isize, &str, &str) -> Result<ResolvedElement, ScopedFailure>;
+
+#[cfg(test)]
+thread_local! {
+    static SCOPED_UIA_HOOK: std::cell::Cell<Option<ScopedUiaHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_scoped_uia_hook(hook: Option<ScopedUiaHook>) {
+    SCOPED_UIA_HOOK.with(|c| c.set(hook));
+}
+
+/// Scoped UIA resolve rooted at the observation walk HWND (never `GetRootElement`). The
+/// caller gets a closed state/reason on every failure; nothing is dispatched.
+pub fn resolve_scoped(
+    hwnd: isize,
+    ridh: &str,
+    fp: &str,
+    deadline: Duration,
+) -> Result<ResolvedElement, ScopedFailure> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = SCOPED_UIA_HOOK.with(|c| c.get()) {
+            return hook(hwnd, ridh, fp);
+        }
+    }
+    let ridh = ridh.to_string();
+    let fp = fp.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("hands-uia-scoped".into())
+        .spawn(move || {
+            let _ = tx.send(sta_resolve_scoped(hwnd, &ridh, &fp));
+        })
+        .map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(_) => Err(ScopedFailure::unknown("provider_timeout")),
+    }
+}
+
+fn sta_resolve_scoped(hwnd: isize, ridh: &str, fp: &str) -> Result<ResolvedElement, ScopedFailure> {
+    let _sta = StaGuard::enter().map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    let automation = create_automation().map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    let root = unsafe { automation.ElementFromHandle(crate::foreground::raw_hwnd(hwnd)) }
+        .map_err(|_| ScopedFailure::unknown("window_unreadable"))?;
+    let walker = unsafe { automation.ControlViewWalker() }
+        .map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    let mut stack = vec![root];
+    let mut visited = 0usize;
+    let mut matches = Vec::new();
+    let mut cap_hit = false;
+    while let Some(element) = stack.pop() {
+        visited += 1;
+        if visited > SCOPED_NODE_CAP {
+            cap_hit = true;
+            break;
+        }
+        if let Some(id) = runtime_id(&element)
+            && runtime_id_hash(&id) == ridh
+            && let Some(candidate) = scoped_candidate(&walker, &element)
+        {
+            matches.push(candidate);
+            if matches.len() >= SCOPED_MATCH_CAP {
+                break;
+            }
+        }
+        push_children(&walker, &element, &mut stack);
+    }
+    scoped_matches_outcome(matches, cap_hit, hwnd, fp)
+}
+
+fn scoped_candidate(
+    walker: &IUIAutomationTreeWalker,
+    element: &IUIAutomationElement,
+) -> Option<ResolvedElement> {
+    let rect = unsafe { element.CurrentBoundingRectangle() }
+        .ok()
+        .map(rect_from_uia)?;
+    let runtime_id = runtime_id(element)?;
+    let own_name = unsafe { element.CurrentName() }
+        .ok()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let own_role = fingerprint_role(element);
+    let is_password = unsafe { element.CurrentIsPassword() }
+        .ok()
+        .map(|v| v.as_bool())
+        .unwrap_or(false);
+    let (name, role) = name_and_role(walker, element);
+    let hwnd = native_hwnd(walker, element);
+    Some(ResolvedElement {
+        rect,
+        name,
+        role,
+        hwnd,
+        runtime_id,
+        own_name,
+        own_role,
+        is_password,
+    })
+}
+
+/// Pure candidate arbitration used by the live walk and tests. A cap hit with no resolved
+/// hash is `unknown`, never a partial first match.
+pub(crate) fn scoped_matches_outcome(
+    matches: Vec<ResolvedElement>,
+    cap_hit: bool,
+    hwnd: isize,
+    fp: &str,
+) -> Result<ResolvedElement, ScopedFailure> {
+    if matches.is_empty() {
+        return Err(if cap_hit {
+            ScopedFailure::unknown("provider_timeout")
+        } else {
+            ScopedFailure::stale("stale_element")
+        });
+    }
+    let mut within = Vec::new();
+    for candidate in matches {
+        if candidate
+            .hwnd
+            .is_some_and(|native| crate::foreground::related_to_root(native, hwnd))
+        {
+            within.push(candidate);
+        }
+    }
+    if within.is_empty() {
+        return Err(ScopedFailure::stale("window_mismatch"));
+    }
+    if within.len() > 1 {
+        return Err(ScopedFailure::ambiguous("duplicate_runtime_id"));
+    }
+    let found = within
+        .into_iter()
+        .next()
+        .ok_or_else(|| ScopedFailure::stale("stale_element"))?;
+    let actual = format!("{:08x}", found.own_fingerprint());
+    if actual != fp {
+        return Err(ScopedFailure::stale("identity_mismatch"));
+    }
+    Ok(found)
 }
 
 fn sta_collect(detail: Detail, cap: usize, hwnd: Option<isize>) -> Result<UiaSnapshot, HandsError> {
@@ -908,5 +1135,103 @@ mod tests {
         let worker = &src[src.find("fn sta_document_rect(").unwrap()
             ..src.find("pub fn resolve_runtime_id(").unwrap()];
         assert!(worker.contains("StaGuard::enter"));
+    }
+
+    fn found(own_name: &str, own_role: &str) -> ResolvedElement {
+        ResolvedElement {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            name: "ancestor display".into(),
+            role: "ancestor role".into(),
+            hwnd: Some(0x1234),
+            runtime_id: vec![1, 2],
+            own_name: own_name.into(),
+            own_role: own_role.into(),
+            is_password: false,
+        }
+    }
+
+    #[test]
+    fn fingerprint_uses_own_name_and_role_not_ancestor() {
+        let mut a = found("Send", "Button");
+        let mut b = found("Send", "Button");
+        b.name = "different ancestor".into();
+        b.role = "different ancestor role".into();
+        assert_eq!(a.own_fingerprint(), b.own_fingerprint());
+        b.own_name = "Cancel".into();
+        assert_ne!(a.own_fingerprint(), b.own_fingerprint());
+        a.own_role = "Hyperlink".into();
+        assert_ne!(a.own_fingerprint(), b.own_fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_role_matches_map_element_fallback() {
+        assert_eq!(ControlKind::from_uia_id(50_000).type_name(), "Button");
+        assert_eq!(ControlKind::from_uia_id(50_004).type_name(), "Edit");
+        let src = include_str!("uia.rs");
+        let start = src
+            .find("pub(crate) fn fingerprint_role")
+            .expect("fingerprint_role");
+        let end = src
+            .find("/// First non-empty name wins")
+            .expect("name_and_role doc");
+        let slice = &src[start..end];
+        assert!(slice.contains("CurrentLocalizedControlType"));
+        assert!(slice.contains("ControlKind::from_uia_id"));
+    }
+
+    #[test]
+    fn role_of_fallback_is_unchanged() {
+        let src = include_str!("uia.rs");
+        let start = src.find("fn role_of(").expect("role_of");
+        let end = src
+            .find("pub(crate) fn fingerprint_role")
+            .expect("fingerprint_role");
+        let slice = &src[start..end];
+        assert!(slice.contains("unwrap_or_else(|| \"element\".into())"));
+    }
+
+    #[test]
+    fn scoped_walk_roots_at_element_from_handle() {
+        let src = include_str!("uia.rs");
+        let start = src
+            .find("fn sta_resolve_scoped(")
+            .expect("sta_resolve_scoped");
+        let end = src.find("fn scoped_candidate(").expect("scoped_candidate");
+        let body = &src[start..end];
+        assert!(body.contains("ElementFromHandle"));
+        assert!(!body.contains("GetRootElement"));
+        assert!(body.contains("SCOPED_NODE_CAP"));
+    }
+
+    #[test]
+    fn scoped_walk_cap_is_unknown_not_first_match() {
+        let err =
+            scoped_matches_outcome(Vec::new(), true, 0x1234, "00000000").expect_err("cap hit");
+        assert_eq!(err.state, IdentityState::Unknown);
+        assert_eq!(err.reason, "provider_timeout");
+    }
+
+    #[test]
+    fn scoped_matches_duplicate_is_ambiguous() {
+        let err = scoped_matches_outcome(
+            vec![found("Send", "Button"), found("Send", "Button")],
+            false,
+            0x1234,
+            "00000000",
+        )
+        .expect_err("duplicate");
+        assert_eq!(err.state, IdentityState::Ambiguous);
+        assert_eq!(err.reason, "duplicate_runtime_id");
+    }
+
+    #[test]
+    #[ignore = "live desktop; H5 owner evidence"]
+    fn live_scoped_uia_ref_notepad() {
+        // Owner HITL: resolve a scoped ref against a real Notepad window.
     }
 }

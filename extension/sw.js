@@ -37,44 +37,110 @@ function scheduleReconnect() {
   }, 1000);
 }
 
-function sendToContent(port, tabId, msg) {
-  chrome.tabs.sendMessage(tabId, msg, (reply) => {
-    const last = chrome.runtime.lastError;
-    try {
-      if (last) {
-        port.postMessage({ error: "no-content" });
-      } else {
-        port.postMessage(reply || { error: "empty" });
+function post(port, message) {
+  try {
+    port.postMessage(message);
+  } catch (_err) {}
+}
+
+function withTabEvidence(port, tab, fallback, msg) {
+  chrome.windows.get(tab.windowId, (win) => {
+    if (chrome.runtime.lastError || !win) {
+      post(port, { error: "window_unreadable", tab: tab.id });
+      return;
+    }
+    const evidence = {
+      tab: tab.id,
+      window: tab.windowId,
+      active: !!tab.active,
+      focused: !!win.focused,
+      fallback: fallback,
+    };
+    chrome.tabs.sendMessage(tab.id, msg, (reply) => {
+      if (chrome.runtime.lastError) {
+        post(port, Object.assign({ error: "no_content" }, evidence));
+        return;
       }
-    } catch (_err) {}
+      if (!reply) {
+        post(port, Object.assign({ error: "empty" }, evidence));
+        return;
+      }
+      const out = {};
+      for (const key in reply) {
+        if (Object.prototype.hasOwnProperty.call(reply, key)) {
+          out[key] = reply[key];
+        }
+      }
+      Object.assign(out, evidence);
+      post(port, out);
+    });
   });
 }
 
 function forward(port, msg) {
   const op = msg && msg.op;
-  if (op !== "snapshot" && op !== "resolve" && op !== "assess") {
-    try {
-      port.postMessage({ error: "unsupported-op" });
-    } catch (_err) {}
+  if (
+    op !== "snapshot" &&
+    op !== "resolve" &&
+    op !== "assess" &&
+    op !== "binding"
+  ) {
+    post(port, { error: "unsupported-op" });
     return;
   }
+  if (msg.tab != null) {
+    // Named/scoped request: route by tab id and never fall back to the active tab.
+    const want = Number(msg.tab);
+    if (!Number.isInteger(want) || want <= 0) {
+      post(port, { error: "protocol_error" });
+      return;
+    }
+    chrome.tabs.get(want, (tab) => {
+      if (chrome.runtime.lastError || !tab || tab.id == null) {
+        post(port, { error: "tab_unavailable", tab: want });
+        return;
+      }
+      if (tab.id !== want) {
+        post(port, { error: "protocol_error", tab: want });
+        return;
+      }
+      if (op === "binding") {
+        chrome.windows.get(tab.windowId, (win) => {
+          if (chrome.runtime.lastError || !win) {
+            post(port, { error: "window_unreadable", tab: want });
+            return;
+          }
+          post(port, {
+            tab: want,
+            window: tab.windowId,
+            active: !!tab.active,
+            focused: !!win.focused,
+            fallback: false,
+          });
+        });
+        return;
+      }
+      withTabEvidence(port, tab, false, msg);
+    });
+    return;
+  }
+  // Unscoped observe keeps the existing last-focused → normal-window fallback, but labels
+  // the answering tab and marks the fallback so refs are withheld.
   chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
     void chrome.runtime.lastError;
     const tab = tabs && tabs[0];
     if (tab && tab.id != null) {
-      sendToContent(port, tab.id, msg);
+      withTabEvidence(port, tab, false, msg);
       return;
     }
     chrome.tabs.query({ active: true, windowType: "normal" }, (rest) => {
       void chrome.runtime.lastError;
       const fallback = rest && rest[0];
       if (!fallback || fallback.id == null) {
-        try {
-          port.postMessage({ error: "no-tab" });
-        } catch (_err) {}
+        post(port, { error: "no-tab" });
         return;
       }
-      sendToContent(port, fallback.id, msg);
+      withTabEvidence(port, fallback, true, msg);
     });
   });
 }

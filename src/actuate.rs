@@ -4099,6 +4099,87 @@ mod tests {
     }
 
     #[test]
+    fn flag_off_real_blind_click_has_no_hittest_fields() {
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::uia::set_hit_test_hook(Some(panic_hit_test));
+        crate::input::set_send_inputs_hook(Some(count_sends));
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            grant_blind("s-0128-flagoff");
+            let env = click(blind_pixel_req("s-0128-flagoff", x, y)).expect("click");
+            assert!(env.ok, "{env:?}");
+            assert!(env.assessment.is_none(), "{env:?}");
+            assert!(env.interactable_checked.is_none(), "{env:?}");
+            let json = serialize_envelope(&env).expect("json");
+            assert!(!json.contains("\"assessment\""), "{json}");
+            assert!(!json.contains("interactable_checked"), "{json}");
+        });
+    }
+
+    #[test]
+    fn require_interactable_blocked_refuses_runtime_seam_before_offer() {
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let _ = crate::foreground::take_offer_calls();
+        let map = act_remap_map(100, 80);
+        let css_rect = crate::point::CssRect {
+            left: 100.0,
+            top: 50.0,
+            width: 200.0,
+            height: 40.0,
+        };
+        let css = css_rect.center();
+        let contract = crate::point::contract_for(&map, css);
+        let rect = crate::point::map_rect(&contract, css_rect).expect("rect");
+        let mut assessment: crate::hittest::Assessment = serde_json::from_str(include_str!(
+            "../tests/fixtures/hittest/replies/sticky-header.json"
+        ))
+        .expect("assessment");
+        assessment.selected_point = css;
+        assessment.target_rect_css = css_rect;
+        assessment.interactable = Some(false);
+        assessment.reason = Some("blocked".into());
+        chrome::set_resolve_stub(Some(chrome::ChromeHit {
+            id: "chr:0".into(),
+            name: "Sign in".into(),
+            role: "Button".into(),
+            rect,
+            css_rect,
+            css_point: css,
+            contract,
+            hwnd: Some(0x10),
+            map: Some(map),
+            assessment: Some(assessment),
+        }));
+        let env = click(ActuateRequest {
+            session_id: Some("s-0128-seam".into()),
+            element_id: Some("chr:0".into()),
+            require_interactable: true,
+            ..ActuateRequest::default()
+        })
+        .expect("click");
+        chrome::set_resolve_stub(None);
+        assert!(!env.ok, "{env:?}");
+        assert_eq!(env.error.as_deref(), Some("interactable_blocked: blocked"));
+        assert_eq!(env.interactable_checked, Some(true));
+        assert!(
+            crate::foreground::take_offer_calls().is_empty(),
+            "blocked refusal must not offer/focus"
+        );
+    }
+
+    #[test]
     fn blind_click_element_id_refuses_before_resolve() {
         let _g = elevation_lock();
         crate::elevation::set_caller_rid_hook(Some(|| 0x2000));

@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>hittest open shadow pointer-events none</title>
+</head><body>
+<button id="target" data-fixture="open-shadow-pointer-events-none" style="position:absolute;left:100px;top:50px;width:200px;height:40px">Sign in</button>
+<div id="host"></div>
+<script>
+const host = document.getElementById("host");
+const root = host.attachShadow({ mode: "open" });
+const overlay = document.createElement("div");
+overlay.setAttribute("aria-label", "Visual shadow overlay");
+overlay.style.cssText = "position:fixed;left:0;top:0;width:100vw;height:100vh;background:rgba(0,0,0,.3);pointer-events:none;z-index:4";
+root.appendChild(overlay);
+</script>
+</body></html>

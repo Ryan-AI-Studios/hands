@@ -1,0 +1,8 @@
+{
+  "shadow_path": ["div"],
+  "interactable": null,
+  "reason": "shadow_pierce_unavailable",
+  "notes": [],
+  "confidence": "none",
+  "elapsed_ms": 1.1
+}

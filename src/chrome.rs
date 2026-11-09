@@ -644,6 +644,10 @@ pub fn try_resolve_assessed(
         Some(path) => load_fixture_raw(&path)?,
         None => pipe_resolve_raw(id, assess, samples)?,
     };
+    let mut raw = raw;
+    if !assess {
+        raw.assessment = None;
+    }
     hit_from_raw(raw, id, hwnd, fixture)
 }
 
@@ -937,6 +941,22 @@ pub fn try_snapshot_identity(detail: Detail, hwnd: Option<isize>) -> SnapshotOut
     }
 }
 
+fn assessment_from_reply(reply: &serde_json::Value, raw: &RawNode) -> Option<Assessment> {
+    reply
+        .get("assessment")
+        .cloned()
+        .filter(|v| !v.is_null())
+        .map(|value| {
+            serde_json::from_value(value).unwrap_or_else(|_| {
+                Assessment::unknown(
+                    raw.rect_css.center(),
+                    raw.rect_css,
+                    "assessment_unavailable",
+                )
+            })
+        })
+}
+
 fn pipe_resolve_raw(
     id: &str,
     assess: bool,
@@ -964,13 +984,7 @@ fn pipe_resolve_raw(
                 HandsError::Chrome(format!("Chrome resolve {id} missing metrics"))
             })?)
             .map_err(|err| HandsError::Chrome(format!("Chrome resolve metrics: {err}")))?;
-        let assessment = reply
-            .get("assessment")
-            .cloned()
-            .filter(|v| !v.is_null())
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|err| HandsError::Chrome(format!("Chrome resolve assessment: {err}")))?;
+        let assessment = assessment_from_reply(&reply, &raw);
         return Ok(RawSnapshot {
             url: reply
                 .get("url")
@@ -1059,6 +1073,24 @@ pub struct AssessReply {
     pub identity: PageIdentity,
 }
 
+/// Distinguishes a real host/transport failure from a malformed/unsupported reply.
+#[derive(Debug, Clone)]
+pub enum AssessError {
+    HostDown(String),
+    Timeout(String),
+    Unavailable(String),
+}
+
+impl AssessError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::HostDown(message) | Self::Timeout(message) | Self::Unavailable(message) => {
+                message
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 static ASSESS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -1074,7 +1106,7 @@ pub(crate) fn reset_assess_calls() {
 
 /// `{op:"assess", css, mode:"point", samples}`. Only called after the snapshot advertises
 /// `assess_v >= 1`; an old service worker would silently drop the op and stall the host.
-pub fn assess_at(css: CssPoint, samples: u32) -> Result<AssessReply, HandsError> {
+pub fn assess_at(css: CssPoint, samples: u32) -> Result<AssessReply, AssessError> {
     #[cfg(test)]
     ASSESS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let req = serde_json::json!({
@@ -1084,33 +1116,41 @@ pub fn assess_at(css: CssPoint, samples: u32) -> Result<AssessReply, HandsError>
         "samples": samples,
     });
     let reply = pipe_request(&req).map_err(|err| {
-        HandsError::Chrome(format!(
-            "Chrome host is not connected (pipe); assess failed: {err}"
-        ))
+        let text = err.to_string();
+        if text.contains("client timed out after") {
+            AssessError::Timeout(text)
+        } else if text.contains("not connected") || text.contains("connect failed") {
+            AssessError::HostDown(text)
+        } else {
+            AssessError::Unavailable(text)
+        }
     })?;
     if let Some(err) = reply.get("error") {
-        return Err(HandsError::Chrome(format!("Chrome assess error: {err}")));
+        return Err(AssessError::Unavailable(format!(
+            "Chrome assess error: {err}"
+        )));
     }
     let at_point: AtPoint = serde_json::from_value(
         reply
             .get("at_point")
             .cloned()
-            .ok_or_else(|| HandsError::Chrome("Chrome assess reply has no at_point".into()))?,
+            .ok_or_else(|| HandsError::Chrome("Chrome assess reply has no at_point".into()))
+            .map_err(|err| AssessError::Unavailable(err.to_string()))?,
     )
-    .map_err(|err| HandsError::Chrome(format!("Chrome assess at_point: {err}")))?;
+    .map_err(|err| AssessError::Unavailable(format!("Chrome assess at_point: {err}")))?;
     let css = reply
         .get("css")
         .cloned()
         .filter(|v| !v.is_null())
         .map(serde_json::from_value)
         .transpose()
-        .map_err(|err| HandsError::Chrome(format!("Chrome assess css echo: {err}")))?;
+        .map_err(|err| AssessError::Unavailable(format!("Chrome assess css echo: {err}")))?;
     let metrics: ChromeMetrics = reply
         .get("metrics")
         .cloned()
         .map(serde_json::from_value)
         .transpose()
-        .map_err(|err| HandsError::Chrome(format!("Chrome assess metrics: {err}")))?
+        .map_err(|err| AssessError::Unavailable(format!("Chrome assess metrics: {err}")))?
         .unwrap_or_default();
     let mut identity = metrics.identity();
     identity.url = reply
@@ -2564,6 +2604,27 @@ mod tests {
 
     fn all_windows_chrome(_: Option<isize>) -> bool {
         true
+    }
+
+    #[test]
+    fn malformed_assessment_is_unknown_not_ok_false() {
+        let raw = RawNode {
+            id: Some("chr:0".into()),
+            role: Some("Button".into()),
+            text: Some("Go".into()),
+            rect_css: CssRect {
+                left: 10.0,
+                top: 20.0,
+                width: 100.0,
+                height: 40.0,
+            },
+            _href: None,
+        };
+        let reply = serde_json::json!({"assessment": "not-an-object"});
+        let assessment = assessment_from_reply(&reply, &raw).expect("unknown assessment");
+        assert_eq!(assessment.interactable, None);
+        assert_eq!(assessment.reason.as_deref(), Some("assessment_unavailable"));
+        assert_eq!(assessment.selected_point, raw.rect_css.center());
     }
 
     #[test]

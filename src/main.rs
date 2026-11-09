@@ -60,7 +60,7 @@ enum Command {
         #[arg(long)]
         fg_preview: bool,
     },
-    /// Read-only DOM hit-test / interactivity assessment. `--element-id chr:N` asks whether a real press at that element's validated CSS point would reach it (blocked by an overlay, clipped, iframe, closed shadow, or unknown). `--x/--y` or `--grid` asks what is under that physical point (top frame only, foreground Chrome). `ok:true` means the query ran; `interactable:null` is an honest unknown, not a failure. Assessment is advisory unless `click --require-interactable` opts in. No input, no lease, no native-window occlusion; page names are untrusted and never logged.
+    /// Read-only DOM hit-test / interactivity assessment. `--element-id chr:N` asks whether a real press at that element's validated CSS point would reach it (blocked by an overlay, clipped, iframe, closed shadow, or unknown). `--x/--y` or `--grid` asks what is under that physical point (top frame only, foreground Chrome); `interactable:true` only for an interactive/nameable topmost element, otherwise `null` with `not_interactive`. `ok:true` means the query ran; `interactable:null` is an honest unknown, not a failure. Assessment is advisory unless `click --require-interactable` opts in. No input, no lease, no native-window occlusion; page names are untrusted and never logged.
     Hittest {
         #[arg(
             long,

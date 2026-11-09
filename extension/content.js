@@ -1295,6 +1295,7 @@ function pierce(x, y) {
     notes: [],
     iframe: false,
     shadowUninspectable: false,
+    shadowPointerEventsNone: false,
   };
   let el = document.elementFromPoint(x, y);
   if (!el) return out;
@@ -1329,6 +1330,14 @@ function pierce(x, y) {
       inner = null;
     }
     if (!inner || inner === el) {
+      return out;
+    }
+    const innerStyle = window.getComputedStyle(inner);
+    if (innerStyle && innerStyle.pointerEvents === "none") {
+      // `ShadowRoot.elementFromPoint` ignores pointer-events; do not accept a shadow inner
+      // hit that cannot receive the press. Report unknown rather than a false negative.
+      out.shadowPointerEventsNone = true;
+      out.el = el;
       return out;
     }
     if (out.shadowPath.length < ASSESS_SHADOW_PATH) {
@@ -1548,7 +1557,11 @@ function assessAt(target, rectCss, samples) {
       misses.push({ el: hit.el, x: p.x, y: p.y, iframe: hit.iframe, shadowUninspectable: hit.shadowUninspectable });
     }
   }
-  const visible = points.length > 0 ? samplesHit / points.length : null;
+  const visibleBase = points.length > 0 ? samplesHit / points.length : null;
+  const visible =
+    visibleBase != null && onscreen != null
+      ? Math.min(visibleBase, onscreen)
+      : visibleBase;
   const center = pierce(selected.x, selected.y);
   const notes = notesFor(target, clip.notes, center);
   let interactable = null;
@@ -1556,6 +1569,9 @@ function assessAt(target, rectCss, samples) {
   if (!pointInRect(selected, viewport)) {
     interactable = false;
     reason = "center_outside_viewport";
+  } else if (center.shadowPointerEventsNone) {
+    interactable = null;
+    reason = "shadow_pierce_unavailable";
   } else if (center.el && !center.iframe && !center.shadowUninspectable && composedContains(target, center.el)) {
     interactable = true;
     const style = window.getComputedStyle(target);
@@ -1616,6 +1632,42 @@ function assessAt(target, rectCss, samples) {
   };
 }
 
+function isInteractiveHit(el) {
+  if (!el || el.nodeType !== 1) return false;
+  const tag = String(el.tagName || "").toLowerCase();
+  if (
+    ["a", "button", "input", "select", "textarea", "summary", "label", "option"].indexOf(tag) !==
+    -1
+  ) {
+    return true;
+  }
+  const role = (el.getAttribute("role") || "").toLowerCase();
+  if (
+    [
+      "button",
+      "link",
+      "checkbox",
+      "radio",
+      "tab",
+      "menuitem",
+      "menuitemcheckbox",
+      "menuitemradio",
+      "option",
+      "textbox",
+      "combobox",
+      "treeitem",
+      "slider",
+      "switch",
+    ].indexOf(role) !== -1
+  ) {
+    return true;
+  }
+  if (el.hasAttribute("tabindex") && el.getAttribute("tabindex") !== "-1") {
+    return true;
+  }
+  return !!el.isContentEditable;
+}
+
 function buildAssess(msg) {
   const started = performance.now();
   const metrics = windowMetrics();
@@ -1641,12 +1693,20 @@ function buildAssess(msg) {
     base.at_point = unknownAtPoint("shadow_closed", hit);
     return base;
   }
+  if (hit.shadowPointerEventsNone) {
+    base.at_point = unknownAtPoint("shadow_pierce_unavailable", hit);
+    return base;
+  }
   if (hit.iframe) {
     base.at_point = unknownAtPoint("cross_frame", hit);
     return base;
   }
   if (!hit.el) {
     base.at_point = unknownAtPoint("outside_viewport", hit);
+    return base;
+  }
+  if (!isInteractiveHit(hit.el)) {
+    base.at_point = unknownAtPoint("not_interactive", hit);
     return base;
   }
   const element = describeElement(hit.el, null);

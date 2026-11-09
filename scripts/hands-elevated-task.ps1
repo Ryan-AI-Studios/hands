@@ -190,8 +190,22 @@ function Get-InstalledExeHolders {
         })
 }
 
+# Starts the task and confirms it actually reached Running (a successful cmdlet call only
+# proves a start request was accepted).
+function Start-TaskAndConfirm([string]$Name) {
+    Start-ScheduledTask -TaskName $Name | Out-Null
+    $deadline = (Get-Date).AddSeconds(3)
+    while ((Get-Date) -lt $deadline -and (Get-ScheduledTask -TaskName $Name).State -ne "Running") {
+        Start-Sleep -Milliseconds 200
+    }
+    return ((Get-ScheduledTask -TaskName $Name).State -eq "Running")
+}
+
 # The task's own server is `serve --pipe ...`; anything else (a harness bridge) is foreign.
-$foreign = @(Get-InstalledExeHolders | Where-Object { $_.CommandLine -notmatch ([regex]::Escape($pipeArgs) + '(\s|$)') })
+# Match the whole command line (exe + exact action args) so a `do-task --goal "... serve --pipe ..."`
+# invocation cannot be mistaken for the task's server.
+$taskCommandRe = '^\s*"?' + [regex]::Escape($installedExe) + '"?\s+' + [regex]::Escape($pipeArgs) + '\s*$'
+$foreign = @(Get-InstalledExeHolders | Where-Object { $_.CommandLine -notmatch $taskCommandRe })
 if ($foreign.Count -gt 0 -and -not $StopHolders) {
     Write-Host "The installed exe is in use by processes other than the task:"
     $foreign | ForEach-Object { Write-Host ("  pid {0}  {1}" -f $_.ProcessId, ($_.CommandLine -replace '\s+', ' ')) }
@@ -307,8 +321,7 @@ try {
     }
     if ($null -ne $failure -and $wasRunning -and -not $rollbackFailed) {
         try {
-            Start-ScheduledTask -TaskName $taskName | Out-Null
-            $restarted = $true
+            $restarted = Start-TaskAndConfirm $taskName
         } catch {
             Write-Warning "Could not restart $($taskName): $($_.Exception.Message)"
         }
@@ -358,8 +371,7 @@ try {
     $restarted = $false
     if ($wasRunning) {
         try {
-            Start-ScheduledTask -TaskName $taskName | Out-Null
-            $restarted = $true
+            $restarted = Start-TaskAndConfirm $taskName
         } catch {
             Write-Warning "Could not restart $($taskName): $($_.Exception.Message)"
         }

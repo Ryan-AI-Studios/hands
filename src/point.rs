@@ -298,6 +298,19 @@ fn anchor_basis(rect: Rect, page: &PageMetrics) -> Option<CssBasis> {
     }
 }
 
+/// Strict positive-area overlap. A monitor that merely touches the anchor edge (for example a
+/// Chrome window flush against a different-DPI secondary display) is not a straddle.
+fn strict_overlap(a: Rect, b: Rect) -> bool {
+    a.w > 0
+        && a.h > 0
+        && b.w > 0
+        && b.h > 0
+        && a.x < b.x.saturating_add(b.w)
+        && b.x < a.x.saturating_add(a.w)
+        && a.y < b.y.saturating_add(b.h)
+        && b.y < a.y.saturating_add(a.h)
+}
+
 fn pick_anchor(rects: &[Rect], page: &PageMetrics) -> AnchorPick {
     let matches: Vec<(Rect, CssBasis)> = rects
         .iter()
@@ -539,7 +552,7 @@ pub fn build_map(inputs: MapInputs) -> ViewportMap {
     let mut straddle_dpis: Vec<u32> = inputs
         .monitors
         .iter()
-        .filter(|m| m.rect.intersects(anchor))
+        .filter(|m| strict_overlap(m.rect, anchor))
         .map(|m| m.dpi)
         .collect();
     straddle_dpis.sort_unstable();
@@ -1134,6 +1147,69 @@ mod tests {
         let map = build_map(i);
         assert!(!map.report.valid);
         assert!(map.report.reason.unwrap().starts_with("mixed_dpi_straddle"));
+    }
+
+    #[test]
+    fn abutting_different_dpi_monitor_is_not_a_straddle() {
+        let monitors = || {
+            vec![
+                MonitorDpi {
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        w: 1920,
+                        h: 1080,
+                    },
+                    dpi: 96,
+                },
+                MonitorDpi {
+                    rect: Rect {
+                        x: 1920,
+                        y: 0,
+                        w: 1920,
+                        h: 1080,
+                    },
+                    dpi: 144,
+                },
+            ]
+        };
+        // Anchor [920,1920) touches the secondary monitor at x=1920 but does not overlap it.
+        let mut touching = inputs(
+            Rect {
+                x: 920,
+                y: 0,
+                w: 1000,
+                h: 900,
+            },
+            page(1.0, (1000.0, 900.0), None),
+        );
+        touching.monitors = monitors();
+        let map = build_map(touching);
+        assert!(map.report.valid, "{:?}", map.report.reason);
+        assert_eq!(map.report.dpi, Some(96));
+
+        // Genuine overlap [960,1960) across the boundary still refuses.
+        let mut overlap = inputs(
+            Rect {
+                x: 960,
+                y: 0,
+                w: 1000,
+                h: 900,
+            },
+            page(1.0, (1000.0, 900.0), None),
+        );
+        overlap.monitors = monitors();
+        let map = build_map(overlap);
+        assert!(!map.report.valid, "{:?}", map.report);
+        assert!(
+            map.report
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("mixed_dpi_straddle"),
+            "{:?}",
+            map.report.reason
+        );
     }
 
     #[test]

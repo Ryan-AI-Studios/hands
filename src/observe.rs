@@ -4437,7 +4437,8 @@ mod tests {
             .join("tests/fixtures/chrome-spa-autocomplete.json")
     }
 
-    fn envelope_from_chrome_map(map: chrome::ChromeMap) -> ObserveEnvelope {
+    fn envelope_from_chrome_map(mut map: chrome::ChromeMap) -> ObserveEnvelope {
+        let transform = map.transform.take();
         let (extract, elements, elements_total, chrome_connected) = fuse_maps(
             Detail::Default,
             "Barchart",
@@ -4466,7 +4467,7 @@ mod tests {
             target_window: None,
             view: ObserveView::Auto,
             observe_source: ObserveSource::Live,
-            transform: None,
+            transform,
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
@@ -5967,18 +5968,124 @@ mod tests {
         assert!(json.len() <= DEFAULT_ENVELOPE_MAX_BYTES, "{}", json.len());
     }
 
+    fn live_map_geometry(
+        metrics: &chrome::ChromeMetrics,
+        _: Option<&str>,
+        hwnd: isize,
+    ) -> crate::point::MapInputs {
+        crate::point::MapInputs {
+            hwnd: Some(hwnd),
+            window_rect: Some(Rect {
+                x: -10,
+                y: -10,
+                w: 4000,
+                h: 3000,
+            }),
+            dpi: Some(120),
+            virtual_screen: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            page: crate::point::PageMetrics {
+                inner_width: Some(metrics.inner_width),
+                inner_height: Some(metrics.inner_height),
+                client_width: metrics.client_width,
+                client_height: metrics.client_height,
+                dpr: Some(metrics.device_pixel_ratio),
+                ..crate::point::PageMetrics::default()
+            },
+            render_widgets: vec![Rect {
+                x: 100,
+                y: 80,
+                w: 1500,
+                h: 1125,
+            }],
+            uia_document: None,
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: Some("Example".into()),
+            fixture: false,
+            identity: crate::point::WindowIdentity::Confirmed,
+            fixture_origin: None,
+        }
+    }
+
+    fn invalid_live_map_geometry(
+        metrics: &chrome::ChromeMetrics,
+        title: Option<&str>,
+        hwnd: isize,
+    ) -> crate::point::MapInputs {
+        let mut inputs = live_map_geometry(metrics, title, hwnd);
+        inputs.render_widgets.clear();
+        inputs
+    }
+
     #[test]
-    fn unknown_transform_omits_chr_names_reason() {
-        // C10: invalid transform is explained and no chr: element is listed.
-        let mut env = fat_envelope(0);
-        env.transform = Some(crate::point::TransformReport::invalid(
-            "no_viewport_anchor: no matching render-widget child",
-            Some("f3a9c1d2e4b5a607".into()),
-        ));
-        let json = serde_json::to_string(&env).unwrap();
+    fn live_invalid_transform_omits_chr_names_and_reason() {
+        // C10: drive the production live map (geometry seam, not fixture). The element has a
+        // `chr:` id and `chr:` text; an invalid live map must drop it and explain why.
+        let raw = serde_json::json!({
+            "url": "https://example.com/",
+            "title": "Example",
+            "elements": [{
+                "id": "chr:7",
+                "role": "Button",
+                "text": "chr: fake page text",
+                "rectCss": { "left": 10.0, "top": 10.0, "width": 100.0, "height": 30.0 }
+            }],
+            "metrics": {
+                "screenX": 0.0, "screenY": 0.0,
+                "outerWidth": 1200.0, "outerHeight": 900.0,
+                "innerWidth": 1200.0, "innerHeight": 900.0,
+                "devicePixelRatio": 1.25
+            }
+        })
+        .to_string();
+
+        chrome::set_geometry_hook(Some(live_map_geometry));
+        let valid = chrome::map_from_raw_json(&raw, Some(0x1234), "f3a9c1d2e4b5a607".into());
+        assert!(
+            valid.transform.as_ref().is_some_and(|t| t.valid),
+            "{:?}",
+            valid.transform
+        );
+        assert!(
+            valid
+                .elements
+                .iter()
+                .any(|e| e.id == "chr:7" && e.text.as_deref().unwrap_or_default().contains("chr:")),
+            "control: valid live map must list the chr: element"
+        );
+
+        chrome::set_geometry_hook(Some(invalid_live_map_geometry));
+        let map = chrome::map_from_raw_json(&raw, Some(0x1234), "f3a9c1d2e4b5a607".into());
+        let env = envelope_from_chrome_map(map);
+        chrome::set_geometry_hook(None);
+
+        let transform = env.transform.as_ref().expect("envelope transform");
+        assert!(!transform.valid, "{transform:?}");
+        assert!(
+            transform
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("no_viewport_anchor"),
+            "{transform:?}"
+        );
+        assert!(env.elements.is_empty(), "{:?}", env.elements);
+        assert_eq!(env.elements_total, 0, "no fabricated coordinates");
+        assert!(
+            env.elements.iter().all(|e| {
+                !e.id.contains("chr:") && !e.text.as_deref().unwrap_or_default().contains("chr:")
+            }),
+            "{:?}",
+            env.elements
+        );
+        let json = serialize_envelope(&env).unwrap();
         assert!(json.contains("\"valid\":false"), "{json}");
         assert!(json.contains("no_viewport_anchor"), "{json}");
-        assert!(env.elements.iter().all(|e| !e.id.starts_with("chr:")));
     }
 
     #[test]

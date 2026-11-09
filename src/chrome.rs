@@ -681,6 +681,14 @@ fn parse_snapshot_bytes(bytes: &[u8], hwnd: Option<isize>) -> Result<ChromeMap, 
     Ok(map_from_raw(raw, hwnd, true, obs))
 }
 
+/// Test-only bridge so `observe` tests can drive the production live-map path from a raw JSON
+/// snapshot without exposing `RawSnapshot`.
+#[cfg(test)]
+pub(crate) fn map_from_raw_json(raw_json: &str, hwnd: Option<isize>, obs: String) -> ChromeMap {
+    let raw: RawSnapshot = serde_json::from_str(raw_json).expect("raw snapshot JSON");
+    map_from_raw(raw, hwnd, false, obs)
+}
+
 fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: String) -> ChromeMap {
     let map = map_for_raw(&raw, hwnd, fixture, obs);
     let mut elements = Vec::new();

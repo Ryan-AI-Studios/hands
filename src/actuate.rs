@@ -623,6 +623,24 @@ fn fail_with_point(
     finalize_envelope(env)
 }
 
+/// Failure after dispatch may have sent input (for example a post-dispatch freeze): keep the
+/// contract but serialize `verified:false` so consumers do not read `ok:false` as "nothing sent".
+#[allow(clippy::too_many_arguments)]
+fn fail_with_point_unverified(
+    session_id: String,
+    target: ActuateTarget,
+    err: HandsError,
+    foregrounded: bool,
+    retried: bool,
+    settled: bool,
+    point: Option<PointContract>,
+) -> Result<ActuateEnvelope, HandsError> {
+    let mut env = fail(session_id, target, err, foregrounded, retried, settled)?;
+    env.point = point;
+    env.verified = false;
+    finalize_envelope(env)
+}
+
 fn none_target() -> ActuateTarget {
     let (x, y) = input::cursor_pos().unwrap_or((0, 0));
     ActuateTarget {
@@ -1194,7 +1212,15 @@ fn dispatch_blind_click(
         return fail_with_point(session_id, info, err, foregrounded, false, false, point);
     }
     if let Err(err) = input::left_click(&mut rng) {
-        return fail_with_point(session_id, info, err, foregrounded, false, false, point);
+        return fail_with_point_unverified(
+            session_id,
+            info,
+            err,
+            foregrounded,
+            false,
+            false,
+            point,
+        );
     }
     if lease::is_frozen() {
         let mut env = base(
@@ -1208,6 +1234,8 @@ fn dispatch_blind_click(
             Some("desk lease frozen (physical input or Pause/Break)".into()),
         )?;
         env.point = point;
+        // The click may already have landed at an unverified blind target.
+        env.verified = false;
         return finalize_envelope(env);
     }
     let mut env = base(
@@ -4123,10 +4151,17 @@ mod tests {
         lease::reset_for_test();
     }
 
-    fn freeze_on_send(
-        _: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+    fn freeze_on_click_release(
+        inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
     ) -> Result<(), HandsError> {
-        lease::freeze_now_with(lease::FreezeCause::Physical);
+        // Freeze on the button-up so `left_click` still returns Ok and the post-dispatch
+        // frozen branch (not the pre-dispatch move/error branch) is exercised.
+        if inputs.iter().any(|input| {
+            unsafe { input.Anonymous.mi.dwFlags }
+                .contains(windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP)
+        }) {
+            lease::freeze_now_with(lease::FreezeCause::Physical);
+        }
         Ok(())
     }
 
@@ -4139,7 +4174,7 @@ mod tests {
         crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
         crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
         crate::uia::set_hit_test_hook(Some(panic_hit_test));
-        crate::input::set_send_inputs_hook(Some(freeze_on_send));
+        crate::input::set_send_inputs_hook(Some(freeze_on_click_release));
         lease::reset_for_test();
         crate::allows::with_test_env(|| {
             let space = ensure_dpi()
@@ -4150,6 +4185,10 @@ mod tests {
             let env = click(blind_pixel_req("s-0121-frozen-point", x, y)).expect("click");
             assert!(!env.ok, "{env:?}");
             assert!(env.frozen, "{env:?}");
+            assert!(
+                !env.verified,
+                "post-dispatch freeze must be unverified: {env:?}"
+            );
             let point = env
                 .point
                 .as_ref()
@@ -4164,6 +4203,7 @@ mod tests {
             let json = serialize_envelope(&env).expect("json");
             assert!(json.contains("\"point\""), "{json}");
             assert!(json.contains("\"source\":\"blind\""), "{json}");
+            assert!(json.contains("\"verified\":false"), "{json}");
         });
         lease::reset_for_test();
     }

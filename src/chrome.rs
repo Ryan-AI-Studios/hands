@@ -290,6 +290,15 @@ fn focused_chrome_popup_owns_foreground(target: isize) -> bool {
     }
 }
 
+/// A focused non-Chrome window that is not the resolved Chrome window is also a `window_mismatch`:
+/// the click would otherwise land on that foreign window if `offer` cannot raise Chrome.
+fn focused_non_chrome_foreground(target: isize) -> bool {
+    match foreground::foreground_hwnd() {
+        Some(fg) if fg != target => !foreground::target_is_chrome(Some(fg)),
+        _ => false,
+    }
+}
+
 fn observe_identity(title: Option<&str>, hwnd: Option<isize>) -> crate::point::WindowIdentity {
     let Some(hwnd) = hwnd else {
         return crate::point::WindowIdentity::Mismatch;
@@ -532,8 +541,9 @@ fn remap_identity(hwnd: isize) -> (Option<String>, usize, bool) {
             return hook(hwnd);
         }
     }
-    let is_chrome =
-        foreground::target_is_chrome(Some(hwnd)) && !focused_chrome_popup_owns_foreground(hwnd);
+    let is_chrome = foreground::target_is_chrome(Some(hwnd))
+        && !focused_chrome_popup_owns_foreground(hwnd)
+        && !focused_non_chrome_foreground(hwnd);
     if is_chrome {
         (
             Some(foreground::title(Some(hwnd))),

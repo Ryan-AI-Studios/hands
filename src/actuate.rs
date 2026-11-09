@@ -1197,7 +1197,7 @@ fn dispatch_blind_click(
         return fail_with_point(session_id, info, err, foregrounded, false, false, point);
     }
     if lease::is_frozen() {
-        return base(
+        let mut env = base(
             session_id,
             info,
             false,
@@ -1206,7 +1206,9 @@ fn dispatch_blind_click(
             false,
             foregrounded,
             Some("desk lease frozen (physical input or Pause/Break)".into()),
-        );
+        )?;
+        env.point = point;
+        return finalize_envelope(env);
     }
     let mut env = base(
         session_id,
@@ -4121,6 +4123,51 @@ mod tests {
         lease::reset_for_test();
     }
 
+    fn freeze_on_send(
+        _: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
+    ) -> Result<(), HandsError> {
+        lease::freeze_now_with(lease::FreezeCause::Physical);
+        Ok(())
+    }
+
+    #[test]
+    fn blind_click_frozen_after_dispatch_keeps_point() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::uia::set_hit_test_hook(Some(panic_hit_test));
+        crate::input::set_send_inputs_hook(Some(freeze_on_send));
+        lease::reset_for_test();
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            grant_blind("s-0121-frozen-point");
+            let env = click(blind_pixel_req("s-0121-frozen-point", x, y)).expect("click");
+            assert!(!env.ok, "{env:?}");
+            assert!(env.frozen, "{env:?}");
+            let point = env
+                .point
+                .as_ref()
+                .expect("point on frozen dispatch envelope");
+            assert_eq!(point.source, crate::point::PointSource::Blind);
+            assert_eq!(point.physical, Some(crate::point::PhysicalPoint { x, y }));
+            assert_eq!(
+                point.transform.method,
+                crate::point::TransformMethod::Explicit
+            );
+            assert!(point.transform.valid);
+            let json = serialize_envelope(&env).expect("json");
+            assert!(json.contains("\"point\""), "{json}");
+            assert!(json.contains("\"source\":\"blind\""), "{json}");
+        });
+        lease::reset_for_test();
+    }
+
     #[test]
     fn blind_paths_consult_req_blind_before_guards() {
         let src = include_str!("actuate.rs");
@@ -4351,6 +4398,8 @@ mod tests {
         fn drop(&mut self) {
             chrome::set_remap_geometry_hook(None);
             chrome::set_remap_identity_hook(None);
+            crate::foreground::set_foreground_hwnd_hook(None);
+            crate::foreground::set_chrome_target_hook(None);
             crate::input::set_send_inputs_hook(None);
             let _ = crate::foreground::take_offer_calls();
         }
@@ -4568,6 +4617,62 @@ mod tests {
         resolved.hwnd = None;
         let env = final_live_remap("s-0129", &mut info, &mut resolved).expect("remap result");
         assert_refusal("missing hwnd", env, "window_mismatch");
+        assert!(crate::foreground::take_offer_calls().is_empty());
+    }
+
+    fn fg_notepad() -> Option<isize> {
+        Some(0x9999)
+    }
+
+    fn only_target_chrome(hwnd: Option<isize>) -> bool {
+        hwnd == Some(0x1234)
+    }
+
+    #[test]
+    fn final_remap_non_chrome_foreground_refuses_window_mismatch() {
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        // No identity hook: exercise the production foreground comparison.
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_notepad));
+        crate::foreground::set_chrome_target_hook(Some(only_target_chrome));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let _ = crate::foreground::take_offer_calls();
+        let (mut resolved, mut info, _, old_rect, _) = final_remap_fixture();
+
+        let env = final_live_remap("s-0129", &mut info, &mut resolved)
+            .expect("remap result")
+            .expect("window_mismatch refusal");
+        assert!(!env.ok, "{env:?}");
+        assert!(!env.verified, "{env:?}");
+        assert!(
+            env.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("window_mismatch"),
+            "{env:?}"
+        );
+        let point = env.point.as_ref().expect("point contract");
+        assert!(point.physical.is_none(), "{point:?}");
+        assert!(
+            point
+                .transform
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("window_mismatch"),
+            "{point:?}"
+        );
+        // A refused re-map must not move the target or dispatch.
+        assert_eq!((resolved.x, resolved.y), (200, 130));
+        assert_eq!(resolved.rect, old_rect);
         assert!(crate::foreground::take_offer_calls().is_empty());
     }
 

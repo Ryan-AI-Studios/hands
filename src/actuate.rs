@@ -1027,6 +1027,13 @@ fn scoped_binding_refusal(
     info: &ActuateTarget,
     target: &Target,
 ) -> Result<Option<ActuateEnvelope>, HandsError> {
+    let Some(report) = scoped_binding_report(target)? else {
+        return Ok(None);
+    };
+    refuse_identity(session_id.to_string(), info.clone(), report).map(Some)
+}
+
+fn scoped_binding_report(target: &Target) -> Result<Option<IdentityReport>, HandsError> {
     let Target::Scoped(r @ SnapshotRef::Chrome { tab, .. }) = target else {
         return Ok(None);
     };
@@ -1040,15 +1047,44 @@ fn scoped_binding_refusal(
             } else {
                 "window_not_focused"
             };
-            refuse_identity(
-                session_id.to_string(),
-                info.clone(),
-                IdentityReport::chrome_failure(r, IdentityState::Unknown, reason),
-            )
-            .map(Some)
+            Ok(Some(IdentityReport::chrome_failure(
+                r,
+                IdentityState::Unknown,
+                reason,
+            )))
         }
-        Err(report) => refuse_identity(session_id.to_string(), info.clone(), report).map(Some),
+        Err(report) => Ok(Some(report)),
     }
+}
+
+/// The first click was already sent, so a binding change before the retry must not be reported
+/// as a pre-dispatch "nothing sent" refusal. Keep the point and serialize `verified:false`.
+fn post_dispatch_binding_refusal(
+    session_id: String,
+    info: ActuateTarget,
+    resolved: &ResolvedTarget,
+    settled: bool,
+    foregrounded: bool,
+    report: IdentityReport,
+) -> Result<ActuateEnvelope, HandsError> {
+    let reason = report
+        .reason
+        .clone()
+        .unwrap_or_else(|| report.state_token().to_string());
+    let mut env = base(
+        session_id,
+        info,
+        false,
+        lease::is_frozen(),
+        false,
+        settled,
+        foregrounded,
+        Some(reason),
+    )?;
+    env.point = point_for_dispatch(resolved);
+    env.verified = false;
+    env.identity = Some(report);
+    finalize_envelope(env)
 }
 
 pub fn click(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -1344,8 +1380,17 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             let _ = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
         }
         // A tab switch during the first click/settle must not re-click the foreground tab.
+        // The first click already went out, so this is a post-dispatch refusal.
         if let Some(env) = scoped_binding_refusal(&session_id, &info, &resolved.target)? {
-            return Ok(env);
+            let report = env.identity.expect("binding refusal has identity");
+            return post_dispatch_binding_refusal(
+                session_id,
+                info,
+                &resolved,
+                settled,
+                foregrounded,
+                report,
+            );
         }
         if let Err(err) = input::left_click(&mut rng) {
             return fail_with_point_unverified(
@@ -6663,6 +6708,67 @@ mod tests {
         let identity = refusal.identity.expect("identity");
         assert_eq!(identity.state, IdentityState::Unknown);
         assert_eq!(identity.reason.as_deref(), Some("tab_not_active"));
+    }
+
+    #[test]
+    fn post_dispatch_binding_refusal_keeps_point_and_unverified() {
+        let map = act_remap_map(0, 0);
+        let css = CssPoint::new(60.0, 60.0);
+        let contract = crate::point::contract_for(&map, css);
+        let r = SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 7,
+        };
+        let resolved = ResolvedTarget {
+            target: Target::Scoped(r.clone()),
+            kind: "element",
+            id: Some(r.to_string()),
+            x: 100,
+            y: 100,
+            rect: Rect {
+                x: 100,
+                y: 100,
+                w: 100,
+                h: 100,
+            },
+            hwnd: Some(0x1234),
+            name: "Sign in".into(),
+            role: "Button".into(),
+            css_point: Some(css),
+            css_rect: Some(CssRect {
+                left: 10.0,
+                top: 10.0,
+                width: 100.0,
+                height: 100.0,
+            }),
+            contract: Some(contract),
+            map: Some(map),
+            assessment: None,
+            identity: Some(IdentityReport::exact_chrome(&r)),
+            uia_runtime_id: None,
+            uia_expected_fp: None,
+        };
+        let report = IdentityReport::chrome_failure(&r, IdentityState::Unknown, "tab_not_active");
+        let env = post_dispatch_binding_refusal(
+            "s-retry".into(),
+            none_target(),
+            &resolved,
+            true,
+            true,
+            report,
+        )
+        .expect("post-dispatch refusal");
+        assert!(!env.ok);
+        assert!(!env.verified);
+        assert!(env.point.is_some());
+        assert_eq!(env.error.as_deref(), Some("tab_not_active"));
+        assert_eq!(
+            env.identity.as_ref().and_then(|i| i.reason.as_deref()),
+            Some("tab_not_active")
+        );
     }
 
     #[test]

@@ -151,9 +151,7 @@ impl TransformReport {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PointContract {
     pub source: PointSource,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub css: Option<CssPoint>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub physical: Option<PhysicalPoint>,
     #[serde(flatten)]
     pub transform: TransformReport,

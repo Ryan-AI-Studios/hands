@@ -4045,6 +4045,7 @@ mod tests {
         assert!(point.physical.is_none());
         let json = serialize_envelope(&env).unwrap();
         assert!(json.contains("\"verified\":false"), "{json}");
+        assert!(json.contains("\"physical\":null"), "{json}");
         assert!(json.contains("\"reason\":\"no_viewport_anchor"), "{json}");
     }
 

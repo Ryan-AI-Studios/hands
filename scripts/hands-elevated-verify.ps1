@@ -113,7 +113,13 @@ try {
 
     $status = Call-Tool 2 "elevation_status" @{}
     if ($Window) {
-        Call-Tool 3 "activate" @{ window = $Window } | Out-Null
+        $activateLine = Call-Tool 3 "activate" @{ window = $Window }
+        $activate = $activateLine | ConvertFrom-Json
+        if ($activate.result.isError) { throw "activate failed: $activateLine" }
+        $activateResult = $activate.result.content[0].text | ConvertFrom-Json
+        if (-not $activateResult.ok -or -not $activateResult.foregrounded) {
+            throw ("activate did not take the foreground (ok={0}, foregrounded={1}, reason={2}); refusing to type" -f $activateResult.ok, $activateResult.foregrounded, $activateResult.reason)
+        }
         Start-Sleep -Milliseconds 500
     } elseif (-not $NoPrompt) {
         Write-Host ""

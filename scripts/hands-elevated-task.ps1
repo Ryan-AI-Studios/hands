@@ -169,21 +169,58 @@ if (-not $isAdmin) {
     Fail "This script must be run from an elevated (Administrator) shell. It does not raise UAC and does not self-elevate."
 }
 
-# Stop only this task's own server so the installed exe is not locked.
+# The installed exe can be held open by any process running that image (for example a
+# `hands mcp --bridge` started from a WSL session). `schtasks /End` stops only the task,
+# so detect holders, stop only this task, and restore it if the replacement fails.
 $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-if ($existing -and $existing.State -eq "Running") {
+$wasRunning = [bool]($existing -and $existing.State -eq "Running")
+
+function Get-InstalledExeHolders {
+    $target = [System.IO.Path]::GetFullPath($installedExe)
+    @(Get-CimInstance Win32_Process -Filter "Name='hands.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            if (-not $_.ExecutablePath) { return $false }
+            try { return ([System.IO.Path]::GetFullPath($_.ExecutablePath) -ieq $target) }
+            catch { return $false }
+        })
+}
+
+if ($wasRunning) {
     Write-Host "Stopping running $taskName before replacing its exe."
     Stop-ScheduledTask -TaskName $taskName
-    Start-Sleep -Seconds 1
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline -and (Get-InstalledExeHolders).Count -gt 0) {
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+$holders = @(Get-InstalledExeHolders)
+if ($holders.Count -gt 0) {
+    if ($wasRunning) { Start-ScheduledTask -TaskName $taskName | Out-Null }
+    Write-Host "The installed exe is still in use by:"
+    $holders | ForEach-Object { Write-Host ("  pid {0}  {1}" -f $_.ProcessId, ($_.CommandLine -replace '\s+', ' ')) }
+    Fail "Stop those processes and re-run (Stop-Process -Id <pid> -Force). The task was restarted if it had been running."
 }
 
 New-Item -ItemType Directory -Force -Path $installDirFull | Out-Null
-if ($sourceExe -ne $installedExe) {
-    Copy-Item -LiteralPath $sourceExe -Destination $installedExe -Force
+$stagedExe = "$installedExe.new"
+try {
+    if ($sourceExe -ne $installedExe) {
+        Copy-Item -LiteralPath $sourceExe -Destination $stagedExe -Force
+        if (Test-Path -LiteralPath $installedExe) {
+            [System.IO.File]::Replace($stagedExe, $installedExe, $null)
+        } else {
+            Move-Item -LiteralPath $stagedExe -Destination $installedExe
+        }
+    }
+    $srcHash = (Get-FileHash -LiteralPath $sourceExe -Algorithm SHA256).Hash
+    $dstHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
+    if ($srcHash -ne $dstHash) { throw "Installed exe hash differs from source ($dstHash vs $srcHash)." }
+} catch {
+    Remove-Item -LiteralPath $stagedExe -ErrorAction SilentlyContinue
+    if ($wasRunning) { Start-ScheduledTask -TaskName $taskName | Out-Null }
+    Fail "Replacing the installed exe failed: $($_.Exception.Message) The task was restarted if it had been running."
 }
-$srcHash = (Get-FileHash -LiteralPath $sourceExe -Algorithm SHA256).Hash
-$dstHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
-if ($srcHash -ne $dstHash) { Fail "Installed exe hash differs from source ($dstHash vs $srcHash)." }
 
 $problems = @(Get-WritableByUntrusted $installedExe)
 if ($problems.Count -gt 0) {

@@ -22,7 +22,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
 ureq = "3.4.0"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std", "sync", "net", "io-util"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std", "sync", "net", "io-util", "time"] }
 uuid = { version = "1.24.1", features = ["v4"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
@@ -33,6 +33,7 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_Ole",
     "Win32_System_Variant",
     "Win32_System_DataExchange",

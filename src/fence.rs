@@ -383,13 +383,18 @@ mod tests {
         // Retained 0004 disposition: a wiped session allow must not be reused by
         // the semantic path, because every call re-decides the fence.
         allows::with_test_env(|| {
-            allows::grant(
-                "s-sem-stale",
-                "desktop",
-                Category::Messages,
-                AllowMode::Session,
-            )
-            .expect("grant");
+            // The synthetic target's domain is read from the *live* foreground window
+            // ("desktop" for a non-Chrome window, "unknown" for Chrome-class), so grant both
+            // exact grains. Without this the test flips with whatever window is focused.
+            for domain in ["desktop", "unknown"] {
+                allows::grant(
+                    "s-sem-stale",
+                    domain,
+                    Category::Messages,
+                    AllowMode::Session,
+                )
+                .expect("grant");
+            }
             assert!(
                 gate_semantic("s-sem-stale", &semantic_target("Send", "button"))
                     .expect("gate")

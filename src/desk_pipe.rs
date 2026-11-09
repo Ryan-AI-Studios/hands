@@ -17,6 +17,7 @@ use windows::Win32::Security::{
     SetSecurityDescriptorSacl, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
     TokenUser, WinBuiltinAdministratorsSid, WinMediumLabelSid,
 };
+use windows::Win32::System::Console::FreeConsole;
 use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, NMPWAIT_NOWAIT, WaitNamedPipeW};
 use windows::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcess, OpenMutexW, OpenProcessToken,
@@ -477,7 +478,7 @@ pub async fn serve_pipe_named(pipe_name: &str, mutex_name: &str) -> Result<(), H
     // Install the desk lease (WH_KEYBOARD_LL / WH_MOUSE_LL)
     let _lease = lease::install()?;
 
-    serve_loop(pipe_name, &pipe_sa).await
+    serve_loop(pipe_name, &pipe_sa, true).await
 }
 
 /// Keep the desk-driver mutex handle alive for the stdio server lifetime.
@@ -524,8 +525,15 @@ fn create_listener(
 async fn serve_loop(
     pipe_name: &str,
     sa: &windows::Win32::Security::SECURITY_ATTRIBUTES,
+    detach_console: bool,
 ) -> Result<(), HandsError> {
     let mut server = create_listener(pipe_name, sa, true)?;
+    if detach_console {
+        // A Task Scheduler-launched console PE leaves a persistent, focus-stealing
+        // window. The resident server talks only over the pipe, so detach once the
+        // listener exists. Failure is non-fatal: serving continues, the window stays.
+        let _ = unsafe { FreeConsole() };
+    }
     loop {
         server
             .connect()
@@ -536,7 +544,11 @@ async fn serve_loop(
             Ok(service) => {
                 let _ = service.waiting().await;
             }
-            Err(e) => eprintln!("serve error: {e}"),
+            // `writeln!` does not panic on an invalid stderr handle; `eprintln!` would.
+            Err(e) => {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "serve error: {e}");
+            }
         }
         server = next_server;
     }
@@ -629,13 +641,47 @@ pub async fn run_bridge_named(
     min_server_rid: u32,
 ) -> Result<(), HandsError> {
     bridge_preflight(pipe_name, mutex_name)?;
-    let mut connected = open_bridge_client(pipe_name)
+    let connected = open_bridge_client(pipe_name)
         .map_err(|e| HandsError::Input(format!("bridge pipe connect failed: {e}")))?;
     verify_pipe_server(&connected, min_server_rid)?;
-    let mut stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
-    tokio::io::copy_bidirectional(&mut stdio, &mut connected)
-        .await
-        .map_err(|e| HandsError::Input(format!("bridge copy failed: {e}")))?;
+    let (pipe_reader, pipe_writer) = tokio::io::split(connected);
+    pump_bridge(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        pipe_reader,
+        pipe_writer,
+    )
+    .await
+}
+
+/// Copy between host stdio and the desk pipe until either side ends.
+///
+/// Deliberately not `copy_bidirectional`: that waits for both directions, so a
+/// bridge whose server disconnects but whose host stdin stays open would stay
+/// resident and keep the installed exe locked (review F2).
+async fn pump_bridge<R, W, PR, PW>(
+    mut input: R,
+    mut output: W,
+    mut pipe_reader: PR,
+    mut pipe_writer: PW,
+) -> Result<(), HandsError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    PR: tokio::io::AsyncRead + Unpin,
+    PW: tokio::io::AsyncWrite + Unpin,
+{
+    let to_pipe = tokio::io::copy(&mut input, &mut pipe_writer);
+    let from_pipe = tokio::io::copy(&mut pipe_reader, &mut output);
+    tokio::pin!(to_pipe, from_pipe);
+    tokio::select! {
+        r = &mut to_pipe => {
+            r.map_err(|e| HandsError::Input(format!("bridge copy failed: {e}")))?;
+        }
+        r = &mut from_pipe => {
+            r.map_err(|e| HandsError::Input(format!("bridge copy failed: {e}")))?;
+        }
+    }
     Ok(())
 }
 
@@ -725,7 +771,7 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let holder = MediumSecurityDescriptor::new().unwrap();
         let name = format!(r"\\.\pipe\hands-test-{}", uuid::Uuid::new_v4());
-        let loop_task = serve_loop(&name, &holder.sa);
+        let loop_task = serve_loop(&name, &holder.sa, false);
         let client_task = async {
             for _ in 0..2 {
                 let mut client = loop {
@@ -987,7 +1033,7 @@ mod tests {
             "bridge must verify the pipe server before copying bytes"
         );
         let verify_at = body.find("verify_pipe_server(").unwrap();
-        assert!(body.find("copy_bidirectional").unwrap() > verify_at);
+        assert!(body.find("pump_bridge(").unwrap() > verify_at);
         let pre = production
             .split("fn bridge_preflight(")
             .nth(1)
@@ -1011,5 +1057,32 @@ mod tests {
     #[test]
     fn mutex_name_constant() {
         assert_eq!(MUTEX_NAME, r"Local\hands-desk-driver");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridge_exits_when_the_server_disconnects_even_with_stdin_open() {
+        use tokio::io::duplex;
+
+        // Host stdin: the writer stays open for the whole test, as a live harness would.
+        let (_stdin_writer, stdin_reader) = duplex(64);
+        // Host stdout: the pump writes here; the reader stays open.
+        let (stdout_writer, _stdout_reader) = duplex(64);
+        // Server -> bridge: the server has already gone away.
+        let (pipe_reader, pipe_writer) = duplex(64);
+        drop(pipe_writer);
+        // Bridge -> server: nothing is written, so this end may stay open.
+        let (_server_reader, pipe_write_end) = duplex(64);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            pump_bridge(stdin_reader, stdout_writer, pipe_reader, pipe_write_end),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "bridge stayed resident after the server disconnected (review F2)"
+        );
+        assert!(result.unwrap().is_ok());
     }
 }

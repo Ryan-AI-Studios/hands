@@ -4336,9 +4336,86 @@ mod tests {
             include_str!("target.rs"),
             include_str!("point.rs"),
         ] {
-            assert!(!src.contains(&["outer_height", "-", "inner_height"].join(" ")));
-            assert!(!src.contains(&["outer_width", "-", "inner_width"].join(" ")));
+            assert!(
+                !src.contains(&["metrics.outer_height", "-", "metrics.inner_height"].join(" "))
+            );
+            assert!(!src.contains(&["metrics.outer_width", "-", "metrics.inner_width"].join(" ")));
         }
+
+        // chrome.rs: the legacy formula may exist only inside the fixture-listing helper.
+        let chrome = include_str!("chrome.rs");
+        let legacy_y = ["metrics.outer_height", "-", "metrics.inner_height"].join(" ");
+        let legacy_x = ["metrics.outer_width", "-", "metrics.inner_width"].join(" ");
+        let def_start = chrome
+            .find("fn fixture_listing_origin(")
+            .expect("fixture_listing_origin definition");
+        let def_end = chrome[def_start..]
+            .find("\n}\n")
+            .map(|i| def_start + i)
+            .expect("fixture_listing_origin body end");
+        let occurrences: Vec<usize> = chrome.match_indices(&legacy_y).map(|(i, _)| i).collect();
+        assert_eq!(
+            occurrences.len(),
+            1,
+            "outer-inner height arithmetic must exist only in fixture_listing_origin"
+        );
+        assert!(occurrences[0] > def_start && occurrences[0] < def_end);
+        let x_occurrences: Vec<usize> = chrome.match_indices(&legacy_x).map(|(i, _)| i).collect();
+        assert_eq!(
+            x_occurrences.len(),
+            1,
+            "outer-inner width arithmetic must exist only in fixture_listing_origin"
+        );
+        assert!(x_occurrences[0] > def_start && x_occurrences[0] < def_end);
+
+        // The helper has exactly one call site, inside `fixture_map` with `fixture: true`.
+        let calls: Vec<usize> = chrome
+            .match_indices("fixture_listing_origin(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            2,
+            "expected the definition and one fixture call site: {calls:?}"
+        );
+        let call = *calls
+            .iter()
+            .find(|i| **i > def_end)
+            .expect("fixture_listing_origin call site");
+        let map_start = chrome.find("fn fixture_map(").expect("fixture_map");
+        let map_end = chrome.find("fn no_hwnd_map(").expect("no_hwnd_map");
+        assert!(
+            call > map_start && call < map_end,
+            "fixture_listing_origin must be called only from fixture_map"
+        );
+        let fixture = &chrome[map_start..map_end];
+        assert!(fixture.contains("fixture: true"));
+        assert!(fixture.contains("fixture_origin: fixture_listing_origin("));
+
+        // The live map builder never uses the fixture helper or the legacy arithmetic.
+        let live_start = chrome.find("fn live_map_inputs(").expect("live_map_inputs");
+        let live_end = chrome.find("fn build_live_map(").expect("build_live_map");
+        let live = &chrome[live_start..live_end];
+        assert!(!live.contains("fixture_listing_origin"));
+        assert!(!live.contains(&legacy_y));
+        assert!(!live.contains(&legacy_x));
+
+        // A live `chr:` hit builds its contract from the validated map, not the legacy helper.
+        let hit_start = chrome.find("fn hit_from_raw(").expect("hit_from_raw");
+        let hit_end = chrome.find("fn snapshot_env(").expect("snapshot_env");
+        let hit = &chrome[hit_start..hit_end];
+        assert!(hit.contains("contract_for(&map,"));
+        assert!(!hit.contains("fixture_listing_origin"));
+
+        // The click-time `chr:` finishing path maps the contract point/rect, never a raw centre.
+        let target = include_str!("target.rs");
+        let finish_start = target.find("fn finish_chr(").expect("finish_chr");
+        let finish_end = target.find("fn invalid_from(").expect("invalid_from");
+        let finish = &target[finish_start..finish_end];
+        assert!(finish.contains("contract_for("));
+        assert!(finish.contains("map_point(&contract, css_rect.center())"));
+        assert!(finish.contains("map_rect(&contract, css_rect)"));
+        assert!(!finish.contains("found.rect.center()"));
     }
 
     #[test]

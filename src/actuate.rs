@@ -850,6 +850,10 @@ fn final_live_remap(
             let new_contract = contract_for(&new_map, css);
             let Some(p) = new_contract.physical else {
                 let mut bad = new_contract;
+                bad.physical = None;
+                bad.transform.valid = false;
+                bad.transform.method = TransformMethod::None;
+                bad.transform.confidence = TransformConfidence::None;
                 bad.transform.reason = Some("stale_viewport: point left the viewport".into());
                 return refuse_transform(session_id.to_string(), info.clone(), bad).map(Some);
             };
@@ -4610,6 +4614,60 @@ mod tests {
         (Some("Owner Web Access - Google Chrome".into()), 1, true)
     }
 
+    fn edge_page() -> crate::point::PageMetrics {
+        crate::point::PageMetrics {
+            inner_width: Some(100.0),
+            inner_height: Some(100.0),
+            client_width: Some(100.0),
+            client_height: Some(100.0),
+            dpr: Some(1.0),
+            ..crate::point::PageMetrics::default()
+        }
+    }
+
+    fn edge_map_inputs(anchor_x: i32) -> crate::point::MapInputs {
+        crate::point::MapInputs {
+            hwnd: Some(0x1234),
+            window_rect: Some(Rect {
+                x: -200,
+                y: -50,
+                w: 600,
+                h: 400,
+            }),
+            dpi: Some(96),
+            virtual_screen: Some(Rect {
+                x: -1920,
+                y: -200,
+                w: 8000,
+                h: 6000,
+            }),
+            page: edge_page(),
+            render_widgets: vec![Rect {
+                x: anchor_x,
+                y: 0,
+                w: 100,
+                h: 100,
+            }],
+            uia_document: None,
+            monitors: Vec::new(),
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+            page_title: Some("Edge".into()),
+            fixture: false,
+            identity: crate::point::WindowIdentity::Confirmed,
+            fixture_origin: None,
+        }
+    }
+
+    fn edge_remap_geometry(page: crate::point::PageMetrics, _: isize) -> crate::point::MapInputs {
+        let mut inputs = edge_map_inputs(-99);
+        inputs.page = page;
+        inputs
+    }
+
+    fn edge_remap_identity(_: isize) -> (Option<String>, usize, bool) {
+        (Some("Edge - Google Chrome".into()), 1, true)
+    }
+
     struct FinalRemapSeam;
 
     impl Drop for FinalRemapSeam {
@@ -5081,6 +5139,78 @@ mod tests {
             "{offers:?}"
         );
         lease::reset_for_test();
+    }
+
+    #[test]
+    fn final_remap_point_left_viewport_serializes_invalid_contract() {
+        // A 1 px move (-100 -> -99) across the half-open physical viewport edge: the CSS point
+        // 99.5 rounds to -1 inside the old viewport but +1 outside the new one. The refusal must
+        // clear `valid`, not emit `valid:true` with `physical:null`.
+        let _seam = FinalRemapSeam;
+        chrome::set_remap_geometry_hook(Some(edge_remap_geometry));
+        chrome::set_remap_identity_hook(Some(edge_remap_identity));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let old_map = crate::point::build_map(edge_map_inputs(-100));
+        assert!(old_map.report.valid, "{:?}", old_map.report.reason);
+        let css = crate::point::CssPoint::new(99.5, 50.0);
+        let old_contract = contract_for(&old_map, css);
+        let old_point = old_contract.physical.expect("old point inside edge");
+        let css_rect = crate::point::CssRect {
+            left: 99.0,
+            top: 49.0,
+            width: 1.0,
+            height: 2.0,
+        };
+        let old_rect = map_rect(&old_contract, css_rect).expect("old rect");
+        let mut resolved = ResolvedTarget {
+            target: Target::ElementId("chr:5".into()),
+            kind: "element",
+            id: Some("chr:5".into()),
+            x: old_point.x,
+            y: old_point.y,
+            rect: old_rect,
+            hwnd: Some(0x1234),
+            name: String::new(),
+            role: String::new(),
+            css_point: Some(css),
+            css_rect: Some(css_rect),
+            contract: Some(old_contract),
+            map: Some(old_map),
+        };
+        let mut info = resolved_info("element", Some("chr:5".into()), old_point.x, old_point.y);
+        let _ = crate::foreground::take_offer_calls();
+
+        let env = final_live_remap("s-0129", &mut info, &mut resolved)
+            .expect("remap result")
+            .expect("edge refusal");
+        assert!(!env.ok, "{env:?}");
+        assert!(!env.verified, "{env:?}");
+        assert!(
+            env.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("stale_viewport"),
+            "{env:?}"
+        );
+        let point = env.point.as_ref().expect("point contract");
+        assert!(!point.transform.valid, "{point:?}");
+        assert!(point.physical.is_none(), "{point:?}");
+        assert!(
+            point
+                .transform
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("stale_viewport"),
+            "{point:?}"
+        );
+        assert_eq!((resolved.x, resolved.y), (old_point.x, old_point.y));
+        assert_eq!(resolved.rect, old_rect);
+        let json = serialize_envelope(&env).expect("json");
+        assert!(json.contains("\"valid\":false"), "{json}");
+        assert!(json.contains("\"physical\":null"), "{json}");
+        assert!(json.contains("\"verified\":false"), "{json}");
+        assert!(crate::foreground::take_offer_calls().is_empty());
     }
 
     #[test]

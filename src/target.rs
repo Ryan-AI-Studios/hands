@@ -31,6 +31,8 @@ pub struct ResolvedTarget {
     pub css_rect: Option<CssRect>,
     pub contract: Option<PointContract>,
     pub(crate) map: Option<ViewportMap>,
+    /// Optional DOM assessment carried from the same resolve reply.
+    pub assessment: Option<crate::hittest::Assessment>,
 }
 
 /// Resolve outcome. A transform-invalid `chr:` is an explicit unresolved refusal carrying
@@ -42,6 +44,7 @@ pub enum TargetOutcome {
         target: Target,
         contract: Box<PointContract>,
         hwnd: Option<isize>,
+        assessment: Option<Box<crate::hittest::Assessment>>,
     },
 }
 
@@ -116,16 +119,38 @@ impl Target {
         space: Space,
         hwnd: Option<isize>,
     ) -> Result<TargetOutcome, HandsError> {
+        self.resolve_with_opts(space, hwnd, false)
+    }
+
+    /// Shared `chr:` resolve used by `click` and `hittest`. `assess:true` asks the extension for
+    /// the DOM assessment in the same resolve reply (no second call, 0108 lock intact).
+    pub fn resolve_with_opts(
+        &self,
+        space: Space,
+        hwnd: Option<isize>,
+        assess: bool,
+    ) -> Result<TargetOutcome, HandsError> {
+        self.resolve_with_opts_samples(space, hwnd, assess, None)
+    }
+
+    pub fn resolve_with_opts_samples(
+        &self,
+        space: Space,
+        hwnd: Option<isize>,
+        assess: bool,
+        samples: Option<u32>,
+    ) -> Result<TargetOutcome, HandsError> {
         match self {
             Self::ElementId(id) => {
                 if id.starts_with("chr:") {
-                    let mut hit = chrome::try_resolve(id, hwnd)?;
+                    let mut hit = chrome::try_resolve_assessed(id, hwnd, assess, samples)?;
                     if hit.contract.transform.valid {
                         if finish_chr(id, &mut hit, space)?.is_some() {
                             return Ok(TargetOutcome::Unresolved {
                                 target: self.clone(),
                                 contract: Box::new(hit.contract),
                                 hwnd: hit.hwnd,
+                                assessment: hit.assessment.map(Box::new),
                             });
                         }
                         return Ok(TargetOutcome::Resolved(Box::new(hit.into_resolved())));
@@ -134,6 +159,7 @@ impl Target {
                         target: self.clone(),
                         contract: Box::new(hit.contract),
                         hwnd: hit.hwnd,
+                        assessment: hit.assessment.map(Box::new),
                     });
                 }
                 let runtime_id = parse_runtime_id(id)?;
@@ -170,6 +196,7 @@ impl Target {
                         crate::point::PhysicalPoint { x, y },
                     )),
                     map: None,
+                    assessment: None,
                 })))
             }
             Self::Pixel { x, y } => {
@@ -204,6 +231,7 @@ impl Target {
                         crate::point::PhysicalPoint { x: *x, y: *y },
                     )),
                     map: None,
+                    assessment: None,
                 })))
             }
         }
@@ -226,6 +254,7 @@ impl chrome::ChromeHit {
             css_rect: Some(self.css_rect),
             contract: Some(self.contract),
             map: self.map,
+            assessment: self.assessment,
         }
     }
 }
@@ -316,6 +345,7 @@ fn finish_element(
             crate::point::PhysicalPoint { x, y },
         )),
         map: None,
+        assessment: None,
     })
 }
 
@@ -651,6 +681,7 @@ mod tests {
             contract,
             hwnd,
             map: None,
+            assessment: None,
         }
     }
 

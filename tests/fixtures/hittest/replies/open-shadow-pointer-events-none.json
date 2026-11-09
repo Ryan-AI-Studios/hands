@@ -1,0 +1,9 @@
+{
+  "element": {"kind": "element", "tag": "div", "role": "button"},
+  "shadow_path": [],
+  "interactable": true,
+  "reason": null,
+  "notes": [],
+  "confidence": "high",
+  "elapsed_ms": 1.2
+}

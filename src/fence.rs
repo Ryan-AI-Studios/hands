@@ -340,6 +340,7 @@ mod tests {
             css_rect: None,
             contract: None,
             map: None,
+            assessment: None,
         }
     }
 
@@ -520,6 +521,7 @@ mod tests {
             css_rect: None,
             contract: None,
             map: None,
+            assessment: None,
         }
     }
 

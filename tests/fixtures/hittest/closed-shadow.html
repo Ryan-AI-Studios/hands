@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>hittest closed shadow</title>
+</head><body>
+<button id="target" data-fixture="closed-shadow" style="position:absolute;left:100px;top:50px;width:200px;height:40px">Sign in</button>
+<div id="host"></div>
+<script>
+const host = document.getElementById("host");
+const root = host.attachShadow({ mode: "closed" });
+const overlay = document.createElement("div");
+overlay.setAttribute("role", "dialog");
+overlay.style.cssText = "position:fixed;left:0;top:0;width:100vw;height:100vh;background:rgba(0,0,0,.4)";
+root.appendChild(overlay);
+</script>
+</body></html>

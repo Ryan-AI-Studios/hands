@@ -1,0 +1,34 @@
+{
+  "id": "chr:12",
+  "role": "Button",
+  "text": "Sign in",
+  "rectCss": {"left": 100.0, "top": 50.0, "width": 200.0, "height": 40.0},
+  "url": "https://example.test/",
+  "title": "Example",
+  "metrics": {
+    "screenX": 0.0,
+    "screenY": 0.0,
+    "outerWidth": 1200.0,
+    "outerHeight": 900.0,
+    "innerWidth": 1200.0,
+    "innerHeight": 900.0,
+    "devicePixelRatio": 1.0,
+    "clientWidth": 1200.0,
+    "clientHeight": 900.0
+  },
+  "assessment": {
+    "interactable": true,
+    "selected_point": {"x": 200.0, "y": 70.0},
+    "target_rect_css": {"left": 100.0, "top": 50.0, "width": 200.0, "height": 40.0},
+    "visible_fraction": 1.0,
+    "onscreen_fraction": 1.0,
+    "samples": 25,
+    "samples_hit": 25,
+    "blocked_by": [],
+    "clipped_by": null,
+    "notes": [],
+    "reason": null,
+    "confidence": "high",
+    "elapsed_ms": 1.1
+  }
+}

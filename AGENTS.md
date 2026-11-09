@@ -52,6 +52,7 @@ CLI (same observe contract as MCP):
 ```powershell
 cargo run -- mcp --help
 cargo run -- observe --help
+cargo run -- hittest --help
 cargo run -- click --help
 cargo run -- uia-action --help
 cargo run -- hover --help

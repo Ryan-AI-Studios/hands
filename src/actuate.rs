@@ -69,6 +69,10 @@ pub struct ActuateEnvelope {
     pub point: Option<crate::point::PointContract>,
     #[serde(default = "verified_default", skip_serializing_if = "verified_is_true")]
     pub verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<crate::hittest::Assessment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interactable_checked: Option<bool>,
     #[serde(flatten, default)]
     pub semantic: Option<crate::uia_actions::SemanticInfo>,
 }
@@ -97,6 +101,7 @@ pub struct ActuateRequest {
     pub dy: Option<i32>,
     pub dx: Option<i32>,
     pub blind: bool,
+    pub require_interactable: bool,
     pub action: Option<String>,
     pub value: Option<String>,
     pub timeout_ms: Option<u64>,
@@ -249,6 +254,8 @@ pub(crate) fn refuse_if_blocked(
         guidance: None,
         point: None,
         verified: true,
+        assessment: None,
+        interactable_checked: None,
         semantic: None,
     })
     .map(Some)
@@ -448,6 +455,8 @@ fn base(
         guidance: None,
         point: None,
         verified: true,
+        assessment: None,
+        interactable_checked: None,
         semantic: None,
     })
 }
@@ -473,6 +482,8 @@ fn refuse_yield(session_id: String, target: ActuateTarget) -> Result<ActuateEnve
         guidance: None,
         point: None,
         verified: true,
+        assessment: None,
+        interactable_checked: None,
         semantic: None,
     })
 }
@@ -582,6 +593,8 @@ pub(crate) fn refuse_fence(
         guidance: None,
         point: None,
         verified: true,
+        assessment: None,
+        interactable_checked: None,
         semantic: None,
     })
 }
@@ -747,7 +760,11 @@ fn after_actuate(
 
 fn resolve_req(req: &ActuateRequest, space: Space) -> Result<TargetOutcome, HandsError> {
     let target = Target::parse(req.element_id.as_deref(), req.grid.as_deref(), req.x, req.y)?;
-    target.resolve_with(space, foreground::foreground_hwnd())
+    target.resolve_with_opts(
+        space,
+        foreground::foreground_hwnd(),
+        req.require_interactable,
+    )
 }
 
 /// Transform-invalid refusal: `ok:false`, `verified:false`, full `point` contract, no
@@ -782,6 +799,8 @@ pub(crate) fn refuse_transform(
         guidance: None,
         point: Some(contract),
         verified: false,
+        assessment: None,
+        interactable_checked: None,
         semantic: None,
     })
 }
@@ -888,7 +907,15 @@ fn point_for_dispatch(resolved: &ResolvedTarget) -> Option<PointContract> {
 
 pub fn click(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let blind = req.blind;
-    after_actuate("click", click_inner(req), None, None, blind)
+    let require_interactable = req.require_interactable;
+    let result = click_inner(req).map(|mut env| {
+        if require_interactable && env.interactable_checked.is_none() {
+            // Positive marker on every envelope from a binary that understood the flag.
+            env.interactable_checked = Some(true);
+        }
+        env
+    });
+    after_actuate("click", result, None, None, blind)
 }
 
 fn click_miss(same: bool, focus_lost: bool) -> Option<&'static str> {
@@ -996,6 +1023,16 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             false,
         );
     }
+    if req.require_interactable && req.blind {
+        return fail(
+            session_id,
+            none_target(),
+            HandsError::Input("interactable_unavailable: click on chr: only".into()),
+            false,
+            false,
+            false,
+        );
+    }
     let outcome = match resolve_req(&req, space) {
         Ok(r) => r,
         Err(err) => return fail(session_id, none_target(), err, false, false, false),
@@ -1009,6 +1046,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             target,
             contract,
             hwnd,
+            assessment: _,
         } => {
             let info = unresolved_info(&target, &contract);
             let point = contract.physical.map(|p| (p.x, p.y));
@@ -1028,6 +1066,14 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     }
     if let Some(contract) = contract_refusal {
         return refuse_transform(session_id, info, *contract);
+    }
+    if req.require_interactable {
+        let resolved_ref = resolved.as_ref().expect("resolved outcome");
+        if let Some(env) =
+            crate::hittest::guard_require_interactable(&session_id, &info, resolved_ref)?
+        {
+            return Ok(env);
+        }
     }
     let resolved_ref = resolved.as_mut().expect("resolved outcome");
     fence::ensure_installed();
@@ -1204,6 +1250,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     env.point = point_for_dispatch(&resolved);
     env.miss = effect.miss.map(str::to_string);
     env.navigated = effect.navigated;
+    env.assessment = resolved.assessment.clone();
     finalize_envelope(env)
 }
 
@@ -1285,6 +1332,16 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         Ok(id) => id,
         Err(err) => return fail(raw_session(&req), none_target(), err, false, false, false),
     };
+    if req.require_interactable {
+        return fail(
+            session_id,
+            none_target(),
+            HandsError::Input("interactable_unavailable: click on chr: only".into()),
+            false,
+            false,
+            false,
+        );
+    }
     if req.blind {
         return fail(
             session_id,
@@ -1312,6 +1369,7 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             target,
             contract,
             hwnd,
+            assessment: _,
         } => {
             let info = unresolved_info(&target, &contract);
             let point = contract.physical.map(|p| (p.x, p.y));
@@ -1867,6 +1925,8 @@ mod tests {
             guidance: None,
             point: None,
             verified: true,
+            assessment: None,
+            interactable_checked: None,
             semantic: None,
         };
         let err = finalize_envelope(env).expect_err("must not emit oversize");
@@ -1909,6 +1969,8 @@ mod tests {
             guidance: None,
             point: None,
             verified: true,
+            assessment: None,
+            interactable_checked: None,
             semantic: None,
         };
         let json = serialize_envelope(&env).expect("json");
@@ -1947,6 +2009,8 @@ mod tests {
             guidance: None,
             point: None,
             verified: true,
+            assessment: None,
+            interactable_checked: None,
             semantic: None,
         };
         let json = serialize_envelope(&env).expect("json");
@@ -1983,6 +2047,8 @@ mod tests {
             guidance: None,
             point: None,
             verified: true,
+            assessment: None,
+            interactable_checked: None,
             semantic: None,
         };
         let json = serialize_envelope(&env).expect("json");
@@ -2017,6 +2083,8 @@ mod tests {
             guidance: None,
             point: None,
             verified: true,
+            assessment: None,
+            interactable_checked: None,
             semantic: None,
         };
         let json = serialize_envelope(&env).expect("json");
@@ -2050,6 +2118,8 @@ mod tests {
             guidance: None,
             point: None,
             verified: true,
+            assessment: None,
+            interactable_checked: None,
             semantic: None,
         };
         let json = serialize_envelope(&env).expect("json");
@@ -2323,6 +2393,7 @@ mod tests {
             css_rect: None,
             contract: None,
             map: None,
+            assessment: None,
         }
     }
 
@@ -4028,6 +4099,87 @@ mod tests {
     }
 
     #[test]
+    fn flag_off_real_blind_click_has_no_hittest_fields() {
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::uia::set_hit_test_hook(Some(panic_hit_test));
+        crate::input::set_send_inputs_hook(Some(count_sends));
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            grant_blind("s-0128-flagoff");
+            let env = click(blind_pixel_req("s-0128-flagoff", x, y)).expect("click");
+            assert!(env.ok, "{env:?}");
+            assert!(env.assessment.is_none(), "{env:?}");
+            assert!(env.interactable_checked.is_none(), "{env:?}");
+            let json = serialize_envelope(&env).expect("json");
+            assert!(!json.contains("\"assessment\""), "{json}");
+            assert!(!json.contains("interactable_checked"), "{json}");
+        });
+    }
+
+    #[test]
+    fn require_interactable_blocked_refuses_runtime_seam_before_offer() {
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let _ = crate::foreground::take_offer_calls();
+        let map = act_remap_map(100, 80);
+        let css_rect = crate::point::CssRect {
+            left: 100.0,
+            top: 50.0,
+            width: 200.0,
+            height: 40.0,
+        };
+        let css = css_rect.center();
+        let contract = crate::point::contract_for(&map, css);
+        let rect = crate::point::map_rect(&contract, css_rect).expect("rect");
+        let mut assessment: crate::hittest::Assessment = serde_json::from_str(include_str!(
+            "../tests/fixtures/hittest/replies/sticky-header.json"
+        ))
+        .expect("assessment");
+        assessment.selected_point = css;
+        assessment.target_rect_css = css_rect;
+        assessment.interactable = Some(false);
+        assessment.reason = Some("blocked".into());
+        chrome::set_resolve_stub(Some(chrome::ChromeHit {
+            id: "chr:0".into(),
+            name: "Sign in".into(),
+            role: "Button".into(),
+            rect,
+            css_rect,
+            css_point: css,
+            contract,
+            hwnd: Some(0x10),
+            map: Some(map),
+            assessment: Some(assessment),
+        }));
+        let env = click(ActuateRequest {
+            session_id: Some("s-0128-seam".into()),
+            element_id: Some("chr:0".into()),
+            require_interactable: true,
+            ..ActuateRequest::default()
+        })
+        .expect("click");
+        chrome::set_resolve_stub(None);
+        assert!(!env.ok, "{env:?}");
+        assert_eq!(env.error.as_deref(), Some("interactable_blocked: blocked"));
+        assert_eq!(env.interactable_checked, Some(true));
+        assert!(
+            crate::foreground::take_offer_calls().is_empty(),
+            "blocked refusal must not offer/focus"
+        );
+    }
+
+    #[test]
     fn blind_click_element_id_refuses_before_resolve() {
         let _g = elevation_lock();
         crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
@@ -4704,6 +4856,7 @@ mod tests {
                 contract,
                 hwnd: Some(0x1234),
                 map: Some(map),
+                assessment: None,
             },
             css,
         )
@@ -4748,6 +4901,7 @@ mod tests {
             css_rect: Some(css),
             contract: Some(contract.clone()),
             map: Some(old),
+            assessment: None,
         };
         let info = resolved_info("element", Some("chr:5".into()), 200, 130);
         (resolved, info, css, old_rect, contract)
@@ -5048,6 +5202,58 @@ mod tests {
     }
 
     #[test]
+    fn require_interactable_true_dispatches_and_marks() {
+        let _g = elevation_lock();
+        let _seam = FinalRemapSeam;
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 300,
+                y: 200,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        let (mut hit, css) = chr_hit(100, 80);
+        let mut assessment: crate::hittest::Assessment = serde_json::from_str(include_str!(
+            "../tests/fixtures/hittest/replies/unobstructed.json"
+        ))
+        .expect("assessment");
+        assessment.selected_point = hit.contract.css.expect("css");
+        assessment.target_rect_css = css;
+        hit.assessment = Some(assessment);
+        chrome::set_resolve_stub(Some(hit));
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::input::set_send_inputs_hook(Some(noop_sends));
+        crate::capture::set_capture_roi_hook(Some(fake_capture));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        let _ = crate::foreground::take_offer_calls();
+
+        let env = click(ActuateRequest {
+            session_id: Some("s-0128-true".into()),
+            element_id: Some("chr:5".into()),
+            require_interactable: true,
+            ..ActuateRequest::default()
+        })
+        .expect("click");
+        chrome::set_resolve_stub(None);
+        assert!(env.ok, "{env:?}");
+        assert_eq!(env.interactable_checked, Some(true), "{env:?}");
+        assert!(env.assessment.is_some(), "{env:?}");
+        let offers = crate::foreground::take_offer_calls();
+        assert!(
+            offers.iter().any(|(hwnd, _)| *hwnd == Some(0x1234)),
+            "unobstructed opted-in click must dispatch: {offers:?}"
+        );
+        lease::reset_for_test();
+    }
+
+    #[test]
     fn chr_click_stale_remap_refuses_before_offer_and_input() {
         let _g = elevation_lock();
         let _seam = FinalRemapSeam;
@@ -5176,6 +5382,7 @@ mod tests {
             css_rect: Some(css_rect),
             contract: Some(old_contract),
             map: Some(old_map),
+            assessment: None,
         };
         let mut info = resolved_info("element", Some("chr:5".into()), old_point.x, old_point.y);
         let _ = crate::foreground::take_offer_calls();
@@ -5708,6 +5915,200 @@ mod tests {
         assert!(!ext.contains(&["element", ".click("].join("")));
         assert!(!ext.contains(&["dispatch", "Event("].join("")));
         assert!(!ext.contains(&["all_frames", ": true"].join("")));
+    }
+
+    #[test]
+    fn click_inner_guard_order_transform_interactable_fence_outside() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let end = src.find("fn dispatch_blind_click").expect("blind");
+        let body = &src[start..end];
+        let transform = body
+            .find("refuse_transform(session_id, info, *contract)")
+            .expect("transform refusal");
+        let guard = body
+            .find("guard_require_interactable")
+            .expect("interactable guard");
+        let fence = body.find("fence::ensure_installed").expect("fence");
+        let gate = body.find("fence::gate_click").expect("gate_click");
+        let remap = body.find("final_live_remap").expect("final remap");
+        let client = body
+            .find("refuse_if_outside_client")
+            .expect("outside client");
+        let offer = body.find("foreground::offer").expect("offer");
+        assert!(
+            transform < guard
+                && guard < fence
+                && fence < gate
+                && gate < remap
+                && remap < client
+                && client < offer,
+            "locked order transform < interactable < fence < remap < outside_client < offer:\n{body}"
+        );
+        assert!(
+            body.find("try_snapshot").is_none()
+                && body.find("try_resolve").is_none()
+                && body.find("note_last_url").is_none(),
+            "0108 lock: click_inner must not add a snapshot/resolve/URL call"
+        );
+    }
+
+    #[test]
+    fn require_interactable_blocked_refuses_before_fence_offer_and_input() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let end = src.find("fn dispatch_blind_click").expect("blind");
+        let body = &src[start..end];
+        let guard = body
+            .find("guard_require_interactable")
+            .expect("interactable guard");
+        let offer = body.find("foreground::offer").expect("offer");
+        let move_to = body.find("input::move_to").expect("move_to");
+        let click_input = body.find("input::left_click").expect("left_click");
+        assert!(
+            guard < offer && guard < move_to && guard < click_input,
+            "the refusal must be pre-dispatch:\n{body}"
+        );
+        // The guard itself never dispatches.
+        let hittest = include_str!("hittest.rs");
+        let guard_start = hittest
+            .find("pub fn guard_require_interactable")
+            .expect("guard fn");
+        let guard_end = hittest[guard_start..]
+            .find("pub fn refusal")
+            .map(|i| guard_start + i)
+            .expect("refusal fn");
+        let guard_body = &hittest[guard_start..guard_end];
+        for forbidden in ["foreground::offer", "input::move_to", "input::left_click"] {
+            assert!(
+                !guard_body.contains(forbidden),
+                "guard must not call {forbidden}:\n{guard_body}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_interactable_blind_refuses() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner").expect("click_inner");
+        let end = src.find("fn dispatch_blind_click").expect("blind");
+        let body = &src[start..end];
+        let blind = body
+            .find("req.require_interactable && req.blind")
+            .expect("blind flag refusal");
+        let resolve = body.find("resolve_req").expect("resolve_req");
+        assert!(
+            blind < resolve,
+            "blind + require_interactable must refuse before any DOM read:\n{body}"
+        );
+        assert!(body.contains("interactable_unavailable"), "{body}");
+    }
+
+    #[test]
+    fn hover_require_interactable_refuses() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn hover_inner").expect("hover_inner");
+        let end = src.find("pub fn type_text").expect("type_text");
+        let body = &src[start..end];
+        let guard = body
+            .find("req.require_interactable")
+            .expect("hover flag guard");
+        let resolve = body.find("resolve_req").expect("resolve_req");
+        let move_to = body.find("input::move_to").expect("move_to");
+        assert!(
+            guard < resolve && guard < move_to,
+            "hover must refuse the flag before resolve/move:\n{body}"
+        );
+        assert!(body.contains("interactable_unavailable"), "{body}");
+    }
+
+    #[test]
+    fn require_interactable_true_guard_allows() {
+        // Positive control at the guard seam: true is not a refusal. Dispatch wiring is the
+        // existing click path; this test pins that the guard returns None for a true verdict.
+        let report = crate::point::TransformReport {
+            valid: true,
+            method: crate::point::TransformMethod::RenderWidgetHost,
+            confidence: crate::point::TransformConfidence::High,
+            scale: Some(1.0),
+            dpr: Some(1.0),
+            dpi: Some(96),
+            page_zoom: Some(1.0),
+            page_viewport: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 1200,
+                h: 900,
+            }),
+            anchor_basis: Some(crate::point::CssBasis::Client),
+            layout_basis: Some(crate::point::CssBasis::Client),
+            reason: None,
+            observe_id: Some("f3a9c1d2e4b5a607".into()),
+        };
+        let css = crate::point::CssPoint::new(10.0, 20.0);
+        let contract = crate::point::PointContract {
+            source: PointSource::Chr,
+            css: Some(css),
+            physical: crate::point::map_point(
+                &crate::point::PointContract {
+                    source: PointSource::Chr,
+                    css: Some(css),
+                    physical: None,
+                    transform: report.clone(),
+                },
+                css,
+            )
+            .ok(),
+            transform: report,
+        };
+        let mut assessment: crate::hittest::Assessment = serde_json::from_str(include_str!(
+            "../tests/fixtures/hittest/replies/unobstructed.json"
+        ))
+        .expect("assessment");
+        assessment.selected_point = css;
+        assessment.target_rect_css = crate::point::CssRect {
+            left: 0.0,
+            top: 0.0,
+            width: 100.0,
+            height: 40.0,
+        };
+        let resolved = crate::target::ResolvedTarget {
+            target: Target::ElementId("chr:0".into()),
+            kind: "element",
+            id: Some("chr:0".into()),
+            x: 10,
+            y: 20,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 40,
+            },
+            hwnd: Some(0x1234),
+            name: String::new(),
+            role: String::new(),
+            css_point: Some(css),
+            css_rect: Some(crate::point::CssRect {
+                left: 0.0,
+                top: 0.0,
+                width: 100.0,
+                height: 40.0,
+            }),
+            contract: Some(contract),
+            map: None,
+            assessment: Some(assessment),
+        };
+        let info = ActuateTarget {
+            kind: "element".into(),
+            id: Some("chr:0".into()),
+            x: 10,
+            y: 20,
+        };
+        assert!(
+            crate::hittest::guard_require_interactable("s-test", &info, &resolved)
+                .expect("guard")
+                .is_none()
+        );
     }
 
     #[test]

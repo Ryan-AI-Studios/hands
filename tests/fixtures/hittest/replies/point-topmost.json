@@ -1,0 +1,16 @@
+{
+  "element": {
+    "kind": "element",
+    "tag": "button",
+    "role": "button",
+    "name": "Sign in",
+    "rect_css": {"left": 100.0, "top": 50.0, "width": 200.0, "height": 40.0},
+    "reason": null
+  },
+  "shadow_path": ["app-shell"],
+  "interactable": true,
+  "reason": null,
+  "notes": [],
+  "confidence": "medium",
+  "elapsed_ms": 1.3
+}

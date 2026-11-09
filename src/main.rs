@@ -60,7 +60,29 @@ enum Command {
         #[arg(long)]
         fg_preview: bool,
     },
-    /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content. Point must be inside the intended window's true client or an owned popup (no `--window` on click; activate first). Out-of-client is `ok:false` (named refusal, cooldown), not SendInput. `ok:true` means delivered; `miss` (`no_change` / `focus_lost`) is the effect signal. `navigated:true` is a Chrome caption change or loading interstitial, or a non-Chrome http(s) UIA Document URL change — `miss` omitted, no retry; `chr:` ids died, re-observe. Chrome soft-routes with the same caption stay `no_change`. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on `focus_lost`. Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default. The `point` object carries the shared PointContract; a transform-invalid `chr:` refuses `ok:false` with `verified:false`, `physical:null` and a named `reason`, and never calls offer/SendInput. `verified` semantics: on `ok:true`, dispatch delivered and effect unproven; pre-dispatch refusals carry the target reason and send nothing (the `verified` key is omitted); a post-dispatch freeze or post-dispatch failure sets `verified:false` because input may already have been sent.
+    /// Read-only DOM hit-test / interactivity assessment. `--element-id chr:N` asks whether a real press at that element's validated CSS point would reach it (blocked by an overlay, clipped, iframe, closed shadow, or unknown). `--x/--y` or `--grid` asks what is under that physical point (top frame only, foreground Chrome); `interactable:true` only for an interactive/nameable topmost element, otherwise `null` with `not_interactive`. `ok:true` means the query ran; `interactable:null` is an honest unknown, not a failure. Assessment is advisory unless `click --require-interactable` opts in. No input, no lease, no native-window occlusion; page names are untrusted and never logged.
+    Hittest {
+        #[arg(
+            long,
+            help = "Chrome page-local chr: walk index (dies on navigation; re-observe)"
+        )]
+        element_id: Option<String>,
+        #[arg(long, help = "grid cell g:col:row; asks what is under its center")]
+        grid: Option<String>,
+        #[arg(
+            long,
+            allow_negative_numbers = true,
+            help = "virtual-screen pixel; origin can be negative"
+        )]
+        x: Option<i32>,
+        #[arg(long, allow_negative_numbers = true)]
+        y: Option<i32>,
+        #[arg(long, help = "sample count 5..49 (default 25; clamped)")]
+        samples: Option<u32>,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Bézier-move and left-click a UIA id, Chrome `chr:` id, grid cell, or pixel. `uia:` is RuntimeId; `chr:` is a page-local walk index (dies on navigation; re-observe). Prefer `chr:` for Chrome page content. Point must be inside the intended window's true client or an owned popup (no `--window` on click; activate first). Out-of-client is `ok:false` (named refusal, cooldown), not SendInput. `ok:true` means delivered; `miss` (`no_change` / `focus_lost`) is the effect signal. `navigated:true` is a Chrome caption change or loading interstitial, or a non-Chrome http(s) UIA Document URL change — `miss` omitted, no retry; `chr:` ids died, re-observe. Chrome soft-routes with the same caption stay `no_change`. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on `focus_lost`. Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default. The `point` object carries the shared PointContract; a transform-invalid `chr:` refuses `ok:false` with `verified:false`, `physical:null` and a named `reason`, and never calls offer/SendInput. `verified` semantics: on `ok:true`, dispatch delivered and effect unproven; pre-dispatch refusals carry the target reason and send nothing (the `verified` key is omitted); a post-dispatch freeze or post-dispatch failure sets `verified:false` because input may already have been sent. `--require-interactable` opts in to refusing a blocked/unknown `chr:` before fence/offer/SendInput; `interactable_checked:true` marks that this binary honoured the flag.
     Click {
         #[arg(
             long,
@@ -84,6 +106,11 @@ enum Command {
             help = "skip target verification for a same-IL UIA-opaque surface; requires --x/--y or --grid; does not verify effect; does not reach elevated windows; activate first"
         )]
         blind: bool,
+        #[arg(
+            long,
+            help = "chr: only: refuse a blocked/unknown target before fence/offer/SendInput (read-only DOM assessment; advisory unless set)"
+        )]
+        require_interactable: bool,
     },
     /// Invoke / toggle / expand / collapse / select / set-value a `uia:` element through UIA patterns. No pointer move, no foreground steal, no SendInput. `ok:true` means the pattern call succeeded (not proof of effect); `delivery` is `delivered` / `undelivered` / `unknown`, and `unknown` is never retried. `set-value` replaces text (read-only, password and non-text roles refuse); `toggle` with `--value on|off|true|false|checked|unchecked` is idempotent, omitted flips.
     UiaAction {
@@ -527,6 +554,19 @@ async fn main() {
         }
         Command::NativeHostDoctor => native_host_doctor_main(),
         Command::ElevationStatus => elevation_status_main(),
+        Command::Hittest {
+            element_id,
+            grid,
+            x,
+            y,
+            samples,
+            session_id,
+        } => {
+            if let Err(err) = dpi {
+                fail(err);
+            }
+            hittest_main(element_id, grid, x, y, samples, session_id)
+        }
         other => {
             if let Err(err) = dpi {
                 fail(err);
@@ -723,6 +763,7 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             y,
             session_id,
             blind,
+            require_interactable,
         } => pack(actuate::click(ActuateRequest {
             session_id,
             element_id,
@@ -730,6 +771,7 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             x,
             y,
             blind,
+            require_interactable,
             ..ActuateRequest::default()
         }))?,
         Command::UiaAction {
@@ -857,7 +899,8 @@ fn input_main(command: Command) -> Result<(), HandsError> {
         | Command::NativeHost { .. }
         | Command::NativeHostManifest { .. }
         | Command::NativeHostDoctor
-        | Command::ElevationStatus => {
+        | Command::ElevationStatus
+        | Command::Hittest { .. } => {
             unreachable!()
         }
     };
@@ -885,6 +928,30 @@ fn elevation_status_main() -> Result<(), HandsError> {
     let status = hands::elevation::status()?;
     let json = hands::elevation::serialize_status(&status)?;
     println!("{json}");
+    Ok(())
+}
+
+fn hittest_main(
+    element_id: Option<String>,
+    grid: Option<String>,
+    x: Option<i32>,
+    y: Option<i32>,
+    samples: Option<u32>,
+    session_id: Option<String>,
+) -> Result<(), HandsError> {
+    let envelope = hands::hittest::run(hands::hittest::HittestRequest {
+        session_id,
+        element_id,
+        grid,
+        x,
+        y,
+        samples,
+    })?;
+    let json = hands::hittest::serialize(&envelope)?;
+    println!("{json}");
+    if !envelope.ok {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

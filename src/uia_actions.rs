@@ -353,6 +353,8 @@ fn base_envelope(
         guidance: None,
         point: None,
         verified: false,
+        assessment: None,
+        interactable_checked: None,
         semantic: Some(SemanticInfo {
             action: action.as_str().to_string(),
             delivery: Delivery::Undelivered,
@@ -1110,6 +1112,7 @@ mod tests {
             css_rect: None,
             contract: None,
             map: None,
+            assessment: None,
         }
     }
 

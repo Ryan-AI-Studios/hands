@@ -943,7 +943,7 @@ mod tests {
         assert!(body.contains("uia_actions::uia_action"));
         // Actuation installs the desk lease: uia-action must not be listed in
         // the no-lease/unreachable arm.
-        let unreachable_arm = &src[src.find("Command::Mcp\n").expect("arm")..];
+        let unreachable_arm = &src[src.find("Command::Mcp { .. }").expect("arm")..];
         assert!(
             !unreachable_arm[..600].contains("Command::UiaAction { .. }"),
             "uia-action must stay out of the unreachable arm"

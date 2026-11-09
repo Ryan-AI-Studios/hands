@@ -1,0 +1,17 @@
+{
+  "interactable": false,
+  "selected_point": {"x": 170.0, "y": 170.0},
+  "target_rect_css": {"left": 90.0, "top": 150.0, "width": 200.0, "height": 40.0},
+  "visible_fraction": 0.0,
+  "onscreen_fraction": 1.0,
+  "samples": 25,
+  "samples_hit": 0,
+  "blocked_by": [],
+  "clipped_by": {"kind": "element", "tag": "div", "role": null, "name": "outer",
+                 "rect_css": {"left": 80.0, "top": 40.0, "width": 240.0, "height": 120.0},
+                 "reason": "clipped"},
+  "notes": [],
+  "reason": "clipped_out",
+  "confidence": "medium",
+  "elapsed_ms": 1.2
+}

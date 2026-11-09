@@ -898,6 +898,17 @@ mod tests {
     }
 
     #[test]
+    fn nested_scroll_centre_outside_clip_is_false() {
+        let a = assessment("nested-scroll.json");
+        assert_eq!(a.interactable, Some(false));
+        assert_eq!(a.reason.as_deref(), Some("clipped_out"));
+        assert_eq!(
+            a.clipped_by.expect("clipped_by").tag.as_deref(),
+            Some("div")
+        );
+    }
+
+    #[test]
     fn transformed_reply_passes() {
         assert_eq!(
             assessment("transformed-ancestor.json").interactable,
@@ -1665,6 +1676,20 @@ mod tests {
             .expect("refusal");
         assert_eq!(env.interactable_checked, Some(true));
         assert_eq!(flag_off_golden().interactable_checked, None);
+        let src = include_str!("actuate.rs");
+        assert!(
+            src.contains("if require_interactable && env.interactable_checked.is_none()"),
+            "successful opted-in click must carry the positive marker"
+        );
+    }
+
+    #[test]
+    fn rust_never_calls_a_dom_hit_test() {
+        let src = include_str!("hittest.rs");
+        let element = ["element", "FromPoint("].concat();
+        let elements = ["elements", "FromPoint("].concat();
+        assert!(!src.contains(&element));
+        assert!(!src.contains(&elements));
     }
 
     fn flag_off_golden() -> ActuateEnvelope {

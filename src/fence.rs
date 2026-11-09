@@ -98,21 +98,24 @@ pub fn gate_high_il(
     let Some(hwnd) = hwnd else {
         return Ok(None);
     };
-    if !crate::elevation::window_is_high_il(hwnd) {
-        return Ok(None);
-    }
-    if !crate::elevation::process_uiaccess()? {
-        return Err(HandsError::Fence(crate::elevation::UNGRANTED_MSG.into()));
-    }
-    match allows::check(session_id, "desktop", classify::Category::Elevated)? {
-        AllowHit::Miss => Ok(Some(FenceInfo {
-            domain: "desktop".into(),
-            category: classify::Category::Elevated.to_string(),
-            name: "elevated window".into(),
-            role: "window".into(),
-            modes: vec!["once".into(), "session".into(), "persist".into()],
-        })),
-        _ => Ok(None),
+
+    match crate::elevation::high_il_reach(Some(hwnd))? {
+        crate::elevation::HighIlReach::Allow => Ok(None),
+        crate::elevation::HighIlReach::ConfirmElevated => {
+            match allows::check(session_id, "desktop", classify::Category::Elevated)? {
+                AllowHit::Miss => Ok(Some(FenceInfo {
+                    domain: "desktop".into(),
+                    category: classify::Category::Elevated.to_string(),
+                    name: "elevated window".into(),
+                    role: "window".into(),
+                    modes: vec!["once".into(), "session".into(), "persist".into()],
+                })),
+                _ => Ok(None),
+            }
+        }
+        crate::elevation::HighIlReach::Refuse => {
+            Err(HandsError::Fence(crate::elevation::UNGRANTED_MSG.into()))
+        }
     }
 }
 
@@ -380,13 +383,18 @@ mod tests {
         // Retained 0004 disposition: a wiped session allow must not be reused by
         // the semantic path, because every call re-decides the fence.
         allows::with_test_env(|| {
-            allows::grant(
-                "s-sem-stale",
-                "desktop",
-                Category::Messages,
-                AllowMode::Session,
-            )
-            .expect("grant");
+            // The synthetic target's domain is read from the *live* foreground window
+            // ("desktop" for a non-Chrome window, "unknown" for Chrome-class), so grant both
+            // exact grains. Without this the test flips with whatever window is focused.
+            for domain in ["desktop", "unknown"] {
+                allows::grant(
+                    "s-sem-stale",
+                    domain,
+                    Category::Messages,
+                    AllowMode::Session,
+                )
+                .expect("grant");
+            }
             assert!(
                 gate_semantic("s-sem-stale", &semantic_target("Send", "button"))
                     .expect("gate")
@@ -577,10 +585,24 @@ mod tests {
     }
 
     #[test]
+    fn high_caller_same_integrity_has_no_elevated_fence() {
+        let _lock = crate::elevation::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _hooks = crate::elevation::HookGuard;
+        crate::elevation::set_caller_rid_hook(Some(|| crate::elevation::HIGH_IL_RID));
+        crate::elevation::set_window_rid_hook(Some(|_| Ok(crate::elevation::HIGH_IL_RID)));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        assert_eq!(gate_high_il("s-0120-high", Some(1)).unwrap(), None);
+    }
+
+    #[test]
     fn gate_high_il_ungranted_is_named_error_granted_is_desktop_elevated() {
         let _elev = crate::elevation::TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _hooks = crate::elevation::HookGuard;
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
         crate::elevation::set_high_il_hook(Some(|_| true));
         crate::elevation::set_uiaccess_hook(Some(|| false));
         let err = gate_high_il("s-0119", Some(0x22)).expect_err("ungranted");

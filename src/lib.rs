@@ -12,6 +12,7 @@ pub mod challenge;
 pub mod chrome;
 pub mod classify;
 pub mod cooldown;
+pub mod desk_pipe;
 pub mod dialogs;
 pub mod dotask;
 pub mod elevation;

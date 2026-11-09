@@ -281,11 +281,20 @@ fn make_observe_id(raw: &RawSnapshot, hwnd: Option<isize>, element_count: usize)
     observe_id(&parts)
 }
 
+/// A focused Chrome-owned window that is not the resolved Chrome window (for example an owned
+/// popup) is a `window_mismatch`; never re-root the click behind it.
+fn focused_chrome_popup_owns_foreground(target: isize) -> bool {
+    match foreground::foreground_hwnd() {
+        Some(fg) if fg != target => foreground::target_is_chrome(Some(fg)),
+        _ => false,
+    }
+}
+
 fn observe_identity(title: Option<&str>, hwnd: Option<isize>) -> crate::point::WindowIdentity {
     let Some(hwnd) = hwnd else {
         return crate::point::WindowIdentity::Mismatch;
     };
-    if !foreground::is_chrome_hwnd(hwnd) {
+    if !foreground::target_is_chrome(Some(hwnd)) || focused_chrome_popup_owns_foreground(hwnd) {
         return crate::point::WindowIdentity::Mismatch;
     }
     let caption = foreground::title(Some(hwnd));
@@ -523,7 +532,8 @@ fn remap_identity(hwnd: isize) -> (Option<String>, usize, bool) {
             return hook(hwnd);
         }
     }
-    let is_chrome = foreground::is_chrome_hwnd(hwnd);
+    let is_chrome =
+        foreground::target_is_chrome(Some(hwnd)) && !focused_chrome_popup_owns_foreground(hwnd);
     if is_chrome {
         (
             Some(foreground::title(Some(hwnd))),
@@ -2306,5 +2316,37 @@ mod tests {
 
         REMAP_DPI.with(|c| c.set(120));
         set_remap_geometry_hook(None);
+    }
+
+    fn fg_popup() -> Option<isize> {
+        Some(0x5678)
+    }
+
+    fn fg_target() -> Option<isize> {
+        Some(0x1234)
+    }
+
+    fn all_windows_chrome(_: Option<isize>) -> bool {
+        true
+    }
+
+    #[test]
+    fn focused_chrome_popup_is_window_mismatch() {
+        let target = 0x1234;
+        let _ = crate::foreground::take_offer_calls();
+        crate::foreground::set_chrome_target_hook(Some(all_windows_chrome));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_popup));
+        assert!(focused_chrome_popup_owns_foreground(target));
+        assert_eq!(
+            observe_identity(Some("Owner Web Access"), Some(target)),
+            crate::point::WindowIdentity::Mismatch
+        );
+
+        // The resolved window itself is not a popup.
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_target));
+        assert!(!focused_chrome_popup_owns_foreground(target));
+
+        crate::foreground::set_foreground_hwnd_hook(None);
+        crate::foreground::set_chrome_target_hook(None);
     }
 }

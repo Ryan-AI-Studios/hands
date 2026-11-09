@@ -4482,6 +4482,8 @@ mod tests {
         crate::input::set_send_inputs_hook(Some(panic_sends));
         let (mut resolved, mut info, _, old_rect, _) = final_remap_fixture();
         let _ = crate::foreground::take_offer_calls();
+        let seed = distinctive_seed_rect();
+        remember_target(seed);
 
         // Same origin, changed size: the recorded page metrics no longer match.
         ACT_REMAP_ANCHOR.with(|c| {
@@ -4517,9 +4519,10 @@ mod tests {
                 .starts_with("stale_viewport"),
             "{point:?}"
         );
-        // A refused re-map must not move the target or the envelope.
+        // A refused re-map must not move the target, the envelope or `LAST_TARGET`.
         assert_eq!((resolved.x, resolved.y), (200, 130));
         assert_eq!(resolved.rect, old_rect);
+        assert_eq!(last_target(), Some(seed));
         assert!(crate::foreground::take_offer_calls().is_empty());
     }
 

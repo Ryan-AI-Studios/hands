@@ -1171,7 +1171,7 @@ mod tests {
             },
             base_page,
         ));
-        let mut resize = inputs(
+        let resize = inputs(
             Rect {
                 x: 100,
                 y: 80,
@@ -1180,9 +1180,6 @@ mod tests {
             },
             base_page,
         );
-        resize.page.inner_width = Some(1100.0);
-        // build_map validates against the new metrics, so force a recorded-metrics mismatch.
-        resize.page = base_page;
         assert!(
             remap(&old, resize)
                 .unwrap_err()
@@ -1368,30 +1365,95 @@ mod tests {
     }
 
     #[test]
-    fn reason_tokens_are_stable_and_bounded() {
-        for token in [
-            "bad_dpr",
-            "no_page_metrics",
-            "no_viewport_anchor",
-            "anchor_ambiguous",
-            "anchor_size_mismatch",
-            "anchor_outside_window",
-            "anchor_outside_virtual_screen",
-            "mixed_dpi_straddle",
-            "stale_viewport",
-            "window_mismatch",
-            "window_identity_ambiguous",
-            "not_chrome",
-            "high_il_unreadable",
-            "zoom_out_of_range",
-            "no_hwnd",
-            "point_outside_viewport",
-            "visual_viewport_mismatch",
-            "fixture_snapshot",
-        ] {
-            let report = TransformReport::invalid(format!("{token}: detail"), None);
-            assert!(report.reason.unwrap().starts_with(token));
+    fn invalid_preconditions_produce_named_reasons() {
+        // Each named reason must come from its real precondition through `build_map`, not from
+        // `TransformReport::invalid` echoing a token back.
+        let base = page(1.0, (1200.0, 900.0), None);
+        let anchor = Rect {
+            x: 100,
+            y: 80,
+            w: 1200,
+            h: 900,
+        };
+        let cases: Vec<(&str, MapInputs)> = vec![
+            ("zoom_out_of_range", {
+                let mut i = inputs(anchor, page(0.2, (1200.0, 900.0), None));
+                i.dpi = Some(96); // page_zoom = 0.2 / 1.0, outside [0.25, 5.0]
+                i
+            }),
+            ("anchor_outside_window", {
+                let mut i = inputs(anchor, base);
+                i.window_rect = Some(Rect {
+                    x: 0,
+                    y: 0,
+                    w: 800,
+                    h: 600,
+                });
+                i
+            }),
+            ("anchor_outside_virtual_screen", {
+                let mut i = inputs(anchor, base);
+                i.virtual_screen = Some(Rect {
+                    x: 0,
+                    y: 0,
+                    w: 1000,
+                    h: 1000,
+                });
+                i
+            }),
+            (
+                "no_page_metrics",
+                inputs(
+                    anchor,
+                    PageMetrics {
+                        dpr: Some(1.0),
+                        ..PageMetrics::default()
+                    },
+                ),
+            ),
+            ("window_identity_ambiguous", {
+                let mut i = inputs(anchor, base);
+                i.identity = WindowIdentity::Ambiguous;
+                i
+            }),
+            ("visual_viewport_mismatch", {
+                let mut i = inputs(anchor, base);
+                i.page.visual_scale = Some(1.5);
+                i
+            }),
+        ];
+
+        for (token, i) in cases {
+            let map = build_map(i);
+            assert!(!map.report.valid, "{token} must be invalid");
+            assert!(
+                map.report
+                    .reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with(token),
+                "{token}: {:?}",
+                map.report.reason
+            );
+            let contract = contract_for(&map, CssPoint::new(10.0, 20.0));
+            assert!(contract.physical.is_none(), "{token} must not map a point");
         }
+
+        // `stale_viewport` is a re-map precondition, not a fresh `build_map` error.
+        let old = build_map(inputs(anchor, base));
+        assert!(old.report.valid, "{:?}", old.report.reason);
+        let resized = inputs(
+            Rect {
+                x: 100,
+                y: 80,
+                w: 1100,
+                h: 900,
+            },
+            base,
+        );
+        let reason = remap(&old, resized).unwrap_err();
+        assert!(reason.starts_with("stale_viewport"), "{reason}");
+
         let long = TransformReport::invalid("x".repeat(500), None);
         assert!(long.reason.unwrap().chars().count() <= 120);
         let src = include_str!("point.rs");

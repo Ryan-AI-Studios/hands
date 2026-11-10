@@ -3797,12 +3797,14 @@ mod tests {
         fn drop(&mut self) {
             crate::elevation::set_high_il_hook(None);
             crate::elevation::set_caller_rid_hook(None);
+            crate::elevation::set_window_rid_hook(None);
             crate::elevation::set_uiaccess_hook(None);
             crate::input::set_send_inputs_hook(None);
             crate::foreground::set_foreground_hwnd_hook(None);
             crate::foreground::set_client_rect_hook(None);
             crate::uia::set_focused_leaf_hook(None);
             crate::uia::set_hit_test_hook(None);
+            crate::uia::set_focused_hit_hook(None);
             crate::capture::set_capture_roi_hook(None);
             HOVER_DWELL_HOOK.with(|c| *c.borrow_mut() = None);
         }
@@ -7956,6 +7958,585 @@ mod tests {
             env.outcome.expect("outcome").retry.reason,
             "partial_input_unproven"
         );
+    }
+
+    // ---- 0126: cross-IL stop, blind/fence parity -------------------------------------------
+
+    #[test]
+    fn type_and_key_send_errors_route_through_the_single_partial_dispatch_helper() {
+        // 0124 shipped one post-dispatch vocabulary. 0126 asserts the routing and forbids a
+        // second unverified helper: a send error on type/key must reach fail_partial_dispatch.
+        let src = include_str!("actuate.rs");
+        let production = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_eq!(
+            production.matches("fn fail_partial_dispatch(").count(),
+            1,
+            "exactly one partial-dispatch helper may exist"
+        );
+        assert_eq!(
+            production.matches("fail_partial_dispatch(").count(),
+            3,
+            "one definition and exactly two send-error call sites (type + key)"
+        );
+        let type_body = production
+            .split("fn type_text_inner(")
+            .nth(1)
+            .unwrap()
+            .split("\nfn refuse_unless_focused_editable(")
+            .next()
+            .unwrap();
+        assert!(
+            type_body.contains(
+                "Err(err) => fail_partial_dispatch(session_id, info, err, true, false, false, None)"
+            ),
+            "type send errors must route through fail_partial_dispatch:\n{type_body}"
+        );
+        let key_body = production
+            .split("fn key_inner(")
+            .nth(1)
+            .unwrap()
+            .split("\npub fn scroll(")
+            .next()
+            .unwrap();
+        assert!(
+            key_body.contains(
+                "Err(err) => fail_partial_dispatch(session_id, info, err, false, false, false, None)"
+            ),
+            "key send errors must route through fail_partial_dispatch:\n{key_body}"
+        );
+    }
+
+    /// Owns the temp stop-request path, the env override and the test ingest switch. A Drop
+    /// guard, so a panic cannot leak a fresh stop request into later tests.
+    struct SecondWriterStopDir {
+        path: std::path::PathBuf,
+        prev: Option<std::ffi::OsString>,
+        _ingest: lease::IngestGuard,
+    }
+
+    impl SecondWriterStopDir {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("hands-stop-0126-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("temp stop dir");
+            let path = dir.join("stop-request.json");
+            let prev = std::env::var_os("HANDS_STOP_REQUEST_PATH");
+            unsafe { std::env::set_var("HANDS_STOP_REQUEST_PATH", &path) };
+            let ingest = lease::enable_stop_ingest_for_test();
+            Self {
+                path,
+                prev,
+                _ingest: ingest,
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for SecondWriterStopDir {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(value) => unsafe { std::env::set_var("HANDS_STOP_REQUEST_PATH", value) },
+                None => unsafe { std::env::remove_var("HANDS_STOP_REQUEST_PATH") },
+            }
+            if let Some(dir) = self.path.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    fn with_second_writer_stop<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let guard = SecondWriterStopDir::new();
+        f(guard.path())
+    }
+
+    fn unix_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    thread_local! {
+        static SECOND_WRITER_SENDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static SECOND_WRITER_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static LEFTUP_SENDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A second writer (not this process) drops a fresh stop request mid-type. This is the
+    /// file path a medium `hands stop` uses, not an in-process freeze.
+    fn second_writer_stop_send(_: &[INPUT]) -> Result<(), HandsError> {
+        let n = SECOND_WRITER_SENDS.with(|c| {
+            let n = c.get() + 1;
+            c.set(n);
+            n
+        });
+        if n == SECOND_WRITER_AT.with(|c| c.get()) {
+            lease::request_stop().map_err(|err| HandsError::Input(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn stop_on_first_left_up(inputs: &[INPUT]) -> Result<(), HandsError> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTUP;
+        if inputs
+            .iter()
+            .any(|input| unsafe { input.Anonymous.mi.dwFlags }.contains(MOUSEEVENTF_LEFTUP))
+        {
+            let n = LEFTUP_SENDS.with(|c| {
+                let n = c.get() + 1;
+                c.set(n);
+                n
+            });
+            if n == 1 {
+                lease::request_stop().map_err(|err| HandsError::Input(err.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stop_request_from_second_writer_aborts_in_flight_type() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::uia::set_focused_leaf_hook(Some(leaf_edit_fg));
+        SECOND_WRITER_SENDS.with(|c| c.set(0));
+        SECOND_WRITER_AT.with(|c| c.set(2));
+        crate::input::set_send_inputs_hook(Some(second_writer_stop_send));
+        // 24 ASCII chars: TYPE_UNICODE_MAX = 32, so this stays on type_unicode and polls the
+        // lease per code unit. A >32-char filler would paste via the clipboard and prove nothing.
+        let text = "ABCDEFGHIJKLMNOPQRSTUVWX";
+        assert!(text.chars().count() <= crate::input::TYPE_UNICODE_MAX);
+        with_second_writer_stop(|path| {
+            let env = type_text(ActuateRequest {
+                session_id: Some("s-0126-stop-inflight".into()),
+                text: Some(text.into()),
+                ..ActuateRequest::default()
+            })
+            .expect("type envelope");
+            assert!(!env.ok, "{env:?}");
+            assert!(env.frozen, "the call must come back frozen: {env:?}");
+            assert!(!env.verified, "an aborted type is unverified: {env:?}");
+            assert!(env.post_dispatch, "{env:?}");
+            assert_eq!(env.delivery, Some(crate::outcome::Delivery::Unknown));
+            let outcome = env.outcome.expect("outcome");
+            assert_eq!(outcome.retry.reason, "partial_input_unproven");
+            assert_eq!(
+                outcome.retry.disposition,
+                crate::outcome::RetryDisposition::Unsafe
+            );
+            assert!(
+                path.exists(),
+                "the second writer's stop request must be on disk"
+            );
+            let sends = SECOND_WRITER_SENDS.with(|c| c.get());
+            assert_eq!(
+                sends, 2,
+                "no code unit may be sent after the stop landed (down+up for the first unit only)"
+            );
+        });
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn stop_request_older_than_ttl_does_not_freeze_a_later_action() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::uia::set_focused_leaf_hook(Some(leaf_edit_fg));
+        SECOND_WRITER_SENDS.with(|c| c.set(0));
+        SECOND_WRITER_AT.with(|c| c.set(0));
+        crate::input::set_send_inputs_hook(Some(second_writer_stop_send));
+        with_second_writer_stop(|path| {
+            // Freshness TTL is IDLE_REARM = 2 s; 3 s old is stale, not a kill switch.
+            std::fs::write(
+                path,
+                format!(
+                    r#"{{"schema":"{}","at_unix_ms":{}}}"#,
+                    lease::STOP_REQUEST_SCHEMA,
+                    unix_now_ms().saturating_sub(3_000)
+                ),
+            )
+            .expect("stale stop request");
+            let text = "ABCD";
+            let env = type_text(ActuateRequest {
+                session_id: Some("s-0126-stop-stale".into()),
+                text: Some(text.into()),
+                ..ActuateRequest::default()
+            })
+            .expect("type envelope");
+            assert!(
+                env.ok,
+                "a stale stop must not freeze a later action: {env:?}"
+            );
+            assert!(!env.frozen, "{env:?}");
+            assert_eq!(
+                SECOND_WRITER_SENDS.with(|c| c.get()),
+                8,
+                "every code unit of a 4-char type must be sent (down+up each)"
+            );
+        });
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn click_retry_suppressed_after_stop() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::uia::set_hit_test_hook(Some(free_hit));
+        crate::capture::set_capture_roi_hook(Some(fake_capture));
+        LEFTUP_SENDS.with(|c| c.set(0));
+        crate::input::set_send_inputs_hook(Some(stop_on_first_left_up));
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        with_second_writer_stop(|_| {
+            crate::allows::with_test_env(|| {
+                let space = ensure_dpi()
+                    .and_then(|_| virtual_screen())
+                    .expect("virtual_screen");
+                let (x, y) = in_space_pixel(space);
+                let env = click(ActuateRequest {
+                    session_id: Some("s-0126-click-retry".into()),
+                    x: Some(x),
+                    y: Some(y),
+                    ..ActuateRequest::default()
+                })
+                .expect("click");
+                assert!(!env.ok, "{env:?}");
+                assert!(env.frozen, "{env:?}");
+                assert!(
+                    !env.retried,
+                    "the retry must never be sent after a stop: {env:?}"
+                );
+                assert_eq!(
+                    LEFTUP_SENDS.with(|c| c.get()),
+                    1,
+                    "exactly one click may land; the retry is suppressed"
+                );
+            });
+        });
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn blind_type_under_freeze_refuses_before_send() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cool = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        lease::freeze_now_with(lease::FreezeCause::Physical);
+        let env = type_text(ActuateRequest {
+            session_id: Some("s-0126-blind-frozen".into()),
+            text: Some("hi".into()),
+            blind: true,
+            ..ActuateRequest::default()
+        })
+        .expect("type envelope");
+        assert!(!env.ok, "{env:?}");
+        assert!(env.frozen, "{env:?}");
+        assert!(
+            env.fence.is_none(),
+            "freeze must refuse before gate_blind: {env:?}"
+        );
+        assert_eq!(env.refusal, Some(crate::outcome::RefusalToken::DeskFrozen));
+        assert!(
+            env.error
+                .clone()
+                .unwrap_or_default()
+                .contains("desk lease frozen"),
+            "{env:?}"
+        );
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn blind_type_under_cooling_refuses_before_send() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cool = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        for _ in 0..crate::cooldown::REJECTS_BEFORE_COOLDOWN {
+            crate::cooldown::note_rejection("s-0126-blind-cooling");
+        }
+        assert!(crate::cooldown::is_cooling("s-0126-blind-cooling"));
+        let env = type_text(ActuateRequest {
+            session_id: Some("s-0126-blind-cooling".into()),
+            text: Some("hi".into()),
+            blind: true,
+            ..ActuateRequest::default()
+        })
+        .expect("type envelope");
+        assert!(!env.ok, "{env:?}");
+        assert!(!env.frozen, "{env:?}");
+        assert!(
+            env.fence.is_none(),
+            "cooling must refuse before gate_blind: {env:?}"
+        );
+        assert_eq!(
+            env.refusal,
+            Some(crate::outcome::RefusalToken::CooldownActive)
+        );
+        assert!(
+            env.error
+                .clone()
+                .unwrap_or_default()
+                .contains("session cooling"),
+            "{env:?}"
+        );
+        crate::cooldown::reset_for_test();
+    }
+
+    #[test]
+    fn medium_blind_type_high_target_refuses() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cool = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_window_rid_hook(Some(|_| Ok(crate::elevation::HIGH_IL_RID)));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        let env = type_text(ActuateRequest {
+            session_id: Some("s-0126-blind-high".into()),
+            text: Some("hi".into()),
+            blind: true,
+            ..ActuateRequest::default()
+        })
+        .expect("type envelope");
+        assert!(!env.ok, "{env:?}");
+        assert!(
+            env.fence.is_none(),
+            "a medium caller must be refused, not fenced: {env:?}"
+        );
+        assert_eq!(
+            env.refusal,
+            Some(crate::outcome::RefusalToken::HighIlUnavailable)
+        );
+        assert!(
+            env.error
+                .clone()
+                .unwrap_or_default()
+                .contains("elevated window is above this process integrity"),
+            "{env:?}"
+        );
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn medium_blind_click_high_target_refuses() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cool = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_window_rid_hook(Some(|_| Ok(crate::elevation::HIGH_IL_RID)));
+        crate::elevation::set_uiaccess_hook(Some(|| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::uia::set_hit_test_hook(Some(panic_hit_test));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            grant_blind("s-0126-blind-click-high");
+            let env = click(blind_pixel_req("s-0126-blind-click-high", x, y)).expect("click");
+            assert!(!env.ok, "{env:?}");
+            assert!(env.fence.is_none(), "{env:?}");
+            assert_eq!(
+                env.refusal,
+                Some(crate::outcome::RefusalToken::HighIlUnavailable)
+            );
+        });
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn high_caller_high_target_click_allows_without_elevated_fence() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cool = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        // High caller + High target: Allow skips only the UIPI/elevated gate.
+        crate::elevation::set_caller_rid_hook(Some(|| crate::elevation::HIGH_IL_RID));
+        crate::elevation::set_window_rid_hook(Some(|_| Ok(crate::elevation::HIGH_IL_RID)));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::uia::set_hit_test_hook(Some(free_hit));
+        crate::capture::set_capture_roi_hook(Some(fake_capture));
+        TYPE_SENDS.with(|c| c.set(0));
+        crate::input::set_send_inputs_hook(Some(count_sends));
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            let env = click(ActuateRequest {
+                session_id: Some("s-0126-high-high".into()),
+                x: Some(x),
+                y: Some(y),
+                ..ActuateRequest::default()
+            })
+            .expect("click");
+            assert!(env.ok, "{env:?}");
+            assert!(
+                env.fence.is_none(),
+                "a High caller + High target needs no elevated confirm: {env:?}"
+            );
+            assert!(TYPE_SENDS.with(|c| c.get()) > 0, "{env:?}");
+        });
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn money_category_on_an_elevated_target_still_fences() {
+        fn pay_button_hit(_: i32, _: i32) -> Result<crate::uia::HitElement, HandsError> {
+            Ok(crate::uia::HitElement {
+                name: "Pay".into(),
+                role: "button".into(),
+                hwnd: Some(0x10),
+                value: None,
+            })
+        }
+
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cool = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| crate::elevation::HIGH_IL_RID));
+        crate::elevation::set_window_rid_hook(Some(|_| Ok(crate::elevation::HIGH_IL_RID)));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::uia::set_hit_test_hook(Some(pay_button_hit));
+        crate::capture::set_capture_roi_hook(Some(fake_capture));
+        crate::input::set_send_inputs_hook(Some(panic_sends));
+        crate::allows::with_test_env(|| {
+            let space = ensure_dpi()
+                .and_then(|_| virtual_screen())
+                .expect("virtual_screen");
+            let (x, y) = in_space_pixel(space);
+            let env = click(ActuateRequest {
+                session_id: Some("s-0126-money-high".into()),
+                x: Some(x),
+                y: Some(y),
+                ..ActuateRequest::default()
+            })
+            .expect("click");
+            assert!(!env.ok, "{env:?}");
+            let fence = env
+                .fence
+                .expect("semantic money fence on an elevated target");
+            assert_eq!(fence.category, "money");
+            assert_eq!(fence.name, "Pay");
+        });
+        lease::reset_for_test();
+    }
+
+    #[test]
+    fn enter_refuses_without_allow_then_proceeds_after_once() {
+        fn send_button_focused() -> Result<crate::uia::HitElement, HandsError> {
+            Ok(crate::uia::HitElement {
+                name: "Send".into(),
+                role: "button".into(),
+                hwnd: Some(0x10),
+                value: None,
+            })
+        }
+
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cool = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        lease::reset_for_test();
+        crate::cooldown::reset_for_test();
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::uia::set_focused_hit_hook(Some(send_button_focused));
+        TYPE_SENDS.with(|c| c.set(0));
+        crate::input::set_send_inputs_hook(Some(count_sends));
+        crate::allows::with_test_env(|| {
+            let session = "s-0126-enter-fence";
+            let refused = key(ActuateRequest {
+                session_id: Some(session.into()),
+                name: Some("enter".into()),
+                ..ActuateRequest::default()
+            })
+            .expect("key envelope");
+            assert!(!refused.ok, "{refused:?}");
+            let fence = refused.fence.clone().expect("gate_enter must fence");
+            assert_eq!(fence.category, "messages");
+            assert_eq!(fence.name, "Send");
+            assert_eq!(
+                TYPE_SENDS.with(|c| c.get()),
+                0,
+                "a fenced enter must send nothing"
+            );
+
+            crate::allows::grant(
+                session,
+                &fence.domain,
+                crate::classify::Category::Messages,
+                crate::allows::AllowMode::Once,
+            )
+            .expect("once grant");
+            TYPE_SENDS.with(|c| c.set(0));
+            let allowed = key(ActuateRequest {
+                session_id: Some(session.into()),
+                name: Some("enter".into()),
+                ..ActuateRequest::default()
+            })
+            .expect("key envelope");
+            assert!(allowed.ok, "{allowed:?}");
+            assert_eq!(
+                TYPE_SENDS.with(|c| c.get()),
+                2,
+                "one Enter press is one down + one up after the once allow"
+            );
+        });
+        lease::reset_for_test();
     }
 
     #[test]

@@ -447,7 +447,9 @@ fn atomic_write_stop(path: &Path, data: &[u8]) -> Result<(), HandsError> {
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(dir).map_err(|err| {
+        // Medium-labelled at any creator IL: a High-first profile must not block a medium
+        // `hands stop` with a High directory label (0126 R3).
+        crate::logs::ensure_private_dir(dir).map_err(|err| {
             HandsError::Lease(format!(
                 "create dir {} for {}: {err}",
                 dir.display(),

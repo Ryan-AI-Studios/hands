@@ -317,6 +317,52 @@ pub fn logs_dir() -> Result<PathBuf, HandsError> {
     Ok(local_app_hands()?.join("logs"))
 }
 
+/// Create a Hands-owned directory with the existing medium mandatory label.
+///
+/// `%LOCALAPPDATA%\hands` (and its `logs` child) can be created by the High-IL server on a
+/// clean profile. A plain `create_dir_all` from a High token produces a High-labelled
+/// directory with `SYSTEM_MANDATORY_LABEL_NO_WRITE_UP`, which silently blocks a later medium
+/// `hands stop` from writing `stop-request.json` (the mandatory label overrides the DACL).
+/// Creating each missing directory with the descriptor the desk mutex and pipe already use
+/// keeps the directory writable from medium at any creator integrity level.
+///
+/// The label ACE is non-inheriting on purpose: High-written log files stay High and
+/// medium-written stop/allow files stay medium. Existing directories are left exactly as
+/// they are - a label change is not retroactive.
+pub(crate) fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    if path.as_os_str().is_empty() || path.is_dir() {
+        return Ok(());
+    }
+    let mut missing: Vec<&Path> = Vec::new();
+    let mut cursor = Some(path);
+    while let Some(dir) = cursor {
+        if dir.as_os_str().is_empty() || dir.is_dir() {
+            break;
+        }
+        missing.push(dir);
+        cursor = dir.parent();
+    }
+    for dir in missing.into_iter().rev() {
+        match create_private_dir(dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+    use windows::core::PCWSTR;
+
+    let sa = crate::desk_pipe::build_medium_security_descriptor()
+        .map_err(|err| std::io::Error::other(format!("build medium security descriptor: {err}")))?;
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe { CreateDirectoryW(PCWSTR(wide.as_ptr()), Some(&sa)) }.map_err(std::io::Error::from)
+}
+
 fn is_legal_id(id: &str) -> bool {
     !id.is_empty()
         && id != "."
@@ -380,7 +426,7 @@ fn acquire_lock(jsonl: &Path) -> Result<FileLock, HandsError> {
                 dir.display()
             )));
         }
-        std::fs::create_dir_all(dir)
+        ensure_private_dir(dir)
             .map_err(|err| HandsError::Logs(format!("create logs dir {}: {err}", dir.display())))?;
     }
     loop {
@@ -421,7 +467,7 @@ fn append_event(event: &Event, allow_desk: bool) -> Result<(), HandsError> {
     with_log_io(|| {
         let _disk = acquire_lock(&path)?;
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|err| {
+            ensure_private_dir(dir).map_err(|err| {
                 HandsError::Logs(format!("create logs dir {}: {err}", dir.display()))
             })?;
         }
@@ -1509,6 +1555,104 @@ mod tests {
                 "{err}"
             );
         });
+    }
+
+    /// Mandatory-label RID of a path (S-1-16-<rid>), read from its SACL label ACE.
+    fn dir_label_rid(dir: &Path) -> Option<u32> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
+        use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows::Win32::Security::{
+            ACL, GetAce, GetSecurityDescriptorSacl, GetSidSubAuthority, GetSidSubAuthorityCount,
+            LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SYSTEM_MANDATORY_LABEL_ACE,
+        };
+
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let mut sacl: *mut ACL = std::ptr::null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                None,
+                None,
+                None,
+                Some(&raw mut sacl),
+                &raw mut sd,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        let mut present = windows::core::BOOL::default();
+        let mut defaulted = windows::core::BOOL::default();
+        let mut label_acl: *mut ACL = std::ptr::null_mut();
+        let mut rid = None;
+        if unsafe {
+            GetSecurityDescriptorSacl(sd, &raw mut present, &raw mut label_acl, &raw mut defaulted)
+        }
+        .is_ok()
+            && present.as_bool()
+            && !label_acl.is_null()
+        {
+            let mut ace = std::ptr::null_mut();
+            if unsafe { GetAce(label_acl, 0, &raw mut ace) }.is_ok() {
+                let label = unsafe { &*ace.cast::<SYSTEM_MANDATORY_LABEL_ACE>() };
+                let sid = PSID(std::ptr::from_ref(&label.SidStart).cast_mut().cast());
+                unsafe {
+                    let count = *GetSidSubAuthorityCount(sid);
+                    if count > 0 {
+                        rid = Some(*GetSidSubAuthority(sid, u32::from(count) - 1));
+                    }
+                }
+            }
+        }
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+        }
+        rid
+    }
+
+    #[test]
+    fn ensure_private_dir_creates_a_medium_label() {
+        // R3: a High-first profile must not leave %LOCALAPPDATA%\hands High-labelled with
+        // NO_WRITE_UP, because that silently blocks a medium `hands stop`.
+        const MEDIUM_RID: u32 = 0x2000;
+        let root = std::env::temp_dir().join(format!("hands-private-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let nested = root.join("hands").join("logs");
+        ensure_private_dir(&nested).expect("ensure_private_dir creates the tree");
+        assert!(nested.is_dir(), "{}", nested.display());
+        assert_eq!(
+            dir_label_rid(&root.join("hands")),
+            Some(MEDIUM_RID),
+            "the created hands root must carry a Medium mandatory label"
+        );
+        assert_eq!(
+            dir_label_rid(&nested),
+            Some(MEDIUM_RID),
+            "the created logs child must carry a Medium mandatory label"
+        );
+
+        // Control: a plain create_dir_all is exactly what the helper replaces.
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let creator = crate::elevation::process_integrity_rid().unwrap();
+        if creator >= crate::elevation::HIGH_IL_RID {
+            assert_ne!(
+                dir_label_rid(&plain),
+                Some(MEDIUM_RID),
+                "a High creator's plain create must not be Medium: the helper is what applies the label"
+            );
+        }
+
+        // An existing directory is left exactly as it is (no retroactive relabel).
+        let before = dir_label_rid(&plain);
+        ensure_private_dir(&plain).expect("existing dir is a no-op");
+        assert_eq!(dir_label_rid(&plain), before);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

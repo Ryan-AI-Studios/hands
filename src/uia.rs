@@ -314,7 +314,30 @@ pub fn hit_test(x: i32, y: i32) -> Result<HitElement, HandsError> {
         .map_err(|_| HandsError::Uia("UIA STA thread panicked".to_string()))?
 }
 
+#[cfg(test)]
+type FocusedHitHook = fn() -> Result<HitElement, HandsError>;
+
+#[cfg(test)]
+thread_local! {
+    static FOCUSED_HIT_HOOK: std::cell::Cell<Option<FocusedHitHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only seam for `focused()` (the `gate_enter` evidence source). `set_focused_leaf_hook`
+/// feeds the type focus gate; this one feeds the enter fence so a gated element can be
+/// exercised without a live desktop.
+#[cfg(test)]
+pub(crate) fn set_focused_hit_hook(hook: Option<FocusedHitHook>) {
+    FOCUSED_HIT_HOOK.with(|c| c.set(hook));
+}
+
 pub fn focused() -> Result<HitElement, HandsError> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = FOCUSED_HIT_HOOK.with(|c| c.get()) {
+            return hook();
+        }
+    }
     std::thread::Builder::new()
         .name("hands-uia-sta".into())
         .spawn(sta_focused)

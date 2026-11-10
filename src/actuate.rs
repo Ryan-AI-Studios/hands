@@ -81,6 +81,15 @@ pub struct ActuateEnvelope {
     /// treat `identity` alone as "nothing sent" when this is set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub post_dispatch: bool,
+    /// Single delivery truth (0122 vocabulary; semantic and physical actions share it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<crate::outcome::Delivery>,
+    /// Versioned outcome: effect/verdict/retry/postcondition. Absent until classified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<crate::outcome::OutcomeInfo>,
+    /// Closed pre-dispatch refusal token. Internal plumbing; never serialized.
+    #[serde(skip)]
+    pub refusal: Option<crate::outcome::RefusalToken>,
     #[serde(flatten, default)]
     pub semantic: Option<crate::uia_actions::SemanticInfo>,
 }
@@ -113,6 +122,8 @@ pub struct ActuateRequest {
     pub action: Option<String>,
     pub value: Option<String>,
     pub timeout_ms: Option<u64>,
+    /// Opt-in postcondition, click only. Validated before the lease/fence/input.
+    pub postcondition: Option<crate::outcome::Postcondition>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -242,6 +253,11 @@ pub(crate) fn refuse_if_blocked(
     } else {
         Some("session cooling — honor cooldown_ms; do not retry yet".into())
     };
+    let refusal = Some(if frozen {
+        crate::outcome::RefusalToken::DeskFrozen
+    } else {
+        crate::outcome::RefusalToken::CooldownActive
+    });
     finalize_envelope(ActuateEnvelope {
         session_id: session_id.into(),
         ok: false,
@@ -267,6 +283,9 @@ pub(crate) fn refuse_if_blocked(
         semantic: None,
         identity: None,
         post_dispatch: false,
+        delivery: None,
+        outcome: None,
+        refusal,
     })
     .map(Some)
 }
@@ -470,6 +489,9 @@ fn base(
         semantic: None,
         identity: None,
         post_dispatch: false,
+        delivery: None,
+        outcome: None,
+        refusal: Some(crate::outcome::RefusalToken::InvalidRequest),
     })
 }
 
@@ -499,6 +521,9 @@ fn refuse_yield(session_id: String, target: ActuateTarget) -> Result<ActuateEnve
         semantic: None,
         identity: None,
         post_dispatch: false,
+        delivery: None,
+        outcome: None,
+        refusal: Some(crate::outcome::RefusalToken::ChallengeYielded),
     })
 }
 
@@ -520,7 +545,7 @@ fn refuse_if_outside_client(
 ) -> Result<Option<ActuateEnvelope>, HandsError> {
     let fg = foreground::foreground_hwnd();
     let Some(intended) = resolved.hwnd.and_then(foreground::root_hwnd).or(fg) else {
-        return fail(
+        let mut env = fail(
             session_id.to_string(),
             info.clone(),
             HandsError::Target(
@@ -530,8 +555,9 @@ fn refuse_if_outside_client(
             false,
             false,
             false,
-        )
-        .map(Some);
+        )?;
+        env.refusal = Some(crate::outcome::RefusalToken::OutsideClient);
+        return Ok(Some(env));
     };
     if foreground::point_in_allowed_client(resolved.x, resolved.y, intended, resolved.hwnd, None) {
         return Ok(None);
@@ -544,7 +570,7 @@ fn refuse_if_outside_client(
     });
     let title = foreground::title(Some(intended));
     let hwnd = foreground::format_hwnd(intended);
-    fail(
+    let mut env = fail(
         session_id.to_string(),
         info.clone(),
         HandsError::Target(format!(
@@ -554,8 +580,9 @@ fn refuse_if_outside_client(
         false,
         false,
         false,
-    )
-    .map(Some)
+    )?;
+    env.refusal = Some(crate::outcome::RefusalToken::OutsideClient);
+    Ok(Some(env))
 }
 
 pub(crate) fn refuse_if_high_il(
@@ -570,15 +597,18 @@ pub(crate) fn refuse_if_high_il(
         Ok(Some(fence_info)) => {
             refuse_fence(session_id.to_string(), info.clone(), fence_info).map(Some)
         }
-        Err(err) => fail(
-            session_id.to_string(),
-            info.clone(),
-            err,
-            false,
-            false,
-            false,
-        )
-        .map(Some),
+        Err(err) => {
+            let mut env = fail(
+                session_id.to_string(),
+                info.clone(),
+                err,
+                false,
+                false,
+                false,
+            )?;
+            env.refusal = Some(crate::outcome::RefusalToken::HighIlUnavailable);
+            Ok(Some(env))
+        }
     }
 }
 
@@ -612,6 +642,9 @@ pub(crate) fn refuse_fence(
         semantic: None,
         identity: None,
         post_dispatch: false,
+        delivery: None,
+        outcome: None,
+        refusal: Some(crate::outcome::RefusalToken::FenceRequiresConfirm),
     })
 }
 
@@ -634,6 +667,13 @@ fn fail(
         foregrounded,
         Some(err.tool_message()),
     )
+}
+
+fn with_offer_foregrounded(mut env: ActuateEnvelope, foregrounded: bool) -> ActuateEnvelope {
+    // 0123 L8: a post-offer identity refusal carries the real `offer` result instead of a
+    // hard-coded `false`.
+    env.foregrounded = foregrounded;
+    env
 }
 
 /// Failure after a point contract existed (dispatch/attempt path). `point` is retained.
@@ -667,6 +707,28 @@ fn fail_with_point_unverified(
     let mut env = fail(session_id, target, err, foregrounded, retried, settled)?;
     env.point = point;
     env.verified = false;
+    env.post_dispatch = true;
+    env.refusal = None;
+    finalize_envelope(env)
+}
+
+/// A send call may already have delivered part of the input (type/key). Conservative: unknown
+/// delivery, never a pre-dispatch "nothing sent" claim.
+#[allow(clippy::too_many_arguments)]
+fn fail_partial_dispatch(
+    session_id: String,
+    target: ActuateTarget,
+    err: HandsError,
+    foregrounded: bool,
+    retried: bool,
+    settled: bool,
+    point: Option<PointContract>,
+) -> Result<ActuateEnvelope, HandsError> {
+    let mut env = fail(session_id, target, err, foregrounded, retried, settled)?;
+    env.point = point;
+    env.verified = false;
+    env.post_dispatch = true;
+    env.refusal = None;
     finalize_envelope(env)
 }
 
@@ -767,30 +829,163 @@ fn after_actuate(
     type_len: Option<usize>,
     key: Option<&str>,
     blind: bool,
+    extras: OutcomeExtras,
 ) -> Result<ActuateEnvelope, HandsError> {
     logs::ensure_installed();
     let result = match result {
         Ok(mut env) => {
             settle_cooldown(tool, &mut env);
-            Ok(env)
+            apply_outcome(tool, &mut env, blind, &extras);
+            Ok(shrink_envelope(env))
         }
         Err(err) => Err(err),
     };
     if let Ok(env) = &result {
         logs::remember_session(&env.session_id);
-        let _ = logs::record_actuate(
-            &env.session_id,
-            tool,
-            env.ok,
-            env.error.as_deref(),
-            Some(log_target(&env.target)),
-            env.fence.as_ref().map(log_fence),
-            type_len,
-            key,
-            blind,
-        );
+        let outcome = env.outcome.as_ref().map(|outcome| logs::LogOutcome {
+            delivery: env
+                .delivery
+                .unwrap_or(crate::outcome::Delivery::Undelivered)
+                .as_str()
+                .to_string(),
+            effect: outcome.effect.as_str().to_string(),
+            verdict: outcome.verdict.as_str().to_string(),
+            retry: outcome.retry.disposition.as_str().to_string(),
+            retry_reason: outcome.retry.reason.clone(),
+            postcondition_kind: outcome.postcondition.as_ref().map(|p| p.kind.clone()),
+            postcondition_state: outcome
+                .postcondition
+                .as_ref()
+                .map(|p| p.state.as_str().to_string()),
+            postcondition_reason: outcome
+                .postcondition
+                .as_ref()
+                .and_then(|p| p.reason.clone()),
+        });
+        let _ = match outcome {
+            Some(outcome) => logs::record_actuate_with_outcome(
+                &env.session_id,
+                tool,
+                env.ok,
+                env.error.as_deref(),
+                Some(log_target(&env.target)),
+                env.fence.as_ref().map(log_fence),
+                type_len,
+                key,
+                blind,
+                outcome,
+            ),
+            None => logs::record_actuate(
+                &env.session_id,
+                tool,
+                env.ok,
+                env.error.as_deref(),
+                Some(log_target(&env.target)),
+                env.fence.as_ref().map(log_fence),
+                type_len,
+                key,
+                blind,
+            ),
+        };
     }
     result
+}
+
+/// Postcondition result carried from `click()` into `after_actuate`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OutcomeExtras {
+    pub postcondition: Option<crate::outcome::PostconditionReport>,
+    pub requested: bool,
+    pub wait_ms: u64,
+}
+
+/// Tools that carry the outcome contract. Read-only tools (`wait_settle`, `stop`, `observe`,
+/// `hittest`, `logs`) keep both fields `None`.
+fn carries_outcome(tool: &str) -> bool {
+    matches!(tool, "click" | "hover" | "type" | "key" | "scroll")
+}
+
+fn apply_outcome(tool: &str, env: &mut ActuateEnvelope, blind: bool, extras: &OutcomeExtras) {
+    if !carries_outcome(tool) {
+        env.delivery = None;
+        env.outcome = None;
+        return;
+    }
+    let input = crate::outcome::OutcomeInputs {
+        tool: tool.to_string(),
+        ok: env.ok,
+        post_dispatch: env.post_dispatch,
+        miss: env.miss.clone(),
+        navigated: env.navigated,
+        retried: env.retried,
+        blind,
+        identity: env.identity.clone(),
+        semantic: None,
+        postcondition: extras.postcondition.clone(),
+        postcondition_wait_ms: extras.wait_ms,
+        refusal: env.refusal,
+    };
+    let classification = crate::outcome::classify_outcome(&input);
+    env.delivery = Some(classification.delivery);
+    env.outcome = Some(crate::outcome::OutcomeInfo {
+        v: crate::outcome::OutcomeInfo::VERSION,
+        effect: classification.effect,
+        verdict: classification.verdict,
+        retry: classification.retry,
+        postcondition: extras.postcondition.clone(),
+        postcondition_checked: extras.requested.then_some(true),
+    });
+}
+
+/// Post-classification 16 KiB re-check. Degrades optional blocks only; a dispatched action is
+/// never converted into an `Err` (only pre-dispatch constructors keep the hard failure).
+/// Order follows spec §3.8: assessment details -> identity hint -> assessment -> guidance,
+/// then `outcome.postcondition` as the last optional block. If the envelope is still oversized
+/// after the ladder (a non-degradable required field), a bounded diagnostic token is written to
+/// `guidance` so the condition is never silent; it is still returned, never `Err`.
+pub(crate) fn shrink_envelope(mut env: ActuateEnvelope) -> ActuateEnvelope {
+    if serialize_len(&env) <= ENVELOPE_MAX_BYTES {
+        return env;
+    }
+    if let Some(assessment) = env.assessment.as_mut() {
+        assessment.blocked_by.clear();
+        assessment.clipped_by = None;
+        assessment.notes.clear();
+    }
+    if serialize_len(&env) <= ENVELOPE_MAX_BYTES {
+        return env;
+    }
+    if let Some(identity) = env.identity.as_mut() {
+        identity.hint = None;
+    }
+    if serialize_len(&env) <= ENVELOPE_MAX_BYTES {
+        return env;
+    }
+    env.assessment = None;
+    if serialize_len(&env) <= ENVELOPE_MAX_BYTES {
+        return env;
+    }
+    env.guidance = None;
+    if serialize_len(&env) <= ENVELOPE_MAX_BYTES {
+        return env;
+    }
+    if let Some(outcome) = env.outcome.as_mut() {
+        outcome.postcondition = None;
+    }
+    if serialize_len(&env) <= ENVELOPE_MAX_BYTES {
+        return env;
+    }
+    env.guidance = Some(ENVELOPE_OVER_BUDGET.into());
+    env
+}
+
+const ENVELOPE_OVER_BUDGET: &str = "actuate_envelope_over_budget";
+
+fn serialize_len(env: &ActuateEnvelope) -> usize {
+    // A serialization failure must never look like a small envelope.
+    serialize_envelope(env)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
 }
 
 fn resolve_req(req: &ActuateRequest, space: Space) -> Result<TargetOutcome, HandsError> {
@@ -847,6 +1042,9 @@ pub(crate) fn refuse_transform(
         interactable_checked: None,
         identity,
         post_dispatch: false,
+        delivery: None,
+        outcome: None,
+        refusal: Some(crate::outcome::RefusalToken::TransformInvalid),
         semantic: None,
     })
 }
@@ -879,6 +1077,7 @@ pub(crate) fn refuse_identity(
         Some(error),
     )?;
     env.identity = Some(report);
+    env.refusal = None;
     finalize_envelope(env)
 }
 
@@ -1169,6 +1368,7 @@ fn post_dispatch_binding_refusal(
     env.point = point_for_dispatch(resolved);
     env.verified = false;
     env.post_dispatch = true;
+    env.refusal = None;
     env.identity = Some(report);
     finalize_envelope(env)
 }
@@ -1176,6 +1376,11 @@ fn post_dispatch_binding_refusal(
 pub fn click(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let blind = req.blind;
     let require_interactable = req.require_interactable;
+    let condition = req.postcondition.clone();
+    let wait_ms = condition.as_ref().map(|c| c.wait_ms).unwrap_or(0);
+    if let Some(condition) = condition.as_ref() {
+        condition.validate().map_err(HandsError::Input)?;
+    }
     let result = click_inner(req).map(|mut env| {
         if require_interactable && env.interactable_checked.is_none() {
             // Positive marker on every envelope from a binary that understood the flag.
@@ -1183,7 +1388,244 @@ pub fn click(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         }
         env
     });
-    after_actuate("click", result, None, None, blind)
+    // The postcondition runs after `click_inner` returns (0108 lock): never a second content
+    // read inside the dispatch path.
+    let extras = match result {
+        Ok(ref env) => {
+            let (report, requested) = apply_postcondition(env, condition.as_ref());
+            OutcomeExtras {
+                postcondition: report,
+                requested,
+                wait_ms,
+            }
+        }
+        Err(_) => OutcomeExtras {
+            postcondition: None,
+            requested: condition.is_some(),
+            wait_ms,
+        },
+    };
+    after_actuate("click", result, None, None, blind, extras)
+}
+
+/// Evaluate an opt-in postcondition **after** `click_inner` returned. Never changes `ok`,
+/// `delivery`, `point`, `identity`, `miss`, `navigated` or the fence/lease/cooldown state.
+/// A missing/timed-out/unavailable read is a diagnostic, never `failed`.
+fn apply_postcondition(
+    env: &ActuateEnvelope,
+    condition: Option<&crate::outcome::Postcondition>,
+) -> (Option<crate::outcome::PostconditionReport>, bool) {
+    use crate::outcome::{PostconditionKind, PostconditionReport, PostconditionState};
+    let Some(condition) = condition else {
+        return (None, false);
+    };
+    let kind = condition.kind_token();
+    let report =
+        |state, reason: Option<&str>| Some(PostconditionReport::new(kind, state, reason, "dom"));
+    // Nothing dispatched: the opt-in marker is still set.
+    if !env.ok && !env.post_dispatch {
+        return (
+            report(PostconditionState::NotEvaluated, Some("not_dispatched")),
+            true,
+        );
+    }
+    let reference = env
+        .identity
+        .as_ref()
+        .and_then(|report| report.r#ref.clone())
+        .or_else(|| env.target.id.clone());
+    let Some(parsed) = reference
+        .as_deref()
+        .and_then(|raw| SnapshotRef::parse(raw).ok())
+    else {
+        return (
+            report(
+                PostconditionState::Unavailable,
+                Some("requires_scoped_chrome_ref"),
+            ),
+            true,
+        );
+    };
+    let SnapshotRef::Chrome {
+        tab,
+        frame,
+        doc,
+        snap,
+        idx,
+    } = parsed
+    else {
+        return (
+            report(PostconditionState::Unavailable, Some("dom_only")),
+            true,
+        );
+    };
+    if frame > 0 {
+        return (
+            report(
+                PostconditionState::Unavailable,
+                Some("frame_postcondition_out_of_scope"),
+            ),
+            true,
+        );
+    }
+    if let Some(identity) = env.identity.as_ref()
+        && identity.state != IdentityState::Exact
+    {
+        return (
+            report(
+                PostconditionState::Unavailable,
+                Some(identity.reason.as_deref().unwrap_or("protocol_error")),
+            ),
+            true,
+        );
+    }
+    if matches!(
+        condition.kind,
+        PostconditionKind::ElementPresent | PostconditionKind::ElementAbsent
+    ) {
+        match condition
+            .r#ref
+            .as_deref()
+            .and_then(|raw| SnapshotRef::parse(raw).ok())
+        {
+            Some(SnapshotRef::Chrome {
+                tab: ref_tab,
+                frame: ref_frame,
+                ..
+            }) if ref_tab == tab && ref_frame == 0 => {}
+            Some(SnapshotRef::Chrome {
+                frame: ref_frame, ..
+            }) if ref_frame > 0 => {
+                return (
+                    report(
+                        PostconditionState::Unavailable,
+                        Some("frame_postcondition_out_of_scope"),
+                    ),
+                    true,
+                );
+            }
+            Some(SnapshotRef::Uia { .. }) => {
+                return (
+                    report(PostconditionState::Unavailable, Some("dom_only")),
+                    true,
+                );
+            }
+            _ => {
+                return (
+                    report(PostconditionState::Unavailable, Some("invalid_condition")),
+                    true,
+                );
+            }
+        }
+    }
+    let parts = crate::chrome::PostcheckRef {
+        doc: &doc,
+        snap: &snap,
+        idx,
+    };
+    let wait_ms = condition.wait_ms;
+    let mut last = postcheck_once(tab, condition, parts);
+    if wait_ms > 0 {
+        let deadline = Instant::now() + Duration::from_millis(wait_ms);
+        // A final read MUST happen at/after the deadline; otherwise `failed` could be inferred
+        // from a pre-deadline snapshot (G1). `failed` is only reachable from an `Unsatisfied`
+        // report whose last read observed the caller's deadline.
+        loop {
+            if last.state != PostconditionState::Unsatisfied {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                last = postcheck_once(tab, condition, parts);
+                break;
+            }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(POSTCHECK_POLL_MS)));
+            last = postcheck_once(tab, condition, parts);
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+    (Some(last), true)
+}
+
+const POSTCHECK_POLL_MS: u64 = 100;
+
+fn postcheck_once(
+    tab: u32,
+    condition: &crate::outcome::Postcondition,
+    parts: crate::chrome::PostcheckRef<'_>,
+) -> crate::outcome::PostconditionReport {
+    use crate::outcome::{PostconditionReport, PostconditionState};
+    let kind = condition.kind_token();
+    let unavailable = |reason: &str| {
+        PostconditionReport::new(kind, PostconditionState::Unavailable, Some(reason), "dom")
+    };
+    // Every reason that reaches the envelope is from the documented closed set; an unknown
+    // token from an old/foreign extension degrades to `protocol_error`, never a free-form string.
+    let closed = |reason: Option<&str>, fallback: &'static str| -> String {
+        reason
+            .filter(|reason| crate::outcome::POSTCONDITION_REASONS.contains(reason))
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    match chrome::postcheck(tab, condition, Some(parts)) {
+        Ok(reply) => {
+            if reply.tab != Some(tab) || reply.fallback {
+                return unavailable("protocol_error");
+            }
+            if !reply.active {
+                return unavailable("tab_not_active");
+            }
+            if !reply.focused {
+                return unavailable("window_not_focused");
+            }
+            if reply.visibility_state.as_deref() == Some("hidden") {
+                return unavailable("tab_hidden");
+            }
+            match reply.state.as_str() {
+                "satisfied" => PostconditionReport::new(
+                    kind,
+                    PostconditionState::Satisfied,
+                    reply.reason.as_deref(),
+                    "dom",
+                ),
+                "unsatisfied" => PostconditionReport::new(
+                    kind,
+                    PostconditionState::Unsatisfied,
+                    reply.reason.as_deref(),
+                    "dom",
+                ),
+                "unavailable" => {
+                    let reason = match reply.reason.as_deref() {
+                        Some(reason) if crate::outcome::POSTCONDITION_REASONS.contains(&reason) => {
+                            reason.to_string()
+                        }
+                        Some(_) => "protocol_error".to_string(),
+                        None => "evaluation_failed".to_string(),
+                    };
+                    PostconditionReport::new(
+                        kind,
+                        PostconditionState::Unavailable,
+                        Some(reason.as_str()),
+                        "dom",
+                    )
+                }
+                _ => unavailable("protocol_error"),
+            }
+        }
+        Err(crate::chrome::PostcheckError::Timeout(_)) => PostconditionReport::new(
+            kind,
+            PostconditionState::Timeout,
+            Some("postcondition_timeout"),
+            "dom",
+        ),
+        Err(crate::chrome::PostcheckError::HostDown(_)) => unavailable("host_down"),
+        Err(crate::chrome::PostcheckError::Unavailable(reason)) => {
+            let reason = closed(Some(&reason), "protocol_error");
+            unavailable(reason.as_str())
+        }
+    }
 }
 
 fn click_miss(same: bool, focus_lost: bool) -> Option<&'static str> {
@@ -1270,6 +1712,12 @@ fn should_retry_click(effect: &ClickEffect) -> bool {
     effect.miss.is_some() && !effect.navigated
 }
 
+/// 0123 L1: a scoped `sref1:` ref never auto-retries. An out-of-ROI effect (toast/dialog/new
+/// tab) makes `no_change` a false negative, and a second click can double-submit.
+fn auto_retry_allowed(target: &Target) -> bool {
+    !matches!(target, Target::Scoped(_))
+}
+
 fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let session_id = match session(&req) {
         Ok(id) => id,
@@ -1292,14 +1740,16 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         );
     }
     if req.require_interactable && req.blind {
-        return fail(
+        let mut env = fail(
             session_id,
             none_target(),
             HandsError::Input("interactable_unavailable: click on chr: or sref1:c only".into()),
             false,
             false,
             false,
-        );
+        )?;
+        env.refusal = Some(crate::outcome::RefusalToken::BlindGuard);
+        return Ok(env);
     }
     let outcome = match resolve_req(&req, space) {
         Ok(r) => r,
@@ -1391,9 +1841,14 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let mut rng = Rng::from_time();
     let roi = settle::default_roi(space, Some(resolved.rect), (resolved.x, resolved.y));
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
+    // 0123 L2: re-probe the tab binding after `offer` and immediately before the pointer
+    // moves, so a tab flip during the offer refuses before any physical movement.
+    if let Some(env) = scoped_binding_refusal(&session_id, &info, &resolved.target)? {
+        return Ok(with_offer_foregrounded(env, foregrounded));
+    }
     // Immediately before the pointer moves: re-read the child doc/snap and the fresh chain.
     if let Some(env) = frame_binding_refusal(&session_id, &info, &resolved.target)? {
-        return Ok(env);
+        return Ok(with_offer_foregrounded(env, foregrounded));
     }
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
         return fail_with_point(
@@ -1424,7 +1879,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     // offer/move/capture is still refused with no input; the probe→click microseconds remain
     // the named residual.
     if let Some(env) = scoped_binding_refusal(&session_id, &info, &resolved.target)? {
-        return Ok(env);
+        return Ok(with_offer_foregrounded(env, foregrounded));
     }
     if let Err(err) = input::left_click(&mut rng) {
         return fail_with_point_unverified(
@@ -1464,7 +1919,8 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         true,
     );
     let mut retried = false;
-    if should_retry_click(&effect) && lease::poll().is_ok() {
+    if auto_retry_allowed(&resolved.target) && should_retry_click(&effect) && lease::poll().is_ok()
+    {
         retried = true;
         if focus_lost {
             let _ = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
@@ -1535,6 +1991,8 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
         env.point = point_for_dispatch(&resolved);
         // The click may already have landed at the now-frozen desk.
         env.verified = false;
+        env.post_dispatch = true;
+        env.refusal = None;
         return finalize_envelope(env);
     }
     let mut env = base(
@@ -1552,6 +2010,7 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     env.navigated = effect.navigated;
     env.assessment = resolved.assessment.clone();
     env.identity = resolved.identity.clone();
+    env.refusal = None;
     finalize_envelope(env)
 }
 
@@ -1600,6 +2059,8 @@ fn dispatch_blind_click(
         env.point = point;
         // The click may already have landed at an unverified blind target.
         env.verified = false;
+        env.post_dispatch = true;
+        env.refusal = None;
         return finalize_envelope(env);
     }
     let mut env = base(
@@ -1620,12 +2081,20 @@ fn dispatch_blind_click(
             y: resolved.y,
         },
     ));
+    env.refusal = None;
     finalize_envelope(env)
 }
 
 pub fn hover(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let blind = req.blind;
-    after_actuate("hover", hover_inner(req), None, None, blind)
+    after_actuate(
+        "hover",
+        hover_inner(req),
+        None,
+        None,
+        blind,
+        OutcomeExtras::default(),
+    )
 }
 
 fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -1756,7 +2225,14 @@ fn hover_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
 pub fn type_text(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let type_len = req.text.as_ref().map(|t| t.chars().count());
     let blind = req.blind;
-    after_actuate("type", type_text_inner(req), type_len, None, blind)
+    after_actuate(
+        "type",
+        type_text_inner(req),
+        type_len,
+        None,
+        blind,
+        OutcomeExtras::default(),
+    )
 }
 
 fn type_text_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -1817,7 +2293,7 @@ fn type_text_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
             }
             Ok(env)
         }
-        Err(err) => fail(session_id, info, err, false, false, false),
+        Err(err) => fail_partial_dispatch(session_id, info, err, true, false, false, None),
     }
 }
 
@@ -1906,7 +2382,14 @@ fn refuse_unless_focused_editable(
 
 pub fn key(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let name = req.name.clone();
-    after_actuate("key", key_inner(req), None, name.as_deref(), false)
+    after_actuate(
+        "key",
+        key_inner(req),
+        None,
+        name.as_deref(),
+        false,
+        OutcomeExtras::default(),
+    )
 }
 
 fn key_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -1948,12 +2431,19 @@ fn key_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     challenge::note_actuation();
     match input::named_key(name) {
         Ok(()) => base(session_id, info, true, false, false, false, false, None),
-        Err(err) => fail(session_id, info, err, false, false, false),
+        Err(err) => fail_partial_dispatch(session_id, info, err, false, false, false, None),
     }
 }
 
 pub fn scroll(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    after_actuate("scroll", scroll_inner(req), None, None, false)
+    after_actuate(
+        "scroll",
+        scroll_inner(req),
+        None,
+        None,
+        false,
+        OutcomeExtras::default(),
+    )
 }
 
 fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -2072,7 +2562,14 @@ fn scroll_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
 }
 
 pub fn wait_settle(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    after_actuate("wait_settle", wait_settle_inner(req), None, None, false)
+    after_actuate(
+        "wait_settle",
+        wait_settle_inner(req),
+        None,
+        None,
+        false,
+        OutcomeExtras::default(),
+    )
 }
 
 fn wait_settle_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -2173,7 +2670,14 @@ fn hover_dwell() -> Result<(), HandsError> {
 
 /// MCP `stop` — posts a desk-wide request, then freezes this process.
 pub fn stop(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    after_actuate("stop", stop_inner(req), None, None, false)
+    after_actuate(
+        "stop",
+        stop_inner(req),
+        None,
+        None,
+        false,
+        OutcomeExtras::default(),
+    )
 }
 
 fn stop_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -2182,7 +2686,14 @@ fn stop_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
 
 /// CLI `stop` without installing hooks — posts the same desk-wide request.
 pub fn stop_cli_noop(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
-    after_actuate("stop", stop_cli_noop_inner(req), None, None, false)
+    after_actuate(
+        "stop",
+        stop_cli_noop_inner(req),
+        None,
+        None,
+        false,
+        OutcomeExtras::default(),
+    )
 }
 
 fn stop_cli_noop_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
@@ -2268,6 +2779,9 @@ mod tests {
             semantic: None,
             identity: None,
             post_dispatch: false,
+            delivery: None,
+            outcome: None,
+            refusal: None,
         };
         let err = finalize_envelope(env).expect_err("must not emit oversize");
         assert!(err.to_string().contains("16384"), "{err}");
@@ -2314,6 +2828,9 @@ mod tests {
             semantic: None,
             identity: None,
             post_dispatch: false,
+            delivery: None,
+            outcome: None,
+            refusal: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"roi\""), "{json}");
@@ -2356,6 +2873,9 @@ mod tests {
             semantic: None,
             identity: None,
             post_dispatch: false,
+            delivery: None,
+            outcome: None,
+            refusal: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(!json.contains("\"roi\""), "{json}");
@@ -2396,6 +2916,9 @@ mod tests {
             semantic: None,
             identity: None,
             post_dispatch: false,
+            delivery: None,
+            outcome: None,
+            refusal: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"navigated\":true"), "{json}");
@@ -2434,6 +2957,9 @@ mod tests {
             semantic: None,
             identity: None,
             post_dispatch: false,
+            delivery: None,
+            outcome: None,
+            refusal: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(json.contains("\"miss\":\"no_change\""), "{json}");
@@ -2471,6 +2997,9 @@ mod tests {
             semantic: None,
             identity: None,
             post_dispatch: false,
+            delivery: None,
+            outcome: None,
+            refusal: None,
         };
         let json = serialize_envelope(&env).expect("json");
         assert!(!json.contains("\"miss\""), "{json}");
@@ -2809,7 +3338,15 @@ mod tests {
             .expect("named refusal");
         crate::foreground::set_client_rect_hook(None);
         assert!(!env.ok, "{env:?}");
-        let out = after_actuate("click", Ok(env), None, None, false).expect("after");
+        let out = after_actuate(
+            "click",
+            Ok(env),
+            None,
+            None,
+            false,
+            OutcomeExtras::default(),
+        )
+        .expect("after");
         assert!(!out.ok, "{out:?}");
         let snap = crate::cooldown::snapshot("s-0105-rej");
         assert_eq!(snap.attempt, 1, "{snap:?}");
@@ -6815,12 +7352,21 @@ mod tests {
             .expect("dispatch_blind_click");
         let body = &src[start..end];
         let capture = body.find("capture_roi").expect("capture_roi");
-        let probe = body
+        let probe = body[capture..]
             .find("scoped_binding_refusal(&session_id, &info, &resolved.target)")
+            .map(|i| capture + i)
             .expect("pre-click binding probe");
         let click = body.find("input::left_click").expect("left_click");
         assert!(capture < probe);
         assert!(probe < click);
+        // 0123 L2: an earlier probe also runs after `offer` and before the pointer moves.
+        let offer = body.find("foreground::offer").expect("offer");
+        let move_to = body.find("input::move_to").expect("move_to");
+        let early = body
+            .find("scoped_binding_refusal(&session_id, &info, &resolved.target)")
+            .expect("post-offer probe");
+        assert!(offer < early);
+        assert!(early < move_to);
         assert!(body.contains("Narrow R7"));
     }
 
@@ -7204,5 +7750,904 @@ mod tests {
         let point = point_for_dispatch(&resolved).expect("point contract");
         assert!(point.transform.valid);
         assert_eq!(resolved.identity.unwrap().state, IdentityState::Exact);
+    }
+
+    // ---------------------------------------------------------------- 0124 outcome
+
+    fn scoped_ref() -> SnapshotRef {
+        SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 7,
+        }
+    }
+
+    fn outcome_env(miss: Option<&str>, navigated: bool, retried: bool) -> ActuateEnvelope {
+        let mut env = base(
+            "s-0124".into(),
+            none_target(),
+            true,
+            false,
+            retried,
+            false,
+            true,
+            None,
+        )
+        .expect("base");
+        env.miss = miss.map(str::to_string);
+        env.navigated = navigated;
+        env.refusal = None;
+        env
+    }
+
+    #[test]
+    fn scoped_ref_miss_sends_one_click_no_retry() {
+        let r = scoped_ref();
+        assert!(
+            !auto_retry_allowed(&Target::Scoped(r.clone())),
+            "a scoped ref must never auto-retry"
+        );
+        assert!(auto_retry_allowed(&Target::ElementId("chr:0".into())));
+        assert!(auto_retry_allowed(&Target::Pixel { x: 1, y: 2 }));
+        // The predicate guards the only retry block in `click_inner`.
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner(").expect("click_inner");
+        let end = src.find("fn dispatch_blind_click(").expect("blind");
+        let body = &src[start..end];
+        assert!(
+            body.contains("auto_retry_allowed(&resolved.target) && should_retry_click("),
+            "the scoped gate must guard the retry block"
+        );
+        let mut env = outcome_env(Some("no_change"), false, false);
+        env.identity = Some(IdentityReport::exact_chrome(&r));
+        apply_outcome("click", &mut env, false, &OutcomeExtras::default());
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(env.delivery, Some(crate::outcome::Delivery::Delivered));
+        assert_eq!(
+            outcome.retry.disposition,
+            crate::outcome::RetryDisposition::Reobserve
+        );
+        assert_eq!(outcome.retry.reason, "scoped_ref_no_auto_retry");
+        assert!(!env.retried);
+    }
+
+    #[test]
+    fn legacy_chr_miss_still_retries_once() {
+        let effect = ClickEffect {
+            navigated: false,
+            miss: Some("no_change"),
+        };
+        assert!(should_retry_click(&effect));
+        assert!(auto_retry_allowed(&Target::ElementId("chr:3".into())));
+        let mut env = outcome_env(Some("no_change"), false, true);
+        apply_outcome("click", &mut env, false, &OutcomeExtras::default());
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(
+            outcome.retry.disposition,
+            crate::outcome::RetryDisposition::Unsafe
+        );
+        assert_eq!(outcome.retry.reason, "auto_retry_exhausted");
+    }
+
+    #[test]
+    fn navigated_has_no_retry_and_reobserve() {
+        let effect = ClickEffect {
+            navigated: true,
+            miss: None,
+        };
+        assert!(!should_retry_click(&effect));
+        let mut env = outcome_env(None, true, false);
+        apply_outcome("click", &mut env, false, &OutcomeExtras::default());
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(outcome.effect, crate::outcome::Effect::Observed);
+        assert_eq!(outcome.retry.reason, "navigated_refs_stale");
+    }
+
+    #[test]
+    fn post_dispatch_send_error_is_unknown_unsafe() {
+        let env = fail_with_point_unverified(
+            "s-0124-send".into(),
+            none_target(),
+            HandsError::Input("send failed".into()),
+            true,
+            false,
+            false,
+            None,
+        )
+        .expect("failure envelope");
+        let mut env = env;
+        apply_outcome("click", &mut env, false, &OutcomeExtras::default());
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(env.delivery, Some(crate::outcome::Delivery::Unknown));
+        assert_eq!(outcome.verdict, crate::outcome::Verdict::Unknown);
+        assert_eq!(
+            outcome.retry.disposition,
+            crate::outcome::RetryDisposition::Unsafe
+        );
+        assert_eq!(outcome.retry.reason, "post_dispatch_unverified");
+    }
+
+    #[test]
+    fn post_dispatch_settle_error_is_unknown_unsafe() {
+        // The settle error uses the same post-dispatch helper.
+        let env = fail_with_point_unverified(
+            "s-0124-settle".into(),
+            none_target(),
+            HandsError::Input("settle failed".into()),
+            true,
+            false,
+            false,
+            None,
+        )
+        .expect("failure envelope");
+        let mut env = env;
+        apply_outcome("click", &mut env, false, &OutcomeExtras::default());
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(outcome.verdict, crate::outcome::Verdict::Unknown);
+        assert_eq!(outcome.retry.reason, "post_dispatch_unverified");
+    }
+
+    #[test]
+    fn pre_dispatch_freeze_is_undelivered_wait() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lease::reset_for_test();
+        lease::freeze_now_with(lease::FreezeCause::Physical);
+        let mut env = refuse_if_blocked("s-0124-freeze", none_target())
+            .expect("refusal")
+            .expect("frozen envelope");
+        lease::reset_for_test();
+        assert_eq!(env.refusal, Some(crate::outcome::RefusalToken::DeskFrozen));
+        apply_outcome("click", &mut env, false, &OutcomeExtras::default());
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(env.delivery, Some(crate::outcome::Delivery::Undelivered));
+        assert_eq!(
+            outcome.retry.disposition,
+            crate::outcome::RetryDisposition::Wait
+        );
+        assert_eq!(outcome.retry.reason, "desk_frozen");
+    }
+
+    #[test]
+    fn type_partial_send_is_unknown() {
+        let mut env = fail_partial_dispatch(
+            "s-0124-type".into(),
+            none_target(),
+            HandsError::Input("partial type".into()),
+            true,
+            false,
+            false,
+            None,
+        )
+        .expect("partial envelope");
+        apply_outcome("type", &mut env, false, &OutcomeExtras::default());
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(env.delivery, Some(crate::outcome::Delivery::Unknown));
+        assert_eq!(outcome.effect, crate::outcome::Effect::NotEvaluated);
+        assert_eq!(outcome.retry.reason, "partial_input_unproven");
+        assert_eq!(
+            outcome.retry.disposition,
+            crate::outcome::RetryDisposition::Unsafe
+        );
+    }
+
+    #[test]
+    fn key_send_error_is_unknown() {
+        let mut env = fail_partial_dispatch(
+            "s-0124-key".into(),
+            none_target(),
+            HandsError::Input("key".into()),
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("key envelope");
+        apply_outcome("key", &mut env, false, &OutcomeExtras::default());
+        assert_eq!(env.delivery, Some(crate::outcome::Delivery::Unknown));
+        assert_eq!(
+            env.outcome.expect("outcome").retry.reason,
+            "partial_input_unproven"
+        );
+    }
+
+    #[test]
+    fn hover_dwell_error_is_unknown_reobserve() {
+        let mut env = fail_with_point_unverified(
+            "s-0124-hover".into(),
+            none_target(),
+            HandsError::Input("dwell".into()),
+            true,
+            false,
+            false,
+            None,
+        )
+        .expect("hover envelope");
+        apply_outcome("hover", &mut env, false, &OutcomeExtras::default());
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(env.delivery, Some(crate::outcome::Delivery::Unknown));
+        assert_eq!(
+            outcome.retry.disposition,
+            crate::outcome::RetryDisposition::Reobserve
+        );
+    }
+
+    #[test]
+    fn scroll_error_is_unknown_unsafe() {
+        let mut env = fail_with_point_unverified(
+            "s-0124-scroll".into(),
+            none_target(),
+            HandsError::Input("wheel".into()),
+            true,
+            false,
+            false,
+            None,
+        )
+        .expect("scroll envelope");
+        apply_outcome("scroll", &mut env, false, &OutcomeExtras::default());
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(env.delivery, Some(crate::outcome::Delivery::Unknown));
+        assert_eq!(
+            outcome.retry.disposition,
+            crate::outcome::RetryDisposition::Unsafe
+        );
+    }
+
+    #[test]
+    fn post_offer_refusal_carries_foregrounded() {
+        let env = refuse_identity(
+            "s-0124-offer".into(),
+            none_target(),
+            IdentityReport::chrome_failure(&scoped_ref(), IdentityState::Unknown, "tab_not_active"),
+        )
+        .expect("identity refusal");
+        let env = with_offer_foregrounded(env, true);
+        assert!(env.foregrounded);
+        assert!(env.refusal.is_none());
+        let mut env = env;
+        apply_outcome("click", &mut env, false, &OutcomeExtras::default());
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(
+            outcome.retry.disposition,
+            crate::outcome::RetryDisposition::Safe
+        );
+        assert_eq!(outcome.retry.reason, "binding_precondition");
+    }
+
+    #[test]
+    fn after_actuate_classifies_every_helper() {
+        // Constructors stamp a closed token; identity refusals are mapped by state/reason.
+        let helpers = [
+            fail(
+                "s-0124-a".into(),
+                none_target(),
+                HandsError::Input("bad".into()),
+                false,
+                false,
+                false,
+            ),
+            refuse_fence(
+                "s-0124-b".into(),
+                none_target(),
+                FenceInfo {
+                    domain: "example.com".into(),
+                    category: "money".into(),
+                    name: "Buy".into(),
+                    role: "button".into(),
+                    modes: Vec::new(),
+                },
+            ),
+            refuse_transform(
+                "s-0124-c".into(),
+                none_target(),
+                crate::point::PointContract {
+                    source: PointSource::Chr,
+                    css: None,
+                    physical: None,
+                    transform: crate::point::TransformReport::invalid("window_mismatch", None),
+                },
+                None,
+            ),
+        ];
+        for env in helpers {
+            let env = env.expect("helper envelope");
+            assert!(
+                env.refusal.is_some(),
+                "every pre-dispatch helper stamps a token"
+            );
+        }
+        let refused = refuse_identity(
+            "s-0124-d".into(),
+            none_target(),
+            IdentityReport::chrome_failure(&scoped_ref(), IdentityState::Stale, "stale_element"),
+        )
+        .expect("identity");
+        assert!(
+            refused.refusal.is_none(),
+            "identity uses the total reason map"
+        );
+        let mut refused = refused;
+        apply_outcome("click", &mut refused, false, &OutcomeExtras::default());
+        assert_eq!(
+            refused.delivery,
+            Some(crate::outcome::Delivery::Undelivered)
+        );
+        // Read-only tools never carry the contract.
+        let mut read_only = outcome_env(None, false, false);
+        apply_outcome(
+            "wait_settle",
+            &mut read_only,
+            false,
+            &OutcomeExtras::default(),
+        );
+        assert!(read_only.delivery.is_none());
+        assert!(read_only.outcome.is_none());
+    }
+
+    #[test]
+    fn envelope_under_16k_with_outcome() {
+        let mut env = outcome_env(Some("no_change"), false, false);
+        apply_outcome("click", &mut env, false, &OutcomeExtras::default());
+        let json = serialize_envelope(&env).expect("json");
+        assert!(json.len() < ENVELOPE_MAX_BYTES, "{} bytes", json.len());
+        assert!(json.contains("\"delivery\":\"delivered\""));
+        assert!(json.contains("\"outcome\":{\"v\":1"));
+        assert!(json.contains("\"retry\":{\"disposition\":\"reobserve\""));
+    }
+
+    #[test]
+    fn densest_dispatched_envelope_shrinks_not_errors() {
+        let mut env = outcome_env(Some("no_change"), false, false);
+        env.guidance = Some("g".repeat(20_000));
+        env.post_dispatch = true;
+        apply_outcome("click", &mut env, false, &OutcomeExtras::default());
+        let shrunk = shrink_envelope(env);
+        assert!(shrunk.guidance.is_none());
+        let json = serialize_envelope(&shrunk).expect("json");
+        assert!(json.len() < ENVELOPE_MAX_BYTES, "{}", json.len());
+        // Never an Err after dispatch: shrink returns the envelope with its contract intact.
+        assert!(shrunk.post_dispatch);
+        assert!(shrunk.outcome.is_some());
+    }
+
+    #[test]
+    fn postcheck_not_inside_click_inner() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner(").expect("click_inner");
+        let end = src.find("fn dispatch_blind_click(").expect("blind");
+        let body = &src[start..end];
+        assert!(
+            !body.contains("postcheck"),
+            "0108 lock: no postcheck in click_inner"
+        );
+        assert!(!body.contains("apply_postcondition"));
+    }
+
+    #[test]
+    fn click_postcondition_without_dispatch_is_not_evaluated() {
+        let condition: crate::outcome::Postcondition =
+            serde_json::from_str("{\"kind\":\"dialog_present\"}").expect("condition");
+        let env = fail(
+            "s-0124-nodispatch".into(),
+            none_target(),
+            HandsError::Input("bad".into()),
+            false,
+            false,
+            false,
+        )
+        .expect("refusal");
+        let (report, requested) = apply_postcondition(&env, Some(&condition));
+        let report = report.expect("report");
+        assert!(requested);
+        assert_eq!(
+            report.state,
+            crate::outcome::PostconditionState::NotEvaluated
+        );
+        assert_eq!(report.reason.as_deref(), Some("not_dispatched"));
+    }
+
+    #[test]
+    fn click_postcondition_after_settle_sets_checked() {
+        let condition: crate::outcome::Postcondition =
+            serde_json::from_str("{\"kind\":\"dialog_present\"}").expect("condition");
+        let mut env = outcome_env(None, false, false);
+        // A non-scoped dispatch is still evaluated: it reports unavailable after dispatch.
+        let (report, requested) = apply_postcondition(&env, Some(&condition));
+        assert!(requested);
+        assert_eq!(
+            report.expect("report").state,
+            crate::outcome::PostconditionState::Unavailable
+        );
+        apply_outcome(
+            "click",
+            &mut env,
+            false,
+            &OutcomeExtras {
+                postcondition: Some(crate::outcome::PostconditionReport::new(
+                    "dialog_present",
+                    crate::outcome::PostconditionState::Unavailable,
+                    Some("requires_scoped_chrome_ref"),
+                    "dom",
+                )),
+                requested: true,
+                wait_ms: 0,
+            },
+        );
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(outcome.postcondition_checked, Some(true));
+        assert_eq!(
+            outcome.effect,
+            crate::outcome::Effect::Unconfirmed,
+            "unavailable is never failed"
+        );
+    }
+
+    #[test]
+    fn wait_ms_polls_then_confirms() {
+        let r = scoped_ref();
+        let condition: crate::outcome::Postcondition =
+            serde_json::from_str("{\"kind\":\"dialog_present\",\"wait_ms\":160}").expect("cond");
+        let mut env = outcome_env(None, false, false);
+        env.identity = Some(IdentityReport::exact_chrome(&r));
+        env.target = ActuateTarget {
+            kind: "element".into(),
+            id: Some(r.to_string()),
+            x: 10,
+            y: 20,
+        };
+        chrome::reset_postcheck_calls();
+        chrome::set_postcheck_sequence(vec![
+            Ok(chrome::PostcheckReply {
+                state: "unsatisfied".into(),
+                reason: None,
+                doc: Some("9f3a".into()),
+                snap: Some("a1b2c3d4".into()),
+                tab: Some(12),
+                active: true,
+                focused: true,
+                visibility_state: Some("visible".into()),
+                fallback: false,
+            }),
+            Ok(chrome::PostcheckReply {
+                state: "satisfied".into(),
+                reason: None,
+                doc: Some("9f3a".into()),
+                snap: Some("a1b2c3d4".into()),
+                tab: Some(12),
+                active: true,
+                focused: true,
+                visibility_state: Some("visible".into()),
+                fallback: false,
+            }),
+        ]);
+        let (report, requested) = apply_postcondition(&env, Some(&condition));
+        chrome::set_postcheck_sequence(Vec::new());
+        assert!(requested);
+        assert_eq!(
+            report.expect("report").state,
+            crate::outcome::PostconditionState::Satisfied
+        );
+        assert!(chrome::postcheck_calls() >= 2, "bounded poll re-checks");
+    }
+
+    #[test]
+    fn postcondition_timeout_is_unconfirmed() {
+        let r = scoped_ref();
+        let condition: crate::outcome::Postcondition =
+            serde_json::from_str("{\"kind\":\"dialog_present\"}").expect("cond");
+        let mut env = outcome_env(None, false, false);
+        env.identity = Some(IdentityReport::exact_chrome(&r));
+        chrome::set_postcheck_stub(Some(Err(chrome::PostcheckError::Timeout(
+            "client timed out".into(),
+        ))));
+        let (report, requested) = apply_postcondition(&env, Some(&condition));
+        chrome::set_postcheck_stub(None);
+        assert!(requested);
+        assert_eq!(
+            report.expect("report").state,
+            crate::outcome::PostconditionState::Timeout
+        );
+        apply_outcome(
+            "click",
+            &mut env,
+            false,
+            &OutcomeExtras {
+                postcondition: Some(crate::outcome::PostconditionReport::new(
+                    "dialog_present",
+                    crate::outcome::PostconditionState::Timeout,
+                    Some("postcondition_timeout"),
+                    "dom",
+                )),
+                requested: true,
+                wait_ms: 0,
+            },
+        );
+        let outcome = env.outcome.expect("outcome");
+        assert_ne!(outcome.effect, crate::outcome::Effect::Failed);
+        assert_eq!(outcome.retry.reason, "postcondition_timeout");
+    }
+
+    #[test]
+    fn frame_ref_postcondition_is_unavailable() {
+        let r = SnapshotRef::Chrome {
+            tab: 12,
+            frame: 3,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 7,
+        };
+        let mut env = outcome_env(None, false, false);
+        env.identity = Some(IdentityReport::exact_chrome(&r));
+        let condition: crate::outcome::Postcondition =
+            serde_json::from_str("{\"kind\":\"dialog_present\"}").expect("cond");
+        let (report, requested) = apply_postcondition(&env, Some(&condition));
+        assert!(requested);
+        let report = report.expect("report");
+        assert_eq!(
+            report.state,
+            crate::outcome::PostconditionState::Unavailable
+        );
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("frame_postcondition_out_of_scope")
+        );
+    }
+
+    #[test]
+    fn postcheck_background_tab_is_unavailable() {
+        let r = scoped_ref();
+        let condition: crate::outcome::Postcondition =
+            serde_json::from_str("{\"kind\":\"dialog_present\"}").expect("cond");
+        let mut env = outcome_env(None, false, false);
+        env.identity = Some(IdentityReport::exact_chrome(&r));
+        chrome::set_postcheck_stub(Some(Ok(chrome::PostcheckReply {
+            state: "satisfied".into(),
+            reason: None,
+            doc: Some("9f3a".into()),
+            snap: Some("a1b2c3d4".into()),
+            tab: Some(12),
+            active: false,
+            focused: true,
+            visibility_state: Some("visible".into()),
+            fallback: false,
+        })));
+        let (report, _) = apply_postcondition(&env, Some(&condition));
+        chrome::set_postcheck_stub(None);
+        let report = report.expect("report");
+        assert_eq!(
+            report.state,
+            crate::outcome::PostconditionState::Unavailable
+        );
+        assert_eq!(report.reason.as_deref(), Some("tab_not_active"));
+        // A satisfied payload in the wrong tab is never trusted.
+        chrome::set_postcheck_stub(Some(Ok(chrome::PostcheckReply {
+            state: "satisfied".into(),
+            reason: None,
+            doc: Some("9f3a".into()),
+            snap: Some("a1b2c3d4".into()),
+            tab: Some(99),
+            active: true,
+            focused: true,
+            visibility_state: Some("visible".into()),
+            fallback: false,
+        })));
+        let (report, _) = apply_postcondition(&env, Some(&condition));
+        chrome::set_postcheck_stub(None);
+        assert_eq!(
+            report.expect("report").reason.as_deref(),
+            Some("protocol_error")
+        );
+    }
+
+    #[test]
+    fn uia_ref_postcondition_is_dom_only_after_dispatch() {
+        let condition: crate::outcome::Postcondition =
+            serde_json::from_str("{\"kind\":\"dialog_present\"}").expect("cond");
+        let mut env = outcome_env(None, false, false);
+        env.target = ActuateTarget {
+            kind: "element".into(),
+            id: Some("sref1:u.1a2b3c.7d0e1f22.42a1b2c3".into()),
+            x: 10,
+            y: 20,
+        };
+        let (report, requested) = apply_postcondition(&env, Some(&condition));
+        assert!(requested);
+        assert_eq!(report.expect("report").reason.as_deref(), Some("dom_only"));
+    }
+
+    // ------------------------------------------------- G1: deadline semantics (end-to-end)
+
+    fn postcheck_reply(state: &str) -> chrome::PostcheckReply {
+        chrome::PostcheckReply {
+            state: state.into(),
+            reason: None,
+            doc: Some("9f3a".into()),
+            snap: Some("a1b2c3d4".into()),
+            tab: Some(12),
+            active: true,
+            focused: true,
+            visibility_state: Some("visible".into()),
+            fallback: false,
+        }
+    }
+
+    fn scoped_env_with_condition(wait_ms: u64) -> (ActuateEnvelope, crate::outcome::Postcondition) {
+        let r = scoped_ref();
+        let mut env = outcome_env(None, false, false);
+        env.identity = Some(IdentityReport::exact_chrome(&r));
+        env.target = ActuateTarget {
+            kind: "element".into(),
+            id: Some(r.to_string()),
+            x: 10,
+            y: 20,
+        };
+        let condition: crate::outcome::Postcondition = serde_json::from_value(
+            serde_json::json!({"kind": "dialog_present", "wait_ms": wait_ms}),
+        )
+        .expect("condition");
+        (env, condition)
+    }
+
+    #[test]
+    fn wait_ms_zero_unsatisfied_is_unconfirmed_end_to_end() {
+        let (env, condition) = scoped_env_with_condition(0);
+        chrome::reset_postcheck_calls();
+        chrome::set_postcheck_stub(Some(Ok(postcheck_reply("unsatisfied"))));
+        let (report, _) = apply_postcondition(&env, Some(&condition));
+        chrome::set_postcheck_stub(None);
+        assert_eq!(
+            chrome::postcheck_calls(),
+            1,
+            "wait_ms:0 is exactly one read"
+        );
+        let report = report.expect("report");
+        assert_eq!(
+            report.state,
+            crate::outcome::PostconditionState::Unsatisfied
+        );
+        let mut env = env;
+        apply_outcome(
+            "click",
+            &mut env,
+            false,
+            &OutcomeExtras {
+                postcondition: Some(report),
+                requested: true,
+                wait_ms: 0,
+            },
+        );
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(outcome.effect, crate::outcome::Effect::Unconfirmed);
+        assert_ne!(outcome.effect, crate::outcome::Effect::Failed);
+        assert_eq!(outcome.retry.reason, "postcondition_not_met_yet");
+    }
+
+    #[test]
+    fn wait_ms_deadline_read_is_never_single_read() {
+        let (env, condition) = scoped_env_with_condition(120);
+        chrome::reset_postcheck_calls();
+        chrome::set_postcheck_stub(Some(Ok(postcheck_reply("unsatisfied"))));
+        let started = Instant::now();
+        let (report, _) = apply_postcondition(&env, Some(&condition));
+        let elapsed = started.elapsed();
+        chrome::set_postcheck_stub(None);
+        assert!(
+            chrome::postcheck_calls() >= 2,
+            "a wait_ms deadline always takes a post-sleep read"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "the poll observes the deadline: {elapsed:?}"
+        );
+        let report = report.expect("report");
+        assert_eq!(
+            report.state,
+            crate::outcome::PostconditionState::Unsatisfied
+        );
+        let mut env = env;
+        apply_outcome(
+            "click",
+            &mut env,
+            false,
+            &OutcomeExtras {
+                postcondition: Some(report),
+                requested: true,
+                wait_ms: 120,
+            },
+        );
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(outcome.effect, crate::outcome::Effect::Failed);
+        assert_eq!(outcome.verdict, crate::outcome::Verdict::Failed);
+        assert_eq!(outcome.retry.reason, "postcondition_failed");
+    }
+
+    #[test]
+    fn wait_ms_late_effect_confirms_near_deadline() {
+        let (env, condition) = scoped_env_with_condition(120);
+        chrome::reset_postcheck_calls();
+        chrome::set_postcheck_sequence(vec![
+            Ok(postcheck_reply("unsatisfied")),
+            Ok(postcheck_reply("unsatisfied")),
+            Ok(postcheck_reply("satisfied")),
+        ]);
+        let (report, _) = apply_postcondition(&env, Some(&condition));
+        chrome::set_postcheck_sequence(Vec::new());
+        assert!(
+            chrome::postcheck_calls() >= 3,
+            "the final read observes the late effect"
+        );
+        let report = report.expect("report");
+        assert_eq!(report.state, crate::outcome::PostconditionState::Satisfied);
+        let mut env = env;
+        apply_outcome(
+            "click",
+            &mut env,
+            false,
+            &OutcomeExtras {
+                postcondition: Some(report),
+                requested: true,
+                wait_ms: 120,
+            },
+        );
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(outcome.effect, crate::outcome::Effect::Confirmed);
+        assert_eq!(outcome.retry.reason, "effect_confirmed");
+    }
+
+    #[test]
+    fn shrink_ladder_exhaustion_is_named_not_silent() {
+        let mut env = outcome_env(None, false, false);
+        env.target.id = Some("x".repeat(20_000));
+        env.guidance = Some("g".repeat(20_000));
+        apply_outcome("click", &mut env, false, &OutcomeExtras::default());
+        let shrunk = shrink_envelope(env);
+        assert_eq!(shrunk.guidance.as_deref(), Some(ENVELOPE_OVER_BUDGET));
+        // Still an envelope, never an Err.
+        let json = serialize_envelope(&shrunk).expect("serialize");
+        assert!(json.len() > ENVELOPE_MAX_BYTES);
+    }
+
+    #[test]
+    fn blind_guard_stamps_closed_token() {
+        let env = click(ActuateRequest {
+            session_id: Some("s-0124-blind-guard".into()),
+            blind: true,
+            require_interactable: true,
+            x: Some(10),
+            y: Some(10),
+            ..ActuateRequest::default()
+        })
+        .expect("refusal envelope");
+        assert!(!env.ok);
+        assert_eq!(env.refusal, Some(crate::outcome::RefusalToken::BlindGuard));
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(
+            outcome.retry.disposition,
+            crate::outcome::RetryDisposition::Safe
+        );
+        assert_eq!(outcome.retry.reason, "blind_guard");
+    }
+
+    #[test]
+    fn postcheck_positive_only_reason_is_not_observed() {
+        let (env, _) = scoped_env_with_condition(0);
+        chrome::set_postcheck_stub(Some(Ok(chrome::PostcheckReply {
+            state: "unavailable".into(),
+            reason: Some("not_observed".into()),
+            ..postcheck_reply("unavailable")
+        })));
+        let condition: crate::outcome::Postcondition =
+            serde_json::from_str("{\"kind\":\"dialog_present\"}").expect("cond");
+        let (report, _) = apply_postcondition(&env, Some(&condition));
+        chrome::set_postcheck_stub(None);
+        let report = report.expect("report");
+        assert_eq!(report.reason.as_deref(), Some("not_observed"));
+        assert_eq!(
+            report.state,
+            crate::outcome::PostconditionState::Unavailable
+        );
+    }
+
+    #[test]
+    fn postcheck_unknown_reason_degrades_to_protocol_error() {
+        let (env, _) = scoped_env_with_condition(0);
+        chrome::set_postcheck_stub(Some(Ok(chrome::PostcheckReply {
+            state: "unavailable".into(),
+            reason: Some("no_content".into()),
+            ..postcheck_reply("unavailable")
+        })));
+        let condition: crate::outcome::Postcondition =
+            serde_json::from_str("{\"kind\":\"dialog_present\"}").expect("cond");
+        let (report, _) = apply_postcondition(&env, Some(&condition));
+        chrome::set_postcheck_stub(None);
+        assert_eq!(
+            report.expect("report").reason.as_deref(),
+            Some("protocol_error"),
+            "0123 transport tokens never leak into the postcondition reason set"
+        );
+    }
+
+    // ------------------------------------------------- G5: behavioural one-send (scoped)
+
+    thread_local! {
+        static LEFT_CLICK_SENDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn count_left_clicks(inputs: &[INPUT]) -> Result<(), HandsError> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::MOUSEEVENTF_LEFTDOWN;
+        if inputs
+            .iter()
+            .any(|input| unsafe { input.Anonymous.mi.dwFlags }.contains(MOUSEEVENTF_LEFTDOWN))
+        {
+            LEFT_CLICK_SENDS.with(|c| c.set(c.get() + 1));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_ref_miss_sends_exactly_one_click() {
+        let _lease = lease::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = elevation_lock();
+        let (r, hit) = scoped_valid_hit();
+        chrome::set_scoped_resolve_stub(Some(Ok(hit)));
+        chrome::set_binding_stub(Some(Ok(chrome::BindingEvidence {
+            tab: 12,
+            window: Some(45),
+            active: true,
+            focused: true,
+        })));
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 100,
+                y: 80,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        crate::elevation::set_caller_rid_hook(Some(|| 0x2000));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        crate::foreground::set_foreground_hwnd_hook(Some(fg_10));
+        crate::foreground::set_client_rect_hook(Some(hook_client_virtual));
+        crate::uia::set_hit_test_hook(Some(free_hit));
+        crate::capture::set_capture_roi_hook(Some(fake_capture));
+        input::set_send_inputs_hook(Some(count_left_clicks));
+        LEFT_CLICK_SENDS.with(|c| c.set(0));
+        lease::reset_for_test();
+        let env = crate::allows::with_test_env(|| {
+            click(ActuateRequest {
+                session_id: Some("s-0124-one-send".into()),
+                element_id: Some(r.to_string()),
+                ..ActuateRequest::default()
+            })
+            .expect("click")
+        });
+        chrome::set_scoped_resolve_stub(None);
+        chrome::set_binding_stub(None);
+        chrome::set_remap_geometry_hook(None);
+        chrome::set_remap_identity_hook(None);
+        crate::elevation::set_caller_rid_hook(None);
+        crate::elevation::set_high_il_hook(None);
+        crate::foreground::set_foreground_hwnd_hook(None);
+        crate::foreground::set_client_rect_hook(None);
+        crate::uia::set_hit_test_hook(None);
+        crate::capture::set_capture_roi_hook(None);
+        input::set_send_inputs_hook(None);
+        lease::reset_for_test();
+        assert!(env.ok, "{env:?}");
+        assert_eq!(
+            LEFT_CLICK_SENDS.with(|c| c.get()),
+            1,
+            "a scoped miss sends exactly one click: {env:?}"
+        );
+        assert!(!env.retried, "{env:?}");
+        let outcome = env.outcome.expect("outcome");
+        assert_eq!(
+            outcome.retry.disposition,
+            crate::outcome::RetryDisposition::Reobserve
+        );
+        assert_eq!(outcome.retry.reason, "scoped_ref_no_auto_retry");
     }
 }

@@ -702,6 +702,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     op !== "snapshot" &&
     op !== "resolve" &&
     op !== "assess" &&
+    op !== "postcheck" &&
     op !== "frame_top" &&
     op !== "frame_binding" &&
     op !== "frame_commit"
@@ -717,6 +718,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse(buildSnapshot(msg));
     } else if (op === "assess") {
       sendResponse(buildAssess(msg));
+    } else if (op === "postcheck") {
+      sendResponse(buildPostcheck(msg));
     } else if (op === "frame_top") {
       sendResponse(frameTopReply());
     } else if (op === "frame_binding") {
@@ -782,6 +785,9 @@ function buildSnapshot(msg) {
       nodes: nodes,
       keys: keys,
       retained: nodes.length,
+      // Internal baseline for `url_changed`/`title_changed`; never emitted in an envelope.
+      url: location.href || "",
+      title: document.title || "",
     };
   } else if (pending) {
     // Candidate only: the SW commits it after the fan-out deadline. A discarded late reply
@@ -801,6 +807,8 @@ function buildSnapshot(msg) {
       keys: keys,
       retained: nodes.length,
       commit_by: commitBy,
+      url: location.href || "",
+      title: document.title || "",
     });
   } else {
     retained = 0;
@@ -966,6 +974,188 @@ function resolveScoped(msg) {
     reply.assessment = assessAt(node, rect, msg.samples);
   }
   return reply;
+}
+
+function isPostcheckRendered(el) {
+  if (!el || !el.isConnected) {
+    return false;
+  }
+  if (cssRect(el) == null) {
+    return false;
+  }
+  try {
+    const style = window.getComputedStyle(el);
+    if (style && (style.display === "none" || style.visibility === "hidden")) {
+      return false;
+    }
+  } catch (_err) {}
+  return true;
+}
+
+function isEditableActive(el) {
+  if (!el || el === document.body || el === document.documentElement) {
+    return false;
+  }
+  const tag = String(el.tagName || "").toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+    return true;
+  }
+  if (el.isContentEditable) {
+    return true;
+  }
+  const role = String(el.getAttribute("role") || "").toLowerCase();
+  return (
+    role === "textbox" || role === "combobox" || role === "searchbox"
+  );
+}
+
+// Read-only postcondition check. Returns booleans/states only: never page text, URL, title,
+// value, a snapshot walk, or a DOM mutation. Stored-node kinds follow the clicked snapshot.
+function buildPostcheck(msg) {
+  const kind = msg && msg.kind;
+  const record = lastSnapshot;
+  const reply = {
+    doc: DOC_NONCE,
+    snap: record ? record.snap : null,
+    visibilityState: document.visibilityState,
+  };
+  const unavailable = (reason) =>
+    Object.assign(reply, { state: "unavailable", reason: reason });
+  const storedNode = () => {
+    if (!record) {
+      return { error: "stale_document" };
+    }
+    if (msg.doc !== record.doc) {
+      return { error: "stale_document" };
+    }
+    if (msg.snap !== record.snap) {
+      return { error: "stale_snapshot" };
+    }
+    const idx = Number(msg.idx);
+    if (
+      !Number.isInteger(idx) ||
+      idx < 0 ||
+      idx >= record.nodes.length ||
+      idx >= record.retained
+    ) {
+      return { error: "stale_element" };
+    }
+    const node = record.nodes[idx];
+    if (!node) {
+      return { error: "stale_element" };
+    }
+    return { node: node };
+  };
+  if (kind === "url_prefix" || kind === "url_equals" || kind === "title_equals") {
+    if (typeof msg.value !== "string") {
+      return unavailable("invalid_condition");
+    }
+    if (kind === "title_equals") {
+      return Object.assign(reply, {
+        state: document.title === msg.value ? "satisfied" : "unsatisfied",
+      });
+    }
+    if (kind === "url_prefix") {
+      return Object.assign(reply, {
+        state: (location.href || "").startsWith(msg.value)
+          ? "satisfied"
+          : "unsatisfied",
+      });
+    }
+    return Object.assign(reply, {
+      state: location.href === msg.value ? "satisfied" : "unsatisfied",
+    });
+  }
+  if (kind === "url_changed" || kind === "title_changed") {
+    if (!record) {
+      return unavailable("stale_document");
+    }
+    if (msg.doc !== record.doc || msg.snap !== record.snap) {
+      return unavailable("baseline_mismatch");
+    }
+    const before = kind === "url_changed" ? record.url : record.title;
+    if (typeof before !== "string") {
+      return unavailable("baseline_mismatch");
+    }
+    const now = kind === "url_changed" ? location.href || "" : document.title || "";
+    return Object.assign(reply, {
+      state: now !== before ? "satisfied" : "unsatisfied",
+    });
+  }
+  if (kind === "element_present" || kind === "element_absent") {
+    const found = storedNode();
+    if (found.error) {
+      return unavailable(found.error);
+    }
+    const rendered = isPostcheckRendered(found.node);
+    const satisfied = kind === "element_present" ? rendered : !rendered;
+    return Object.assign(reply, {
+      state: satisfied ? "satisfied" : "unsatisfied",
+    });
+  }
+  if (kind === "focus_editable") {
+    return Object.assign(reply, {
+      state: isEditableActive(document.activeElement)
+        ? "satisfied"
+        : "unavailable",
+      reason: isEditableActive(document.activeElement) ? undefined : "not_observed",
+    });
+  }
+  if (kind === "dialog_present") {
+    let found = false;
+    try {
+      const dialogs = document.querySelectorAll(
+        'dialog[open], [role="dialog"], [role="alertdialog"]'
+      );
+      const cap = Math.min(dialogs.length, 10);
+      for (let i = 0; i < cap; i += 1) {
+        if (isPostcheckRendered(dialogs[i])) {
+          found = true;
+          break;
+        }
+      }
+    } catch (_err) {}
+    return Object.assign(reply, {
+      state: found ? "satisfied" : "unavailable",
+      reason: found ? undefined : "not_observed",
+    });
+  }
+  if (kind === "count_at_least") {
+    const role = msg.role;
+    const n = Number(msg.n);
+    if (
+      typeof role !== "string" ||
+      !/^[a-z][a-z-]*$/.test(role) ||
+      !Number.isInteger(n) ||
+      n < 1 ||
+      n > 50
+    ) {
+      return unavailable("invalid_condition");
+    }
+    let count = 0;
+    try {
+      const nodes = document.querySelectorAll('[role="' + role + '"]');
+      const cap = Math.min(nodes.length, 50);
+      for (let i = 0; i < cap; i += 1) {
+        if (isPostcheckRendered(nodes[i])) {
+          count += 1;
+          if (count >= n) {
+            break;
+          }
+        }
+      }
+      if (count < n && nodes.length >= 50) {
+        return unavailable("count_capped");
+      }
+    } catch (_err) {
+      return unavailable("evaluation_failed");
+    }
+    return Object.assign(reply, {
+      state: count >= n ? "satisfied" : "unavailable",
+      reason: count >= n ? undefined : "not_observed",
+    });
+  }
+  return unavailable("unsupported");
 }
 
 function parseChrId(id) {

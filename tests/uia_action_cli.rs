@@ -106,12 +106,15 @@ fn uia_action_json_envelope_has_flat_semantic_fields() {
         identity: None,
         semantic: Some(hands::uia_actions::SemanticInfo {
             action: "toggle".into(),
-            delivery: hands::uia_actions::Delivery::Delivered,
             verify: Some("state_readback".into()),
             foreground_changed: false,
             pointer_moved: false,
+            error_code: None,
         }),
         post_dispatch: false,
+        delivery: Some(hands::uia_actions::Delivery::Delivered),
+        outcome: None,
+        refusal: None,
     };
     env.ok = true;
     let json = hands::actuate::serialize_envelope(&env).expect("serialize");
@@ -122,9 +125,10 @@ fn uia_action_json_envelope_has_flat_semantic_fields() {
     assert_eq!(value["foreground_changed"], false);
     assert_eq!(value["pointer_moved"], false);
     assert!(value.get("semantic").is_none(), "wire shape must stay flat");
-    // Non-semantic envelopes carry none of these keys.
+    // Read-only / pre-classification envelopes carry neither delivery nor outcome.
     let plain = hands::actuate::ActuateEnvelope {
         semantic: None,
+        delivery: None,
         ..env
     };
     let plain_json = hands::actuate::serialize_envelope(&plain).expect("serialize");

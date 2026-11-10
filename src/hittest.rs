@@ -877,6 +877,12 @@ pub fn refusal(
         "mismatch" => "assessment_point_mismatch: selected_point != point.css".into(),
         other => format!("interactable_{other}: {reason}"),
     };
+    let refusal = match kind {
+        "blocked" => crate::outcome::RefusalToken::InteractableBlocked,
+        "unknown" => crate::outcome::RefusalToken::InteractableUnknown,
+        "unavailable" => crate::outcome::RefusalToken::InteractableUnavailable,
+        _ => crate::outcome::RefusalToken::AssessmentUnavailable,
+    };
     crate::actuate::finalize_envelope(ActuateEnvelope {
         session_id: session_id.to_string(),
         ok: false,
@@ -902,6 +908,9 @@ pub fn refusal(
         interactable_checked: Some(true),
         identity: None,
         post_dispatch: false,
+        delivery: None,
+        outcome: None,
+        refusal: Some(refusal),
     })
 }
 
@@ -2479,6 +2488,9 @@ mod tests {
             interactable_checked: None,
             identity: None,
             post_dispatch: false,
+            delivery: None,
+            outcome: None,
+            refusal: None,
         }
     }
 

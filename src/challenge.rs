@@ -1937,7 +1937,7 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_str(include_str!("../extension/manifest.json")).expect("manifest");
         assert_eq!(manifest["manifest_version"], serde_json::json!(3));
-        assert_eq!(manifest["version"], serde_json::json!("0.3.0"));
+        assert_eq!(manifest["version"], serde_json::json!("0.3.1"));
         assert_eq!(
             manifest["permissions"],
             serde_json::json!(["nativeMessaging"])

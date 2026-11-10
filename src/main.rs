@@ -111,6 +111,16 @@ enum Command {
             help = "chr:/sref1:c only: refuse a blocked/unknown target before fence/offer/SendInput (read-only DOM assessment; advisory unless set)"
         )]
         require_interactable: bool,
+        #[arg(
+            long,
+            help = "opt-in DOM postcondition as JSON: {\"kind\":\"dialog_present\",\"wait_ms\":0}. kinds: url_prefix,url_equals,url_changed,title_equals,title_changed,element_present,element_absent,focus_editable,dialog_present,count_at_least. Evaluated after dispatch; never changes ok"
+        )]
+        postcondition: Option<String>,
+        #[arg(
+            long,
+            help = "read the postcondition JSON from a UTF-8 file (Windows PowerShell 5.1 quoting)"
+        )]
+        postcondition_file: Option<std::path::PathBuf>,
     },
     /// Invoke / toggle / expand / collapse / select / set-value a `uia:` or `sref1:u` element through UIA patterns. No pointer move, no foreground steal, no SendInput. `ok:true` means the pattern call succeeded (not proof of effect); `delivery` is `delivered` / `undelivered` / `unknown`, and `unknown` is never retried. `set-value` replaces text (read-only, password and non-text roles refuse); `toggle` with `--value on|off|true|false|checked|unchecked` is idempotent, omitted flips.
     UiaAction {
@@ -765,6 +775,8 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             session_id,
             blind,
             require_interactable,
+            postcondition,
+            postcondition_file,
         } => pack(actuate::click(ActuateRequest {
             session_id,
             element_id,
@@ -773,6 +785,7 @@ fn input_main(command: Command) -> Result<(), HandsError> {
             y,
             blind,
             require_interactable,
+            postcondition: parse_postcondition(postcondition, postcondition_file)?,
             ..ActuateRequest::default()
         }))?,
         Command::UiaAction {
@@ -910,6 +923,42 @@ fn input_main(command: Command) -> Result<(), HandsError> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Parse the click postcondition from inline JSON or a UTF-8 file (never both). The condition
+/// is validated before the lease/fence/input.
+fn parse_postcondition(
+    inline: Option<String>,
+    file: Option<std::path::PathBuf>,
+) -> Result<Option<hands::outcome::Postcondition>, HandsError> {
+    match (inline, file) {
+        (Some(_), Some(_)) => Err(HandsError::Input(
+            "--postcondition and --postcondition-file are mutually exclusive".into(),
+        )),
+        (None, None) => Ok(None),
+        (inline, file) => {
+            let text = match (inline, file) {
+                (Some(text), _) => text,
+                (_, Some(path)) => {
+                    let bytes = std::fs::read(&path).map_err(|err| {
+                        HandsError::Input(format!("postcondition file {}: {err}", path.display()))
+                    })?;
+                    if bytes.len() > 8192 {
+                        return Err(HandsError::Input(
+                            "postcondition file is larger than 8192 bytes".into(),
+                        ));
+                    }
+                    String::from_utf8(bytes)
+                        .map_err(|_| HandsError::Input("postcondition file is not UTF-8".into()))?
+                }
+                _ => unreachable!("one form is present"),
+            };
+            let condition: hands::outcome::Postcondition = serde_json::from_str(&text)
+                .map_err(|err| HandsError::Input(format!("postcondition JSON: {err}")))?;
+            condition.validate().map_err(HandsError::Input)?;
+            Ok(Some(condition))
+        }
+    }
 }
 
 fn pack(result: Result<hands::ActuateEnvelope, HandsError>) -> Result<(String, bool), HandsError> {
@@ -1740,5 +1789,62 @@ mod tests {
             parse.command,
             Command::Click { element_id: Some(ref id), .. } if id.starts_with("sref1:c.")
         ));
+    }
+
+    // ------------------------------------------------------------ 0124 outcome
+
+    #[test]
+    fn click_help_names_postcondition() {
+        let mut cmd = Cli::command();
+        let click = cmd.find_subcommand_mut("click").expect("click");
+        let help = click.render_long_help().to_string();
+        assert!(help.contains("--postcondition"), "{help}");
+        assert!(help.contains("--postcondition-file"), "{help}");
+        assert!(help.contains("dialog_present"), "{help}");
+        assert!(help.contains("never changes ok"), "{help}");
+    }
+
+    #[test]
+    fn click_postcondition_parses() {
+        let condition = parse_postcondition(
+            Some(r#"{"kind":"dialog_present","wait_ms":50}"#.into()),
+            None,
+        )
+        .expect("parse")
+        .expect("condition");
+        assert_eq!(
+            condition.kind,
+            hands::outcome::PostconditionKind::DialogPresent
+        );
+        assert_eq!(condition.wait_ms, 50);
+        assert!(parse_postcondition(Some("{}".into()), None).is_err());
+    }
+
+    #[test]
+    fn click_postcondition_file_parses() {
+        let dir = std::env::temp_dir().join(format!(
+            "hands-postcondition-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("condition.json");
+        std::fs::write(
+            &path,
+            r#"{"kind":"url_equals","value":"https://example.test/done"}"#,
+        )
+        .expect("write");
+        let condition = parse_postcondition(None, Some(path.clone()))
+            .expect("parse file")
+            .expect("condition");
+        assert_eq!(
+            condition.value.as_deref(),
+            Some("https://example.test/done")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // Both forms at once is refused.
+        assert!(parse_postcondition(Some("{}".into()), Some(path)).is_err());
     }
 }

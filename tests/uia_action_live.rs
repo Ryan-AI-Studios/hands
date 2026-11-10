@@ -191,7 +191,8 @@ fn action(
 
 fn semantic_kind(env: &hands::ActuateEnvelope) -> (&str, &str) {
     let info = env.semantic.as_ref().expect("semantic block");
-    (info.action.as_str(), info.delivery.as_str())
+    let delivery = env.delivery.expect("delivery");
+    (info.action.as_str(), delivery.as_str())
 }
 
 #[test]

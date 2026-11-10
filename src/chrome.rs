@@ -2086,6 +2086,231 @@ fn binding_report(tab: u32, state: IdentityState, reason: &str) -> IdentityRepor
     out
 }
 
+/// Parts of the clicked scoped ref echoed into a `postcheck` request. `doc`/`snap` prove the
+/// `url_changed`/`title_changed` baseline; `idx` addresses the stored node for
+/// `element_present`/`element_absent`.
+#[derive(Debug, Clone, Copy)]
+pub struct PostcheckRef<'a> {
+    pub doc: &'a str,
+    pub snap: &'a str,
+    pub idx: u32,
+}
+
+/// Closed postcheck transport failure. Never carries page text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostcheckError {
+    Timeout(String),
+    Unavailable(String),
+    HostDown(String),
+}
+
+/// Boolean-only postcheck reply. `visibilityState` is the pinned camelCase wire name; there is
+/// deliberately no url/title/text/value field.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PostcheckReply {
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub doc: Option<String>,
+    #[serde(default)]
+    pub snap: Option<String>,
+    #[serde(default)]
+    pub tab: Option<u32>,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default, rename = "visibilityState")]
+    pub visibility_state: Option<String>,
+    #[serde(default)]
+    pub fallback: bool,
+}
+
+#[cfg(test)]
+pub(crate) const REF_ERROR_TOKENS: &[&str] = &[
+    "stale_document",
+    "stale_snapshot",
+    "stale_element",
+    "stale_identity",
+    "not_visible",
+    "identity_mismatch",
+    "window_mismatch",
+    "frame_unavailable",
+    "frame_document_changed",
+    "frame_not_visible",
+    "duplicate_runtime_id",
+    "duplicate_identity",
+    "frame_link_ambiguous",
+    "tab_unavailable",
+    "no_tab",
+    "no_content",
+    "not_chrome",
+    "host_down",
+    "resolve_timeout",
+    "protocol_error",
+    "frame_unsupported",
+    "window_unreadable",
+    "unbound_extension",
+    "provider_timeout",
+    "tab_not_active",
+    "window_not_focused",
+    "tab_hidden",
+    "frame_geometry_unavailable",
+    "frame_occluded",
+    "frame_probe_timeout",
+    "frame_depth_exceeded",
+    "frame_link_missing",
+    "frame_budget_exceeded",
+];
+
+#[cfg(test)]
+static POSTCHECK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn postcheck_calls() -> usize {
+    POSTCHECK_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    static POSTCHECK_STUB: std::cell::RefCell<Option<Result<PostcheckReply, PostcheckError>>> =
+        const { std::cell::RefCell::new(None) };
+    static POSTCHECK_SEQUENCE: std::cell::RefCell<Vec<Result<PostcheckReply, PostcheckError>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_postcheck_stub(stub: Option<Result<PostcheckReply, PostcheckError>>) {
+    POSTCHECK_STUB.with(|c| *c.borrow_mut() = stub);
+}
+
+#[cfg(test)]
+pub(crate) fn set_postcheck_sequence(sequence: Vec<Result<PostcheckReply, PostcheckError>>) {
+    POSTCHECK_SEQUENCE.with(|c| *c.borrow_mut() = sequence);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_postcheck_calls() {
+    POSTCHECK_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Request for the read-only `postcheck` op. Carries an explicit `frame: 0`: 0124's
+/// postconditions are top-frame only and 0131 owns frame composition.
+pub fn postcheck_request(
+    tab: u32,
+    condition: &crate::outcome::Postcondition,
+    parts: Option<PostcheckRef<'_>>,
+) -> serde_json::Value {
+    use crate::outcome::PostconditionKind as Kind;
+    let mut req = serde_json::json!({
+        "op": "postcheck",
+        "tab": tab,
+        "frame": 0,
+        "kind": condition.kind_token(),
+    });
+    match condition.kind {
+        Kind::UrlPrefix | Kind::UrlEquals | Kind::TitleEquals => {
+            if let Some(value) = condition.value.as_deref() {
+                req["value"] = serde_json::Value::String(value.to_string());
+            }
+        }
+        Kind::CountAtLeast => {
+            if let Some(role) = condition.role.as_deref() {
+                req["role"] = serde_json::Value::String(role.to_string());
+            }
+            if let Some(n) = condition.n {
+                req["n"] = serde_json::Value::from(n);
+            }
+        }
+        Kind::ElementPresent | Kind::ElementAbsent => {
+            if let Some(reference) = condition.r#ref.as_deref()
+                && let Ok(SnapshotRef::Chrome { doc, snap, idx, .. }) =
+                    SnapshotRef::parse(reference)
+            {
+                req["doc"] = serde_json::Value::String(doc);
+                req["snap"] = serde_json::Value::String(snap);
+                req["idx"] = serde_json::Value::from(idx);
+            }
+        }
+        Kind::UrlChanged | Kind::TitleChanged => {}
+        Kind::FocusEditable | Kind::DialogPresent => {}
+    }
+    if matches!(condition.kind, Kind::UrlChanged | Kind::TitleChanged)
+        && let Some(parts) = parts
+    {
+        req["doc"] = serde_json::Value::String(parts.doc.to_string());
+        req["snap"] = serde_json::Value::String(parts.snap.to_string());
+    }
+    let _ = parts;
+    req
+}
+
+/// One read-only postcheck attempt (one 400 ms named-pipe request). The bounded `wait_ms`
+/// loop lives in `actuate::apply_postcondition`, outside `click_inner`.
+pub fn postcheck(
+    tab: u32,
+    condition: &crate::outcome::Postcondition,
+    parts: Option<PostcheckRef<'_>>,
+) -> Result<PostcheckReply, PostcheckError> {
+    #[cfg(test)]
+    {
+        POSTCHECK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let next = POSTCHECK_SEQUENCE.with(|c| {
+            let mut sequence = c.borrow_mut();
+            if sequence.is_empty() {
+                None
+            } else {
+                Some(sequence.remove(0))
+            }
+        });
+        if let Some(result) = next {
+            return result;
+        }
+        if let Some(stub) = POSTCHECK_STUB.with(|c| c.borrow().clone()) {
+            return stub;
+        }
+    }
+    if snapshot_env().is_some() {
+        return Err(PostcheckError::Unavailable("fixture_snapshot".into()));
+    }
+    let req = postcheck_request(tab, condition, parts);
+    let reply = pipe_request(&req).map_err(|err| {
+        let text = err.to_string();
+        if text.contains("client timed out after") {
+            PostcheckError::Timeout(text)
+        } else {
+            PostcheckError::HostDown(text)
+        }
+    })?;
+    if let Some(token) = error_token(&reply) {
+        // Postcondition reasons are a distinct closed vocabulary (§3.5.1); a 0123 identity
+        // transport token degrades instead of leaking into the postcondition reason set.
+        return Err(PostcheckError::Unavailable(postcheck_error_reason(&token)));
+    }
+    serde_json::from_value::<PostcheckReply>(reply)
+        .map_err(|_| PostcheckError::Unavailable("protocol_error".into()))
+}
+
+/// Map a raw host/extension error token onto the documented closed postcondition reasons.
+fn postcheck_error_reason(token: &str) -> String {
+    match token {
+        "empty" | "unsupported-op" | "unsupported" => "unsupported",
+        "host_down" => "host_down",
+        "window_unreadable" => "window_unreadable",
+        "tab_not_active" => "tab_not_active",
+        "window_not_focused" => "window_not_focused",
+        "tab_hidden" => "tab_hidden",
+        "stale_document" => "stale_document",
+        "stale_snapshot" => "stale_snapshot",
+        "stale_element" => "stale_element",
+        "baseline_mismatch" => "baseline_mismatch",
+        "fixture_snapshot" => "fixture_snapshot",
+        _ => "protocol_error",
+    }
+    .to_string()
+}
+
 fn pipe_snapshot(
     detail: Detail,
     hwnd: Option<isize>,
@@ -4966,5 +5191,140 @@ mod tests {
         assert!(!body.contains("nodePayload("));
         assert!(body.contains("keyPayload("));
         assert!(body.contains("snapshotKey("));
+    }
+
+    // -------------------------------------------------------------- 0124 postcheck
+
+    fn postcheck_condition(
+        kind: crate::outcome::PostconditionKind,
+    ) -> crate::outcome::Postcondition {
+        crate::outcome::Postcondition {
+            kind,
+            value: None,
+            r#ref: None,
+            role: None,
+            n: None,
+            wait_ms: 0,
+        }
+    }
+
+    #[test]
+    fn postcheck_request_uses_frame_zero_and_closed_fields() {
+        let req = postcheck_request(
+            12,
+            &postcheck_condition(crate::outcome::PostconditionKind::DialogPresent),
+            None,
+        );
+        assert_eq!(req["op"], "postcheck");
+        assert_eq!(req["tab"], 12);
+        assert_eq!(req["frame"], 0);
+        assert_eq!(req["kind"], "dialog_present");
+        let text = req.to_string();
+        assert!(!text.contains("title"));
+        assert!(!text.contains("url"));
+        assert!(!text.contains("value"));
+
+        let mut condition = postcheck_condition(crate::outcome::PostconditionKind::UrlChanged);
+        condition.wait_ms = 0;
+        let req = postcheck_request(
+            12,
+            &condition,
+            Some(PostcheckRef {
+                doc: "9f3a",
+                snap: "a1b2c3d4",
+                idx: 7,
+            }),
+        );
+        assert_eq!(req["doc"], "9f3a");
+        assert_eq!(req["snap"], "a1b2c3d4");
+        assert_eq!(req["frame"], 0);
+    }
+
+    #[test]
+    fn postcheck_fixture_is_unavailable() {
+        reset_postcheck_calls();
+        set_postcheck_stub(Some(Err(PostcheckError::Unavailable(
+            "fixture_snapshot".into(),
+        ))));
+        let reply = postcheck(
+            12,
+            &postcheck_condition(crate::outcome::PostconditionKind::DialogPresent),
+            None,
+        );
+        set_postcheck_stub(None);
+        assert_eq!(
+            reply,
+            Err(PostcheckError::Unavailable("fixture_snapshot".into()))
+        );
+        assert_eq!(postcheck_calls(), 1);
+    }
+
+    #[test]
+    fn postcheck_timeout_is_timeout() {
+        set_postcheck_stub(Some(Err(PostcheckError::Timeout(
+            "client timed out after 400ms".into(),
+        ))));
+        let reply = postcheck(
+            12,
+            &postcheck_condition(crate::outcome::PostconditionKind::DialogPresent),
+            None,
+        );
+        set_postcheck_stub(None);
+        assert!(matches!(reply, Err(PostcheckError::Timeout(_))));
+    }
+
+    #[test]
+    fn postcheck_old_extension_empty_is_unavailable() {
+        set_postcheck_stub(Some(Err(PostcheckError::Unavailable("unsupported".into()))));
+        let reply = postcheck(
+            12,
+            &postcheck_condition(crate::outcome::PostconditionKind::DialogPresent),
+            None,
+        );
+        set_postcheck_stub(None);
+        assert_eq!(
+            reply,
+            Err(PostcheckError::Unavailable("unsupported".into()))
+        );
+    }
+
+    #[test]
+    fn postcheck_visibility_state_camel_case() {
+        let reply: PostcheckReply = serde_json::from_value(serde_json::json!({
+            "state": "satisfied",
+            "tab": 12,
+            "active": true,
+            "focused": true,
+            "visibilityState": "hidden",
+            "fallback": false
+        }))
+        .expect("reply");
+        assert_eq!(reply.visibility_state.as_deref(), Some("hidden"));
+        assert_eq!(reply.tab, Some(12));
+        // No page text/URL/title field exists on the wire type.
+        let text = serde_json::to_string(&reply).expect("json");
+        assert!(!text.contains("\"url\""));
+        assert!(!text.contains("\"title\""));
+        assert!(!text.contains("\"value\""));
+        assert!(!text.contains("\"text\""));
+    }
+
+    #[test]
+    fn postcheck_no_text_url_title_in_reply() {
+        let reply = PostcheckReply {
+            state: "unsatisfied".into(),
+            reason: Some("postcondition_not_met_yet".into()),
+            doc: Some("9f3a".into()),
+            snap: Some("a1b2c3d4".into()),
+            tab: Some(12),
+            active: true,
+            focused: true,
+            visibility_state: Some("visible".into()),
+            fallback: false,
+        };
+        let json = serde_json::to_string(&reply).expect("json");
+        assert!(json.contains("visibilityState"));
+        assert!(!json.contains("http"));
+        assert!(!json.contains("innerText"));
     }
 }

@@ -351,7 +351,20 @@ pub struct LogsParams {
     pub tail: Option<u32>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ChangesParams {
+    /// Public `rev` token from a Chrome observe: `<tab>.<doc>.<rev>.<fp16>.<shape4>`.
+    pub since: String,
+    /// `default` (omitted) or `dom`; must match the observe the token came from.
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Adds `timing_ms` to the envelope.
+    #[serde(default)]
+    pub timing: bool,
+}
+
 pub struct HandsServer;
 
 #[tool_router(server_handler)]
@@ -384,6 +397,16 @@ impl HandsServer {
         Parameters(params): Parameters<FindParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(run_find(params))
+    }
+
+    #[tool(
+        description = "Read-only change poll (0130) against the stored baseline of one Chrome observe. since = the `rev` token from a Chrome observe envelope (`<tab>.<doc>.<rev>.<fp16>.<shape4>`); the token names its tab, and the poll is routed to that tab only (focus changes never change which tab answers). One ~400 ms request: no screenshot, no UIA walk, no PNG, no window list, no refs, no `elements`, no lease, no cooldown, no JSONL row. Reports added / removed / changed elements (changed carries fields text|role|href|rect) and a document-level `context` (url/title with from/to; main_text/cards/frames by name only), plus a `viewport` entry for scroll/size. `unchanged:true` means no difference in the walked page map for this tab, never that the page is unchanged everywhere: coverage.page_complete is always false, and closed shadow roots, disabled/hidden nodes, frame contents, canvas and video are outside the walk. A poll never replaces the baseline: repeated polls repeat the same report, and only a new full observe advances it. resync.required:true (reason: no_baseline | document_changed | stale_revision | changed_request | delta_overflow | rev_unavailable) means run a full observe and do not trust a partial list; delta_overflow carries complete counts and no arrays. A malformed since is ok:false (a usage error, sent nothing). To act on a changed element, re-observe: a poll mints no ref. An old extension answers rev_unavailable; an old installed server does not expose this tool."
+    )]
+    fn changes(
+        &self,
+        Parameters(params): Parameters<ChangesParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_changes(params))
     }
 
     #[tool(
@@ -716,6 +739,28 @@ fn run_find(params: FindParams) -> CallToolResult {
     {
         Ok((true, json)) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Ok((false, json)) => CallToolResult::error(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
+fn run_changes(params: ChangesParams) -> CallToolResult {
+    let detail = match Detail::parse_arg(params.detail.as_deref()) {
+        Ok(detail) => detail,
+        Err(message) => {
+            return CallToolResult::error(vec![ContentBlock::text(
+                HandsError::Observe(message).tool_message(),
+            )]);
+        }
+    };
+    let envelope = crate::changes::run(
+        &params.since,
+        detail,
+        params.session_id.as_deref(),
+        params.timing,
+    );
+    match crate::changes::serialize(&envelope) {
+        Ok(json) if envelope.ok => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Ok(json) => CallToolResult::error(vec![ContentBlock::text(json)]),
         Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
     }
 }
@@ -1083,5 +1128,34 @@ mod tests {
         assert!(src.contains("effect"));
         assert!(src.contains("retry"));
         assert!(src.contains("postcondition"));
+    }
+}
+
+#[cfg(test)]
+mod changes_tool_tests {
+    use super::*;
+
+    #[test]
+    fn changes_tool_refuses_a_malformed_since_like_the_cli() {
+        // Parity: the CLI and the MCP tool share `changes::run`/`serialize`; a malformed token is
+        // an error result with no request sent, never a resync.
+        let result = run_changes(ChangesParams {
+            since: "not-a-token".into(),
+            detail: None,
+            session_id: None,
+            timing: false,
+        });
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn changes_tool_refuses_an_unknown_detail() {
+        let result = run_changes(ChangesParams {
+            since: "12.5678.2.0123456789abcdef.0fa0".into(),
+            detail: Some("bogus".into()),
+            session_id: None,
+            timing: false,
+        });
+        assert_eq!(result.is_error, Some(true));
     }
 }

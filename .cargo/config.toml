@@ -1,0 +1,6 @@
+# Debug builds run the clap command tree and the `#[tokio::main]` dispatch future on the main
+# thread's default 1 MiB stack. The 0130 `changes` subcommand pushed `hands --help` over that limit
+# (a stack overflow at startup, exit 127). An 8 MiB main-thread stack reserve is virtual address
+# space committed on demand; it changes no code path. MSVC only (the CI and dev host target).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]

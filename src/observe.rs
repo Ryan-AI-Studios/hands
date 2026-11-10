@@ -259,6 +259,10 @@ pub struct ObserveEnvelope {
     /// Snapshot-bound identity evidence (agent-facing Chrome walks only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SnapshotBinding>,
+    /// 0130 public content-revision token `<tab>.<doc>.<rev>.<fp16>.<shape4>` (agent-facing Chrome
+    /// observes from an extension with `rev_v:1` only). Never page text; never trimmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -712,6 +716,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
             })
     });
     let fusion_t = Instant::now();
+    let rev = chrome.as_ref().and_then(|map| map.rev.clone());
     let (mut extract, mut elements, elements_total, _) =
         fuse_maps(req.detail, &snap.title, &snap.nodes, chrome, opts);
     crate::dialogs::promote(&mut extract, &mut elements);
@@ -771,6 +776,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         },
         fg_preview_path,
         snapshot,
+        rev,
     };
     let sidecar_full = full.clone();
     let envelope = match req.detail {
@@ -1747,6 +1753,9 @@ fn envelope_from_sidecar(sidecar: ObserveSidecar, view: ObserveView) -> ObserveE
         },
         fg_preview_path: sidecar.fg_preview_path,
         snapshot: sidecar.snapshot,
+        // A `--from` reshape reads a sidecar that never carried a revision (DoD-5 keeps the
+        // sidecar schema unchanged), so the reshaped envelope names no revision.
+        rev: None,
     }
 }
 
@@ -1908,6 +1917,7 @@ mod tests {
 
     fn fat_envelope(n: usize) -> ObserveEnvelope {
         ObserveEnvelope {
+            rev: None,
             session_id: "sess".into(),
             screenshot_path: "C:\\tmp\\observe.png".into(),
             observe_path: "C:\\tmp\\observe.json".into(),
@@ -2077,6 +2087,7 @@ mod tests {
             transform: None,
             identity: None,
             snapshot: None,
+            rev: None,
         };
         let nodes: Vec<RawNode> = (0..5).map(uia).collect();
         let (extract, els, total, connected) = fuse_maps(
@@ -2398,6 +2409,33 @@ mod tests {
                 .iter()
                 .all(|el| el.text.as_deref() == Some("Search") && el.sref.is_some())
         );
+    }
+
+    #[test]
+    fn rev_token_keeps_the_dense_4kib_floor_and_element_count() {
+        // 0130 R5: the revision token must not cost an element on the dense fixture. The token
+        // for tab 12 is 31 characters, so its JSON field is 39 bytes (target <= 40).
+        let token = "12.5678.2.0123456789abcdef.0fa0";
+        let plain = cap_default_envelope(dense_ref_envelope());
+        let mut with_rev = dense_ref_envelope();
+        with_rev.rev = Some(token.to_string());
+        let capped = cap_default_envelope(with_rev);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        assert_eq!(
+            capped.elements.len(),
+            plain.elements.len(),
+            "rev must not drop an element on the dense fixture"
+        );
+        assert_eq!(capped.rev.as_deref(), Some(token), "rev is never trimmed");
+        let field = format!(",\"rev\":\"{token}\"");
+        assert!(field.len() <= 40, "rev field is {} bytes", field.len());
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["rev"], token);
     }
 
     #[test]
@@ -2805,6 +2843,7 @@ mod tests {
         let space = Space::new(0, 0, 1920, 1080).unwrap();
         stamp_grid(space, &mut elements);
         let raw = ObserveEnvelope {
+            rev: None,
             session_id: "sess".into(),
             screenshot_path: "C:\\tmp\\observe.png".into(),
             observe_path: "C:\\tmp\\observe.json".into(),
@@ -3486,6 +3525,7 @@ mod tests {
         assert_eq!(extract.dialogs[0].id, "uia:1.42");
         assert_eq!(elements[0].id, "uia:1.42");
         let raw = ObserveEnvelope {
+            rev: None,
             session_id: "sess".into(),
             screenshot_path: "C:\\tmp\\observe.png".into(),
             observe_path: "C:\\tmp\\observe.json".into(),
@@ -3567,6 +3607,7 @@ mod tests {
             transform: None,
             identity: None,
             snapshot: None,
+            rev: None,
         };
         let nodes = vec![uia_node(
             42,
@@ -3596,6 +3637,7 @@ mod tests {
         assert_eq!(VIEWPORT_ENVELOPE_ELEMENT_CAP, 20);
         assert_eq!(crate::dialogs::DIALOG_CAP, 4);
         let raw = ObserveEnvelope {
+            rev: None,
             session_id: "sess".into(),
             screenshot_path: "C:\\tmp\\observe.png".into(),
             observe_path: "C:\\tmp\\observe.json".into(),
@@ -3685,6 +3727,7 @@ mod tests {
             },
         );
         let chrome = chrome::ChromeMap {
+            rev: None,
             frame_rows: Vec::new(),
             frames_transient: false,
             tab: None,
@@ -4061,6 +4104,7 @@ mod tests {
         assert!(!elements.iter().any(|e| e.id == "uia:1.50"));
         assert!(elements.iter().any(|e| e.id == "uia:1.51"));
         let raw = ObserveEnvelope {
+            rev: None,
             session_id: "sess".into(),
             screenshot_path: "C:\\tmp\\observe.png".into(),
             observe_path: "C:\\tmp\\observe.json".into(),
@@ -4523,6 +4567,7 @@ mod tests {
     #[test]
     fn electron_chrome_widget_win_1_does_not_fuse_amazon_title_2026_09_03() {
         let chrome = chrome::ChromeMap {
+            rev: None,
             frame_rows: Vec::new(),
             frames_transient: false,
             tab: None,
@@ -4578,6 +4623,7 @@ mod tests {
         assert!(!els.iter().any(|e| e.id.starts_with("chr:")));
         assert!(els.iter().any(|e| e.id == "uia:1.9"));
         let chrome = chrome::ChromeMap {
+            rev: None,
             frame_rows: Vec::new(),
             frames_transient: false,
             tab: None,
@@ -5214,6 +5260,7 @@ mod tests {
             fixture_opts(true),
         );
         ObserveEnvelope {
+            rev: None,
             session_id: "sess".into(),
             screenshot_path: "C:\\tmp\\observe.png".into(),
             observe_path: "C:\\tmp\\observe.json".into(),

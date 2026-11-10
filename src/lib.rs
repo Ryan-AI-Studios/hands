@@ -9,6 +9,7 @@ pub mod attach;
 pub mod bezier;
 pub mod capture;
 pub mod challenge;
+pub mod changes;
 pub mod chrome;
 pub mod classify;
 pub mod cooldown;

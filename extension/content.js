@@ -75,6 +75,489 @@ function nextSnap() {
   return hex32(snapCounter);
 }
 
+// ---------------------------------------------------------------- content revision (0130)
+// `rev` is a per-document content revision over the top-frame retained walk projection. It is
+// stored with the agent-facing record and read (never advanced) by `changes`. It is not an
+// identity: `snap`, `sref1:` refs and `observe_id` keep their owners.
+const REV_V = 1;
+const CHANGES_MAX_EVENTS = 24;
+const CHANGES_MAX_ENTRY_TEXT = 80;
+const CHANGES_MAX_BYTES = 4096;
+const CHANGES_CTX_URL_CAP = 256;
+const CHANGES_CTX_TITLE_CAP = 120;
+// Public token: <tab>.<doc>.<rev>.<fp16>.<shape4>. The tab is the poll's routing key; the rest is
+// the content-script core. Digits and lowercase hex only, so no page text ever enters a token.
+const CHANGES_TOKEN_RE =
+  /^([1-9][0-9]{0,9})\.([0-9a-f]{4})\.([1-9][0-9]{0,9})\.([0-9a-f]{16})\.([0-9a-f]{4})$/;
+const CHANGES_EXCLUDED = ["disabled_hidden", "closed_shadow", "frame_contents", "canvas_video"];
+
+function fnv1a32Seeded(str, seed) {
+  let hash = seed >>> 0;
+  for (let i = 0; i < str.length; i += 1) {
+    const code = str.charCodeAt(i);
+    hash ^= code & 0xff;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+    hash ^= (code >>> 8) & 0xff;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+// 64-bit projection digest as two independent 32-bit FNV-1a lanes (16 hex).
+function digest64(str) {
+  return hex32(fnv1a32Seeded(str, 0x811c9dc5)) + hex32(fnv1a32Seeded(str, 0x9e3779b9));
+}
+
+// Exact 4-hex request-shape code: dom bit, light bit, low 14 bits of the node cap.
+function revShape(detail, nodeCap, light) {
+  const code =
+    (detail === "dom" ? 0x8000 : 0) | (light ? 0x4000 : 0) | (Number(nodeCap) & 0x3fff);
+  return (code & 0xffff).toString(16).padStart(4, "0");
+}
+
+function r2(value) {
+  const n = Number(value);
+  if (value == null || !Number.isFinite(n)) {
+    return null;
+  }
+  return Math.round(n * 100) / 100;
+}
+
+function rectRound(rect) {
+  if (!rect) {
+    return null;
+  }
+  return [r2(rect.left), r2(rect.top), r2(rect.width), r2(rect.height)];
+}
+
+function viewportProjection() {
+  const vv = window.visualViewport;
+  return {
+    scroll: [
+      r2(window.scrollX),
+      r2(window.scrollY),
+      vv ? r2(vv.offsetLeft) : null,
+      vv ? r2(vv.offsetTop) : null,
+    ],
+    size: [
+      r2(window.innerWidth),
+      r2(window.innerHeight),
+      r2(window.devicePixelRatio),
+      vv ? r2(vv.width) : null,
+      vv ? r2(vv.height) : null,
+    ],
+  };
+}
+
+// Cards carry a viewport rect; project it in document coordinates so a scroll is one viewport
+// entry, not a card change for every card on the page.
+function cardsProjection(cards) {
+  const sx = Number(window.scrollX) || 0;
+  const sy = Number(window.scrollY) || 0;
+  return (cards || []).map((card) => {
+    const out = {};
+    for (const key of Object.keys(card)) {
+      if (key !== "rectCss") {
+        out[key] = card[key];
+      }
+    }
+    const r = card.rectCss;
+    out.docRect = r
+      ? [r2(r.left + sx), r2(r.top + sy), r2(r.width), r2(r.height)]
+      : null;
+    return out;
+  });
+}
+
+// Canonical projection of the top-frame retained walk. Only fields listed in spec 6.1 enter it:
+// never snapshot.frames[] rows, screenX/Y or Rust-side geometry.
+function buildProjection(nodes, keys, elements, cards, mainTxt, frameRows) {
+  const els = [];
+  for (let k = 0; k < elements.length; k += 1) {
+    const p = elements[k];
+    const node = nodes[p.idx];
+    els.push({
+      idx: p.idx,
+      tag: node ? String(node.tagName || "").toLowerCase() : "",
+      role: p.role || "",
+      text: p.text == null ? null : p.text,
+      href: p.href || "",
+      key: keys[p.idx] == null ? null : keys[p.idx],
+      rect: rectRound(p.rectCss),
+    });
+  }
+  return {
+    url: location.href || "",
+    title: document.title || "",
+    vp: viewportProjection(),
+    main_text: mainTxt || "",
+    cards: cardsProjection(cards),
+    frames: frameRows || [],
+    els: els,
+  };
+}
+
+function collectElements(nodes) {
+  const elements = [];
+  const keys = [];
+  for (let i = 0; i < nodes.length; i += 1) {
+    const payload = keyPayload(nodes[i], i);
+    const key = snapshotKey(nodes[i], payload);
+    const rect = cssRect(nodes[i]);
+    if (rect) {
+      payload.rectCss = rect;
+      payload.idx = i;
+      elements.push(payload);
+      keys.push(key);
+    } else {
+      keys.push(null);
+    }
+  }
+  return { elements: elements, keys: keys };
+}
+
+// Exact UTF-8 byte length without TextEncoder, so the byte cap means the same thing in every
+// realm (the harness VM and the content script alike).
+function utf8Length(text) {
+  let bytes = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      bytes += 4;
+      i += 1;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function capText(value, cap) {
+  if (value == null) {
+    return null;
+  }
+  return String(value).slice(0, cap);
+}
+
+function rectEqual(a, b) {
+  return !!a && !!b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
+}
+
+function rectOverlaps(a, b) {
+  return a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3];
+}
+
+function vpSummary(vp, fields) {
+  const out = {};
+  if (fields.indexOf("scroll") !== -1) {
+    out.scroll = { x: vp.scroll[0], y: vp.scroll[1], vv_left: vp.scroll[2], vv_top: vp.scroll[3] };
+  }
+  if (fields.indexOf("size") !== -1) {
+    out.size = {
+      w: vp.size[0],
+      h: vp.size[1],
+      dpr: vp.size[2],
+      vv_w: vp.size[3],
+      vv_h: vp.size[4],
+    };
+  }
+  return out;
+}
+
+// Two-pass matching over the stored projection and a fresh one. Returns complete counts and,
+// in the caller's cap check, the bounded arrays. Pass 1 pairs by snapshotKey (exact rect first
+// inside a duplicate-key group, then walk order). Pass 2 pairs leftovers of the same tag whose
+// rects overlap, so a visible label change reads as `changed`, not add+remove.
+function diffProjections(oldP, newP) {
+  const oldEls = oldP.els;
+  const newEls = newP.els;
+  const oldUsed = new Uint8Array(oldEls.length);
+  const newUsed = new Uint8Array(newEls.length);
+  const pairs = [];
+  const byKey = new Map();
+  for (let j = 0; j < oldEls.length; j += 1) {
+    const key = oldEls[j].key;
+    if (key == null) {
+      continue;
+    }
+    let list = byKey.get(key);
+    if (!list) {
+      list = [];
+      byKey.set(key, list);
+    }
+    list.push(j);
+  }
+  // Pass 1a: same key and identical rect.
+  for (let i = 0; i < newEls.length; i += 1) {
+    const ne = newEls[i];
+    const list = ne.key == null ? null : byKey.get(ne.key);
+    if (!list) {
+      continue;
+    }
+    for (let t = 0; t < list.length; t += 1) {
+      const j = list[t];
+      if (!oldUsed[j] && rectEqual(oldEls[j].rect, ne.rect)) {
+        oldUsed[j] = 1;
+        newUsed[i] = 1;
+        pairs.push([i, j]);
+        break;
+      }
+    }
+  }
+  // Pass 1b: same key, remaining in walk order (a cursor keeps this linear per key).
+  const cursor = new Map();
+  for (let i = 0; i < newEls.length; i += 1) {
+    if (newUsed[i]) {
+      continue;
+    }
+    const key = newEls[i].key;
+    const list = key == null ? null : byKey.get(key);
+    if (!list) {
+      continue;
+    }
+    let c = cursor.get(key) || 0;
+    while (c < list.length && oldUsed[list[c]]) {
+      c += 1;
+    }
+    cursor.set(key, c);
+    if (c < list.length) {
+      oldUsed[list[c]] = 1;
+      newUsed[i] = 1;
+      pairs.push([i, list[c]]);
+    }
+  }
+  // Pass 2: leftovers of the same tag with overlapping rects, nearest top-left, ties walk order.
+  const oldByTag = new Map();
+  for (let j = 0; j < oldEls.length; j += 1) {
+    if (oldUsed[j]) {
+      continue;
+    }
+    const tag = oldEls[j].tag;
+    let list = oldByTag.get(tag);
+    if (!list) {
+      list = [];
+      oldByTag.set(tag, list);
+    }
+    list.push(j);
+  }
+  for (let i = 0; i < newEls.length; i += 1) {
+    if (newUsed[i]) {
+      continue;
+    }
+    const ne = newEls[i];
+    const list = oldByTag.get(ne.tag) || [];
+    let best = -1;
+    let bestDistance = Infinity;
+    for (let t = 0; t < list.length; t += 1) {
+      const j = list[t];
+      if (oldUsed[j] || !rectOverlaps(oldEls[j].rect, ne.rect)) {
+        continue;
+      }
+      const distance =
+        Math.abs(oldEls[j].rect[0] - ne.rect[0]) + Math.abs(oldEls[j].rect[1] - ne.rect[1]);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = j;
+      }
+    }
+    if (best !== -1) {
+      oldUsed[best] = 1;
+      newUsed[i] = 1;
+      pairs.push([i, best]);
+    }
+  }
+
+  const added = [];
+  for (let i = 0; i < newEls.length; i += 1) {
+    if (!newUsed[i]) {
+      added.push({
+        idx: newEls[i].idx,
+        role: newEls[i].role,
+        text: capText(newEls[i].text, CHANGES_MAX_ENTRY_TEXT),
+      });
+    }
+  }
+  const removed = [];
+  for (let j = 0; j < oldEls.length; j += 1) {
+    if (!oldUsed[j]) {
+      removed.push({
+        idx: oldEls[j].idx,
+        role: oldEls[j].role,
+        text: capText(oldEls[j].text, CHANGES_MAX_ENTRY_TEXT),
+      });
+    }
+  }
+  const scrollSame = JSON.stringify(oldP.vp.scroll) === JSON.stringify(newP.vp.scroll);
+  const sizeSame = JSON.stringify(oldP.vp.size) === JSON.stringify(newP.vp.size);
+  // rect is compared only on a stable viewport and with no add/remove: an insert/remove shifts the
+  // map by construction and reporting the shift as N rect changes is the rect-storm class.
+  const rectAllowed = scrollSame && sizeSame && added.length === 0 && removed.length === 0;
+  const changed = [];
+  for (let p = 0; p < pairs.length; p += 1) {
+    const ni = pairs[p][0];
+    const oj = pairs[p][1];
+    const ne = newEls[ni];
+    const oe = oldEls[oj];
+    const fields = [];
+    if (oe.role !== ne.role) fields.push("role");
+    if (oe.text !== ne.text) fields.push("text");
+    if (oe.href !== ne.href) fields.push("href");
+    if (rectAllowed && !rectEqual(oe.rect, ne.rect)) fields.push("rect");
+    // Carriers for projection inputs the visible fields do not show, so an fp change always has an
+    // entry: `attrs` = an identity attribute (name/type/tag inside snapshotKey) changed with no
+    // visible text/role/href change; `order` = a pure reorder (idx moved) with no add/remove to
+    // explain the shift. Both are additive to the spec's text|role|href|rect vocabulary.
+    if (fields.length === 0 && oe.key !== ne.key) fields.push("attrs");
+    if (
+      fields.length === 0 &&
+      oe.idx !== ne.idx &&
+      added.length === 0 &&
+      removed.length === 0
+    ) {
+      fields.push("order");
+    }
+    if (fields.length) {
+      changed.push({
+        idx: oe.idx,
+        role: ne.role,
+        text: capText(ne.text, CHANGES_MAX_ENTRY_TEXT),
+        fields: fields,
+      });
+    }
+  }
+  const vpFields = [];
+  if (!scrollSame) vpFields.push("scroll");
+  if (!sizeSame) vpFields.push("size");
+  const viewport = vpFields.length
+    ? { fields: vpFields, from: vpSummary(oldP.vp, vpFields), to: vpSummary(newP.vp, vpFields) }
+    : null;
+
+  const context = { changed: [] };
+  if (oldP.url !== newP.url) {
+    context.changed.push("url");
+    context.url = {
+      from: capText(oldP.url, CHANGES_CTX_URL_CAP),
+      to: capText(newP.url, CHANGES_CTX_URL_CAP),
+    };
+  }
+  if (oldP.title !== newP.title) {
+    context.changed.push("title");
+    context.title = {
+      from: capText(oldP.title, CHANGES_CTX_TITLE_CAP),
+      to: capText(newP.title, CHANGES_CTX_TITLE_CAP),
+    };
+  }
+  if (oldP.main_text !== newP.main_text) context.changed.push("main_text");
+  if (JSON.stringify(oldP.cards) !== JSON.stringify(newP.cards)) context.changed.push("cards");
+  if (JSON.stringify(oldP.frames) !== JSON.stringify(newP.frames)) context.changed.push("frames");
+
+  const counts = {
+    added: added.length,
+    removed: removed.length,
+    changed: changed.length,
+    viewport: viewport ? 1 : 0,
+    context: context.changed.length,
+  };
+  counts.total = counts.added + counts.removed + counts.changed + counts.viewport + counts.context;
+  return {
+    counts: counts,
+    events: added.length + removed.length + changed.length,
+    changes: {
+      counts: counts,
+      added: added,
+      removed: removed,
+      changed: changed,
+      viewport: viewport,
+    },
+    context: context,
+  };
+}
+
+function changesCoverage(walked, retained) {
+  return {
+    scope: "retained_walk",
+    page_complete: false,
+    elements_walked: walked,
+    elements_retained: retained,
+    excluded: CHANGES_EXCLUDED.slice(),
+  };
+}
+
+function changesResync(reply, reason) {
+  reply.resync = { required: true, reason: reason };
+  return reply;
+}
+
+// Read-only poll against the stored baseline record. It never assigns lastSnapshot, never calls
+// nextSnap() and never creates a pendingSnapshots entry, so repeated polls repeat the same report.
+function buildChanges(msg) {
+  const token = String(msg.changes_since || "");
+  const detail = msg.detail === "dom" ? "dom" : "default";
+  const shape = revShape(detail, SNAPSHOT_NODE_CAP, false);
+  const base = lastSnapshot;
+  const hasBase = !!(base && base.doc && Number.isInteger(base.rev) && base.proj);
+  const reply = {
+    rev_v: REV_V,
+    rev_core: hasBase ? base.doc + "." + base.rev + "." + base.fp + "." + base.shape : null,
+    coverage: changesCoverage(0, 0),
+  };
+  const m = CHANGES_TOKEN_RE.exec(token);
+  if (!m) {
+    return changesResync(reply, "changed_request");
+  }
+  if (!hasBase) {
+    return changesResync(reply, "no_baseline");
+  }
+  if (m[2] !== base.doc) {
+    return changesResync(reply, "document_changed");
+  }
+  if (m[5] !== shape) {
+    return changesResync(reply, "changed_request");
+  }
+  if (m[5] !== base.shape || m[3] !== String(base.rev) || m[4] !== base.fp) {
+    return changesResync(reply, "stale_revision");
+  }
+  const walked = walk(detail).slice(0, SNAPSHOT_NODE_CAP);
+  const collected = collectElements(walked);
+  const cards = collectCards().cards;
+  const fresh = buildProjection(
+    walked,
+    collected.keys,
+    collected.elements,
+    cards,
+    mainText(),
+    frameElementsReply()
+  );
+  reply.coverage = changesCoverage(walked.length, collected.elements.length);
+  if (digest64(JSON.stringify(fresh)) === base.fp) {
+    reply.unchanged = true;
+    reply.changes = {
+      counts: { added: 0, removed: 0, changed: 0, viewport: 0, context: 0, total: 0 },
+      added: [],
+      removed: [],
+      changed: [],
+      viewport: null,
+    };
+    reply.context = { changed: [] };
+    return reply;
+  }
+  const diff = diffProjections(base.proj, fresh);
+  const bytes = utf8Length(JSON.stringify({ changes: diff.changes, context: diff.context }));
+  if (diff.events > CHANGES_MAX_EVENTS || bytes > CHANGES_MAX_BYTES) {
+    // Overflow: complete counts, no arrays, no context from/to. Never a partial list.
+    reply.resync = { required: true, reason: "delta_overflow", counts: diff.counts };
+    return reply;
+  }
+  reply.unchanged = false;
+  reply.changes = diff.changes;
+  reply.context = diff.context;
+  return reply;
+}
+
 // ---------------------------------------------------------------- frame registry
 // Every injected content script (top and child) self-registers over a private port.
 // A child never walks or posts until the SW asks it to; frame content is data only.
@@ -746,6 +1229,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 function buildSnapshot(msg) {
+  if (msg && typeof msg.changes_since === "string") {
+    return buildChanges(msg);
+  }
   const detail = msg && msg.detail;
   const store = msg && msg.store;
   // A child snapshot is lightweight: elements + metrics + identity only. The top frame keeps
@@ -756,26 +1242,39 @@ function buildSnapshot(msg) {
     : SNAPSHOT_NODE_CAP;
   const metrics = windowMetrics();
   const nodes = walk(detail).slice(0, nodeCap);
-  const elements = [];
-  const keys = [];
-  for (let i = 0; i < nodes.length; i += 1) {
-    const payload = keyPayload(nodes[i], i);
-    const key = snapshotKey(nodes[i], payload);
-    const rect = cssRect(nodes[i]);
-    if (rect) {
-      payload.rectCss = rect;
-      payload.idx = i;
-      elements.push(payload);
-      keys.push(key);
-    } else {
-      keys.push(null);
-    }
-  }
+  const collectedEls = collectElements(nodes);
+  const elements = collectedEls.elements;
+  const keys = collectedEls.keys;
   const pending = msg && msg.pending === true;
+  const topFrame = (SELF_FRAME == null ? 0 : SELF_FRAME) === 0;
+  const collected = light ? { cards: [], cards_walked: 0 } : collectCards();
+  const mainTxt = light ? "" : mainText();
+  // The top reply's frame rows are read once: the digest and the reply share one synchronous read.
+  let frameRowsCache = null;
+  const frameRowsNow = () => {
+    if (frameRowsCache === null) {
+      frameRowsCache = frameElementsReply();
+    }
+    return frameRowsCache;
+  };
   const commitBy = Number.isFinite(Number(msg && msg.commit_by))
     ? Number(msg.commit_by)
     : null;
   const stored = store !== false && !pending;
+  // Revision is minted only by the agent-facing top-frame store. A candidate/pending/store:false
+  // reply computes nothing here and never touches the stored record.
+  let rev = null;
+  let fp = null;
+  let shapeTok = null;
+  let proj = null;
+  if (stored && topFrame) {
+    proj = buildProjection(nodes, keys, elements, collected.cards, mainTxt, frameRowsNow());
+    fp = digest64(JSON.stringify(proj));
+    shapeTok = revShape(detail, nodeCap, light);
+    const prev = lastSnapshot;
+    const prevRev = prev && prev.doc === DOC_NONCE && Number.isInteger(prev.rev) ? prev : null;
+    rev = prevRev ? (prevRev.fp === fp ? prevRev.rev : prevRev.rev + 1) : 1;
+  }
   let doc = null;
   let snap = null;
   let retained = nodes.length;
@@ -791,6 +1290,10 @@ function buildSnapshot(msg) {
       // Internal baseline for `url_changed`/`title_changed`; never emitted in an envelope.
       url: location.href || "",
       title: document.title || "",
+      rev: rev,
+      fp: fp,
+      shape: shapeTok,
+      proj: proj,
     };
   } else if (pending) {
     // Candidate only: the SW commits it after the fan-out deadline. A discarded late reply
@@ -816,7 +1319,6 @@ function buildSnapshot(msg) {
   } else {
     retained = 0;
   }
-  const collected = light ? { cards: [], cards_walked: 0 } : collectCards();
   const out = {
     url: location.href || "",
     title: document.title || "",
@@ -827,7 +1329,7 @@ function buildSnapshot(msg) {
     stored: stored,
   };
   if (!light) {
-    out.main_text = mainText();
+    out.main_text = mainTxt;
   }
   if (light) {
     out.elements = rankFrameElements(elements, metrics).slice(0, FRAME_ELEMENT_CAP);
@@ -839,6 +1341,10 @@ function buildSnapshot(msg) {
   }
   if (pending) {
     out.pending = true;
+  }
+  if (stored && topFrame) {
+    out.rev_v = REV_V;
+    out.rev_core = doc + "." + rev + "." + fp + "." + shapeTok;
   }
   const selfFrame = SELF_FRAME == null ? 0 : SELF_FRAME;
   if (selfFrame !== 0) {
@@ -855,7 +1361,7 @@ function buildSnapshot(msg) {
         msg.frames === true &&
         (msg.frame == null || Number(msg.frame) === 0)))
   ) {
-    out.frame_elements = frameElementsReply();
+    out.frame_elements = frameRowsNow();
   }
   if (collected.cards_walked > 0) {
     out.cards_walked = collected.cards_walked;

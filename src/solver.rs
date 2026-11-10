@@ -637,6 +637,7 @@ mod tests {
             None
         };
         ObserveEnvelope {
+            rev: None,
             session_id: "s".into(),
             screenshot_path: r"C:\tmp\a.png".into(),
             observe_path: r"C:\tmp\a.json".into(),

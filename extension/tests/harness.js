@@ -2753,8 +2753,299 @@ function capabilityTests() {
   assert.equal(actionSupport(cap, "set_value"), "unknown", "password never set_value");
 }
 
+// ---------------------------------------------------------------- content revision (0130)
+
+function revButton(label, top) {
+  return element({
+    tag: "BUTTON",
+    innerText: label,
+    rect: { left: 10, top: top, width: 100, height: 40 },
+  });
+}
+
+function revPage(children, opts) {
+  const root = element({ tag: "HTML" });
+  root.matches = () => false;
+  for (const child of children) {
+    attach(root, child);
+  }
+  return contentContext(Object.assign({ documentElement: root }, opts || {}));
+}
+
+function snapshotVia(ctx, extra) {
+  return listenerResolve(ctx, Object.assign({ op: "snapshot" }, extra || {}));
+}
+
+function storedSnap(ctx) {
+  return vm.runInContext("lastSnapshot.snap", ctx);
+}
+
+function revOf(reply) {
+  return reply.rev_core.split(".")[1];
+}
+
+function revisionTests() {
+  // DoD-1: identical walk keeps rev and advances snap; a changed map advances rev.
+  const buy = revButton("Buy", 20);
+  const sell = revButton("Sell", 70);
+  const ctx = revPage([buy, sell]);
+  const r1 = snapshotVia(ctx);
+  assert.equal(r1.rev_v, 1, "observe carries rev_v");
+  assert.equal(r1.rev_core.split(".").length, 4, "core is doc.rev.fp.shape");
+  assert.equal(revOf(r1), "1", "first store is rev 1");
+  const r2 = snapshotVia(ctx);
+  assert.equal(r2.rev_core, r1.rev_core, "identical walk keeps the same rev token");
+  assert.notEqual(r2.snap, r1.snap, "identical walk still advances snap");
+  sell.innerText = "Sold";
+  const r3 = snapshotVia(ctx);
+  assert.equal(revOf(r3), "2", "changed map increments rev");
+  // A scroll/size change is a viewport change, so it bumps rev.
+  ctx.window.scrollY = 50;
+  const r4 = snapshotVia(ctx);
+  assert.equal(revOf(r4), "3", "scroll bumps rev");
+  // A window-origin-only change never bumps rev.
+  ctx.window.screenX = 300;
+  const r5 = snapshotVia(ctx);
+  assert.equal(r5.rev_core, r4.rev_core, "screenX/Y is outside the digest");
+  // frames:true on a page without iframes keeps the same rev.
+  const r6 = snapshotVia(ctx, { frames: true });
+  assert.equal(r6.rev_core, r5.rev_core, "frames:true does not change rev");
+  // store:false mints no revision and emits no rev_v.
+  const before = storedSnap(ctx);
+  const r7 = snapshotVia(ctx, { store: false });
+  assert.equal(r7.rev_v, undefined, "store:false is not agent-facing");
+  assert.equal(storedSnap(ctx), before, "store:false leaves lastSnapshot alone");
+
+  // m3: a new document restarts rev at 1.
+  const ctxNew = revPage([revButton("Buy", 20)], { nonce: 0x9999 });
+  const fresh = snapshotVia(ctxNew);
+  assert.equal(revOf(fresh), "1", "new doc restarts rev at 1");
+  assert.notEqual(fresh.rev_core.split(".")[0], r1.rev_core.split(".")[0], "new doc nonce");
+
+  // C9/S: the poll is read-only and repeatable: unchanged, no delta arrays, snap unchanged.
+  const tokenNow = "12." + r6.rev_core;
+  const snapHeld = storedSnap(ctx);
+  for (let i = 0; i < 3; i += 1) {
+    const polled = snapshotVia(ctx, { changes_since: tokenNow, store: false });
+    assert.equal(polled.unchanged, true, "identical state is unchanged");
+    assert.equal(polled.changes.counts.total, 0);
+    assert.equal(JSON.stringify(polled.changes.added), JSON.stringify([]));
+    assert.equal(polled.rev_v, 1);
+    assert.equal(polled.coverage.page_complete, false, "zero changes never claims page absence");
+    assert.equal(polled.snap, undefined, "a poll mints no snap");
+  }
+  assert.equal(storedSnap(ctx), snapHeld, "three polls never replace lastSnapshot");
+
+  // DoD-3: insert before existing controls -> one added, no rect churn.
+  const base = revPage([revButton("Buy", 20), revButton("Sell", 70)]);
+  const baseReply = snapshotVia(base);
+  const inserted = revButton("New", 120);
+  base.document.documentElement.children.unshift(inserted);
+  let poll = snapshotVia(base, { changes_since: "12." + baseReply.rev_core, store: false });
+  assert.equal(poll.unchanged, false);
+  assert.equal(poll.changes.counts.added, 1, "insert reports one added");
+  assert.equal(poll.changes.counts.removed, 0);
+  assert.equal(poll.changes.counts.changed, 0, "insert shifts no rects");
+  assert.equal(poll.changes.added[0].text, "New");
+  assert.equal(poll.changes.viewport, null);
+
+  // Removed control.
+  const rem = revPage([revButton("Buy", 20), revButton("Sell", 70)]);
+  const remReply = snapshotVia(rem);
+  rem.document.documentElement.children.splice(1, 1);
+  poll = snapshotVia(rem, { changes_since: "12." + remReply.rev_core, store: false });
+  assert.equal(poll.changes.counts.removed, 1, "removed control reports removed");
+  assert.equal(poll.changes.removed[0].idx, 1, "removed.idx is the baseline index");
+  assert.equal(poll.changes.counts.added, 0);
+
+  // DoD-3: a visible label change on a standard button reports changed fields:text.
+  const lab = revButton("Buy", 20);
+  const labCtx = revPage([lab]);
+  const labReply = snapshotVia(labCtx);
+  lab.innerText = "Buy now";
+  poll = snapshotVia(labCtx, { changes_since: "12." + labReply.rev_core, store: false });
+  assert.equal(poll.changes.counts.changed, 1, "label change is changed");
+  assert.equal(poll.changes.counts.added, 0, "label change is not add+remove");
+  assert.equal(poll.changes.counts.removed, 0);
+  assert.equal(JSON.stringify(poll.changes.changed[0].fields), JSON.stringify(["text"]));
+  assert.equal(poll.changes.changed[0].text, "Buy now");
+
+  // DoD-3: a genuine move with no add/remove reports fields:rect.
+  const mv = revButton("Go", 20);
+  const mvCtx = revPage([mv]);
+  const mvReply = snapshotVia(mvCtx);
+  mv.getBoundingClientRect = () => ({ left: 10, top: 90, width: 100, height: 40 });
+  poll = snapshotVia(mvCtx, { changes_since: "12." + mvReply.rev_core, store: false });
+  assert.equal(poll.changes.counts.changed, 1);
+  assert.equal(JSON.stringify(poll.changes.changed[0].fields), JSON.stringify(["rect"]), "a move is rect only");
+
+  // DoD-3: deleting the head of 10 identical controls reports removed:1 and no rect cascade.
+  const dupes = [];
+  for (let i = 0; i < 10; i += 1) {
+    dupes.push(revButton("Same", 20 + i * 50));
+  }
+  const dupCtx = revPage(dupes);
+  const dupReply = snapshotVia(dupCtx);
+  dupCtx.document.documentElement.children.splice(0, 1);
+  poll = snapshotVia(dupCtx, { changes_since: "12." + dupReply.rev_core, store: false });
+  assert.equal(poll.changes.counts.removed, 1, "head delete reports one removed");
+  assert.equal(poll.changes.removed[0].idx, 0, "the named removed node is the head");
+  assert.equal(poll.changes.counts.changed, 0, "no rect cascade on duplicates");
+  assert.equal(poll.changes.counts.added, 0);
+
+  // Carrier: an identity attribute (name) changes the key but no visible field -> fields:attrs.
+  const nameAttrs = { name: "a" };
+  const named = element({
+    tag: "INPUT",
+    type: "text",
+    attrs: nameAttrs,
+    rect: { left: 10, top: 20, width: 100, height: 40 },
+  });
+  const namedCtx = revPage([named]);
+  const namedReply = snapshotVia(namedCtx);
+  nameAttrs.name = "b";
+  poll = snapshotVia(namedCtx, { changes_since: "12." + namedReply.rev_core, store: false });
+  assert.equal(poll.unchanged, false, "an attribute change is a real fp change");
+  assert.equal(JSON.stringify(poll.changes.changed[0].fields), JSON.stringify(["attrs"]));
+
+  // Carrier: a pure reorder of same-keyed controls is fields:order, never an empty delta.
+  const twinA = revButton("Go", 20);
+  const twinB = revButton("Go", 70);
+  const twinCtx = revPage([twinA, twinB]);
+  const twinReply = snapshotVia(twinCtx);
+  twinCtx.document.documentElement.children.reverse();
+  poll = snapshotVia(twinCtx, { changes_since: "12." + twinReply.rev_core, store: false });
+  assert.equal(poll.unchanged, false, "a reorder changes the revision");
+  assert.equal(poll.changes.counts.changed, 2, "reorder reports every moved control");
+  assert.equal(JSON.stringify(poll.changes.changed[0].fields), JSON.stringify(["order"]));
+
+  // DoD-3 / DoD-7: a scroll is exactly one viewport entry, no element churn.
+  const sc = revPage([revButton("Scroll", 20)]);
+  const scReply = snapshotVia(sc);
+  sc.window.scrollY = 300;
+  poll = snapshotVia(sc, { changes_since: "12." + scReply.rev_core, store: false });
+  assert.equal(JSON.stringify(poll.changes.viewport.fields), JSON.stringify(["scroll"]), "scroll is one viewport entry");
+  assert.equal(poll.changes.counts.changed, 0, "scroll is not rect churn");
+  assert.equal(poll.changes.counts.viewport, 1);
+
+  // DoD-7: a title-unchanged SPA route reports context.url; a title change reports context.title.
+  const spa = revPage([revButton("Item", 20)]);
+  const spaReply = snapshotVia(spa);
+  spa.location.href = "https://example.test/item/42";
+  poll = snapshotVia(spa, { changes_since: "12." + spaReply.rev_core, store: false });
+  assert.equal(JSON.stringify(poll.context.changed), JSON.stringify(["url"]));
+  assert.equal(poll.context.url.from, "https://example.test/");
+  assert.equal(poll.context.url.to, "https://example.test/item/42");
+  assert.equal(poll.unchanged, false);
+  assert.equal(poll.changes.counts.changed + poll.changes.counts.added + poll.changes.counts.removed, 0);
+  assert.equal(poll.changes.counts.total, 1, "url-only change has zero element counts");
+  spa.document.title = "New title";
+  poll = snapshotVia(spa, { changes_since: "12." + spaReply.rev_core, store: false });
+  assert.ok(poll.context.changed.indexOf("title") !== -1, "title change reports context.title");
+
+  // main-text-only change is a named context entry.
+  const mt = revPage([revButton("Item", 20)]);
+  const mtReply = snapshotVia(mt);
+  mt.document.body = { innerText: "Listing body" };
+  poll = snapshotVia(mt, { changes_since: "12." + mtReply.rev_core, store: false });
+  assert.equal(JSON.stringify(poll.context.changed), JSON.stringify(["main_text"]));
+
+  // DoD-4: overflow at CHANGES_MAX_EVENTS+1 has complete counts and no arrays.
+  const many = [];
+  for (let i = 0; i < 25; i += 1) {
+    many.push(revButton("Old " + i, 20 + i * 50));
+  }
+  const manyCtx = revPage(many);
+  const manyReply = snapshotVia(manyCtx);
+  for (let i = 0; i < 25; i += 1) {
+    many[i].innerText = "New " + i;
+  }
+  poll = snapshotVia(manyCtx, { changes_since: "12." + manyReply.rev_core, store: false });
+  assert.equal(poll.resync.reason, "delta_overflow");
+  assert.equal(poll.resync.counts.changed, 25, "overflow counts are complete");
+  assert.equal(poll.changes, undefined, "overflow has no arrays");
+  assert.equal(poll.context, undefined);
+
+  // DoD-4: byte cap with 24 entries of multi-byte text overflows without a partial list.
+  const bytes = [];
+  for (let i = 0; i < 24; i += 1) {
+    bytes.push(revButton("x" + i, 20 + i * 50));
+  }
+  const byteCtx = revPage(bytes);
+  const byteReply = snapshotVia(byteCtx);
+  for (let i = 0; i < 24; i += 1) {
+    bytes[i].innerText = "é".repeat(80) + i;
+  }
+  poll = snapshotVia(byteCtx, { changes_since: "12." + byteReply.rev_core, store: false });
+  assert.equal(poll.resync.reason, "delta_overflow", "byte cap overflows");
+  assert.equal(poll.changes, undefined);
+
+  // DoD-4: a live change with a valid token is diffed, not resynced.
+  const live = revButton("Live", 20);
+  const liveCtx = revPage([live]);
+  const liveReply = snapshotVia(liveCtx);
+  live.innerText = "Live changed";
+  poll = snapshotVia(liveCtx, { changes_since: "12." + liveReply.rev_core, store: false });
+  assert.equal(poll.resync, undefined, "a live change is diffed, not stale");
+  assert.equal(poll.changes.counts.changed, 1);
+
+  // DoD-4: stale_revision fires only after another full observe advanced the baseline.
+  const stale = revButton("Stale", 20);
+  const staleCtx = revPage([stale]);
+  const staleFirst = snapshotVia(staleCtx);
+  stale.innerText = "Stale two";
+  snapshotVia(staleCtx);
+  poll = snapshotVia(staleCtx, { changes_since: "12." + staleFirst.rev_core, store: false });
+  assert.equal(poll.resync.reason, "stale_revision");
+  assert.equal(poll.changes, undefined);
+
+  // no_baseline: a document never observed reports no_baseline, not rev_unavailable.
+  const nob = revPage([revButton("Buy", 20)]);
+  poll = snapshotVia(nob, { changes_since: "12.5678.1.0123456789abcdef.0000", store: false });
+  assert.equal(poll.resync.reason, "no_baseline");
+  assert.equal(poll.rev_v, 1);
+
+  // document_changed: a token from another document.
+  poll = snapshotVia(ctxNew, { changes_since: "12.5678." + r1.rev_core.split(".").slice(1).join("."), store: false });
+  assert.equal(poll.resync.reason, "document_changed");
+
+  // changed_request: a detail mismatch is refused before any diff is trusted.
+  poll = snapshotVia(ctxNew, { changes_since: "12." + fresh.rev_core, store: false, detail: "dom" });
+  assert.equal(poll.resync.reason, "changed_request");
+
+  // malformed token -> changed_request (Rust refuses it as a usage error before sending).
+  poll = snapshotVia(ctxNew, { changes_since: "not-a-token", store: false });
+  assert.equal(poll.resync.reason, "changed_request");
+
+  // Password text never reaches a delta.
+  const pw = element({
+    tag: "INPUT",
+    type: "password",
+    attrs: { type: "password" },
+    rect: { left: 10, top: 20, width: 100, height: 40 },
+  });
+  pw.value = "hunter2-secret";
+  const pwCtx = revPage([pw]);
+  const pwReply = snapshotVia(pwCtx);
+  pw.value = "other-secret";
+  pw.getBoundingClientRect = () => ({ left: 10, top: 90, width: 100, height: 40 });
+  poll = snapshotVia(pwCtx, { changes_since: "12." + pwReply.rev_core, store: false });
+  assert.equal(JSON.stringify(poll).indexOf("secret"), -1, "password value never reaches a delta");
+}
+
+function revisionSourceLocks() {
+  const src = fs.readFileSync(path.join(root, "content.js"), "utf8");
+  assert.equal(/MutationObserver/.test(src), false, "no MutationObserver (D-1)");
+  assert.equal(/history\.(push|replace)State/.test(src), false, "no history patch");
+  assert.equal(/setInterval/.test(src), false, "no poller");
+  const sw = fs.readFileSync(path.join(root, "sw.js"), "utf8");
+  assert.equal(/changes_since|rev_core/.test(sw), false, "sw.js needs no changes op");
+}
+
 function main() {
   contentTests();
+  revisionTests();
+  revisionSourceLocks();
   swTests();
   frameRoutingTests();
   frameOptOutTests();

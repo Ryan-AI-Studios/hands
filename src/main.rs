@@ -82,6 +82,23 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
+    /// Read-only change poll (0130). `--since` is the `rev` token from a Chrome observe envelope (`<tab>.<doc>.<rev>.<fp16>.<shape4>`). One ~400 ms request routed to the token's tab: reports added/removed/changed elements and document-level `context` against that observe's stored baseline. No screenshot, UIA walk, PNG, refs, lease, cooldown or JSONL row; a poll never replaces the baseline. `unchanged:true` is no difference in the walked page map only (`coverage.page_complete` is always false). `resync.required:true` names why (no_baseline, document_changed, stale_revision, changed_request, delta_overflow, rev_unavailable): re-observe. A malformed `--since` is ok:false with nonzero exit and sends nothing.
+    Changes {
+        #[arg(
+            long,
+            help = "public rev token from a Chrome observe: <tab>.<doc>.<rev>.<fp16>.<shape4>"
+        )]
+        since: String,
+        /// `default` (omitted) or `dom`; must match the observe the token came from.
+        #[arg(long)]
+        detail: Option<String>,
+        /// Explicit session id (echoed; no JSONL row is written)
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Add `timing_ms` to the envelope
+        #[arg(long)]
+        timing: bool,
+    },
     /// Read-only search inside an already-bound snapshot scope, and exact drill-down. `--within <sref1:…>` lists matching stored nodes (Chrome document snapshot or one frame's snapshot; a bounded UIA window/subtree walk). `--ref <sref1:…>` describes one element through the 0123 resolve with an opt-in 0128 assessment and read-only capability evidence. ANDed filters: `--role`, `--text`, `--rect-css l,t,w,h` (Chrome), `--rect x,y,w,h` (UIA), `--subtree` (root is the scope ref's own element), `--depth` (UIA). `ok:true` means the scope was read, not that a target is live or clickable. `coverage.page_complete` is always false: zero matches means "no match in this snapshot/scope", never "absent". Chrome list returns `rect_css` only; capability evidence is not authority; a disabled/hidden control is absent from the stored walk. No input, no lease, no cooldown, no JSONL, no inner model.
     Find {
         #[arg(
@@ -632,6 +649,12 @@ async fn main() {
             }
             hittest_main(element_id, grid, x, y, samples, session_id)
         }
+        Command::Changes {
+            since,
+            detail,
+            session_id,
+            timing,
+        } => changes_main(since, detail, session_id, timing),
         Command::Find {
             within,
             window,
@@ -1007,7 +1030,8 @@ fn input_main(command: Command) -> Result<(), HandsError> {
         | Command::NativeHostDoctor
         | Command::ElevationStatus
         | Command::Hittest { .. }
-        | Command::Find { .. } => {
+        | Command::Find { .. }
+        | Command::Changes { .. } => {
             unreachable!()
         }
     };
@@ -1091,6 +1115,23 @@ fn hittest_main(
         samples,
     })?;
     let json = hands::hittest::serialize(&envelope)?;
+    println!("{json}");
+    if !envelope.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn changes_main(
+    since: String,
+    detail: Option<String>,
+    session_id: Option<String>,
+    timing: bool,
+) -> Result<(), HandsError> {
+    let detail =
+        hands::extract::Detail::parse_arg(detail.as_deref()).map_err(HandsError::Observe)?;
+    let envelope = hands::changes::run(&since, detail, session_id.as_deref(), timing);
+    let json = hands::changes::serialize(&envelope)?;
     println!("{json}");
     if !envelope.ok {
         std::process::exit(1);

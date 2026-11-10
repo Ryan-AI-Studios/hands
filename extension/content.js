@@ -216,6 +216,25 @@ function sourceOrigin(raw) {
   }
 }
 
+// Internal iframe identity for deduping a registered-but-unlinked child when its slot report
+// could not arrive (top port down). The SW compares this against the child's browser-set URL;
+// it is never emitted to the agent.
+function sourceUrl(raw) {
+  if (!raw || typeof URL !== "function") {
+    return null;
+  }
+  try {
+    const url = new URL(raw, location.href);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return null;
+    }
+    const href = url.href;
+    return href.length <= 512 ? href : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
 function classifyFrameElement(el) {
   const tag = String(el.tagName || "").toUpperCase();
   if (tag === "FENCEDFRAME") {
@@ -251,7 +270,11 @@ function classifyFrameElement(el) {
       return { reason: "restricted_scheme", origin: null };
     }
   }
-  return { reason: "no_content_script", origin: sourceOrigin(raw) };
+  return {
+    reason: "no_content_script",
+    origin: sourceOrigin(raw),
+    src: sourceUrl(raw),
+  };
 }
 
 function frameElementsReply() {
@@ -262,6 +285,9 @@ function frameElementsReply() {
     const row = { slot: i, reason: verdict.reason };
     if (verdict.origin) {
       row.origin = verdict.origin;
+    }
+    if (verdict.src) {
+      row.src = verdict.src;
     }
     out.push(row);
   }

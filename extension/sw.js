@@ -529,6 +529,17 @@ function clampOrigin(value) {
   return origin;
 }
 
+function clampUrl(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const url = value.trim();
+  if (!url || url.length > 512 || !/^https?:\/\//i.test(url)) {
+    return null;
+  }
+  return url;
+}
+
 function collectFrameRows(tabId, frameElements, childReplies) {
   const frames = frameRegistry.get(tabId) || new Map();
   const rows = [];
@@ -570,7 +581,7 @@ function collectFrameRows(tabId, frameElements, childReplies) {
       knownSlots.add(entry.link.parent + ":" + entry.link.slot);
     }
     const origin = clampOrigin(entry.origin);
-    if (entry.budget) {
+    if (entry.budget && entry.linkState === "ok") {
       const row = {
         frame: entry.frameId,
         status: "unavailable",
@@ -657,7 +668,10 @@ function collectFrameRows(tabId, frameElements, childReplies) {
     (entry.link &&
       entry.link.parent === 0 &&
       Number.isInteger(entry.link.slot));
-  const unlinkedByOrigin = new Map();
+  // Without a slot report (top port down), a registered-unlinked child can only be matched to a
+  // parent iframe by its exact browser-set URL. Origin counting is too coarse: a nested child on
+  // the same origin would otherwise consume a distinct top-level sibling (P8-1).
+  const unlinkedByUrl = new Map();
   for (const entry of frames.values()) {
     if (entry.frameId === 0 || (entry.link && entry.linkState === "ok")) {
       continue;
@@ -665,9 +679,9 @@ function collectFrameRows(tabId, frameElements, childReplies) {
     if (topSlotKnown(entry)) {
       continue;
     }
-    const origin = clampOrigin(entry.origin);
-    if (origin) {
-      unlinkedByOrigin.set(origin, (unlinkedByOrigin.get(origin) || 0) + 1);
+    const url = clampUrl(entry.url);
+    if (url) {
+      unlinkedByUrl.set(url, (unlinkedByUrl.get(url) || 0) + 1);
     }
   }
   const ownerLists = [{ owner: 0, items: Array.isArray(frameElements) ? frameElements : [] }];
@@ -687,16 +701,15 @@ function collectFrameRows(tabId, frameElements, childReplies) {
       if (Number.isInteger(item.slot) && knownSlots.has(owner + ":" + item.slot)) {
         continue;
       }
-      if (
-        owner === 0 &&
-        !topRegistered &&
-        origin &&
-        (unlinkedByOrigin.get(origin) || 0) > 0
-      ) {
-        // Top port down: drop at most one item per registered-unlinked child of that origin,
-        // leaving a distinct same-origin un-injected sibling with its own row.
-        unlinkedByOrigin.set(origin, unlinkedByOrigin.get(origin) - 1);
-        continue;
+      if (owner === 0 && !topRegistered) {
+        // Top port down: drop only the item whose exact URL matches a registered-unlinked
+        // child; a distinct same-origin un-injected sibling keeps its own row.
+        const src = clampUrl(item.src);
+        const matches = src ? unlinkedByUrl.get(src) || 0 : 0;
+        if (matches > 0) {
+          unlinkedByUrl.set(src, matches - 1);
+          continue;
+        }
       }
       const row = { status: "unavailable", reason: item.reason };
       if (origin) row.origin = origin;
@@ -943,8 +956,10 @@ function collectChildSnapshots(
         maybeFinish();
       };
       commitChildSnapshot(entry, reply, settle);
-      // A commit that never answers must not hold the envelope open.
-      setTimeout(() => settle(null), 30);
+      // A commit that never answers must not hold the envelope open, but a slow commit can
+      // still finish before the fan-out deadline; wait up to `commit_by` (bounded).
+      const settleWait = Math.max(30, Math.min(commitBy - Date.now(), 120));
+      setTimeout(() => settle(null), settleWait);
     });
   }
 }

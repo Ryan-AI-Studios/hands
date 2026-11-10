@@ -1129,7 +1129,11 @@ function frameOptOutTests() {
   {
     const h = frameHarness();
     const top = h.addFrame({ frameId: 0 });
-    const child = h.addFrame({ frameId: 3, origin: "https://kid.test" });
+    const child = h.addFrame({
+      frameId: 3,
+      origin: "https://kid.test",
+      href: "https://kid.test/a",
+    });
     child.__parentCtx = top;
     const registeredIframe = element({
       tag: "IFRAME",
@@ -1333,6 +1337,114 @@ function frameOptOutTests() {
     });
     assert.equal(h.sw.registry(12).get(3).slot, 1);
     assert.equal(h.sw.registry(12).get(3).slotParent, 0);
+  }
+
+  // P8-1: a nested registered-unlinked child on the same origin must not consume a distinct
+  // top-level un-injected sibling's row when the top port drops.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({
+      frameId: 3,
+      origin: "https://kid.test",
+      href: "https://kid.test/a",
+    });
+    const nested = h.addFrame({
+      frameId: 5,
+      origin: "https://dup.test",
+      href: "https://dup.test/inner",
+    });
+    child.__parentCtx = top;
+    nested.__parentCtx = child;
+    nested.__dropParentPosts = 99; // registered but never links
+    const childIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://kid.test/a" },
+      rect: { left: 5, top: 5, width: 300, height: 200 },
+    });
+    childIframe.contentWindow = child.window;
+    const siblingIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://dup.test/lazy" },
+      rect: { left: 5, top: 250, width: 300, height: 200 },
+    });
+    const nestedIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://dup.test/inner" },
+      rect: { left: 7, top: 9, width: 200, height: 100 },
+    });
+    nestedIframe.contentWindow = nested.window;
+    const topRoot = element({ tag: "DIV" });
+    attach(topRoot, childIframe);
+    attach(topRoot, siblingIframe);
+    top.document.documentElement = topRoot;
+    top.__elementAt = () => childIframe;
+    const childRoot = element({ tag: "DIV" });
+    attach(childRoot, nestedIframe);
+    child.document.documentElement = childRoot;
+    child.__elementAt = () => nestedIframe;
+    const up = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(rowFor(up, 3).status, "ok");
+    assert.equal(rowFor(up, 5).reason, "frame_link_missing");
+    assert.ok(
+      up.frames.some(
+        (row) => row.parent === 3 && row.reason === "no_content_script"
+      ),
+      "the child names its nested iframe"
+    );
+    assert.ok(
+      up.frames.some(
+        (row) =>
+          row.parent === undefined &&
+          row.reason === "no_content_script" &&
+          row.origin === "https://dup.test"
+      ),
+      "the top-level dup.test sibling is present"
+    );
+    assert.equal(up.frames_total, 5, "top + child + nested + nested-row + sibling");
+    top.__port.__silenceDisconnect();
+    top.__port.disconnect();
+    const down = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(rowFor(down, 3).reason, "frame_geometry_unavailable");
+    assert.equal(rowFor(down, 5).reason, "frame_link_missing");
+    assert.ok(
+      down.frames.some(
+        (row) =>
+          row.parent === undefined &&
+          row.reason === "no_content_script" &&
+          row.origin === "https://dup.test"
+      ),
+      "the top-level sibling is not consumed by the nested unlinked frame"
+    );
+    assert.equal(down.frames.length, 3, "stale child + nested + sibling");
+    assert.equal(down.frames_total, 4, "top + three child rows");
+  }
+
+  // P8-3: a budget flag from an earlier snapshot must not outlive a stale link reason.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 9, origin: "https://slow2.test" });
+    child.__parentCtx = top;
+    const iframe = element({ tag: "IFRAME", rect: { left: 5, top: 5, width: 300, height: 200 } });
+    iframe.contentWindow = child.window;
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, iframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = () => iframe;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "Slow" });
+    h.sw.setContent(12, 9, (msg, cb) => {
+      if (msg.op === "snapshot") {
+        return; // never replies: snapshot 1 marks frame_budget_exceeded
+      }
+      child.__listener(msg, null, (reply) => cb(reply));
+    });
+    const first = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(rowFor(first, 9).reason, "frame_budget_exceeded");
+    top.__port.__silenceDisconnect();
+    top.__port.disconnect();
+    const second = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(rowFor(second, 9).reason, "frame_geometry_unavailable");
   }
 
   // M-3: if the top walk already consumed the client budget, fan-out is skipped honestly.

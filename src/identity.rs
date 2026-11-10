@@ -252,6 +252,9 @@ fn is_false(value: &bool) -> bool {
 pub struct FrameBinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<u32>,
+    /// Owning parent frame id for a frame-less nested row (restricted/injected child iframe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u32>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub doc: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -607,12 +610,23 @@ mod tests {
         let mut with_frames = top;
         with_frames.frames.push(FrameBinding {
             frame: Some(3),
+            parent: None,
             doc: "cafe".into(),
             snap: "00112233".into(),
             retained: 4,
             status: "ok".into(),
             reason: None,
             origin: Some("https://widget.test".into()),
+        });
+        with_frames.frames.push(FrameBinding {
+            frame: None,
+            parent: Some(3),
+            doc: String::new(),
+            snap: String::new(),
+            retained: 0,
+            status: "unavailable".into(),
+            reason: Some("sandboxed_no_scripts".into()),
+            origin: Some("https://nested.test".into()),
         });
         with_frames.frames_total = 13;
         with_frames.frames_truncated = true;
@@ -621,6 +635,10 @@ mod tests {
         assert!(
             json.contains("\"origin\":\"https://widget.test\""),
             "{json}"
+        );
+        assert!(
+            json.contains("\"parent\":3"),
+            "nested row keeps its owning parent: {json}"
         );
         assert!(
             !json.contains("http://localhost:8132/index.html"),

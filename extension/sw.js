@@ -266,7 +266,8 @@ function registerFramePort(port) {
           origin &&
           expected &&
           origin === expected &&
-          (target.slotParent == null || target.slotParent === entry.frameId)
+          (target.slotParent == null || target.slotParent === entry.frameId) &&
+          (target.parent == null || target.parent === entry.frameId)
         ) {
           target.slot = msg.slot;
           // A slot is an index in the reporting parent's iframe list; record the owner.
@@ -531,6 +532,31 @@ function clampOrigin(value) {
 function collectFrameRows(tabId, frameElements, childReplies) {
   const frames = frameRegistry.get(tabId) || new Map();
   const rows = [];
+  // A row may only claim `ok` when its whole parent chain is still live and linked (P7-3): a
+  // re-announce can re-link a grandchild through an ancestor that has already gone stale.
+  const chainOk = (entry) => {
+    const seen = new Set();
+    let cur = entry;
+    for (let depth = 0; depth <= 5; depth += 1) {
+      if (!cur || cur.linkState !== "ok" || !cur.link) {
+        return false;
+      }
+      if (seen.has(cur.frameId)) {
+        return false;
+      }
+      seen.add(cur.frameId);
+      const parent = cur.link.parent;
+      if (parent === 0) {
+        return frames.has(0);
+      }
+      const next = frames.get(parent);
+      if (!next) {
+        return false;
+      }
+      cur = next;
+    }
+    return false;
+  };
   // Slot identity is scoped by its owning parent frame: `${parent}:${slot}`.
   const knownSlots = new Set();
   for (const entry of frames.values()) {
@@ -553,7 +579,7 @@ function collectFrameRows(tabId, frameElements, childReplies) {
       if (origin) row.origin = origin;
       if (entry.link) row.link = entry.link;
       rows.push(row);
-    } else if (entry.link && entry.linkState === "ok") {
+    } else if (entry.link && entry.linkState === "ok" && chainOk(entry)) {
       const row = { frame: entry.frameId, status: "ok" };
       if (entry.link.visible !== true) {
         row.status = "unavailable";
@@ -568,6 +594,15 @@ function collectFrameRows(tabId, frameElements, childReplies) {
       }
       if (origin) row.origin = origin;
       row.link = entry.link;
+      rows.push(row);
+    } else if (entry.linkState === "ok") {
+      // Linked locally, but an ancestor level is no longer valid; never advertise `ok`.
+      const row = {
+        frame: entry.frameId,
+        status: "unavailable",
+        reason: "frame_geometry_unavailable",
+      };
+      if (origin) row.origin = origin;
       rows.push(row);
     } else if (entry.linkState === "stale") {
       const row = {
@@ -614,9 +649,20 @@ function collectFrameRows(tabId, frameElements, childReplies) {
   // Every injected frame enumerates its own iframes. The top reply is owner 0; each child
   // snapshot carries its own `frame_elements` list, owner = that child frame id.
   const topRegistered = [...frames.values()].some((entry) => entry.frameId === 0);
+  // An entry whose iframe is already identified by a top-level slot is deduped by `knownSlots`
+  // and must not also consume a same-origin item (P7-1): a linked-then-stale child is still the
+  // same iframe, and its distinct un-injected sibling must keep its row.
+  const topSlotKnown = (entry) =>
+    (entry.slotParent === 0 && Number.isInteger(entry.slot)) ||
+    (entry.link &&
+      entry.link.parent === 0 &&
+      Number.isInteger(entry.link.slot));
   const unlinkedByOrigin = new Map();
   for (const entry of frames.values()) {
     if (entry.frameId === 0 || (entry.link && entry.linkState === "ok")) {
+      continue;
+    }
+    if (topSlotKnown(entry)) {
       continue;
     }
     const origin = clampOrigin(entry.origin);
@@ -836,6 +882,7 @@ function collectChildSnapshots(
   let pending = entries.length;
   let committing = 0;
   let wantFinish = false;
+  let cut = false;
   let finished = false;
   const finish = () => {
     if (finished) {
@@ -848,7 +895,9 @@ function collectChildSnapshots(
     if (finished || !wantFinish) {
       return;
     }
-    if (pending <= 0 && committing <= 0) {
+    // After the straggler cutoff, finish with the replies received so far; a pending reply is
+    // abandoned so one hung child cannot discard the healthy children's elements (P7-2).
+    if (committing <= 0 && (cut || pending <= 0)) {
       finish();
     }
   };
@@ -861,6 +910,7 @@ function collectChildSnapshots(
   };
   setTimeout(() => {
     wantFinish = true;
+    cut = true;
     maybeFinish();
   }, CHILD_SNAPSHOT_TIMEOUT_MS);
   for (const entry of entries) {

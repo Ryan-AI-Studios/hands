@@ -1197,6 +1197,144 @@ function frameOptOutTests() {
     assert.equal(reply.frames_total, 3, "top + mid + nested");
   }
 
+  // P7-1: a linked child that goes stale on a top-port drop must not consume the distinct
+  // same-origin un-injected sibling (its iframe is already deduped by slot).
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 3, origin: "https://kid.test" });
+    child.__parentCtx = top;
+    const linkedIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://kid.test/a" },
+      rect: { left: 5, top: 5, width: 300, height: 200 },
+    });
+    linkedIframe.contentWindow = child.window;
+    const siblingIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://kid.test/lazy" },
+      rect: { left: 5, top: 250, width: 300, height: 200 },
+    });
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, linkedIframe);
+    attach(rootEl, siblingIframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = () => linkedIframe;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "Kid" });
+    const up = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(up.frames.length, 2, "top-up control: child + sibling");
+    assert.equal(rowFor(up, 3).status, "ok");
+    assert.ok(
+      up.frames.some(
+        (row) => row.reason === "no_content_script" && row.origin === "https://kid.test"
+      )
+    );
+    assert.equal(up.frames_total, 3);
+    top.__port.__silenceDisconnect();
+    top.__port.disconnect();
+    const down = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(down.frames.length, 2, "stale child + sibling");
+    assert.equal(rowFor(down, 3).reason, "frame_geometry_unavailable");
+    assert.ok(
+      down.frames.some(
+        (row) => row.reason === "no_content_script" && row.origin === "https://kid.test"
+      ),
+      "the sibling is not consumed by the stale child"
+    );
+    assert.equal(down.frames_total, 3);
+  }
+
+  // P7-3: a grandchild must not advertise `ok` when its ancestor link is gone.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const mid = h.addFrame({ frameId: 3, origin: "https://mid.test" });
+    const deep = h.addFrame({ frameId: 5, origin: "https://deep.test" });
+    mid.__parentCtx = top;
+    deep.__parentCtx = mid;
+    const midIframe = element({
+      tag: "IFRAME",
+      rect: { left: 5, top: 5, width: 300, height: 200 },
+    });
+    midIframe.contentWindow = mid.window;
+    const topRoot = element({ tag: "DIV" });
+    attach(topRoot, midIframe);
+    top.document.documentElement = topRoot;
+    top.__elementAt = () => midIframe;
+    const deepIframe = element({
+      tag: "IFRAME",
+      rect: { left: 7, top: 9, width: 200, height: 100 },
+    });
+    deepIframe.contentWindow = deep.window;
+    const midRoot = element({ tag: "DIV" });
+    attach(midRoot, deepIframe);
+    mid.document.documentElement = midRoot;
+    mid.__elementAt = () => deepIframe;
+    deep.document.documentElement = element({ tag: "BUTTON", innerText: "Deep" });
+    const up = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(rowFor(up, 5).status, "ok");
+    top.__port.__silenceDisconnect();
+    top.__port.disconnect();
+    const down = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(rowFor(down, 3).reason, "frame_geometry_unavailable");
+    const deepRow = rowFor(down, 5);
+    assert.ok(deepRow, "the grandchild is still named");
+    assert.notEqual(deepRow.status, "ok", "no ok row through a stale ancestor");
+    assert.equal(deepRow.reason, "frame_geometry_unavailable");
+  }
+
+  // P6-4 remainder: a same-origin relay cannot set a linked child's slot; the real parent can.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 3, origin: "https://widget.test" });
+    const relay = h.addFrame({ frameId: 4, origin: "https://widget.test" });
+    child.__parentCtx = top;
+    const iframe = element({ tag: "IFRAME", rect: { left: 5, top: 5, width: 300, height: 200 } });
+    iframe.contentWindow = child.window;
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, iframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = () => iframe;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "Widget" });
+    const originalPost = top.__port.postMessage;
+    top.__port.postMessage = (msg) => {
+      if (msg.op === "frame_slot") {
+        return;
+      }
+      if (msg.op === "frame_link") {
+        const copy = Object.assign({}, msg);
+        delete copy.slot;
+        originalPost.call(top.__port, copy);
+        return;
+      }
+      originalPost.call(top.__port, msg);
+    };
+    fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    top.__port.postMessage = originalPost;
+    const token = h.sw.registry(12).get(3).token;
+    assert.equal(h.sw.registry(12).get(3).slot, undefined);
+    relay.__port.postMessage({
+      op: "frame_slot",
+      token,
+      origin: "https://widget.test",
+      slot: 9,
+    });
+    assert.equal(
+      h.sw.registry(12).get(3).slot,
+      undefined,
+      "a relay cannot set a linked child's slot"
+    );
+    top.__port.postMessage({
+      op: "frame_slot",
+      token,
+      origin: "https://widget.test",
+      slot: 1,
+    });
+    assert.equal(h.sw.registry(12).get(3).slot, 1);
+    assert.equal(h.sw.registry(12).get(3).slotParent, 0);
+  }
+
   // M-3: if the top walk already consumed the client budget, fan-out is skipped honestly.
   {
     const h = frameHarness();
@@ -1546,6 +1684,62 @@ function frameLifecycleTests() {
     const row = rowFor(reply, 9);
     assert.ok(row);
     assert.equal(row.reason, "frame_budget_exceeded");
+  }
+
+  // P7-2: one hung child must not discard a healthy child's elements or its nested rows.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const healthy = h.addFrame({ frameId: 3, origin: "https://healthy.test" });
+    const hung = h.addFrame({ frameId: 4, origin: "https://hung.test" });
+    healthy.__parentCtx = top;
+    hung.__parentCtx = top;
+    const healthyIframe = element({
+      tag: "IFRAME",
+      rect: { left: 5, top: 5, width: 300, height: 200 },
+    });
+    healthyIframe.contentWindow = healthy.window;
+    const hungIframe = element({
+      tag: "IFRAME",
+      rect: { left: 5, top: 250, width: 300, height: 200 },
+    });
+    hungIframe.contentWindow = hung.window;
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, healthyIframe);
+    attach(rootEl, hungIframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = () => healthyIframe;
+    const sandbox = element({
+      tag: "IFRAME",
+      attrs: { sandbox: "allow-forms", src: "https://nested.test/" },
+      rect: { left: 7, top: 9, width: 200, height: 100 },
+    });
+    const healthyRoot = element({ tag: "DIV" });
+    attach(healthyRoot, sandbox);
+    healthy.document.documentElement = healthyRoot;
+    healthy.__elementAt = () => sandbox;
+    hung.document.documentElement = element({ tag: "BUTTON", innerText: "Hung" });
+    h.sw.setContent(12, 4, (msg, cb) => {
+      if (msg.op === "snapshot") {
+        return; // never replies: the straggler cutoff must not drop frame 3
+      }
+      hung.__listener(msg, null, (reply) => cb(reply));
+    });
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    const healthyRow = rowFor(reply, 3);
+    assert.equal(healthyRow.status, "ok");
+    assert.ok(
+      reply.elements.some((el) => el.frame === 3),
+      "the healthy child's elements survive the hung child"
+    );
+    assert.equal(rowFor(reply, 4).reason, "frame_budget_exceeded");
+    assert.ok(
+      reply.frames.some(
+        (row) => row.reason === "sandboxed_no_scripts" && row.parent === 3
+      ),
+      "the healthy child's nested row survives too"
+    );
+    assert.equal(reply.frames_total, 4, "top + healthy + hung + nested");
   }
 
   // F-07: an on-screen frame ranks before a far off-screen frame that connected first.

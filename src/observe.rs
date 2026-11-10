@@ -2462,6 +2462,7 @@ mod tests {
         binding.frames = (1..=12)
             .map(|frame| crate::identity::FrameBinding {
                 frame: Some(frame),
+                parent: None,
                 doc: if frame == 2 {
                     String::new()
                 } else {

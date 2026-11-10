@@ -848,6 +848,7 @@ fn frame_bindings(rows: &[crate::frames::RawFrameLink]) -> Vec<crate::identity::
         }
         frames.push(crate::identity::FrameBinding {
             frame,
+            parent: row.parent.filter(|p| *p > 0),
             doc: if ok {
                 row.doc.clone().unwrap_or_default()
             } else {

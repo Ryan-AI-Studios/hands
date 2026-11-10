@@ -668,9 +668,10 @@ function collectFrameRows(tabId, frameElements, childReplies) {
     (entry.link &&
       entry.link.parent === 0 &&
       Number.isInteger(entry.link.slot));
-  // Without a slot report (top port down), a registered-unlinked child can only be matched to a
-  // parent iframe by its exact browser-set URL. Origin counting is too coarse: a nested child on
-  // the same origin would otherwise consume a distinct top-level sibling (P8-1).
+  // Without a slot report (top port down), a top iframe item can be *related* to a
+  // registered-unlinked child by its exact browser-set URL. It is never dropped on that match:
+  // a distinct iframe may legitimately share the URL, so every top item gets its own row and a
+  // matching item is labelled with the registered child's honest link reason (P8-1/P9-1).
   const unlinkedByUrl = new Map();
   for (const entry of frames.values()) {
     if (entry.frameId === 0 || (entry.link && entry.linkState === "ok")) {
@@ -680,8 +681,15 @@ function collectFrameRows(tabId, frameElements, childReplies) {
       continue;
     }
     const url = clampUrl(entry.url);
-    if (url) {
-      unlinkedByUrl.set(url, (unlinkedByUrl.get(url) || 0) + 1);
+    if (url && !unlinkedByUrl.has(url)) {
+      unlinkedByUrl.set(
+        url,
+        entry.linkState === "ambiguous"
+          ? "frame_link_ambiguous"
+          : entry.linkState === "stale"
+            ? "frame_geometry_unavailable"
+            : "frame_link_missing"
+      );
     }
   }
   const ownerLists = [{ owner: 0, items: Array.isArray(frameElements) ? frameElements : [] }];
@@ -701,17 +709,15 @@ function collectFrameRows(tabId, frameElements, childReplies) {
       if (Number.isInteger(item.slot) && knownSlots.has(owner + ":" + item.slot)) {
         continue;
       }
-      if (owner === 0 && !topRegistered) {
-        // Top port down: drop only the item whose exact URL matches a registered-unlinked
-        // child; a distinct same-origin un-injected sibling keeps its own row.
-        const src = clampUrl(item.src);
-        const matches = src ? unlinkedByUrl.get(src) || 0 : 0;
-        if (matches > 0) {
-          unlinkedByUrl.set(src, matches - 1);
-          continue;
-        }
-      }
-      const row = { status: "unavailable", reason: item.reason };
+      const src = clampUrl(item.src);
+      const related =
+        owner === 0 &&
+        !topRegistered &&
+        item.reason === "no_content_script" &&
+        src
+          ? unlinkedByUrl.get(src) || null
+          : null;
+      const row = { status: "unavailable", reason: related || item.reason };
       if (origin) row.origin = origin;
       if (owner !== 0) row.parent = owner;
       rows.push(row);
@@ -957,8 +963,12 @@ function collectChildSnapshots(
       };
       commitChildSnapshot(entry, reply, settle);
       // A commit that never answers must not hold the envelope open, but a slow commit can
-      // still finish before the fan-out deadline; wait up to `commit_by` (bounded).
-      const settleWait = Math.max(30, Math.min(commitBy - Date.now(), 120));
+      // still finish before the fan-out deadline; wait through `commit_by` plus the delivery
+      // margin, settling just before the outer finalize.
+      const settleWait = Math.max(
+        30,
+        commitBy + FANOUT_MARGIN_MS - 5 - Date.now()
+      );
       setTimeout(() => settle(null), settleWait);
     });
   }
@@ -1076,7 +1086,10 @@ function finishFrameSnapshot(out, tab, port, msg) {
     return;
   }
   const budget = Math.min(FANOUT_BUDGET_MS, remaining);
-  const commitBy = Date.now() + budget;
+  // A child may commit up to `commit_by`; leave one margin so an accepted commit can reach the
+  // SW before the outer finalize instead of being committed child-side and dropped (P9-2).
+  const finalizeAt = Date.now() + budget;
+  const commitBy = finalizeAt - FANOUT_MARGIN_MS;
   setTimeout(finalize, budget);
   const known = frameRegistry.get(tab.id);
   const hasChild = known

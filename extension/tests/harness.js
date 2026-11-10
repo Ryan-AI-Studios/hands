@@ -509,8 +509,8 @@ function swContext() {
     runTimers(limit) {
       runTimers(timers, limit);
     },
-    defer(fn) {
-      timers.push({ fn, ms: 0 });
+    defer(fn, ms) {
+      timers.push({ fn, ms: Number(ms) || 0 });
     },
     lastPost() {
       return calls.posts[calls.posts.length - 1];
@@ -1154,15 +1154,26 @@ function frameOptOutTests() {
     top.__port.__silenceDisconnect();
     top.__port.disconnect();
     const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
-    assert.equal(reply.frames.length, 2, "one registered child + one sibling row");
+    // P9-1: a matching top item is an honest duplicate, never a silent drop.
+    assert.equal(reply.frames.length, 3, "registered child + duplicate top item + sibling");
     assert.equal(reply.frames.find((row) => row.frame === 3).reason, "frame_link_missing");
+    assert.equal(
+      reply.frames.filter(
+        (row) =>
+          row.frame === undefined &&
+          row.origin === "https://kid.test" &&
+          row.reason === "frame_link_missing"
+      ).length,
+      1,
+      "the registered iframe's top item is an honest duplicate"
+    );
     assert.ok(
       reply.frames.some(
         (row) => row.reason === "no_content_script" && row.origin === "https://kid.test"
       ),
       "the distinct same-origin sibling is not silently dropped"
     );
-    assert.equal(reply.frames_total, 3, "top + two children");
+    assert.equal(reply.frames_total, 4, "top + three child rows");
   }
 
   // P6-2: a restricted iframe nested inside an injected child is rowed by that child.
@@ -1420,6 +1431,76 @@ function frameOptOutTests() {
     assert.equal(down.frames_total, 4, "top + three child rows");
   }
 
+  // P9-1: a top-level iframe with the *same URL* as a nested registered-unlinked frame is
+  // still named (honest duplicate), never silently consumed.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({
+      frameId: 3,
+      origin: "https://kid.test",
+      href: "https://kid.test/a",
+    });
+    const nested = h.addFrame({
+      frameId: 5,
+      origin: "https://dup.test",
+      href: "https://dup.test/inner",
+    });
+    child.__parentCtx = top;
+    nested.__parentCtx = child;
+    nested.__dropParentPosts = 99;
+    const childIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://kid.test/a" },
+      rect: { left: 5, top: 5, width: 300, height: 200 },
+    });
+    childIframe.contentWindow = child.window;
+    const sameUrlIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://dup.test/inner" },
+      rect: { left: 5, top: 250, width: 300, height: 200 },
+    });
+    const nestedIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://dup.test/inner" },
+      rect: { left: 7, top: 9, width: 200, height: 100 },
+    });
+    nestedIframe.contentWindow = nested.window;
+    const topRoot = element({ tag: "DIV" });
+    attach(topRoot, childIframe);
+    attach(topRoot, sameUrlIframe);
+    top.document.documentElement = topRoot;
+    top.__elementAt = () => childIframe;
+    const childRoot = element({ tag: "DIV" });
+    attach(childRoot, nestedIframe);
+    child.document.documentElement = childRoot;
+    child.__elementAt = () => nestedIframe;
+    const up = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(rowFor(up, 3).status, "ok");
+    assert.equal(rowFor(up, 5).reason, "frame_link_missing");
+    assert.ok(
+      up.frames.some(
+        (row) => row.parent === 3 && row.reason === "no_content_script"
+      )
+    );
+    assert.equal(up.frames_total, 5);
+    top.__port.__silenceDisconnect();
+    top.__port.disconnect();
+    const down = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(rowFor(down, 3).reason, "frame_geometry_unavailable");
+    assert.equal(rowFor(down, 5).reason, "frame_link_missing");
+    assert.ok(
+      down.frames.some(
+        (row) =>
+          row.frame === undefined &&
+          row.origin === "https://dup.test" &&
+          row.reason === "frame_link_missing"
+      ),
+      "the same-URL top-level sibling is named, not consumed"
+    );
+    assert.equal(down.frames_total, 4);
+  }
+
   // P8-3: a budget flag from an earlier snapshot must not outlive a stale link reason.
   {
     const h = frameHarness();
@@ -1445,6 +1526,38 @@ function frameOptOutTests() {
     top.__port.disconnect();
     const second = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
     assert.equal(rowFor(second, 9).reason, "frame_geometry_unavailable");
+  }
+
+  // P9-2/P9-5: a commit answered at 150 ms (before commit_by) is still emitted, not dropped
+  // by the old fixed 30/120 ms fallback.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 3, origin: "https://slowcommit.test" });
+    child.__parentCtx = top;
+    const iframe = element({ tag: "IFRAME", rect: { left: 5, top: 5, width: 300, height: 200 } });
+    iframe.contentWindow = child.window;
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, iframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = () => iframe;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "SlowCommit" });
+    h.sw.setContent(12, 3, (msg, cb) => {
+      if (msg.op === "frame_commit") {
+        child.__listener(msg, null, (reply) => {
+          h.sw.defer(() => cb(reply), 150);
+        });
+        return;
+      }
+      child.__listener(msg, null, (reply) => cb(reply));
+    });
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    const row = rowFor(reply, 3);
+    assert.equal(row.status, "ok", "a 150 ms commit is not dropped");
+    assert.ok(
+      reply.elements.some((el) => el.frame === 3),
+      "the delayed commit's elements are emitted"
+    );
   }
 
   // M-3: if the top walk already consumed the client budget, fan-out is skipped honestly.

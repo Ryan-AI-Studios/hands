@@ -1424,6 +1424,7 @@ pub(crate) fn hit_from_scoped_reply(
         }
         node.rect_css = crate::frames::compose_rect(&rows, frame, node.rect_css)
             .map_err(|err| frame_report(r, err))?;
+        remember_frame_chain(&r.to_string(), &chain);
         (top.metrics, top.url, top.title, rows)
     } else {
         let metrics: ChromeMetrics = reply
@@ -1719,6 +1720,62 @@ pub struct FrameBindingEvidence {
     pub chain_present: bool,
 }
 
+// Process-local resolve-time chain, keyed by the exact ref. The pre-dispatch `frame_binding`
+// re-read compares against it so a moved/resized iframe is refused before the pointer moves.
+thread_local! {
+    static FRAME_CHAINS: std::cell::RefCell<
+        std::collections::HashMap<String, Vec<crate::frames::FrameLink>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn remember_frame_chain(key: &str, chain: &[crate::frames::FrameLink]) {
+    FRAME_CHAINS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if map.len() >= 32 {
+            map.clear();
+        }
+        map.insert(key.to_string(), chain.to_vec());
+    });
+}
+
+fn cached_frame_chain(key: &str) -> Option<Vec<crate::frames::FrameLink>> {
+    FRAME_CHAINS.with(|cell| cell.borrow().get(key).cloned())
+}
+
+fn clip_matches(a: &[crate::frames::ClipRect], b: &[crate::frames::ClipRect]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).all(|(a, b)| {
+        (a.left - b.left).abs() <= 1.0
+            && (a.top - b.top).abs() <= 1.0
+            && (a.width - b.width).abs() <= 1.0
+            && (a.height - b.height).abs() <= 1.0
+    })
+}
+
+/// 1 CSS px tolerance for a moved/resized/clipped/re-flagged frame chain (spec §3.5.12).
+fn frame_chains_match(
+    expected: &[crate::frames::FrameLink],
+    fresh: &[crate::frames::FrameLink],
+) -> bool {
+    if expected.len() != fresh.len() {
+        return false;
+    }
+    expected.iter().zip(fresh).all(|(a, b)| {
+        a.parent == b.parent
+            && (a.content_left - b.content_left).abs() <= 1.0
+            && (a.content_top - b.content_top).abs() <= 1.0
+            && (a.content_width - b.content_width).abs() <= 1.0
+            && (a.content_height - b.content_height).abs() <= 1.0
+            && a.transform_ok == b.transform_ok
+            && a.visible == b.visible
+            && a.hit_ok == b.hit_ok
+            && a.onscreen == b.onscreen
+            && clip_matches(&a.clip, &b.clip)
+    })
+}
+
 /// Distinct `frame_binding` re-read immediately before `move_to` (0131 DoD-5). It never uses
 /// the observe-time chain and never falls back to the top-frame `binding` op.
 #[allow(clippy::result_large_err)]
@@ -1798,6 +1855,28 @@ pub fn verify_frame_binding(
             IdentityState::Unknown,
             "frame_geometry_unavailable",
         ));
+    }
+    if let Some(expected) = cached_frame_chain(&r.to_string()) {
+        let fresh: Vec<crate::frames::FrameLink> = reply
+            .get("chain")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| {
+                IdentityReport::chrome_failure(
+                    &r,
+                    IdentityState::Unknown,
+                    "frame_geometry_unavailable",
+                )
+            })?
+            .unwrap_or_default();
+        if !frame_chains_match(&expected, &fresh) {
+            return Err(IdentityReport::chrome_failure(
+                &r,
+                IdentityState::Unknown,
+                "frame_geometry_unavailable",
+            ));
+        }
     }
     Ok(FrameBindingEvidence {
         frame,
@@ -3972,6 +4051,51 @@ mod tests {
         let hit = scoped_fixture_hit(&raw, &r, Some(0x1234), false).expect("fixture frame ref");
         assert_eq!(hit.css_rect.left, 50.0);
         assert_eq!(hit.css_rect.top, 80.0);
+    }
+
+    #[test]
+    fn frame_chain_consistency_tolerance_is_one_px() {
+        let base = crate::frames::FrameLink {
+            parent: Some(0),
+            content_left: 40.0,
+            content_top: 60.0,
+            content_width: 300.0,
+            content_height: 250.0,
+            clip: vec![crate::frames::ClipRect {
+                left: 40.0,
+                top: 60.0,
+                width: 300.0,
+                height: 250.0,
+            }],
+            transform_ok: true,
+            visible: true,
+            hit_ok: true,
+            onscreen: true,
+            viewport_w: 1920.0,
+            viewport_h: 1080.0,
+            ..crate::frames::FrameLink::default()
+        };
+        let mut fresh = base.clone();
+        assert!(frame_chains_match(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&fresh)
+        ));
+        fresh.content_left += 0.9;
+        assert!(frame_chains_match(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&fresh)
+        ));
+        fresh.content_left += 1.0;
+        assert!(!frame_chains_match(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&fresh)
+        ));
+        let mut hidden = base.clone();
+        hidden.visible = false;
+        assert!(!frame_chains_match(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&hidden)
+        ));
     }
 
     #[test]

@@ -2253,6 +2253,54 @@ mod tests {
     }
 
     #[test]
+    fn mixed_reserved_fixture_pops_non_reserved_first() {
+        let mut raw = fat_envelope(30);
+        raw.viewport = Some(Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        });
+        for (i, el) in raw.elements.iter_mut().enumerate() {
+            el.id = format!("chr:{i}");
+            el.sref = Some(
+                SnapshotRef::Chrome {
+                    tab: 12,
+                    frame: 0,
+                    doc: "9f3a".into(),
+                    snap: "a1b2c3d4".into(),
+                    idx: i as u32,
+                }
+                .to_string(),
+            );
+            if i < 10 {
+                el.role = "Text".into();
+                el.text = Some("row".into());
+            } else {
+                el.role = "Button".into();
+                el.text = Some("Search".into());
+            }
+        }
+        raw.elements_total = 30;
+        let capped = cap_default_envelope(raw);
+        assert_eq!(capped.elements.len(), 20);
+        assert!(capped.elements_truncated);
+        assert!(
+            capped
+                .elements
+                .iter()
+                .all(|el| is_reserved_control(el, &capped)),
+            "all retained rows must be reserved controls"
+        );
+        assert!(
+            capped
+                .elements
+                .iter()
+                .all(|el| el.text.as_deref() == Some("Search") && el.sref.is_some())
+        );
+    }
+
+    #[test]
     fn default_envelope_with_sref_fits_4kib_and_keeps_reserved() {
         let raw = dense_ref_envelope();
         let original_main_len = raw.extract.main_text.len();

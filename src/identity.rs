@@ -164,6 +164,12 @@ impl IdentityReport {
         self
     }
 
+    pub fn with_reason(mut self, reason: &str) -> Self {
+        self.reason = Some(reason.to_string());
+        self.hint = Some(hint_for(self.state, reason));
+        self
+    }
+
     pub fn state_token(&self) -> &'static str {
         self.state.as_str()
     }
@@ -171,9 +177,16 @@ impl IdentityReport {
 
 fn hint_for(state: IdentityState, reason: &str) -> String {
     let text = match reason {
+        "binding_changed_after_dispatch" => {
+            "a click may already have been sent; re-observe and verify the page before any further action; do not re-click this ref blindly"
+        }
+        "transform_invalid" => {
+            "re-observe the target; the point transform refused and nothing was sent"
+        }
         "tab_not_active" | "window_not_focused" | "tab_hidden" => {
             "activate the target tab in the focused Chrome window, then retry"
         }
+        "not_chrome" => "activate the target Chrome window, then retry",
         "tab_unavailable" | "no_tab" => "re-observe; the tab no longer exists",
         "no_content" | "unbound_extension" => {
             "reload the Helping Hands extension and the target tab, then re-observe"

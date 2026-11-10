@@ -749,16 +749,13 @@ pub(crate) fn settle_cooldown(tool: &str, env: &mut ActuateEnvelope) {
         let binding_precondition = report.state == IdentityState::Unknown
             && matches!(
                 report.reason.as_deref(),
-                Some(
-                    "tab_not_active"
-                        | "window_not_focused"
-                        | "tab_hidden"
-                        | "binding_changed_after_dispatch"
-                )
+                Some("tab_not_active" | "window_not_focused" | "tab_hidden")
             );
         if exempt_state || binding_precondition {
             return;
         }
+        // `binding_changed_after_dispatch` is intentionally NOT exempt: the first click was
+        // already sent, so an unverified dispatched action counts toward loop protection.
     }
     let snap = cooldown::note_rejection(&env.session_id);
     stamp_actuate(env, snap);
@@ -822,10 +819,9 @@ pub(crate) fn refuse_transform(
         .reason
         .clone()
         .unwrap_or_else(|| "transform is not valid".into());
-    let identity = identity.map(|mut report| {
+    let identity = identity.map(|report| {
         // Closed post-transform identity token; the 0129 detail stays in top-level `error`.
-        report.reason = Some("transform_invalid".into());
-        report
+        report.with_reason("transform_invalid")
     });
     finalize_envelope(ActuateEnvelope {
         session_id,
@@ -1081,7 +1077,7 @@ fn post_dispatch_binding_refusal(
     report: IdentityReport,
 ) -> Result<ActuateEnvelope, HandsError> {
     let mut report = report;
-    report.reason = Some("binding_changed_after_dispatch".into());
+    report = report.with_reason("binding_changed_after_dispatch");
     let reason = report
         .reason
         .clone()
@@ -2147,6 +2143,20 @@ fn stop_shared(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
 mod tests {
     use super::*;
     use crate::point::{CssPoint, CssRect};
+    use windows::Win32::UI::Input::KeyboardAndMouse::INPUT;
+
+    thread_local! {
+        static SEND_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn count_identity_sends(_: &[INPUT]) -> Result<(), HandsError> {
+        SEND_COUNT.with(|c| c.set(c.get() + 1));
+        Ok(())
+    }
+
+    fn sent_count() -> usize {
+        SEND_COUNT.with(|c| c.get())
+    }
 
     #[test]
     fn oversized_session_id_is_tool_error() {
@@ -6558,6 +6568,13 @@ mod tests {
             env.identity.as_ref().and_then(|i| i.reason.as_deref()),
             Some("transform_invalid")
         );
+        let hint = env
+            .identity
+            .as_ref()
+            .and_then(|i| i.hint.as_deref())
+            .unwrap_or_default();
+        assert!(hint.contains("re-observe"), "{hint}");
+        assert!(!hint.contains("identity is exact"), "{hint}");
         let point = env.point.as_ref().expect("point contract");
         assert!(!point.transform.valid);
     }
@@ -6732,6 +6749,81 @@ mod tests {
         assert_eq!(identity.reason.as_deref(), Some("tab_not_active"));
     }
 
+    fn scoped_valid_hit() -> (SnapshotRef, chrome::ChromeHit) {
+        let map = act_remap_map(100, 80);
+        let css = CssRect {
+            left: 50.0,
+            top: 40.0,
+            width: 100.0,
+            height: 20.0,
+        };
+        let contract = crate::point::contract_for(&map, css.center());
+        let rect = crate::point::map_rect(&contract, css).expect("scoped rect");
+        let r = SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 7,
+        };
+        let hit = chrome::ChromeHit {
+            id: r.to_string(),
+            name: "Continue".into(),
+            role: "button".into(),
+            rect,
+            css_rect: css,
+            css_point: css.center(),
+            contract,
+            hwnd: Some(0x1234),
+            map: Some(map),
+            assessment: None,
+            identity: Some(IdentityReport::exact_chrome(&r)),
+        };
+        (r, hit)
+    }
+
+    #[test]
+    fn scoped_fixture_valid_transform_refuses_at_binding_and_sends_nothing() {
+        let (r, hit) = scoped_valid_hit();
+        chrome::set_scoped_resolve_stub(Some(Ok(hit)));
+        chrome::set_binding_stub(Some(Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Unknown,
+            "fixture_snapshot",
+        ))));
+        ACT_REMAP_ANCHOR.with(|c| {
+            c.set(Rect {
+                x: 100,
+                y: 80,
+                w: 1200,
+                h: 900,
+            })
+        });
+        chrome::set_remap_geometry_hook(Some(act_remap_geometry));
+        chrome::set_remap_identity_hook(Some(act_remap_identity));
+        crate::elevation::set_high_il_hook(Some(|_| false));
+        input::set_send_inputs_hook(Some(count_identity_sends));
+        SEND_COUNT.with(|c| c.set(0));
+        let env = hover(ActuateRequest {
+            session_id: Some("s-fixture-binding".into()),
+            element_id: Some(r.to_string()),
+            ..ActuateRequest::default()
+        })
+        .expect("hover refusal");
+        chrome::set_scoped_resolve_stub(None);
+        chrome::set_binding_stub(None);
+        chrome::set_remap_geometry_hook(None);
+        chrome::set_remap_identity_hook(None);
+        crate::elevation::set_high_il_hook(None);
+        input::set_send_inputs_hook(None);
+        assert!(!env.ok);
+        assert_eq!(sent_count(), 0);
+        assert_eq!(
+            env.identity.as_ref().and_then(|i| i.reason.as_deref()),
+            Some("fixture_snapshot")
+        );
+    }
+
     #[test]
     fn hover_and_scroll_stale_scoped_ref_refuse() {
         let r = SnapshotRef::Chrome {
@@ -6743,6 +6835,8 @@ mod tests {
         };
         let report = IdentityReport::chrome_failure(&r, IdentityState::Stale, "stale_element");
         chrome::set_scoped_resolve_stub(Some(Err(report)));
+        input::set_send_inputs_hook(Some(count_identity_sends));
+        SEND_COUNT.with(|c| c.set(0));
         let hover_env = hover(ActuateRequest {
             session_id: Some("s-hover-stale".into()),
             element_id: Some(r.to_string()),
@@ -6765,6 +6859,8 @@ mod tests {
         })
         .expect("scroll refusal");
         chrome::set_scoped_resolve_stub(None);
+        input::set_send_inputs_hook(None);
+        assert_eq!(sent_count(), 0, "stale hover/scroll must not send input");
         assert!(!scroll_env.ok);
         assert_eq!(scroll_env.error.as_deref(), Some("stale_element"));
         assert_eq!(
@@ -6833,6 +6929,14 @@ mod tests {
             env.identity.as_ref().and_then(|i| i.reason.as_deref()),
             Some("binding_changed_after_dispatch")
         );
+        let hint = env
+            .identity
+            .as_ref()
+            .and_then(|i| i.hint.as_deref())
+            .unwrap_or_default();
+        assert!(hint.contains("already"), "{hint}");
+        assert!(!hint.to_ascii_lowercase().contains("retry"), "{hint}");
+        assert!(hint.contains("re-observe"), "{hint}");
         let json = serde_json::to_string(&env).unwrap();
         assert!(json.contains("\"post_dispatch\":true"));
         assert!(json.contains("\"verified\":false"));
@@ -6848,6 +6952,14 @@ mod tests {
             pre.identity.as_ref().and_then(|i| i.reason.as_deref()),
             Some("tab_not_active")
         );
+        assert!(
+            pre.identity
+                .as_ref()
+                .and_then(|i| i.hint.as_deref())
+                .unwrap_or_default()
+                .contains("activate"),
+            "pre-dispatch hint remains the activate-and-retry guidance"
+        );
 
         let _g = crate::cooldown::TEST_LOCK
             .lock()
@@ -6857,8 +6969,8 @@ mod tests {
         crate::actuate::settle_cooldown("click", &mut post);
         assert_eq!(
             crate::cooldown::snapshot("s-retry").attempt,
-            0,
-            "post-dispatch binding change is exempt from cooldown"
+            1,
+            "post-dispatch binding change counts toward loop protection"
         );
     }
 

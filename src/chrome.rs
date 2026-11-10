@@ -1373,13 +1373,9 @@ pub fn try_resolve_ref(
             "not_chrome",
         ));
     };
-    if foreground::foreground_hwnd() != Some(hwnd) || !foreground::target_is_chrome(Some(hwnd)) {
-        return Err(IdentityReport::chrome_failure(
-            r,
-            IdentityState::Unknown,
-            "not_chrome",
-        ));
-    }
+    // Do not short-circuit on a non-Chrome foreground: a background Chrome window behind
+    // Notepad must resolve through the extension reply and come back as `window_not_focused`
+    // / `tab_not_active`, not `not_chrome`.
     let req = resolve_ref_request(r, assess, samples);
     let reply = pipe_request(&req).map_err(|err| {
         let text = err.to_string();
@@ -1390,7 +1386,15 @@ pub fn try_resolve_ref(
         };
         IdentityReport::chrome_failure(r, IdentityState::Unknown, reason)
     })?;
-    hit_from_scoped_reply(&reply, r, Some(hwnd), false, assess)
+    let hit = hit_from_scoped_reply(&reply, r, Some(hwnd), false, assess)?;
+    if !foreground::target_is_chrome(Some(hwnd)) {
+        return Err(IdentityReport::chrome_failure(
+            r,
+            IdentityState::Unknown,
+            "not_chrome",
+        ));
+    }
+    Ok(hit)
 }
 
 #[allow(clippy::result_large_err)]
@@ -3464,11 +3468,28 @@ mod tests {
     }
 
     #[test]
-    fn scoped_resolve_reply_window_not_focused_is_unknown() {
+    fn scoped_resolve_does_not_gate_on_non_chrome_foreground() {
+        let src = include_str!("chrome.rs");
+        let start = src
+            .find("pub fn try_resolve_ref(")
+            .expect("try_resolve_ref");
+        let end = src
+            .find("#[allow(clippy::result_large_err)]\nfn scoped_fixture_hit(")
+            .expect("scoped_fixture_hit");
+        let body = &src[start..end];
+        assert!(!body.contains("foreground_hwnd() != Some(hwnd)"));
+        assert!(body.contains("Do not short-circuit on a non-Chrome foreground"));
+        assert!(body.contains("window_not_focused"));
+    }
+
+    #[test]
+    fn background_chrome_window_is_window_not_focused() {
         let r = scoped_ref();
         let mut reply = scoped_reply(&r);
+        reply["active"] = serde_json::json!(true);
         reply["focused"] = serde_json::json!(false);
-        let report = hit_from_scoped_reply(&reply, &r, None, false, false).expect_err("focused");
+        reply["visibilityState"] = serde_json::json!("visible");
+        let report = hit_from_scoped_reply(&reply, &r, None, false, false).expect_err("background");
         assert_eq!(report.state, IdentityState::Unknown);
         assert_eq!(report.reason.as_deref(), Some("window_not_focused"));
     }

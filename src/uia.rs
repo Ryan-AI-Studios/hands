@@ -772,7 +772,7 @@ pub(crate) fn scoped_matches_outcome(
         .ok_or_else(|| ScopedFailure::stale("stale_element"))?;
     let actual = format!("{:08x}", found.own_fingerprint());
     if actual != fp {
-        return Err(ScopedFailure::stale("identity_mismatch"));
+        return Err(ScopedFailure::stale("stale_identity"));
     }
     Ok(found)
 }
@@ -1365,6 +1365,14 @@ mod tests {
         .expect_err("duplicate");
         assert_eq!(err.state, IdentityState::Ambiguous);
         assert_eq!(err.reason, "duplicate_runtime_id");
+    }
+
+    #[test]
+    fn scoped_matches_fp_mismatch_is_stale_identity() {
+        let err = scoped_matches_outcome(vec![found("Send", "Button")], false, 0x1234, "00000000")
+            .expect_err("fingerprint mismatch");
+        assert_eq!(err.state, IdentityState::Stale);
+        assert_eq!(err.reason, "stale_identity");
     }
 
     #[test]

@@ -706,6 +706,9 @@ function bridgeFramePorts(sw, sender, content) {
     __silence() {
       contentListeners.message.length = 0;
     },
+    __silenceDisconnect() {
+      contentListeners.disconnect.length = 0;
+    },
   };
   return { swPort, contentPort };
 }
@@ -1039,6 +1042,84 @@ function frameOptOutTests() {
       (el) => el.frame === 10 || String(el.id || "").startsWith("frame:")
     );
     assert.equal(leaked, undefined, "malformed committed doc/snap never mints a frame id");
+  }
+
+  // P5-1: slot identity is parent-scoped. A top-level un-injected `data:` iframe at slot 0
+  // must not vanish when a nested injected child also has slot 0.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const mid = h.addFrame({ frameId: 3, origin: "https://mid.test" });
+    const deep = h.addFrame({ frameId: 5, origin: "https://deep.test" });
+    mid.__parentCtx = top;
+    deep.__parentCtx = mid;
+    const dataIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "data:text/html,restricted" },
+      rect: { left: 5, top: 5, width: 300, height: 200 },
+    });
+    const midIframe = element({
+      tag: "IFRAME",
+      rect: { left: 5, top: 250, width: 300, height: 200 },
+    });
+    midIframe.contentWindow = mid.window;
+    const topRoot = element({ tag: "DIV" });
+    attach(topRoot, dataIframe);
+    attach(topRoot, midIframe);
+    top.document.documentElement = topRoot;
+    top.__elementAt = () => midIframe;
+    const deepIframe = element({
+      tag: "IFRAME",
+      rect: { left: 7, top: 9, width: 200, height: 100 },
+    });
+    deepIframe.contentWindow = deep.window;
+    const midRoot = element({ tag: "DIV" });
+    attach(midRoot, deepIframe);
+    mid.document.documentElement = midRoot;
+    mid.__elementAt = () => deepIframe;
+    deep.document.documentElement = element({ tag: "BUTTON", innerText: "Deep" });
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(reply.frames.length, 3, "mid + deep + top data iframe rows");
+    assert.ok(reply.frames.some((row) => row.frame === 3));
+    assert.ok(reply.frames.some((row) => row.frame === 5));
+    assert.ok(
+      reply.frames.some((row) => row.reason === "restricted_scheme"),
+      "the top-level data: iframe at slot 0 is not hidden by a nested slot 0"
+    );
+  }
+
+  // P5-2/L-15: while the top port is down, a registered child gets one transient row, not a
+  // second false `no_content_script`.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 3, origin: "https://late.test" });
+    child.__parentCtx = top;
+    const iframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://late.test/" },
+      rect: { left: 5, top: 5, width: 300, height: 200 },
+    });
+    iframe.contentWindow = child.window;
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, iframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = () => iframe;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "Late" });
+    fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    top.__port.__silenceDisconnect();
+    top.__port.disconnect();
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    const childRows = reply.frames.filter((row) => row.frame === 3);
+    assert.equal(childRows.length, 1, "one row for the registered child");
+    assert.ok(
+      childRows[0].status === "ok" || childRows[0].reason === "frame_link_missing",
+      "the registered row is the only honest row"
+    );
+    assert.ok(
+      !reply.frames.some((row) => row.reason === "no_content_script"),
+      "no false no_content_script while the top port is down"
+    );
   }
 
   // M-3: if the top walk already consumed the client budget, fan-out is skipped honestly.

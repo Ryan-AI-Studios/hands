@@ -264,6 +264,8 @@ function registerFramePort(port) {
         const expected = normalizeOrigin(target.origin);
         if (origin && expected && origin === expected) {
           target.slot = msg.slot;
+          // A slot is an index in the reporting parent's iframe list; record the owner.
+          target.slotParent = entry.frameId;
         }
       }
       return;
@@ -424,11 +426,6 @@ function acceptFrameLink(parentEntry, msg) {
   if (target.frameId === parentEntry.frameId) {
     return;
   }
-  // The parent that owns the matched iframe reports its slot. Record it even if the link is
-  // later rejected/ambiguous, so the frame's own parent element row is deduped by identity.
-  if (Number.isInteger(msg.slot) && msg.slot >= 0) {
-    target.slot = msg.slot;
-  }
   const origin = normalizeOrigin(msg.origin);
   const expected = normalizeOrigin(target.origin);
   if (!origin || !expected || origin !== expected) {
@@ -447,6 +444,12 @@ function acceptFrameLink(parentEntry, msg) {
     }
     resolveMeasure(token, null);
     return;
+  }
+  // Slot identity is trusted only after the origin and single-parent guards pass. Record it
+  // with its owning parent even if the link itself is later rejected.
+  if (Number.isInteger(msg.slot) && msg.slot >= 0) {
+    target.slot = msg.slot;
+    target.slotParent = parentEntry.frameId;
   }
   const link = sanitizeLink(msg.link);
   if (!link) {
@@ -519,12 +522,16 @@ function collectFrameRows(tabId, frameElements) {
     if (entry.frameId === 0) {
       continue;
     }
-    // Identity carried from the parent's contentWindow match (link pass), independent of
-    // whether the link ultimately validated. This is the exact iframe slot to dedupe.
-    if (Number.isInteger(entry.slot)) {
+    // A slot is an index in its owning parent's iframe list. Only top-level (parent 0)
+    // identities can dedupe the top document's `frame_elements` array.
+    if (Number.isInteger(entry.slot) && entry.slotParent === 0) {
       linkedSlots.add(entry.slot);
     }
-    if (entry.link && Number.isInteger(entry.link.slot)) {
+    if (
+      entry.link &&
+      entry.link.parent === 0 &&
+      Number.isInteger(entry.link.slot)
+    ) {
       linkedSlots.add(entry.link.slot);
     }
     const origin = clampOrigin(entry.origin);
@@ -537,7 +544,11 @@ function collectFrameRows(tabId, frameElements) {
       if (origin) row.origin = origin;
       if (entry.link) row.link = entry.link;
       rows.push(row);
-      if (entry.link && Number.isInteger(entry.link.slot)) {
+      if (
+        entry.link &&
+        entry.link.parent === 0 &&
+        Number.isInteger(entry.link.slot)
+      ) {
         linkedSlots.add(entry.link.slot);
       }
     } else if (entry.link && entry.linkState === "ok") {
@@ -556,7 +567,7 @@ function collectFrameRows(tabId, frameElements) {
       if (origin) row.origin = origin;
       row.link = entry.link;
       rows.push(row);
-      if (Number.isInteger(entry.link.slot)) {
+      if (entry.link.parent === 0 && Number.isInteger(entry.link.slot)) {
         linkedSlots.add(entry.link.slot);
       }
     } else if (entry.linkState === "ambiguous") {
@@ -595,16 +606,30 @@ function collectFrameRows(tabId, frameElements) {
   }
   // Dedupe by iframe identity/slot. A distinct same-origin un-injected iframe is never
   // suppressed just because another frame shares its origin.
+  const topRegistered = [...frames.values()].some((entry) => entry.frameId === 0);
+  const registeredUnlinkedOrigins = new Set();
+  for (const entry of frames.values()) {
+    if (entry.frameId === 0 || (entry.link && entry.linkState === "ok")) {
+      continue;
+    }
+    const origin = clampOrigin(entry.origin);
+    if (origin) registeredUnlinkedOrigins.add(origin);
+  }
   const seen = Array.isArray(frameElements) ? frameElements : [];
   for (const item of seen) {
     if (!item || typeof item.reason !== "string") {
       continue;
     }
+    const origin = clampOrigin(item.origin);
     if (Number.isInteger(item.slot) && linkedSlots.has(item.slot)) {
       continue;
     }
+    if (!topRegistered && origin && registeredUnlinkedOrigins.has(origin)) {
+      // The top port is down, so its slot report cannot arrive. The registry row already
+      // names this iframe; do not add a false `no_content_script` for it.
+      continue;
+    }
     const row = { status: "unavailable", reason: item.reason };
-    const origin = clampOrigin(item.origin);
     if (origin) row.origin = origin;
     rows.push(row);
   }
@@ -696,11 +721,13 @@ function frameBySlot(tabId, slot) {
     return null;
   }
   for (const entry of frames.values()) {
+    const ownsTopSlot =
+      (entry.link && entry.link.parent === 0) || entry.slotParent === 0;
     if (
       entry.frameId !== 0 &&
-      entry.link &&
-      entry.linkState === "ok" &&
-      entry.link.slot === slot
+      ownsTopSlot &&
+      ((entry.link && entry.linkState === "ok" && entry.link.slot === slot) ||
+        entry.slot === slot)
     ) {
       return entry;
     }

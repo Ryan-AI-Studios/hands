@@ -162,7 +162,14 @@ function collectFrameCandidates(node, out) {
   if (tag === "IFRAME" || tag === "FRAME" || tag === "OBJECT" || tag === "FENCEDFRAME") {
     out.push(node);
   }
-  const shadow = node.shadowRoot;
+  let shadow = node.shadowRoot;
+  if (!shadow && chrome.dom && chrome.dom.openOrClosedShadowRoot) {
+    try {
+      shadow = chrome.dom.openOrClosedShadowRoot(node);
+    } catch (_err) {
+      shadow = null;
+    }
+  }
   if (shadow && shadow.children) {
     for (let i = 0; i < shadow.children.length; i += 1) {
       collectFrameCandidates(shadow.children[i], out);

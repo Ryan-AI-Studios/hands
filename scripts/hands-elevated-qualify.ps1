@@ -587,6 +587,25 @@ Write-Host "TARGET : $Window"
 Write-Host "TEMPLATE: $templateText"
 Write-Host "FILLER : $stopFiller (len=$($stopFiller.Length), unicode path)"
 
+# O-A: record any artifact already at the path. Never attribute a stale artifact (same nonce) to
+# this run; a deliberate -Nonce reuse is refused inside the case below.
+$artifactAtStart = [ordered]@{
+    path                 = $artifactPath
+    exists               = $false
+    sha256               = $null
+    content_matches_nonce = $false
+}
+if (Test-Path -LiteralPath $artifactPath) {
+    $startingState = Get-ArtifactState $artifactPath $Nonce
+    $artifactAtStart.exists = $true
+    $artifactAtStart.sha256 = $startingState.sha256
+    $artifactAtStart.content_matches_nonce = $startingState.content_matches
+}
+$evidence.artifact_preexisting = $artifactAtStart
+if ($artifactAtStart.exists) {
+    Write-Host "ARTIFACT-PREEXISTING: $($artifactAtStart.path) sha256=$($artifactAtStart.sha256) matches_nonce=$($artifactAtStart.content_matches_nonce)"
+}
+
 $bridge = $null
 $counter = $null
 try {
@@ -633,8 +652,17 @@ try {
         Stop-OwnBridge $bridge
         $bridge = $null
         if ($stderrText -match "privileged pipe not available" -or $stderrText -match "not starting a local desk server") {
-            $evidence.verdict = "REFUSED_EXPECTED"
-            $evidence.limitations += "the privileged pipe is absent; the bridge failed loud and no local desk started (owner: start the HandsElevated task, then re-run)"
+            # The absent-server cell belongs to DoD-7 (`-Case lifecycle`) only (N1). Every other
+            # case must not report a pass token or exit 0 when it could not execute.
+            if ($Case -eq "lifecycle") {
+                $evidence.verdict = "REFUSED_EXPECTED"
+                $evidence.effect = "not_attempted"
+                $evidence.limitations += "the privileged pipe is absent; the bridge failed loud and no local desk started (owner: start the HandsElevated task, then re-run)"
+            } else {
+                $evidence.verdict = "NOT_RUN"
+                $evidence.effect = "not_attempted"
+                $evidence.limitations += "the privileged pipe is absent, so -Case $Case did not execute; absent-server is a lifecycle/DoD-7 cell, never a pass for an effect cell (owner: start the HandsElevated task, then re-run)"
+            }
             $script:abortRecorded = $true
             throw [System.OperationCanceledException]::new("absent-server cell recorded")
         }
@@ -651,6 +679,9 @@ try {
         throw "observe did not resolve -Window $Window; refusing to actuate"
     }
     Write-Host "TARGET-ID: $($evidence.target | ConvertTo-Json -Compress)"
+    if ($Case -in @("console", "terminal") -and $artifactAtStart.exists -and $artifactAtStart.content_matches_nonce) {
+        throw "artifact-preexisting: $artifactPath already holds this nonce; never reuse -Nonce - use a fresh nonce so the read-back cannot be a stale artifact"
+    }
 
     switch ($Case) {
         "console" {
@@ -793,19 +824,30 @@ try {
             if (Test-Path -LiteralPath $deskLog) {
                 $deskStopRowsBefore = @(Get-Content -LiteralPath $deskLog -Tail 50 | Where-Object { $_ -match '"stop"' }).Count
             }
-            # The desk must be idle >= 2 s so a prior case's fresh stop cannot leak in. Measure the
-            # gap (F-l4); the sleep is the floor, not the evidence.
+            # The desk must be idle >= 2 s so a prior case's fresh stop cannot leak in. The harness
+            # gap is a precondition; the desk.jsonl mtime is the desk-side bound (N3). Both are
+            # recorded, and either one below 2 s is a timing miss.
             $idleStart = Get-Date
+            $deskLogWriteBefore = $null
+            if (Test-Path -LiteralPath $deskLog) {
+                $deskLogWriteBefore = (Get-Item -LiteralPath $deskLog).LastWriteTime
+            }
             Start-Sleep -Milliseconds 2200
-            $idleMs = [int]((Get-Date) - $idleStart).TotalMilliseconds
+            $sinceLastAction = [int]((Get-Date) - $idleStart).TotalMilliseconds
+            $deskLogGap = if ($null -ne $deskLogWriteBefore) { [int]((Get-Date) - $deskLogWriteBefore).TotalMilliseconds } else { $null }
             $evidence.steps.Add([ordered]@{
-                    step     = "stop-idle-gate"
-                    idle_ms  = $idleMs
-                    required = 2000
-                    last_case = $true
+                    step                 = "stop-idle-gate"
+                    since_last_action_ms = $sinceLastAction
+                    desk_log_gap_ms      = $deskLogGap
+                    precondition_ms      = 2000
+                    basis                = if ($null -ne $deskLogGap) { "harness action gap + desk.jsonl mtime gap" } else { "harness action gap (no desk.jsonl)" }
+                    last_case            = $true
                 }) | Out-Null
-            if ($idleMs -lt 2000) {
-                throw "timing-miss: only $idleMs ms of desk idle before the stop cell; the stop must start from >= 2 s (retry)"
+            if ($sinceLastAction -lt 2000) {
+                throw "timing-miss: only $sinceLastAction ms since this harness's last action; the stop cell needs >= 2 s of desk idle (retry)"
+            }
+            if ($null -ne $deskLogGap -and $deskLogGap -lt 2000) {
+                throw "timing-miss: the desk log changed $deskLogGap ms ago; the desk was not idle for >= 2 s (retry)"
             }
             $null = Assert-ForegroundTarget $bridge $counter $evidence.steps $evidence "stop-type"
             $typeId = $counter.Next
@@ -1004,9 +1046,11 @@ try {
     if (-not $script:abortRecorded) {
         $message = "$($_.Exception.Message)"
         $evidence.limitations += "harness error: $message"
-        # A failed activate / a measured idle shortfall is an environment/timing miss, not a
-        # product failure. A target-binding mismatch or any other error is a failure.
-        if ($message -like "activate-not-foregrounded:*" -or $message -like "timing-miss:*") {
+        # Precondition/timing misses -> NOT_RUN: a failed activate, a desk-idle shortfall, or a
+        # deliberate -Nonce reuse. A target-binding mismatch stays FAILED: the selected target
+        # changed under the harness (R5 expects a refusal); both tokens are non-pass and send
+        # nothing (O-B).
+        if ($message -like "activate-not-foregrounded:*" -or $message -like "timing-miss:*" -or $message -like "artifact-preexisting:*") {
             $evidence.verdict = "NOT_RUN"
         } else {
             $evidence.verdict = "FAILED"

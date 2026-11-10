@@ -531,7 +531,7 @@ fn high_label_set_step_is_present_and_the_reader_reads_it() {
     );
 
     // The reader itself: a plain temp file has no explicit label, and the same set step the
-    // template uses makes the reader return the real High RID.
+    // template uses makes the reader return the real High RID *when the caller can raise a label*.
     let path = std::env::temp_dir().join(format!("hands-label-{}.txt", uuid::Uuid::new_v4()));
     std::fs::write(&path, b"PROBE").expect("write probe");
     assert_eq!(
@@ -539,21 +539,34 @@ fn high_label_set_step_is_present_and_the_reader_reads_it() {
         None,
         "a plain write must not read as High (this is the F-B1 fact)"
     );
-    let out = Command::new("icacls")
-        .arg(&path)
-        .args(["/setintegritylevel", "High"])
-        .output()
-        .expect("icacls");
-    assert!(
-        out.status.success(),
-        "icacls set High failed (the harness needs a High-IL context): {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        label_rid(&path),
-        Some(0x3000),
-        "the reader must read the High label the template sets"
-    );
+    let il = hands::elevation::process_integrity_rid().expect("process integrity");
+    if il >= hands::elevation::HIGH_IL_RID {
+        let out = Command::new("icacls")
+            .arg(&path)
+            .args(["/setintegritylevel", "High"])
+            .output()
+            .expect("icacls");
+        assert!(
+            out.status.success(),
+            "icacls set High failed from a High token: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            label_rid(&path),
+            Some(0x3000),
+            "the reader must read the High label the template sets"
+        );
+    } else {
+        // N2: raising a label above the caller's IL needs SeRelabelPrivilege, which a UAC-filtered
+        // token does not hold. The plain-write half and the template-presence locks above stay
+        // unconditional; CI (windows-latest) and the owner's High shell exercise the raise.
+        eprintln!(
+            "skipping the High label raise: caller IL 0x{il:x} < 0x{:x} (needs SeRelabelPrivilege); \
+             the template-presence and plain-write locks still ran",
+            hands::elevation::HIGH_IL_RID
+        );
+        assert_eq!(label_rid(&path), None, "the plain write stays unlabelled");
+    }
     let _ = std::fs::remove_file(&path);
 }
 
@@ -577,25 +590,25 @@ fn qualify_binds_the_foreground_target_before_every_input() {
         &code,
         "Invoke-WithOptionalOnceConfirm $bridge $counter \"type\"",
         "Assert-ForegroundTarget $bridge",
-        900,
+        400,
     );
     assert_bound_before(
         &code,
         "Invoke-WithOptionalOnceConfirm $bridge $counter \"key\"",
         "Assert-ForegroundTarget $bridge",
-        900,
+        400,
     );
     assert_bound_before(
         &code,
         "params  = @{ name = \"type\"; arguments = @{ text = $stopFiller } }",
         "Assert-ForegroundTarget $bridge",
-        900,
+        400,
     );
     assert_bound_before(
         &code,
         "params  = @{ name = \"key\"; arguments = @{ name = \"enter\" } }",
         "Assert-ForegroundTarget $bridge",
-        900,
+        400,
     );
     // The stop case must activate + click before the in-flight type (F-M2).
     let stop = code
@@ -615,18 +628,27 @@ fn qualify_binds_the_foreground_target_before_every_input() {
 #[test]
 fn qualify_stop_and_lifecycle_cells_are_bounded_and_named() {
     let code = squeezed(&code_only());
-    // F-l4: honour HANDS_LOGS_DIR, measure idle, enforce last-case.
+    // F-l4/N3: honour HANDS_LOGS_DIR, record the real desk-side gap, enforce last-case.
     assert!(code.contains("function Get-DeskLogPath"));
     assert!(code.contains("$env:HANDS_LOGS_DIR"));
-    assert!(code.contains("idle_ms = $idleMs"));
+    assert!(code.contains("since_last_action_ms = $sinceLastAction"));
+    assert!(code.contains("desk_log_gap_ms = $deskLogGap"));
+    assert!(code.contains("precondition_ms = 2000"));
+    assert!(code.contains("the desk log changed $deskLogGap ms ago"));
     assert!(code.contains("stop-case-completed.json"));
     assert!(
         code.contains("stop must be the last case of a session"),
         "the harness must refuse a case after stop"
     );
+    // O-A: a pre-existing artifact at the nonce path can never be this run's effect.
+    assert!(code.contains("$evidence.artifact_preexisting = $artifactAtStart"));
+    assert!(code.contains("artifact-preexisting:"));
     // F-l2: the lifecycle disconnect is the named own-bridge pid kill.
     assert!(code.contains("disconnect_method = \"own-bridge-pid-kill\""));
     assert!(code.contains("Stop-OwnBridge $bridge -KillNow"));
+    // N4: an unknown-effect disconnect carries effect:"unknown" (mapping recorded in spec §2.4).
+    assert!(code.contains("disconnect effect is UNKNOWN"));
+    assert!(code.contains("$evidence.effect = \"unknown\""));
     // F-m1 / F-l3: a frozen-only (pre-dispatch) refusal is NOT_RUN, not DELIVERED_UNVERIFIED.
     let pre = code
         .find("the stop landed before dispatch (frozen without post_dispatch/delivery:unknown)")
@@ -656,4 +678,28 @@ fn qualify_stop_and_lifecycle_cells_are_bounded_and_named() {
     // F-l1: the reader prefers the SACL reader and falls back to the label text.
     assert!(code.contains("[HandsMandatoryLabel]::MandatoryLabelSid"));
     assert!(code.contains("Mandatory Label"));
+}
+
+#[test]
+fn qualify_absent_server_pass_is_lifecycle_only() {
+    // N1: the absent-server bridge refusal is a DoD-7 (`-Case lifecycle`) cell. Every other case
+    // must record NOT_RUN (non-pass, exit 1), never the pass token REFUSED_EXPECTED.
+    let code = squeezed(&code_only());
+    let pass_token = code
+        .find("$evidence.verdict = \"REFUSED_EXPECTED\"")
+        .expect("absent-server pass token");
+    let before = &code[pass_token.saturating_sub(400)..pass_token];
+    assert!(
+        before.contains("if ($Case -eq \"lifecycle\")"),
+        "REFUSED_EXPECTED must be gated on -Case lifecycle:\n{before}"
+    );
+    let after = &code[pass_token..(pass_token + 500).min(code.len())];
+    assert!(
+        after.contains("$evidence.verdict = \"NOT_RUN\""),
+        "a non-lifecycle absent-server must record NOT_RUN:\n{after}"
+    );
+    assert!(
+        !code.contains("\"REFUSED_EXPECTED\", \"UNSUPPORTED\", \"RECORDED\", \"NOT_RUN\""),
+        "NOT_RUN must never join the pass tokens"
+    );
 }

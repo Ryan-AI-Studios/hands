@@ -2590,7 +2590,7 @@ mod tests {
     fn manifest_permissions_unchanged() {
         let manifest: serde_json::Value =
             serde_json::from_str(include_str!("../extension/manifest.json")).expect("manifest");
-        assert_eq!(manifest["version"], "0.4.0");
+        assert_eq!(manifest["version"], "0.4.1");
         assert_eq!(
             manifest["permissions"],
             serde_json::json!(["nativeMessaging"])

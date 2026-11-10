@@ -2800,6 +2800,7 @@ mod tests {
             transform: report,
             identity,
             snapshot: None,
+            rev: None,
         }
     }
 }

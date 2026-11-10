@@ -116,6 +116,9 @@ pub struct ChromeMap {
     pub(crate) identity: Option<PageIdentity>,
     /// Snapshot-bound target identity (tab/document/snapshot), when the extension supplied it.
     pub snapshot: Option<SnapshotBinding>,
+    /// 0130 public content-revision token `<tab>.<doc>.<rev>.<fp16>.<shape4>`. Present only on an
+    /// agent-facing observe from an extension that advertised `rev_v:1` and replied with a tab.
+    pub(crate) rev: Option<String>,
 }
 
 /// Page identity captured from the same snapshot reply as the transform. Used only by
@@ -333,6 +336,12 @@ struct RawSnapshot {
     frames_total: Option<usize>,
     #[serde(default)]
     frames_truncated: Option<bool>,
+    /// 0130 content-revision capability (`rev_v:1`) and the extension core
+    /// `<doc>.<rev>.<fp16>.<shape4>`. Absent on an old extension and on non-stored replies.
+    #[serde(default)]
+    rev_v: Option<u32>,
+    #[serde(default)]
+    rev_core: Option<String>,
 }
 
 /// Fixture/diagnostic **listing** origin using the legacy `outer-inner` formula.
@@ -946,6 +955,7 @@ fn snapshot_binding(
 }
 
 fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: String) -> ChromeMap {
+    let rev = crate::changes::observe_rev(raw.rev_v, raw.tab, raw.rev_core.as_deref());
     let map = map_for_raw(&raw, hwnd, fixture, obs);
     let mut snapshot = snapshot_binding(&raw, hwnd, fixture);
     let link_rows = raw.frames.clone();
@@ -1090,6 +1100,7 @@ fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: Strin
         transform: Some(map.report.clone()),
         identity: Some(identity),
         snapshot,
+        rev,
     }
 }
 
@@ -1569,6 +1580,8 @@ pub(crate) fn hit_from_scoped_reply(
         compose_assessment(assessment, &frame_rows, frame).map_err(|err| frame_report(r, err))?;
     }
     let raw = RawSnapshot {
+        rev_v: None,
+        rev_core: None,
         url: top_url,
         title: top_title,
         main_text: None,
@@ -2985,6 +2998,32 @@ fn parse_host_reply(
     Ok(map_from_raw(raw, hwnd, false, obs))
 }
 
+/// 0130 `changes`: one read-only `snapshot` poll routed by the token's tab. `store:false` keeps the
+/// extension's baseline and refs untouched; `frames` is never set, so there is no fan-out. The reply
+/// is returned raw: a poll has no `metrics`, so it cannot use `RawSnapshot`.
+pub fn poll_changes(
+    tab: u32,
+    since: &str,
+    detail: Detail,
+) -> Result<serde_json::Value, HandsError> {
+    if snapshot_env().is_some() {
+        return Err(HandsError::Chrome(
+            "changes needs the live Chrome host; the HANDS_CHROME_SNAPSHOT fixture has no revision"
+                .into(),
+        ));
+    }
+    let mut req = serde_json::json!({
+        "op": "snapshot",
+        "store": false,
+        "tab": tab,
+        "changes_since": since,
+    });
+    if detail == Detail::Dom {
+        req["detail"] = serde_json::Value::String("dom".into());
+    }
+    pipe_request(&req)
+}
+
 fn pipe_request(req: &serde_json::Value) -> Result<serde_json::Value, HandsError> {
     let deadline = Instant::now() + Duration::from_millis(u64::from(CLIENT_TIMEOUT_MS));
     let name = pipe_name();
@@ -4279,6 +4318,7 @@ mod tests {
                 transform: None,
                 identity: None,
                 snapshot: None,
+                rev: None,
             }))
             .chrome_hint(),
             None
@@ -5008,6 +5048,62 @@ mod tests {
     }
 
     #[test]
+    fn observe_rev_is_composed_only_from_rev_v_tab_and_a_valid_core() {
+        let core = "5678.1.0123456789abcdef.0fa0";
+        let with = |extra: serde_json::Value| {
+            let mut base = serde_json::json!({"stored": true, "tab": 12, "window": 45,
+                "frame": 0, "metrics": {}, "doc": "5678", "snap": "a1b2c3d4"});
+            for (k, v) in extra.as_object().expect("object") {
+                base[k] = v.clone();
+            }
+            map_from_raw_json(&base.to_string(), None, "obs".into()).rev
+        };
+        assert_eq!(
+            with(serde_json::json!({"rev_v": 1, "rev_core": core})).as_deref(),
+            Some("12.5678.1.0123456789abcdef.0fa0")
+        );
+        // An old extension (no rev_v) and a reply with no tab never emit a revision.
+        assert!(with(serde_json::json!({"rev_core": core})).is_none());
+        assert!(
+            with(serde_json::json!({"rev_v": 1, "rev_core": core, "tab": null})).is_none(),
+            "no tab is no unkeyed token"
+        );
+        // A malformed core (uppercase, wrong arity) is never composed.
+        assert!(
+            with(serde_json::json!({"rev_v": 1, "rev_core": "5678.1.0123456789ABCDEF.0fa0"}))
+                .is_none()
+        );
+        assert!(
+            with(serde_json::json!({"rev_v": 1, "rev_core": "5678.1.0123456789abcdef"})).is_none()
+        );
+    }
+
+    #[test]
+    fn poll_changes_request_is_store_false_tab_routed_and_frameless() {
+        // Source lock: the one poll request is read-only, routed by tab and carries no `frames`.
+        let src = include_str!("chrome.rs");
+        let start = src.find("pub fn poll_changes(").expect("poll_changes");
+        let end = src[start..]
+            .find("fn pipe_request(")
+            .map(|i| start + i)
+            .expect("end");
+        let body = &src[start..end];
+        assert!(body.contains("\"store\": false"), "poll must not store");
+        assert!(
+            body.contains("\"tab\": tab"),
+            "poll routes by the token's tab"
+        );
+        assert!(
+            !body.contains("\"frames\""),
+            "poll must not fan out to frames"
+        );
+        assert!(
+            !body.contains("try_snapshot"),
+            "poll must not use the observe snapshot path"
+        );
+    }
+
+    #[test]
     fn non_storing_frame_late_row_holds_the_yield_state() {
         let raw = serde_json::json!({
             "stored": false,
@@ -5703,8 +5799,19 @@ mod tests {
             .expect("buildResolve");
         let body = &src[start..end];
         assert!(!body.contains("nodePayload("));
-        assert!(body.contains("keyPayload("));
-        assert!(body.contains("snapshotKey("));
+        // 0130 moved the per-node payload/key loop into collectElements(); buildSnapshot and the
+        // changes poll both call it, so the payload is still computed once per walk.
+        assert!(body.contains("collectElements("));
+        let helper = src
+            .find("function collectElements(")
+            .expect("collectElements");
+        let helper_end = src[helper..]
+            .find("function utf8Length")
+            .map(|i| helper + i)
+            .expect("helper end");
+        let helper_body = &src[helper..helper_end];
+        assert!(helper_body.contains("keyPayload("));
+        assert!(helper_body.contains("snapshotKey("));
     }
 
     // -------------------------------------------------------------- 0124 postcheck

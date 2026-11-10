@@ -1600,6 +1600,50 @@ mod tests {
     }
 
     #[test]
+    fn confirm_blind_category_parses_and_is_listed() {
+        // 0121 low absorb: `confirm --category blind` must parse and be advertised.
+        assert_eq!(
+            hands::classify::Category::parse("blind").expect("blind category"),
+            hands::classify::Category::Blind
+        );
+        let cmd = Cli::command();
+        let confirm = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "confirm")
+            .expect("confirm subcommand");
+        let help = confirm.clone().render_long_help().to_string();
+        assert!(
+            help.contains("blind"),
+            "confirm --help must list the blind category:\n{help}"
+        );
+        let cli = Cli::try_parse_from([
+            "hands",
+            "confirm",
+            "--domain",
+            "desktop",
+            "--category",
+            "blind",
+            "--mode",
+            "once",
+            "--revoke",
+        ])
+        .expect("confirm --category blind must parse");
+        match cli.command {
+            Command::Confirm {
+                category,
+                mode,
+                revoke,
+                ..
+            } => {
+                assert_eq!(category.as_deref(), Some("blind"));
+                assert_eq!(mode.map(ConfirmModeArg::as_str), Some("once"));
+                assert!(revoke);
+            }
+            _ => panic!("expected Confirm"),
+        }
+    }
+
+    #[test]
     fn scroll_dy_help_is_not_numeric() {
         if let Ok(cli) = Cli::try_parse_from(["hands", "scroll", "--dy", "--help"]) {
             match cli.command {

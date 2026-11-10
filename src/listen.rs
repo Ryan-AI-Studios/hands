@@ -391,7 +391,8 @@ pub fn pcm_to_wav_bytes(pcm: &Pcm) -> Vec<u8> {
 
 fn write_wav_best_effort(pcm: &Pcm) -> Option<String> {
     let dir = listen_dir()?;
-    let _ = std::fs::create_dir_all(&dir);
+    // Same %LOCALAPPDATA%\hands root: keep the explicit Medium label (0126 R3).
+    let _ = crate::logs::ensure_private_dir(&dir);
     let path = dir.join(format!("{}.wav", utc_compact()));
     let bytes = pcm_to_wav_bytes(pcm);
     std::fs::write(&path, bytes).ok()?;

@@ -95,7 +95,7 @@ fn click_help_advertises_require_interactable() {
     let text = String::from_utf8_lossy(&output.stdout);
     for needle in [
         "--require-interactable",
-        "chr: only",
+        "chr:/sref1:c only",
         "interactable_checked",
     ] {
         assert!(

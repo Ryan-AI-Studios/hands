@@ -23,6 +23,7 @@ pub mod foreground;
 pub mod hid;
 pub mod hittest;
 pub mod host_doctor;
+pub mod identity;
 pub mod input;
 pub mod lease;
 pub mod listen;

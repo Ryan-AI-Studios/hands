@@ -187,6 +187,7 @@ impl RawNode {
             rect: self.rect,
             grid: None,
             unnamed,
+            sref: None,
         })
     }
 
@@ -233,6 +234,9 @@ pub struct Element {
     pub grid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unnamed: Option<bool>,
+    /// Canonical snapshot-bound ref (`sref1:`); `id` stays the legacy handle.
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    pub sref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

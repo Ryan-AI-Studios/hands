@@ -120,6 +120,8 @@ pub struct ExecutedStep {
     pub settled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::identity::IdentityReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,6 +172,7 @@ pub struct StepOutcome {
     pub name: Option<String>,
     pub window: Option<String>,
     pub reason: Option<String>,
+    pub identity: Option<crate::identity::IdentityReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +320,7 @@ pub fn sequence_with(
                         navigated: false,
                         settled: None,
                         reason: None,
+                        identity: None,
                     });
                     if hooks.record_steps {
                         record_step(&session_id, "observe", true, None, None)?;
@@ -334,6 +338,7 @@ pub fn sequence_with(
                         navigated: false,
                         settled: None,
                         reason: None,
+                        identity: None,
                     });
                     if hooks.record_steps {
                         record_step(
@@ -390,6 +395,7 @@ pub fn sequence_with(
                     navigated: false,
                     settled: None,
                     reason: None,
+                    identity: None,
                 });
                 if hooks.record_steps {
                     record_step(&session_id, step.tool(), false, Some(&msg), type_len(step))?;
@@ -747,6 +753,7 @@ fn compact_row(step: &SequenceStep, outcome: &StepOutcome) -> ExecutedStep {
             _ => None,
         },
         reason: outcome.reason.clone(),
+        identity: outcome.identity.clone(),
     }
 }
 
@@ -888,6 +895,7 @@ fn from_actuate(env: ActuateEnvelope) -> StepOutcome {
         id: env.target.id,
         name: None,
         window: None,
+        identity: env.identity,
     }
 }
 
@@ -906,6 +914,7 @@ fn from_activate(env: ActivateEnvelope) -> StepOutcome {
         name: None,
         window: env.window.map(|w| format!("hwnd:{}", w.hwnd)),
         reason: env.reason,
+        identity: None,
     }
 }
 
@@ -1010,6 +1019,7 @@ fn live_observe(session_id: &str) -> Result<ObserveSummary, HandsError> {
         card_offset: 0,
         scope: crate::observe::ObserveScope::Fg,
         fg_preview: false,
+        chrome_store: Some(false),
     })?;
     Ok(ObserveSummary {
         observe_path: env.observe_path,
@@ -1440,6 +1450,7 @@ mod tests {
                     navigated: false,
                     settled: Some(true),
                     reason: None,
+                    identity: None,
                 })
                 .collect(),
             fence: None,
@@ -1660,5 +1671,64 @@ mod tests {
                 "{name} must hold TEST_LOCK outside run_hooks so reset_for_test callers cannot wipe its key"
             );
         }
+    }
+
+    fn identity_out() -> StepOutcome {
+        StepOutcome {
+            ok: true,
+            foregrounded: Some(true),
+            settled: Some(true),
+            identity: Some(crate::identity::IdentityReport::legacy()),
+            ..StepOutcome::default()
+        }
+    }
+
+    #[test]
+    fn scoped_ref_step_propagates_identity() {
+        let env = crate::actuate::refuse_identity(
+            "seq-identity".into(),
+            crate::actuate::ActuateTarget {
+                kind: "element".into(),
+                id: Some("sref1:c.12.0.9f3a.a1b2c3d4.7".into()),
+                x: 0,
+                y: 0,
+            },
+            crate::identity::IdentityReport::chrome_failure(
+                &crate::identity::SnapshotRef::Chrome {
+                    tab: 12,
+                    frame: 0,
+                    doc: "9f3a".into(),
+                    snap: "a1b2c3d4".into(),
+                    idx: 7,
+                },
+                crate::identity::IdentityState::Stale,
+                "stale_element",
+            ),
+        )
+        .unwrap();
+        let outcome = from_actuate(env);
+        assert!(outcome.identity.is_some());
+        assert!(!outcome.ok);
+    }
+
+    #[test]
+    fn identity_step_fits_compact_envelope() {
+        let mut steps = Vec::new();
+        for i in 0..8 {
+            steps.push(json!({"tool":"click","x":i,"y":i}));
+        }
+        let hooks = SequenceHooks {
+            click: |_, _| Ok(identity_out()),
+            ..test_hooks()
+        };
+        let env = run_hooks("seq-identity-budget", Value::Array(steps), hooks);
+        assert_eq!(env.stop_reason, StopReason::Completed);
+        assert!(env.executed_steps.iter().all(|s| s.identity.is_some()));
+        let json = serialize_envelope(&env).unwrap();
+        assert!(
+            json.len() <= ENVELOPE_MAX_BYTES,
+            "envelope {} bytes",
+            json.len()
+        );
     }
 }

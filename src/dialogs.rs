@@ -172,6 +172,7 @@ mod tests {
                 h: 16,
             },
             grid: None,
+            sref: None,
         }
     }
 

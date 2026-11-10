@@ -88,6 +88,7 @@ pub fn run_solve(session_id: String) -> Result<ChallengeEnvelope, HandsError> {
             card_offset: 0,
             scope: crate::observe::ObserveScope::Fg,
             fg_preview: false,
+            chrome_store: Some(false),
         })
     };
     let click = |x: i32, y: i32| {
@@ -694,6 +695,7 @@ mod tests {
                     None
                 },
             },
+            snapshot: None,
         }
     }
 
@@ -710,6 +712,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         }
     }
 

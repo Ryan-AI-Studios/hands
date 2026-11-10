@@ -2,6 +2,7 @@
 
 use crate::chrome;
 use crate::error::HandsError;
+use crate::identity::{IdentityReport, IdentityState, SnapshotRef};
 use crate::point::{
     CssPoint, CssRect, PointContract, PointSource, ViewportMap, contract_for, explicit_contract,
     map_point, map_rect,
@@ -12,6 +13,7 @@ use crate::uia::{self, ResolvedElement};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     ElementId(String),
+    Scoped(SnapshotRef),
     Grid { col: i32, row: i32 },
     Pixel { x: i32, y: i32 },
 }
@@ -33,6 +35,12 @@ pub struct ResolvedTarget {
     pub(crate) map: Option<ViewportMap>,
     /// Optional DOM assessment carried from the same resolve reply.
     pub assessment: Option<crate::hittest::Assessment>,
+    /// Identity report for scoped/legacy element targets. Grid/pixel omit it.
+    pub identity: Option<IdentityReport>,
+    /// RuntimeId kept from a scoped UIA resolve for the semantic worker dispatch.
+    pub(crate) uia_runtime_id: Option<Vec<i32>>,
+    /// Own-role/name fingerprint expected by a scoped UIA ref.
+    pub(crate) uia_expected_fp: Option<u32>,
 }
 
 /// Resolve outcome. A transform-invalid `chr:` is an explicit unresolved refusal carrying
@@ -45,6 +53,12 @@ pub enum TargetOutcome {
         contract: Box<PointContract>,
         hwnd: Option<isize>,
         assessment: Option<Box<crate::hittest::Assessment>>,
+        identity: Option<IdentityReport>,
+    },
+    /// Identity could not be proven (stale/ambiguous/unknown). Nothing was sent.
+    Identity {
+        target: Target,
+        report: IdentityReport,
     },
 }
 
@@ -53,6 +67,7 @@ impl TargetOutcome {
         match self {
             Self::Resolved(r) => r.contract.as_ref(),
             Self::Unresolved { contract, .. } => Some(contract.as_ref()),
+            Self::Identity { .. } => None,
         }
     }
 
@@ -60,6 +75,15 @@ impl TargetOutcome {
         match self {
             Self::Resolved(r) => r.hwnd,
             Self::Unresolved { hwnd, .. } => *hwnd,
+            Self::Identity { .. } => None,
+        }
+    }
+
+    pub fn identity(&self) -> Option<&IdentityReport> {
+        match self {
+            Self::Resolved(r) => r.identity.as_ref(),
+            Self::Unresolved { identity, .. } => identity.as_ref(),
+            Self::Identity { report, .. } => Some(report),
         }
     }
 }
@@ -72,6 +96,14 @@ impl Target {
         x: Option<i32>,
         y: Option<i32>,
     ) -> Result<Self, HandsError> {
+        if let Some(raw) = element_id
+            && raw != raw.trim()
+            && raw.trim_start().starts_with("sref")
+        {
+            return Err(HandsError::Target(
+                "sref1: malformed_ref: whitespace is not canonical".into(),
+            ));
+        }
         let el = nonempty(element_id);
         let g = nonempty(grid);
         let xy = match (x, y) {
@@ -108,6 +140,12 @@ impl Target {
                     .transform
                     .reason
                     .unwrap_or_else(|| "transform is not valid".into()),
+            )),
+            TargetOutcome::Identity { report, .. } => Err(HandsError::Target(
+                report
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| report.state_token().to_string()),
             )),
         }
     }
@@ -151,6 +189,7 @@ impl Target {
                                 contract: Box::new(hit.contract),
                                 hwnd: hit.hwnd,
                                 assessment: hit.assessment.map(Box::new),
+                                identity: hit.identity,
                             });
                         }
                         return Ok(TargetOutcome::Resolved(Box::new(hit.into_resolved())));
@@ -160,12 +199,82 @@ impl Target {
                         contract: Box::new(hit.contract),
                         hwnd: hit.hwnd,
                         assessment: hit.assessment.map(Box::new),
+                        identity: hit.identity,
                     });
                 }
                 let runtime_id = parse_runtime_id(id)?;
                 let found = uia::resolve_runtime_id(&runtime_id)?;
-                finish_element(id, found, space).map(|r| TargetOutcome::Resolved(Box::new(r)))
+                finish_element(id, found, space, Some(IdentityReport::legacy()), None, None)
+                    .map(|r| TargetOutcome::Resolved(Box::new(r)))
             }
+            Self::Scoped(r) => match r {
+                SnapshotRef::Chrome { frame, .. } => {
+                    if *frame != 0 {
+                        return Ok(TargetOutcome::Identity {
+                            target: self.clone(),
+                            report: IdentityReport::chrome_failure(
+                                r,
+                                IdentityState::Unknown,
+                                "frame_unsupported",
+                            ),
+                        });
+                    }
+                    match chrome::try_resolve_ref(r, hwnd, assess, samples) {
+                        Ok(mut hit) => {
+                            if hit.contract.transform.valid {
+                                let hit_id = hit.id.clone();
+                                if finish_chr(&hit_id, &mut hit, space)?.is_some() {
+                                    return Ok(TargetOutcome::Unresolved {
+                                        target: self.clone(),
+                                        contract: Box::new(hit.contract),
+                                        hwnd: hit.hwnd,
+                                        assessment: hit.assessment.map(Box::new),
+                                        identity: hit.identity,
+                                    });
+                                }
+                                return Ok(TargetOutcome::Resolved(Box::new(hit.into_resolved())));
+                            }
+                            Ok(TargetOutcome::Unresolved {
+                                target: self.clone(),
+                                contract: Box::new(hit.contract),
+                                hwnd: hit.hwnd,
+                                assessment: hit.assessment.map(Box::new),
+                                identity: hit.identity,
+                            })
+                        }
+                        Err(report) => Ok(TargetOutcome::Identity {
+                            target: self.clone(),
+                            report,
+                        }),
+                    }
+                }
+                SnapshotRef::Uia {
+                    hwnd: walk_hwnd,
+                    fp,
+                    ridh,
+                } => {
+                    let deadline = std::time::Duration::from_millis(500);
+                    match uia::resolve_scoped(*walk_hwnd as isize, ridh, fp, deadline) {
+                        Ok(found) => {
+                            let expected = found.own_fingerprint();
+                            let runtime_id = found.runtime_id.clone();
+                            finish_element(
+                                &r.to_string(),
+                                found,
+                                space,
+                                Some(IdentityReport::exact_uia(r)),
+                                Some(runtime_id),
+                                Some(expected),
+                            )
+                            .map(|resolved| TargetOutcome::Resolved(Box::new(resolved)))
+                        }
+                        Err(failure) => Ok(TargetOutcome::Identity {
+                            target: self.clone(),
+                            report: IdentityReport::uia_failure(r, failure.state, failure.reason),
+                        }),
+                    }
+                }
+            },
             Self::Grid { col, row } => {
                 let rect = space.cell_rect(*col, *row);
                 if rect.area() == 0 || !space.contains(rect) {
@@ -197,6 +306,9 @@ impl Target {
                     )),
                     map: None,
                     assessment: None,
+                    identity: None,
+                    uia_runtime_id: None,
+                    uia_expected_fp: None,
                 })))
             }
             Self::Pixel { x, y } => {
@@ -232,6 +344,9 @@ impl Target {
                     )),
                     map: None,
                     assessment: None,
+                    identity: None,
+                    uia_runtime_id: None,
+                    uia_expected_fp: None,
                 })))
             }
         }
@@ -240,8 +355,15 @@ impl Target {
 
 impl chrome::ChromeHit {
     fn into_resolved(self) -> ResolvedTarget {
+        let target = if self.id.starts_with("sref1:") {
+            SnapshotRef::parse(&self.id)
+                .map(Target::Scoped)
+                .unwrap_or_else(|_| Target::ElementId(self.id.clone()))
+        } else {
+            Target::ElementId(self.id.clone())
+        };
         ResolvedTarget {
-            target: Target::ElementId(self.id.clone()),
+            target,
             kind: "element",
             id: Some(self.id),
             x: self.rect.center().0,
@@ -255,6 +377,9 @@ impl chrome::ChromeHit {
             contract: Some(self.contract),
             map: self.map,
             assessment: self.assessment,
+            identity: self.identity,
+            uia_runtime_id: None,
+            uia_expected_fp: None,
         }
     }
 }
@@ -316,6 +441,9 @@ fn finish_element(
     id: &str,
     found: ResolvedElement,
     space: Space,
+    identity: Option<IdentityReport>,
+    uia_runtime_id: Option<Vec<i32>>,
+    uia_expected_fp: Option<u32>,
 ) -> Result<ResolvedTarget, HandsError> {
     if found.rect.area() == 0 {
         return Err(HandsError::Target(format!(
@@ -328,8 +456,15 @@ fn finish_element(
             "element {id} center is outside the virtual screen"
         )));
     }
+    let target = if id.starts_with("sref1:") {
+        SnapshotRef::parse(id)
+            .map(Target::Scoped)
+            .unwrap_or_else(|_| Target::ElementId(id.to_string()))
+    } else {
+        Target::ElementId(id.to_string())
+    };
     Ok(ResolvedTarget {
-        target: Target::ElementId(id.to_string()),
+        target,
         kind: "element",
         id: Some(id.to_string()),
         x,
@@ -346,10 +481,16 @@ fn finish_element(
         )),
         map: None,
         assessment: None,
+        identity,
+        uia_runtime_id,
+        uia_expected_fp,
     })
 }
 
 pub fn parse_element_id(id: &str) -> Result<Target, HandsError> {
+    if id.starts_with("sref") {
+        return SnapshotRef::parse(id).map(Target::Scoped);
+    }
     if let Some(rest) = id.strip_prefix("uia:") {
         if rest.is_empty() {
             return Err(HandsError::Target("element id is a bare uia:".into()));
@@ -512,6 +653,7 @@ mod tests {
                 assert_eq!(contract.css, Some(CssPoint::new(110.0, 36.0)));
             }
             TargetOutcome::Resolved(_) => panic!("fixture must never be a click contract"),
+            TargetOutcome::Identity { .. } => panic!("chr: must not be an identity failure"),
         }
     }
 
@@ -682,6 +824,7 @@ mod tests {
             hwnd,
             map: None,
             assessment: None,
+            identity: None,
         }
     }
 
@@ -727,6 +870,7 @@ mod tests {
                 assert!(contract.physical.is_none());
             }
             TargetOutcome::Resolved(_) => panic!("invalid chr: must not fabricate geometry"),
+            TargetOutcome::Identity { .. } => panic!("chr: must not be an identity failure"),
         }
     }
 
@@ -799,6 +943,302 @@ mod tests {
                 contract.physical.map(|p| (p.x, p.y)),
                 Some((resolved.x, resolved.y))
             );
+        }
+    }
+
+    // ------------------------------------------------------- scoped identity
+
+    fn scoped_chrome_hit(r: &SnapshotRef, contract: PointContract) -> chrome::ChromeHit {
+        let map = valid_map();
+        chrome::ChromeHit {
+            id: r.to_string(),
+            name: "Sign in".into(),
+            role: "Button".into(),
+            rect: Rect {
+                x: 100,
+                y: 100,
+                w: 100,
+                h: 100,
+            },
+            css_rect: CssRect {
+                left: 10.0,
+                top: 10.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            css_point: CssPoint::new(60.0, 60.0),
+            contract,
+            hwnd: Some(0x1234),
+            map: Some(map),
+            assessment: None,
+            identity: Some(crate::identity::IdentityReport::exact_chrome(r)),
+        }
+    }
+
+    fn chrome_ref(idx: u32) -> SnapshotRef {
+        SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx,
+        }
+    }
+
+    #[test]
+    fn scoped_chrome_ref_exact() {
+        let r = chrome_ref(7);
+        let map = valid_map();
+        let contract = crate::point::contract_for(&map, CssPoint::new(60.0, 60.0));
+        chrome::set_scoped_resolve_stub(Some(Ok(scoped_chrome_hit(&r, contract))));
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let outcome = Target::Scoped(r.clone())
+            .resolve_with(space, Some(0x1234))
+            .unwrap();
+        chrome::set_scoped_resolve_stub(None);
+        match outcome {
+            TargetOutcome::Resolved(resolved) => {
+                assert_eq!(resolved.id.as_deref(), Some(r.to_string().as_str()));
+                let identity = resolved.identity.expect("identity");
+                assert_eq!(identity.binding, crate::identity::Binding::Scoped);
+                assert_eq!(identity.state, IdentityState::Exact);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_chrome_fixture_ref_resolves_identity_and_refuses_transform() {
+        let g = chrome::EnvGuard::lock();
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chrome-scoped.json");
+        g.set_snapshot(Some(&path));
+        let r = SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 0,
+        };
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let outcome = Target::Scoped(r.clone()).resolve_with(space, None).unwrap();
+        g.set_snapshot(None);
+        match outcome {
+            TargetOutcome::Unresolved {
+                contract,
+                identity: Some(identity),
+                ..
+            } => {
+                assert_eq!(
+                    contract.transform.reason.as_deref(),
+                    Some("fixture_snapshot")
+                );
+                assert_eq!(identity.binding, crate::identity::Binding::Scoped);
+                assert_eq!(identity.state, IdentityState::Exact);
+                assert_eq!(identity.r#ref.as_deref(), Some(r.to_string().as_str()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_chrome_ref_stale_is_identity_failure() {
+        let r = chrome_ref(7);
+        chrome::set_scoped_resolve_stub(Some(Err(
+            crate::identity::IdentityReport::chrome_failure(
+                &r,
+                IdentityState::Stale,
+                "stale_element",
+            ),
+        )));
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let outcome = Target::Scoped(r).resolve_with(space, Some(0x1234)).unwrap();
+        chrome::set_scoped_resolve_stub(None);
+        match outcome {
+            TargetOutcome::Identity { report, .. } => {
+                assert_eq!(report.state, IdentityState::Stale);
+                assert_eq!(report.reason.as_deref(), Some("stale_element"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_chrome_ref_unknown_is_identity_failure() {
+        let r = chrome_ref(7);
+        chrome::set_scoped_resolve_stub(Some(Err(
+            crate::identity::IdentityReport::chrome_failure(
+                &r,
+                IdentityState::Unknown,
+                "resolve_timeout",
+            ),
+        )));
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let outcome = Target::Scoped(r).resolve_with(space, Some(0x1234)).unwrap();
+        chrome::set_scoped_resolve_stub(None);
+        match outcome {
+            TargetOutcome::Identity { report, .. } => {
+                assert_eq!(report.state, IdentityState::Unknown);
+                assert!(report.retryable);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_sref_is_hard_error_not_legacy() {
+        for bad in [
+            "sref1:c.0.0.0000.00000000.0",
+            "sref1:c.12.0.9F3A.a1b2c3d4.7",
+            "sref2:c.12.0.9f3a.a1b2c3d4.7",
+            "sref1:c.12.0.9f3a.a1b2c3d4",
+            "sref1:u.0.7d0e1f22.42a1b2c3",
+        ] {
+            let err = Target::parse(Some(bad), None, None, None).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("sref1:"), "{bad}: {msg}");
+            assert!(!msg.contains("chr:"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn legacy_chr_and_uia_still_resolve() {
+        assert!(matches!(
+            Target::parse(Some("chr:0"), None, None, None).unwrap(),
+            Target::ElementId(id) if id == "chr:0"
+        ));
+        assert!(matches!(
+            Target::parse(Some("uia:42.1"), None, None, None).unwrap(),
+            Target::ElementId(id) if id == "uia:42.1"
+        ));
+        assert_eq!(
+            crate::identity::parse_legacy("chr:0"),
+            Some(crate::identity::LegacyKind::Chr(0))
+        );
+    }
+
+    fn uia_ref_with_fp(fp: &str) -> SnapshotRef {
+        SnapshotRef::Uia {
+            hwnd: 0x1234,
+            fp: fp.into(),
+            ridh: "deadbeef".into(),
+        }
+    }
+
+    fn scoped_uia_found() -> uia::ResolvedElement {
+        uia::ResolvedElement {
+            rect: Rect {
+                x: 10,
+                y: 20,
+                w: 60,
+                h: 20,
+            },
+            name: "Send".into(),
+            role: "Button".into(),
+            hwnd: Some(0x1234),
+            runtime_id: vec![1, 2],
+            own_name: "Send".into(),
+            own_role: "Button".into(),
+            is_password: false,
+        }
+    }
+
+    fn uia_fp(found: &uia::ResolvedElement) -> String {
+        format!("{:08x}", found.own_fingerprint())
+    }
+
+    #[test]
+    fn scoped_uia_ref_window_mismatch_is_stale() {
+        uia::set_scoped_uia_hook(Some(|_, _, _| {
+            Err(uia::ScopedFailure {
+                state: IdentityState::Stale,
+                reason: "window_mismatch",
+            })
+        }));
+        let r = uia_ref_with_fp("00000000");
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let outcome = Target::Scoped(r).resolve_with(space, None).unwrap();
+        uia::set_scoped_uia_hook(None);
+        match outcome {
+            TargetOutcome::Identity { report, .. } => {
+                assert_eq!(report.state, IdentityState::Stale);
+                assert_eq!(report.reason.as_deref(), Some("window_mismatch"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_uia_ref_identity_mismatch_is_stale() {
+        uia::set_scoped_uia_hook(Some(|_, _, _| {
+            Err(uia::ScopedFailure {
+                state: IdentityState::Stale,
+                reason: "identity_mismatch",
+            })
+        }));
+        let r = uia_ref_with_fp("00000000");
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let outcome = Target::Scoped(r).resolve_with(space, None).unwrap();
+        uia::set_scoped_uia_hook(None);
+        assert!(
+            matches!(outcome, TargetOutcome::Identity { report, .. } if report.reason.as_deref() == Some("identity_mismatch"))
+        );
+    }
+
+    #[test]
+    fn scoped_uia_ref_duplicate_is_ambiguous() {
+        uia::set_scoped_uia_hook(Some(|_, _, _| {
+            Err(uia::ScopedFailure {
+                state: IdentityState::Ambiguous,
+                reason: "duplicate_runtime_id",
+            })
+        }));
+        let r = uia_ref_with_fp("00000000");
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let outcome = Target::Scoped(r).resolve_with(space, None).unwrap();
+        uia::set_scoped_uia_hook(None);
+        assert!(
+            matches!(outcome, TargetOutcome::Identity { report, .. } if report.state == IdentityState::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn scoped_uia_ref_timeout_is_unknown() {
+        uia::set_scoped_uia_hook(Some(|_, _, _| {
+            Err(uia::ScopedFailure {
+                state: IdentityState::Unknown,
+                reason: "provider_timeout",
+            })
+        }));
+        let r = uia_ref_with_fp("00000000");
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let outcome = Target::Scoped(r).resolve_with(space, None).unwrap();
+        uia::set_scoped_uia_hook(None);
+        assert!(
+            matches!(outcome, TargetOutcome::Identity { report, .. } if report.state == IdentityState::Unknown && !report.retryable)
+        );
+    }
+
+    #[test]
+    fn scoped_uia_ref_exact_keeps_runtime_id_for_dispatch() {
+        let found = scoped_uia_found();
+        let fp = uia_fp(&found);
+        uia::set_scoped_uia_hook(Some(|_, _, _| Ok(scoped_uia_found())));
+        let r = uia_ref_with_fp(&fp);
+        let space = Space::new(0, 0, 1920, 1080).unwrap();
+        let outcome = Target::Scoped(r.clone()).resolve_with(space, None).unwrap();
+        uia::set_scoped_uia_hook(None);
+        match outcome {
+            TargetOutcome::Resolved(resolved) => {
+                assert_eq!(resolved.id.as_deref(), Some(r.to_string().as_str()));
+                assert_eq!(resolved.uia_runtime_id, Some(vec![1, 2]));
+                assert!(resolved.uia_expected_fp.is_some());
+                assert_eq!(
+                    resolved.identity.as_ref().map(|i| i.state),
+                    Some(IdentityState::Exact)
+                );
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 }

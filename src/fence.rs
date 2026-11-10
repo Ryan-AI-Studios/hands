@@ -341,6 +341,9 @@ mod tests {
             contract: None,
             map: None,
             assessment: None,
+            identity: None,
+            uia_runtime_id: None,
+            uia_expected_fp: None,
         }
     }
 
@@ -522,6 +525,9 @@ mod tests {
             contract: None,
             map: None,
             assessment: None,
+            identity: None,
+            uia_runtime_id: None,
+            uia_expected_fp: None,
         }
     }
 

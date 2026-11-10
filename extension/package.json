@@ -1,0 +1,9 @@
+{
+  "name": "hands-extension-tests",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Read-only executable harness for the Hands MV3 extension logic.",
+  "scripts": {
+    "test": "node tests/harness.js"
+  }
+}

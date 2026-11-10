@@ -34,10 +34,11 @@ use crate::challenge;
 use crate::error::HandsError;
 use crate::fence::{self, FenceInfo};
 use crate::foreground;
+use crate::identity::{IdentityReport, IdentityState, SnapshotRef};
 use crate::input;
 use crate::logs::{self, LogFence, LogTarget};
 use crate::space::{ensure_dpi, virtual_screen};
-use crate::target::{ResolvedTarget, Target};
+use crate::target::{ResolvedTarget, Target, TargetOutcome};
 use crate::uia;
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 3000;
@@ -127,6 +128,7 @@ pub(crate) struct SemanticRequest {
     pub action: SemanticAction,
     pub value: Option<String>,
     pub timeout: Duration,
+    pub expected_fp: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +143,8 @@ pub(crate) struct SemanticResult {
     pub foreground_changed: bool,
     pub pointer_moved: bool,
     pub error: Option<SemanticError>,
+    /// Pre-dispatch worker identity failure (state, closed reason), if any.
+    pub identity: Option<(IdentityState, &'static str)>,
 }
 
 impl SemanticResult {
@@ -154,6 +158,7 @@ impl SemanticResult {
             foreground_changed: false,
             pointer_moved: false,
             error: Some(SemanticError { code }),
+            identity: identity_for_code(code),
         }
     }
 
@@ -167,7 +172,18 @@ impl SemanticResult {
             foreground_changed: false,
             pointer_moved: false,
             error: Some(SemanticError { code }),
+            identity: None,
         }
+    }
+}
+
+fn identity_for_code(code: &'static str) -> Option<(IdentityState, &'static str)> {
+    match code {
+        "stale_identity" => Some((IdentityState::Stale, "stale_identity")),
+        "stale_target" | "stale_element" => Some((IdentityState::Stale, "stale_element")),
+        "duplicate_runtime_id" => Some((IdentityState::Ambiguous, "duplicate_runtime_id")),
+        "provider_timeout" | "window_unreadable" => Some((IdentityState::Unknown, code)),
+        _ => None,
     }
 }
 
@@ -247,6 +263,12 @@ pub(crate) fn resolve_code(err: &HandsError) -> &'static str {
     let message = err.tool_message();
     if message.starts_with("no UIA element with RuntimeId") {
         "stale_target"
+    } else if message.starts_with("multiple UIA elements with RuntimeId") {
+        "duplicate_runtime_id"
+    } else if message.starts_with("UIA walk cap reached") {
+        "provider_timeout"
+    } else if message.starts_with("window_unreadable") {
+        "window_unreadable"
     } else {
         // Zero-area / off-screen-centre / any other resolution failure.
         "target_unavailable"
@@ -355,6 +377,7 @@ fn base_envelope(
         verified: false,
         assessment: None,
         interactable_checked: None,
+        identity: None,
         semantic: Some(SemanticInfo {
             action: action.as_str().to_string(),
             delivery: Delivery::Undelivered,
@@ -362,6 +385,7 @@ fn base_envelope(
             foreground_changed: false,
             pointer_moved: false,
         }),
+        post_dispatch: false,
     }
 }
 
@@ -372,6 +396,41 @@ fn unresolved_target(element_id: &str) -> ActuateTarget {
         x: 0,
         y: 0,
     }
+}
+
+fn identity_target(target: &Target, report: &IdentityReport) -> ActuateTarget {
+    ActuateTarget {
+        kind: "element".into(),
+        id: report.r#ref.clone().or_else(|| match target {
+            Target::ElementId(id) => Some(id.clone()),
+            Target::Scoped(r) => Some(r.to_string()),
+            _ => None,
+        }),
+        x: 0,
+        y: 0,
+    }
+}
+
+fn identity_refusal(
+    session_id: &str,
+    target: ActuateTarget,
+    action: SemanticAction,
+    report: IdentityReport,
+) -> ActuateEnvelope {
+    let reason = report
+        .reason
+        .clone()
+        .unwrap_or_else(|| report.state_token().to_string());
+    let mut env = refusal(session_id, target, action, &reason, None);
+    env.identity = Some(report);
+    env.semantic = Some(SemanticInfo {
+        action: action.as_str().to_string(),
+        delivery: Delivery::Undelivered,
+        verify: Some(VERIFY_UNAVAILABLE.to_string()),
+        foreground_changed: false,
+        pointer_moved: false,
+    });
+    env
 }
 
 fn refusal(
@@ -428,6 +487,12 @@ fn dispatched_envelope(
         foreground_changed: result.foreground_changed,
         pointer_moved: result.pointer_moved,
     });
+    if let Some((state, reason)) = result.identity
+        && let Some(id) = env.target.id.as_deref()
+        && let Ok(r) = SnapshotRef::parse(id)
+    {
+        env.identity = Some(IdentityReport::uia_failure(&r, state, reason));
+    }
     match result.error {
         Some(err) => {
             env.ok = false;
@@ -447,7 +512,7 @@ fn dispatched_envelope(
 /// The live gates. Tests implement this to exercise the pipeline without COM
 /// or a desktop.
 pub(crate) trait PolicyEnv {
-    fn resolve(&self, element_id: &str) -> Result<ResolvedTarget, HandsError>;
+    fn resolve(&self, element_id: &str) -> Result<crate::target::TargetOutcome, HandsError>;
     fn yielded(&self, session_id: &str) -> bool;
     fn blocked(
         &self,
@@ -470,9 +535,10 @@ pub(crate) trait PolicyEnv {
 struct LiveEnv;
 
 impl PolicyEnv for LiveEnv {
-    fn resolve(&self, element_id: &str) -> Result<ResolvedTarget, HandsError> {
+    fn resolve(&self, element_id: &str) -> Result<crate::target::TargetOutcome, HandsError> {
         let space = ensure_dpi().and_then(|_| virtual_screen())?;
-        Target::parse(Some(element_id), None, None, None)?.resolve(space)
+        Target::parse(Some(element_id), None, None, None)?
+            .resolve_with(space, foreground::foreground_hwnd())
     }
 
     fn yielded(&self, _session_id: &str) -> bool {
@@ -568,9 +634,11 @@ fn run(
     let element_id = req
         .element_id
         .clone()
-        .ok_or_else(|| HandsError::Input("element id must start with uia:".into()))?;
-    if !element_id.starts_with("uia:") {
-        return Err(HandsError::Input("element id must start with uia:".into()));
+        .ok_or_else(|| HandsError::Input("element id must start with uia: or sref1:u.".into()))?;
+    if !element_id.starts_with("uia:") && !element_id.starts_with("sref1:u.") {
+        return Err(HandsError::Input(
+            "element id must start with uia: or sref1:u.".into(),
+        ));
     }
     let action_name = req
         .action
@@ -582,8 +650,8 @@ fn run(
     let timeout = timeout_from(req);
 
     // 3. resolve (pre-existing unbounded STA join; timeout bounds dispatch only)
-    let resolved = match env.resolve(&element_id) {
-        Ok(resolved) => resolved,
+    let outcome = match env.resolve(&element_id) {
+        Ok(outcome) => outcome,
         Err(err) => {
             let code = resolve_code(&err);
             return Ok(refusal(
@@ -595,11 +663,40 @@ fn run(
             ));
         }
     };
-    let info = ActuateTarget {
-        kind: resolved.kind.to_string(),
-        id: resolved.id.clone(),
-        x: resolved.x,
-        y: resolved.y,
+    let (mut resolved, identity_failure, contract_refusal, info) = match outcome {
+        TargetOutcome::Resolved(resolved) => {
+            let info = ActuateTarget {
+                kind: resolved.kind.to_string(),
+                id: resolved.id.clone(),
+                x: resolved.x,
+                y: resolved.y,
+            };
+            (Some(*resolved), None, None, info)
+        }
+        TargetOutcome::Identity { target, report } => {
+            let info = identity_target(&target, &report);
+            (None, Some(report), None, info)
+        }
+        TargetOutcome::Unresolved {
+            target,
+            contract,
+            hwnd,
+            assessment: _,
+            identity,
+        } => {
+            let info = ActuateTarget {
+                kind: "element".into(),
+                id: match &target {
+                    Target::ElementId(id) => Some(id.clone()),
+                    Target::Scoped(r) => Some(r.to_string()),
+                    _ => None,
+                },
+                x: contract.physical.map(|p| p.x).unwrap_or(0),
+                y: contract.physical.map(|p| p.y).unwrap_or(0),
+            };
+            let _ = hwnd;
+            (None, identity, Some(contract), info)
+        }
     };
 
     // 4. challenge yield
@@ -612,7 +709,34 @@ fn run(
         return Ok(mark_refused(env_out, action));
     }
 
+    if resolved.is_none() {
+        // No target hwnd exists for an identity failure, so step 7 runs with `None` (never a
+        // coordinate fallback), then the identity refusal returns before the fence.
+        if let Some(env_out) = env.high_il(&session_id, &info, None)? {
+            return Ok(mark_refused(env_out, action));
+        }
+        if let Some(report) = identity_failure {
+            return Ok(identity_refusal(&session_id, info, action, report));
+        }
+        if let Some(contract) = contract_refusal {
+            let code = contract
+                .transform
+                .reason
+                .clone()
+                .unwrap_or_else(|| "target_unavailable".into());
+            return Ok(refusal(&session_id, info, action, &code, None));
+        }
+        return Ok(refusal(
+            &session_id,
+            info,
+            action,
+            "target_unavailable",
+            None,
+        ));
+    }
+
     // 6. hwnd required (otherwise High-IL and window text read the foreground)
+    let resolved = resolved.take().expect("resolved branch");
     let Some(hwnd) = resolved.hwnd else {
         return Ok(refusal(&session_id, info, action, "no_target_hwnd", None));
     };
@@ -655,6 +779,7 @@ fn run(
         action,
         value,
         timeout,
+        expected_fp: resolved.uia_expected_fp,
     };
     let result = backend.dispatch(&resolved, &request);
     Ok(dispatched_envelope(&session_id, info, action, result))
@@ -666,16 +791,31 @@ pub(crate) struct LiveBackend;
 
 impl SemanticBackend for LiveBackend {
     fn dispatch(&self, resolved: &ResolvedTarget, req: &SemanticRequest) -> SemanticResult {
-        let want = match crate::target::parse_runtime_id(&req.element_id) {
-            Ok(want) => want,
-            Err(err) => return SemanticResult::refusal(resolve_code(&err)),
+        let want = resolved
+            .uia_runtime_id
+            .clone()
+            .or_else(|| crate::target::parse_runtime_id(&req.element_id).ok());
+        let Some(want) = want else {
+            return SemanticResult::refusal("stale_target");
         };
         let action = req.action;
         let value = req.value.clone();
         let outer_hwnd = resolved.hwnd;
+        let resolve_root = dispatch_resolve_root(resolved);
+        let expected_fp = req.expected_fp;
         bounded_dispatch(req.timeout, move || {
-            worker_run(want, action, value, outer_hwnd)
+            worker_run(want, action, value, outer_hwnd, resolve_root, expected_fp)
         })
+    }
+}
+
+/// Only scoped refs root the dispatch walk at the resolved window and use the 4096 cap.
+/// Legacy `uia:` keeps the unbounded desktop-root first-match walk.
+fn dispatch_resolve_root(resolved: &ResolvedTarget) -> Option<isize> {
+    if matches!(resolved.target, Target::Scoped(_)) {
+        resolved.hwnd
+    } else {
+        None
     }
 }
 
@@ -686,10 +826,14 @@ fn bounded_dispatch<F>(timeout: Duration, work: F) -> SemanticResult
 where
     F: FnOnce() -> SemanticResult + Send + 'static,
 {
+    let Some(slot) = uia::WorkerSlot::acquire() else {
+        return SemanticResult::unknown("provider_timeout");
+    };
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("hands-uia-action".to_string())
         .spawn(move || {
+            let _slot = slot;
             let _ = tx.send(work());
         });
     if spawned.is_err() {
@@ -707,6 +851,8 @@ fn worker_run(
     action: SemanticAction,
     value: Option<String>,
     outer_hwnd: Option<isize>,
+    resolve_root: Option<isize>,
+    expected_fp: Option<u32>,
 ) -> SemanticResult {
     let _sta = match uia::StaGuard::enter() {
         Ok(guard) => guard,
@@ -716,10 +862,15 @@ fn worker_run(
         Ok(automation) => automation,
         Err(err) => return SemanticResult::refusal(resolve_code(&err)),
     };
-    let com = match uia::resolve_on(&automation, &want) {
+    let com = match uia::resolve_on(&automation, &want, resolve_root) {
         Ok(com) => com,
         Err(err) => return SemanticResult::refusal(resolve_code(&err)),
     };
+    if let Some(expected) = expected_fp
+        && com.resolved.own_fingerprint() != expected
+    {
+        return SemanticResult::refusal("stale_identity");
+    }
     let inner = com.resolved.hwnd;
     if let Err(code) = hwnd_matches(outer_hwnd, inner) {
         return SemanticResult::refusal(code);
@@ -788,6 +939,7 @@ fn com_error(err: windows::core::Error) -> SemanticResult {
         foreground_changed: false,
         pointer_moved: false,
         error: Some(SemanticError { code }),
+        identity: None,
     }
 }
 
@@ -820,6 +972,7 @@ fn delivered_readback(verified: bool, state: Option<String>) -> SemanticResult {
         foreground_changed: false,
         pointer_moved: false,
         error: None,
+        identity: None,
     }
 }
 
@@ -833,6 +986,7 @@ fn skipped() -> SemanticResult {
         foreground_changed: false,
         pointer_moved: false,
         error: None,
+        identity: None,
     }
 }
 
@@ -854,6 +1008,7 @@ fn invoke(element: &IUIAutomationElement) -> SemanticResult {
         foreground_changed: false,
         pointer_moved: false,
         error: None,
+        identity: None,
     }
 }
 
@@ -1005,7 +1160,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakeEnv {
-        resolved: Mutex<Option<Result<ResolvedTarget, HandsError>>>,
+        resolved: Mutex<Option<Result<crate::target::TargetOutcome, HandsError>>>,
         yielded: bool,
         blocked: bool,
         high_il: bool,
@@ -1017,7 +1172,9 @@ mod tests {
     impl FakeEnv {
         fn ok() -> Self {
             Self {
-                resolved: Mutex::new(Some(Ok(resolved_target("Send", "button", Some(0x1234))))),
+                resolved: Mutex::new(Some(Ok(crate::target::TargetOutcome::Resolved(Box::new(
+                    resolved_target("Send", "button", Some(0x1234)),
+                ))))),
                 yielded: false,
                 blocked: false,
                 high_il: false,
@@ -1029,12 +1186,12 @@ mod tests {
     }
 
     impl PolicyEnv for FakeEnv {
-        fn resolve(&self, _element_id: &str) -> Result<ResolvedTarget, HandsError> {
-            self.resolved
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or_else(|| Ok(resolved_target("Refresh", "button", Some(0x1234))))
+        fn resolve(&self, _element_id: &str) -> Result<crate::target::TargetOutcome, HandsError> {
+            self.resolved.lock().unwrap().take().unwrap_or_else(|| {
+                Ok(crate::target::TargetOutcome::Resolved(Box::new(
+                    resolved_target("Refresh", "button", Some(0x1234)),
+                )))
+            })
         }
 
         fn yielded(&self, _session_id: &str) -> bool {
@@ -1113,6 +1270,9 @@ mod tests {
             contract: None,
             map: None,
             assessment: None,
+            identity: None,
+            uia_runtime_id: None,
+            uia_expected_fp: None,
         }
     }
 
@@ -1259,7 +1419,9 @@ mod tests {
     #[test]
     fn semantic_requires_target_hwnd() {
         let mut env = FakeEnv::ok();
-        env.resolved = Mutex::new(Some(Ok(resolved_target("Send", "button", None))));
+        env.resolved = Mutex::new(Some(Ok(TargetOutcome::Resolved(Box::new(
+            resolved_target("Send", "button", None),
+        )))));
         let backend = FakeBackend::default();
         let env_out = run_with(&env, &backend, &request("invoke", None));
         assert!(!env_out.ok);
@@ -1494,6 +1656,7 @@ mod tests {
             foreground_changed: false,
             pointer_moved: false,
             error: None,
+            identity: None,
         });
         let env_out = run_with(&env, &backend, &request("invoke", None));
         let info = env_out.semantic.expect("semantic");
@@ -1938,5 +2101,161 @@ mod tests {
             timeout_from(&req),
             Duration::from_millis(DEFAULT_TIMEOUT_MS)
         );
+    }
+
+    fn scoped_uia_request() -> ActuateRequest {
+        ActuateRequest {
+            session_id: Some("uia-action-scoped".into()),
+            element_id: Some("sref1:u.1a2b3c.7d0e1f22.42a1b2c3".into()),
+            action: Some("invoke".into()),
+            timeout_ms: Some(500),
+            ..ActuateRequest::default()
+        }
+    }
+
+    #[test]
+    fn scoped_uia_ref_accepted_by_gate() {
+        let env = FakeEnv::ok();
+        let backend = FakeBackend::with(delivered_readback(true, None));
+        let req = scoped_uia_request();
+        let out = run_with(&env, &backend, &req);
+        assert!(out.ok);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn scoped_uia_ref_rechecks_own_fingerprint_in_worker() {
+        let src = include_str!("uia_actions.rs");
+        let start = src.find("fn worker_run(").expect("worker_run");
+        let end = src.find("fn hwnd_matches(").expect("hwnd_matches");
+        let body = &src[start..end];
+        let fp = body
+            .find("com.resolved.own_fingerprint()")
+            .expect("own fingerprint");
+        let check = body
+            .find("check_element(&com.element)")
+            .expect("check_element");
+        assert!(fp < check);
+        assert!(body.contains("stale_identity"));
+        assert!(!body.contains("com.resolved.name"));
+    }
+
+    #[test]
+    fn empty_localized_role_gate_uses_role_of_not_fingerprint_role() {
+        let src = include_str!("uia_actions.rs");
+        assert!(src.contains("role_admits_set_value(&com.resolved.role)"));
+        let banned = ["role_admits_set_value(&com.resolved.", "own_role)"].join("");
+        assert!(!src.contains(&banned));
+        let start = src.find("fn role_admits_set_value(").expect("role gate");
+        let end = src.find("fn is_no_evidence(").expect("is_no_evidence");
+        let gate = &src[start..end];
+        assert!(gate.contains("Edit"));
+        assert!(gate.contains("Document"));
+        assert!(gate.contains("ComboBox"));
+    }
+
+    #[test]
+    fn scoped_uia_ref_stale_is_undelivered_with_identity() {
+        let r = crate::identity::SnapshotRef::Uia {
+            hwnd: 0x1a2b3c,
+            fp: "7d0e1f22".into(),
+            ridh: "42a1b2c3".into(),
+        };
+        let report = crate::identity::IdentityReport::uia_failure(
+            &r,
+            crate::identity::IdentityState::Stale,
+            "identity_mismatch",
+        );
+        let env = FakeEnv::ok();
+        *env.resolved.lock().unwrap() = Some(Ok(TargetOutcome::Identity {
+            target: Target::Scoped(r),
+            report,
+        }));
+        let backend = FakeBackend::with(delivered_readback(true, None));
+        let out = run_with(&env, &backend, &scoped_uia_request());
+        assert!(!out.ok);
+        assert!(out.identity.is_some());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        let semantic = out.semantic.expect("semantic");
+        assert_eq!(semantic.delivery, Delivery::Undelivered);
+    }
+
+    #[test]
+    fn worker_stale_identity_is_undelivered_with_identity_and_no_cooldown() {
+        let _g = crate::cooldown::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::cooldown::reset_for_test();
+        let r = crate::identity::SnapshotRef::Uia {
+            hwnd: 0x1a2b3c,
+            fp: "7d0e1f22".into(),
+            ridh: "42a1b2c3".into(),
+        };
+        let mut resolved = resolved_target("Send", "button", Some(0x1a2b3c));
+        resolved.target = Target::Scoped(r);
+        resolved.id = Some("sref1:u.1a2b3c.7d0e1f22.42a1b2c3".into());
+        resolved.uia_runtime_id = Some(vec![1, 2]);
+        resolved.uia_expected_fp = Some(0x7d0e1f22);
+        let env = FakeEnv::ok();
+        *env.resolved.lock().unwrap() = Some(Ok(TargetOutcome::Resolved(Box::new(resolved))));
+        let backend = FakeBackend::with(SemanticResult::refusal("stale_identity"));
+        let mut out = run_with(&env, &backend, &scoped_uia_request());
+        assert!(!out.ok);
+        let identity = out.identity.as_ref().expect("worker identity");
+        assert_eq!(identity.state, crate::identity::IdentityState::Stale);
+        assert_eq!(identity.reason.as_deref(), Some("stale_identity"));
+        assert_eq!(
+            out.semantic.as_ref().map(|s| s.delivery),
+            Some(Delivery::Undelivered)
+        );
+        crate::actuate::settle_cooldown("uia-action", &mut out);
+        assert_eq!(
+            crate::cooldown::snapshot("uia-action-scoped").attempt,
+            0,
+            "worker stale identity must not arm cooldown"
+        );
+    }
+
+    #[test]
+    fn resolve_code_maps_dispatch_ambiguity_and_cap() {
+        assert_eq!(
+            resolve_code(&HandsError::Target(
+                "multiple UIA elements with RuntimeId 1.2; ambiguous; re-observe".into()
+            )),
+            "duplicate_runtime_id"
+        );
+        assert_eq!(
+            resolve_code(&HandsError::Target(
+                "UIA walk cap reached before the RuntimeId was resolved; unknown".into()
+            )),
+            "provider_timeout"
+        );
+        assert_eq!(
+            resolve_code(&HandsError::Target(
+                "window_unreadable: UIA root handle is unavailable".into()
+            )),
+            "window_unreadable"
+        );
+        assert_eq!(
+            resolve_code(&HandsError::Target(
+                "no UIA element with RuntimeId 1.2; re-observe".into()
+            )),
+            "stale_target"
+        );
+    }
+
+    #[test]
+    fn legacy_uia_action_passes_none_dispatch_root() {
+        let legacy = resolved_target("Send", "button", Some(0x1a2b3c));
+        assert_eq!(dispatch_resolve_root(&legacy), None);
+        let mut scoped = legacy;
+        scoped.target = Target::Scoped(crate::identity::SnapshotRef::Uia {
+            hwnd: 0x1a2b3c,
+            fp: "7d0e1f22".into(),
+            ridh: "42a1b2c3".into(),
+        });
+        assert_eq!(dispatch_resolve_root(&scoped), Some(0x1a2b3c));
+        let src = include_str!("uia_actions.rs");
+        assert!(src.contains("uia::resolve_on(&automation, &want, resolve_root)"));
     }
 }

@@ -1,0 +1,34 @@
+{
+  "url": "https://example.test/scoped",
+  "title": "Scoped fixture",
+  "main_text": "Scoped fixture",
+  "elements": [
+    {
+      "id": "chr:0",
+      "role": "Button",
+      "text": "Go",
+      "rectCss": {"left": 100.0, "top": 50.0, "width": 200.0, "height": 40.0}
+    }
+  ],
+  "cards": [],
+  "metrics": {
+    "screenX": 0.0,
+    "screenY": 0.0,
+    "outerWidth": 1200.0,
+    "outerHeight": 900.0,
+    "innerWidth": 1200.0,
+    "innerHeight": 900.0,
+    "devicePixelRatio": 1.0,
+    "clientWidth": 1200.0,
+    "clientHeight": 900.0
+  },
+  "assess_v": 1,
+  "tab": 12,
+  "window": 45,
+  "frame": 0,
+  "doc": "9f3a",
+  "snap": "a1b2c3d4",
+  "retained": 1,
+  "stored": true,
+  "fallback": false
+}

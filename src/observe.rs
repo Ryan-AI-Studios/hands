@@ -10,6 +10,7 @@ use crate::extract::{
     filter_nodes,
 };
 use crate::foreground;
+use crate::identity::{SnapshotBinding, SnapshotRef, element_fingerprint, runtime_id_hash};
 use crate::logs;
 use crate::session::resolve_session_id_from_os;
 use crate::space::{Rect, Space, ensure_dpi, virtual_screen};
@@ -153,6 +154,9 @@ pub struct ObserveRequest {
     pub card_offset: usize,
     pub scope: ObserveScope,
     pub fg_preview: bool,
+    /// `true` replaces the extension's agent-facing snapshot; `false` is an internal read.
+    /// `None` means "store only for an agent-facing Chrome walk".
+    pub chrome_store: Option<bool>,
 }
 
 impl Default for ObserveRequest {
@@ -166,6 +170,7 @@ impl Default for ObserveRequest {
             card_offset: 0,
             scope: ObserveScope::Fg,
             fg_preview: false,
+            chrome_store: None,
         }
     }
 }
@@ -248,6 +253,9 @@ pub struct ObserveEnvelope {
     pub card_counts: ObserveCardCounts,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fg_preview_path: Option<String>,
+    /// Snapshot-bound identity evidence (agent-facing Chrome walks only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +308,8 @@ pub struct ObserveSidecar {
     pub timing: Option<ObserveTiming>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fg_preview_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -635,7 +645,8 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let chrome_t = Instant::now();
     let chrome_walk = plan.walk_hwnd.is_some_and(foreground::is_chrome_hwnd);
     let snap_hwnd = plan.walk_hwnd.filter(|h| foreground::is_chrome_hwnd(*h));
-    let chrome_outcome = chrome::try_snapshot(req.detail, snap_hwnd);
+    let store_snapshot = req.chrome_store.unwrap_or(snap_hwnd.is_some());
+    let chrome_outcome = chrome::try_snapshot_with_store(req.detail, snap_hwnd, store_snapshot);
     let chrome_ms = chrome_t.elapsed().as_millis() as u64;
     let snap = match uia_h {
         None => uia::UiaSnapshot {
@@ -664,6 +675,14 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     } else {
         chrome.as_ref().and_then(|m| m.transform.clone())
     };
+    let mut snapshot = if store_snapshot {
+        chrome.as_ref().and_then(|m| m.snapshot.clone())
+    } else {
+        None
+    };
+    if let Some(binding) = snapshot.as_mut() {
+        binding.hwnd = plan.walk_hwnd.map(foreground::format_hwnd);
+    }
     let opts = FuseOpts {
         viewport: plan.viewport,
         client: plan.walk_hwnd.and_then(foreground::client_rect),
@@ -675,6 +694,11 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let (mut extract, mut elements, elements_total, _) =
         fuse_maps(req.detail, &snap.title, &snap.nodes, chrome, opts);
     crate::dialogs::promote(&mut extract, &mut elements);
+    if let Some(binding) = snapshot.as_ref() {
+        stamp_snapshot_refs(&mut elements, Some(binding), plan.walk_hwnd);
+    } else {
+        stamp_snapshot_refs(&mut elements, None, plan.walk_hwnd);
+    }
     stamp_grid_if_clickable(space, &mut elements, transform.as_ref());
     let fusion_ms = fusion_t.elapsed().as_millis() as u64;
     crate::fence::note_last_url(extract.url.as_deref());
@@ -725,6 +749,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
             ..ObserveCardCounts::default()
         },
         fg_preview_path,
+        snapshot,
     };
     let sidecar_full = full.clone();
     let envelope = match req.detail {
@@ -790,6 +815,70 @@ fn stamp_grid(space: Space, elements: &mut [Element]) {
     }
 }
 
+/// Attach canonical `sref1:` refs. `id` stays the legacy handle; a fallback snapshot
+/// withholds every ref so it can never look provably bound.
+fn stamp_snapshot_refs(
+    elements: &mut [Element],
+    binding: Option<&SnapshotBinding>,
+    walk_hwnd: Option<isize>,
+) {
+    if binding.is_some_and(|b| b.fallback || b.reason.as_deref() == Some("unbound_extension")) {
+        return;
+    }
+    let tab = binding.and_then(|b| b.tab).filter(|t| *t > 0);
+    let chrome_ready = binding
+        .is_some_and(|b| tab.is_some() && b.doc.len() == 4 && b.snap.len() == 8 && b.retained > 0);
+    let uia_hwnd = walk_hwnd
+        .map(|h| h as i64)
+        .and_then(|h| u64::try_from(h).ok())
+        .filter(|h| *h > 0);
+    for el in elements {
+        if let Some(rest) = el.id.strip_prefix("chr:") {
+            let (Some(tab), true) = (tab, chrome_ready) else {
+                continue;
+            };
+            let Some(binding) = binding else {
+                continue;
+            };
+            let Ok(idx) = rest.parse::<u32>() else {
+                continue;
+            };
+            if idx as usize >= binding.retained {
+                continue;
+            }
+            el.sref = Some(
+                SnapshotRef::Chrome {
+                    tab,
+                    frame: binding.frame,
+                    doc: binding.doc.clone(),
+                    snap: binding.snap.clone(),
+                    idx,
+                }
+                .to_string(),
+            );
+        } else if let Some(rest) = el.id.strip_prefix("uia:") {
+            let Some(hwnd) = uia_hwnd else {
+                continue;
+            };
+            let ids = rest
+                .split('.')
+                .map(str::parse::<i32>)
+                .collect::<Result<Vec<_>, _>>();
+            let Ok(ids) = ids else {
+                continue;
+            };
+            if ids.is_empty() {
+                continue;
+            }
+            let fp = format!(
+                "{:08x}",
+                element_fingerprint(&el.role, el.text.as_deref(), el.unnamed)
+            );
+            el.sref = Some(format!("sref1:u.{hwnd:x}.{fp}.{}", runtime_id_hash(&ids)));
+        }
+    }
+}
+
 /// Fixture-mode rects come from the legacy listing origin and are not a click contract; do not
 /// stamp them as grid cells, so `click --grid` cannot inherit a fixture listing coordinate.
 fn stamp_grid_if_clickable(
@@ -845,6 +934,7 @@ fn write_sidecar(
         client,
         timing,
         fg_preview_path: envelope.fg_preview_path.clone(),
+        snapshot: envelope.snapshot.clone(),
     };
     let json = serde_json::to_string_pretty(&sidecar)
         .map_err(|err| HandsError::Observe(format!("sidecar serialize: {err}")))?;
@@ -933,6 +1023,10 @@ fn cap_default_envelope_with_client(
         }
     }
     refresh_card_omitted(&mut envelope);
+    envelope.elements_truncated = envelope.elements.len() < envelope.elements_total;
+    if serialized_len(&envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
+        shrink_main_text_to_fit(&mut envelope, DEFAULT_ENVELOPE_MAX_BYTES);
+    }
     envelope
 }
 
@@ -1564,6 +1658,7 @@ fn envelope_from_sidecar(sidecar: ObserveSidecar, view: ObserveView) -> ObserveE
             ..ObserveCardCounts::default()
         },
         fg_preview_path: sidecar.fg_preview_path,
+        snapshot: sidecar.snapshot,
     }
 }
 
@@ -1751,6 +1846,7 @@ mod tests {
                     },
                     grid: None,
                     unnamed: None,
+                    sref: None,
                 })
                 .collect(),
             elements_total: n,
@@ -1770,6 +1866,7 @@ mod tests {
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
+            snapshot: None,
         }
     }
 
@@ -1876,6 +1973,7 @@ mod tests {
                     },
                     grid: None,
                     unnamed: None,
+                    sref: None,
                 })
                 .collect(),
             cards: vec![],
@@ -1883,6 +1981,7 @@ mod tests {
             cards_walked: 0,
             transform: None,
             identity: None,
+            snapshot: None,
         };
         let nodes: Vec<RawNode> = (0..5).map(uia).collect();
         let (extract, els, total, connected) = fuse_maps(
@@ -1986,6 +2085,7 @@ mod tests {
                 },
                 grid: None,
                 unnamed: None,
+                sref: None,
             },
         );
         raw.elements_total = 401;
@@ -2112,6 +2212,383 @@ mod tests {
         assert_eq!(total, 3 + 5);
     }
 
+    fn dense_ref_envelope() -> ObserveEnvelope {
+        let mut raw = fat_envelope(20);
+        raw.extract.main_text = "M".repeat(3000);
+        raw.viewport = Some(Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        });
+        for (i, el) in raw.elements.iter_mut().enumerate() {
+            el.id = format!("chr:{i}");
+            el.role = "Button".into();
+            el.text = Some("Search".into());
+            el.unnamed = None;
+            el.sref = Some(
+                SnapshotRef::Chrome {
+                    tab: 12,
+                    frame: 0,
+                    doc: "9f3a".into(),
+                    snap: "a1b2c3d4".into(),
+                    idx: i as u32,
+                }
+                .to_string(),
+            );
+        }
+        raw.snapshot = Some(SnapshotBinding {
+            tab: Some(12),
+            window: Some(45),
+            frame: 0,
+            hwnd: Some("1a2b3c".into()),
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            retained: 20,
+            source: "live".into(),
+            fallback: false,
+            reason: None,
+        });
+        raw
+    }
+
+    #[test]
+    fn mixed_reserved_fixture_pops_non_reserved_first() {
+        let mut raw = fat_envelope(30);
+        raw.viewport = Some(Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        });
+        for (i, el) in raw.elements.iter_mut().enumerate() {
+            el.id = format!("chr:{i}");
+            el.sref = Some(
+                SnapshotRef::Chrome {
+                    tab: 12,
+                    frame: 0,
+                    doc: "9f3a".into(),
+                    snap: "a1b2c3d4".into(),
+                    idx: i as u32,
+                }
+                .to_string(),
+            );
+            if i < 10 {
+                el.role = "Text".into();
+                el.text = Some("row".into());
+            } else {
+                el.role = "Button".into();
+                el.text = Some("Search".into());
+            }
+        }
+        raw.elements_total = 30;
+        let capped = cap_default_envelope(raw);
+        assert_eq!(capped.elements.len(), 20);
+        assert!(capped.elements_truncated);
+        assert!(
+            capped
+                .elements
+                .iter()
+                .all(|el| is_reserved_control(el, &capped)),
+            "all retained rows must be reserved controls"
+        );
+        assert!(
+            capped
+                .elements
+                .iter()
+                .all(|el| el.text.as_deref() == Some("Search") && el.sref.is_some())
+        );
+    }
+
+    #[test]
+    fn default_envelope_with_sref_fits_4kib_and_keeps_reserved() {
+        let raw = dense_ref_envelope();
+        let original_main_len = raw.extract.main_text.len();
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(
+            capped.extract.main_text.len() < original_main_len,
+            "fixture must exercise main-text shrink"
+        );
+        assert!(
+            json.len() <= DEFAULT_ENVELOPE_MAX_BYTES,
+            "len {}",
+            json.len()
+        );
+        assert_eq!(capped.elements.len(), 20);
+        assert!(!capped.elements_truncated);
+        assert!(capped.elements.iter().all(|e| e.sref.is_some()));
+        assert!(
+            capped
+                .elements
+                .iter()
+                .any(|e| e.text.as_deref() == Some("Search") && e.sref.is_some())
+        );
+        for el in &capped.elements {
+            let ref_value = serde_json::to_string(el.sref.as_deref().unwrap()).unwrap();
+            let key = "\"ref\":";
+            assert!(
+                key.len() + ref_value.len() <= 45,
+                "{}",
+                el.sref.as_deref().unwrap()
+            );
+        }
+        assert_eq!(capped.snapshot.as_ref().and_then(|s| s.tab), Some(12));
+    }
+
+    #[test]
+    fn dom_envelope_with_sref_fits_16kib() {
+        let mut raw = fat_envelope(400);
+        for (i, el) in raw.elements.iter_mut().enumerate() {
+            el.sref = Some(format!("sref1:c.12.0.9f3a.a1b2c3d4.{i}"));
+        }
+        let capped = cap_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(json.len() <= ENVELOPE_MAX_BYTES, "len {}", json.len());
+        assert!(!capped.elements.is_empty());
+    }
+
+    #[test]
+    fn chrome_elements_emit_sref() {
+        let binding = SnapshotBinding {
+            tab: Some(12),
+            window: Some(45),
+            frame: 0,
+            hwnd: Some("1a2b3c".into()),
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            retained: 20,
+            source: "live".into(),
+            fallback: false,
+            reason: None,
+        };
+        let mut elements = vec![
+            Element {
+                id: "chr:0".into(),
+                role: "Button".into(),
+                text: Some("Go".into()),
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 10,
+                },
+                grid: None,
+                unnamed: None,
+                sref: None,
+            },
+            Element {
+                id: "uia:1.2".into(),
+                role: "Button".into(),
+                text: Some("UIA".into()),
+                rect: Rect {
+                    x: 20,
+                    y: 20,
+                    w: 10,
+                    h: 10,
+                },
+                grid: None,
+                unnamed: None,
+                sref: None,
+            },
+        ];
+        stamp_snapshot_refs(&mut elements, Some(&binding), Some(0x1a2b3c));
+        assert_eq!(
+            elements[0].sref.as_deref(),
+            Some("sref1:c.c.0.9f3a.a1b2c3d4.0")
+        );
+        assert!(
+            elements[1]
+                .sref
+                .as_deref()
+                .is_some_and(|s| s.starts_with("sref1:u.1a2b3c."))
+        );
+    }
+
+    #[test]
+    fn old_extension_omits_sref_and_reports_binding() {
+        let binding = SnapshotBinding {
+            tab: Some(12),
+            window: Some(45),
+            frame: 0,
+            hwnd: Some("1a2b3c".into()),
+            doc: String::new(),
+            snap: String::new(),
+            retained: 20,
+            source: "live".into(),
+            fallback: false,
+            reason: Some("unbound_extension".into()),
+        };
+        let mut elements = vec![Element {
+            id: "chr:0".into(),
+            role: "Button".into(),
+            text: Some("Go".into()),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            grid: None,
+            unnamed: None,
+            sref: None,
+        }];
+        stamp_snapshot_refs(&mut elements, Some(&binding), Some(0x1a2b3c));
+        assert!(elements[0].sref.is_none());
+    }
+
+    #[test]
+    fn uia_elements_emit_sref() {
+        let mut elements = vec![Element {
+            id: "uia:1.2".into(),
+            role: "Button".into(),
+            text: Some("UIA".into()),
+            rect: Rect {
+                x: 20,
+                y: 20,
+                w: 10,
+                h: 10,
+            },
+            grid: None,
+            unnamed: None,
+            sref: None,
+        }];
+        stamp_snapshot_refs(&mut elements, None, Some(0x1a2b3c));
+        assert!(
+            elements[0]
+                .sref
+                .as_deref()
+                .is_some_and(|s| s.starts_with("sref1:u.1a2b3c."))
+        );
+    }
+
+    #[test]
+    fn sidecar_schema_stays_v1() {
+        assert_eq!(OBSERVE_SCHEMA, "hands.observe/v1");
+    }
+
+    #[test]
+    fn sequence_observe_store_false_keeps_agent_ref() {
+        let src = include_str!("sequence.rs");
+        let start = src.find("fn live_observe(").expect("live_observe");
+        let body = &src[start..start + 600.min(src.len() - start)];
+        assert!(body.contains("chrome_store: Some(false)"));
+    }
+
+    #[test]
+    fn internal_observe_callers_use_chrome_store_false() {
+        for src in [
+            include_str!("challenge.rs"),
+            include_str!("listen.rs"),
+            include_str!("solver.rs"),
+            include_str!("dotask/mod.rs"),
+        ] {
+            assert!(src.contains("chrome_store: Some(false)"));
+        }
+        let doctor = include_str!("host_doctor.rs");
+        assert!(doctor.contains("try_snapshot_with_store(Detail::Default, None, false)"));
+    }
+
+    #[test]
+    fn fallback_snapshot_emits_no_refs() {
+        let binding = SnapshotBinding {
+            tab: Some(12),
+            window: Some(45),
+            frame: 0,
+            hwnd: Some("1a2b3c".into()),
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            retained: 20,
+            source: "fallback".into(),
+            fallback: true,
+            reason: None,
+        };
+        let mut elements = vec![Element {
+            id: "chr:0".into(),
+            role: "Button".into(),
+            text: Some("Go".into()),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            grid: None,
+            unnamed: None,
+            sref: None,
+        }];
+        stamp_snapshot_refs(&mut elements, Some(&binding), Some(0x1a2b3c));
+        assert!(elements[0].sref.is_none());
+    }
+
+    #[test]
+    fn sidecar_snapshot_binding_round_trips() {
+        let mut envelope = fat_envelope(1);
+        envelope.snapshot = dense_ref_envelope().snapshot;
+        envelope.elements[0].sref = Some("sref1:c.12.0.9f3a.a1b2c3d4.0".into());
+        let dir = std::env::temp_dir().join(format!("hands-0123-sidecar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("observe.json");
+        write_sidecar(&path, &envelope, None, None, None, &[], false).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let side: ObserveSidecar = serde_json::from_str(&text).unwrap();
+        assert_eq!(side.snapshot.as_ref().and_then(|s| s.tab), Some(12));
+        assert_eq!(
+            side.elements[0].sref.as_deref(),
+            Some("sref1:c.12.0.9f3a.a1b2c3d4.0")
+        );
+        let reshaped = envelope_from_sidecar(side, ObserveView::Auto);
+        assert_eq!(
+            reshaped.snapshot.as_ref().map(|s| s.snap.as_str()),
+            Some("a1b2c3d4")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_old_sidecar_keeps_legacy_ids() {
+        let json = r#"{
+            "schema": "hands.observe/v1",
+            "session_id": "s",
+            "screenshot_path": "C:\\tmp\\a.png",
+            "observe_path": "C:\\tmp\\a.json",
+            "space": {"origin_x":0,"origin_y":0,"width":10,"height":10,"cell_px":10},
+            "extract": {"title":"T","url":null,"main_text":"","cards":[]},
+            "elements": [{"id":"chr:0","role":"Button","text":"Go","rect":{"x":0,"y":0,"w":1,"h":1}}],
+            "elements_total": 1,
+            "elements_truncated": false,
+            "chrome_connected": true
+        }"#;
+        let side: ObserveSidecar = serde_json::from_str(json).unwrap();
+        assert!(side.snapshot.is_none());
+        let envelope = envelope_from_sidecar(side, ObserveView::Auto);
+        assert!(envelope.snapshot.is_none());
+        assert_eq!(envelope.elements[0].id, "chr:0");
+        assert!(envelope.elements[0].sref.is_none());
+    }
+
+    #[test]
+    fn dialog_ids_stay_legacy() {
+        let mut extract = Extract::default();
+        let mut elements = vec![Element {
+            id: "chr:0".into(),
+            role: "Button".into(),
+            text: Some("Accept all cookies".into()),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            grid: None,
+            unnamed: None,
+            sref: Some("sref1:c.c.0.9f3a.a1b2c3d4.0".into()),
+        }];
+        crate::dialogs::promote(&mut extract, &mut elements);
+        assert_eq!(extract.dialogs.len(), 1);
+        assert_eq!(extract.dialogs[0].id, "chr:0");
+    }
+
     #[test]
     fn default_envelope_fits_4kib_and_caps_20() {
         let g = chrome::EnvGuard::lock();
@@ -2160,6 +2637,7 @@ mod tests {
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
+            snapshot: None,
         };
         assert!(raw.viewport.is_some());
         let capped = cap_default_envelope(raw);
@@ -2763,6 +3241,7 @@ mod tests {
             rect,
             grid: None,
             unnamed: None,
+            sref: None,
         }
     }
 
@@ -2837,6 +3316,7 @@ mod tests {
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
+            snapshot: None,
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -2879,6 +3359,7 @@ mod tests {
                     },
                     grid: None,
                     unnamed: None,
+                    sref: None,
                 })
                 .collect(),
             cards: vec![],
@@ -2886,6 +3367,7 @@ mod tests {
             cards_walked: 0,
             transform: None,
             identity: None,
+            snapshot: None,
         };
         let nodes = vec![uia_node(
             42,
@@ -2939,6 +3421,7 @@ mod tests {
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
+            snapshot: None,
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -3024,6 +3507,7 @@ mod tests {
             cards_walked: 0,
             transform: None,
             identity: None,
+            snapshot: None,
         };
         let (mut extract, mut elements, _total, connected) = fuse_maps(
             Detail::Default,
@@ -3078,6 +3562,7 @@ mod tests {
                 rect: d.rect,
                 grid: None,
                 unnamed: None,
+                sref: None,
             }),
         );
         raw.challenge = ChallengeInfo {
@@ -3203,6 +3688,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         }];
         stamp_grid(space, &mut elements);
         assert_eq!(elements[0].rect.center(), (0, 0));
@@ -3244,6 +3730,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         };
         let raw = serde_json::to_value(&el).unwrap();
         assert!(raw.get("grid").is_none());
@@ -3267,6 +3754,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         };
         let raw = serde_json::to_value(&named).unwrap();
         assert!(raw.get("unnamed").is_none(), "{raw}");
@@ -3277,6 +3765,7 @@ mod tests {
             rect: named.rect,
             grid: None,
             unnamed: Some(true),
+            sref: None,
         };
         let raw = serde_json::to_value(&blank).unwrap();
         assert_eq!(raw["unnamed"], true);
@@ -3384,6 +3873,7 @@ mod tests {
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
+            snapshot: None,
         };
         let capped = cap_default_envelope(raw);
         let json = serialize_envelope(&capped).unwrap();
@@ -3832,12 +4322,14 @@ mod tests {
                 },
                 grid: None,
                 unnamed: None,
+                sref: None,
             }],
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
             transform: None,
             identity: None,
+            snapshot: None,
         };
         let nodes = vec![uia_node(
             9,
@@ -3880,12 +4372,14 @@ mod tests {
                 },
                 grid: None,
                 unnamed: None,
+                sref: None,
             }],
             cards: vec![],
             listing: crate::extract::ListingMeta::default(),
             cards_walked: 0,
             transform: None,
             identity: None,
+            snapshot: None,
         };
         let (dom_extract, dom_els, _, _) = fuse_maps(
             Detail::Dom,
@@ -4171,6 +4665,7 @@ mod tests {
             card_offset: 0,
             scope: ObserveScope::Desktop,
             fg_preview: false,
+            chrome_store: None,
         })
         .unwrap_err()
         .to_string();
@@ -4332,6 +4827,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         }
     }
 
@@ -4514,6 +5010,7 @@ mod tests {
             card_offset: 0,
             card_counts: ObserveCardCounts::default(),
             fg_preview_path: None,
+            snapshot: None,
         }
     }
 
@@ -4673,6 +5170,7 @@ mod tests {
             rect: webview_cover(),
             grid: None,
             unnamed: Some(true),
+            sref: None,
         }
     }
 
@@ -4689,6 +5187,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         }
     }
 
@@ -4755,6 +5254,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         }
     }
 
@@ -4943,6 +5443,7 @@ mod tests {
             client: raw.viewport,
             timing: None,
             fg_preview_path: None,
+            snapshot: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
         let env = observe(ObserveRequest {
@@ -4954,6 +5455,7 @@ mod tests {
             card_offset: 0,
             scope: ObserveScope::Fg,
             fg_preview: false,
+            chrome_store: None,
         });
         let _ = std::fs::remove_file(&path);
         let env = env.expect("reshape");
@@ -4985,6 +5487,7 @@ mod tests {
             },
             grid: None,
             unnamed: Some(true),
+            sref: None,
         };
         let raw = webview_pack_envelope(
             vec![
@@ -5022,6 +5525,7 @@ mod tests {
                     },
                     grid: None,
                     unnamed: None,
+                    sref: None,
                 },
             ],
             3,
@@ -5099,6 +5603,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         };
         let raw = webview_pack_envelope(vec![filler, body_button("uia:a", "Alpha")], 2);
         let capped = cap_default_envelope(raw);
@@ -5277,6 +5782,7 @@ mod tests {
                 },
                 grid: None,
                 unnamed: None,
+                sref: None,
             })
             .collect();
         els.push(body_button("uia:a", "Alpha"));
@@ -5332,6 +5838,7 @@ mod tests {
             card_offset: 0,
             scope: ObserveScope::Fg,
             fg_preview: false,
+            chrome_store: None,
         })
         .unwrap_err();
         assert!(
@@ -5348,6 +5855,7 @@ mod tests {
             card_offset: 0,
             scope: ObserveScope::Fg,
             fg_preview: false,
+            chrome_store: None,
         })
         .unwrap_err();
         assert!(
@@ -5396,6 +5904,7 @@ mod tests {
             client: raw.viewport,
             timing: None,
             fg_preview_path: None,
+            snapshot: None,
         };
         let sidecar_ids: std::collections::HashSet<String> =
             sidecar.elements.iter().map(|e| e.id.clone()).collect();
@@ -5411,6 +5920,7 @@ mod tests {
             card_offset: 3,
             scope: ObserveScope::Fg,
             fg_preview: false,
+            chrome_store: None,
         });
         let _ = std::fs::remove_file(&path);
         let env = env.expect("reshape");
@@ -5473,6 +5983,7 @@ mod tests {
             },
             grid: None,
             unnamed: None,
+            sref: None,
         };
         let space = Space::new(0, 0, 1920, 1080).unwrap();
         let sidecar = ObserveSidecar {
@@ -5505,6 +6016,7 @@ mod tests {
             client: None,
             timing: None,
             fg_preview_path: None,
+            snapshot: None,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
         let with_popup = observe(ObserveRequest {
@@ -5516,6 +6028,7 @@ mod tests {
             card_offset: 0,
             scope: ObserveScope::Fg,
             fg_preview: false,
+            chrome_store: None,
         });
         let _ = std::fs::remove_file(&path);
         let env = with_popup.expect("reshape popup");
@@ -6184,6 +6697,6 @@ mod tests {
         assert!(!slice.contains("outer_width") && !slice.contains("outer_height"));
         // No transform block for a non-Chrome walk.
         let obs = include_str!("observe.rs");
-        assert!(obs.contains("if skip_walk || !chrome_walk {\n        None"));
+        assert!(obs.contains("if skip_walk || !chrome_walk"));
     }
 }

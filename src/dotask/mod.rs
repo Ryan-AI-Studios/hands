@@ -772,6 +772,7 @@ fn live_exec(name: &str, args: &Value, session_id: &str) -> Result<String, Hands
                 card_offset: 0,
                 scope: crate::observe::ObserveScope::Fg,
                 fg_preview: true,
+                chrome_store: Some(false),
             })?;
             observe::serialize_envelope(&env)
         }

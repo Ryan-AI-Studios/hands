@@ -9,6 +9,13 @@ const vm = require("node:vm");
 
 const root = path.resolve(__dirname, "..");
 
+// Deterministic virtual clock shared by both VM contexts. The fan-out/commit budgets are
+// wall-clock based; a real clock made the harness flaky on slower CI runners.
+const CLOCK = { t: 1_700_000_000_000 };
+function dateShim() {
+  return { now: () => CLOCK.t };
+}
+
 function defaultStyle(overrides) {
   return Object.assign(
     {
@@ -103,6 +110,7 @@ function runTimers(timers, limit) {
       return;
     }
     const timer = timers.splice(index, 1)[0];
+    CLOCK.t += timer.ms;
     timer.fn();
   }
 }
@@ -114,7 +122,7 @@ function contentContext(options) {
   const context = {
     console,
     Math,
-    Date,
+    Date: dateShim(),
     Number,
     String,
     Array,
@@ -366,6 +374,7 @@ function swContext() {
     Math,
     JSON,
     Uint8Array,
+    Date: dateShim(),
     setTimeout(fn, ms) {
       timers.push({ fn, ms: Number(ms) || 0 });
       return timers.length;
@@ -1050,7 +1059,7 @@ function frameOptOutTests() {
       op: "snapshot",
       tab: 12,
       frames: true,
-      __handsStarted: Date.now() - 380,
+      __handsStarted: CLOCK.t - 380,
     });
     assert.ok(
       reply.frames.some(
@@ -1706,7 +1715,7 @@ function frameContentTests() {
     store: false,
     pending: true,
     light: true,
-    commit_by: Date.now() - 1,
+    commit_by: CLOCK.t - 1,
   });
   const expiredCommit = listenerResolve(pendingCtx, {
     op: "frame_commit",

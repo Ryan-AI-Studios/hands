@@ -701,6 +701,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (
     op !== "snapshot" &&
     op !== "resolve" &&
+    op !== "query" &&
     op !== "assess" &&
     op !== "postcheck" &&
     op !== "frame_top" &&
@@ -716,6 +717,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   try {
     if (op === "snapshot") {
       sendResponse(buildSnapshot(msg));
+    } else if (op === "query") {
+      sendResponse(queryScoped(msg));
     } else if (op === "assess") {
       sendResponse(buildAssess(msg));
     } else if (op === "postcheck") {
@@ -973,7 +976,289 @@ function resolveScoped(msg) {
   if (msg.assess === true) {
     reply.assessment = assessAt(node, rect, msg.samples);
   }
+  if (msg.caps === true) {
+    reply.capability = domCapability(node, payload);
+  }
   return reply;
+}
+
+// Read-only list query over the stored snapshot only. Never walks, never re-snapshots, never
+// assigns `lastSnapshot`. Filter semantics are pinned against `tests/fixtures/find-cases.json`.
+function queryScoped(msg) {
+  const selfFrame = SELF_FRAME == null ? 0 : SELF_FRAME;
+  if (Number(msg.frame) !== selfFrame) {
+    return { error: "frame_unsupported" };
+  }
+  const record = lastSnapshot;
+  if (!record) {
+    return { error: "no_snapshot", doc: DOC_NONCE, snap: null, frame: selfFrame };
+  }
+  if (msg.doc !== record.doc) {
+    return {
+      error: "stale_document",
+      doc: record.doc,
+      snap: record.snap,
+      frame: selfFrame,
+    };
+  }
+  if (msg.snap !== record.snap) {
+    return {
+      error: "stale_snapshot",
+      doc: record.doc,
+      snap: record.snap,
+      frame: selfFrame,
+    };
+  }
+  const limit = Number.isInteger(msg.limit) ? Math.max(1, Number(msg.limit)) : 20;
+  const offset = Number.isInteger(msg.offset) ? Math.max(0, Number(msg.offset)) : 0;
+  const budgetMs = Number.isFinite(Number(msg.budgetMs))
+    ? Math.max(0, Number(msg.budgetMs))
+    : 150;
+  const maxNodes = Number.isInteger(msg.maxNodes)
+    ? Math.max(1, Number(msg.maxNodes))
+    : SNAPSHOT_NODE_CAP;
+  const wantRole =
+    typeof msg.role === "string" && msg.role ? msg.role.toLowerCase() : null;
+  const wantText =
+    typeof msg.text === "string" && msg.text ? msg.text.toLowerCase() : null;
+  const wantRect =
+    msg.rectCss && typeof msg.rectCss === "object" ? msg.rectCss : null;
+  let root = null;
+  if (msg.subtreeRoot != null) {
+    const rootIdx = Number(msg.subtreeRoot);
+    if (
+      !Number.isInteger(rootIdx) ||
+      rootIdx < 0 ||
+      rootIdx >= record.nodes.length ||
+      rootIdx >= record.retained
+    ) {
+      return {
+        error: "stale_element",
+        doc: record.doc,
+        snap: record.snap,
+        frame: selfFrame,
+      };
+    }
+    root = record.nodes[rootIdx];
+    if (!root || !root.isConnected || !cssRect(root)) {
+      return {
+        error: "stale_element",
+        doc: record.doc,
+        snap: record.snap,
+        frame: selfFrame,
+      };
+    }
+  }
+  const started = Date.now();
+  const scanCap = Math.min(record.nodes.length, maxNodes);
+  let examined = 0;
+  let matchedTotal = 0;
+  let budgetHit = false;
+  const matches = [];
+  for (let i = 0; i < scanCap; i += 1) {
+    if (Date.now() - started > budgetMs) {
+      budgetHit = true;
+      break;
+    }
+    const node = record.nodes[i];
+    examined += 1;
+    if (!node) {
+      continue;
+    }
+    if (root) {
+      if (i === 0 && node === root) {
+        continue;
+      }
+      if (node === root || !nodeContains(root, node)) {
+        continue;
+      }
+    }
+    const payload = keyPayload(node, i);
+    if (wantRole && String(payload.role || "").toLowerCase() !== wantRole) {
+      continue;
+    }
+    if (wantText) {
+      const haystack = String(payload.text || "").toLowerCase();
+      if (haystack.indexOf(wantText) < 0) {
+        continue;
+      }
+    }
+    const rect = cssRect(node);
+    if (wantRect && (!rect || !rectsIntersect(rect, wantRect))) {
+      continue;
+    }
+    matchedTotal += 1;
+    if (matchedTotal <= offset || matches.length >= limit) {
+      continue;
+    }
+    const connected = node.isConnected !== false;
+    const keyOk = connected && snapshotKey(node, payload) === record.keys[i];
+    const row = {
+      id: "chr:" + String(i),
+      idx: i,
+      role: payload.role,
+      text: payload.text,
+      keyOk: keyOk,
+      connected: connected,
+    };
+    if (rect) {
+      row.rectCss = rect;
+    }
+    if (payload.href) {
+      row.href = payload.href;
+    }
+    matches.push(row);
+  }
+  return {
+    doc: record.doc,
+    snap: record.snap,
+    frame: selfFrame,
+    retained: record.retained,
+    examined: examined,
+    budgetHit: budgetHit,
+    matchedTotal: matchedTotal,
+    matches: matches,
+    metrics: windowMetrics(),
+    url: location.href || "",
+    title: document.title || "",
+    visibilityState: document.visibilityState,
+  };
+}
+
+function nodeContains(root, node) {
+  if (!root || !node) {
+    return false;
+  }
+  if (typeof root.contains === "function") {
+    try {
+      return root.contains(node);
+    } catch (_err) {
+      return false;
+    }
+  }
+  let cur = node.parentElement || null;
+  for (let i = 0; i < 256 && cur; i += 1) {
+    if (cur === root) {
+      return true;
+    }
+    cur = cur.parentElement || null;
+  }
+  return false;
+}
+
+function rectsIntersect(a, b) {
+  const left = Math.max(a.left, b.left);
+  const top = Math.max(a.top, b.top);
+  const right = Math.min(a.left + a.width, b.left + b.width);
+  const bottom = Math.min(a.top + a.height, b.top + b.height);
+  return right > left && bottom > top;
+}
+
+// Read-only DOM capability evidence. Attributes only: never `value`, never focus/click.
+function domCapability(el, payload) {
+  const role = String((payload && payload.role) || "").toLowerCase();
+  const tag = String(el.tagName || "").toUpperCase();
+  const has = (name) => el.hasAttribute(name);
+  const attr = (name) => String(el.getAttribute(name) || "").toLowerCase();
+  const editable = isEditableSurface(el) || el.isContentEditable === true;
+  const password = isPassword(el);
+  const invokeRoles = [
+    "button",
+    "link",
+    "tab",
+    "menuitem",
+    "option",
+    "checkbox",
+    "radio",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "treeitem",
+    "switch",
+  ];
+  const invoke =
+    tag === "BUTTON" ||
+    tag === "A" ||
+    tag === "SUMMARY" ||
+    invokeRoles.indexOf(role) >= 0;
+  const toggle =
+    has("aria-checked") ||
+    (tag === "INPUT" && (el.type === "checkbox" || el.type === "radio")) ||
+    role === "checkbox" ||
+    role === "radio" ||
+    role === "switch";
+  const expand = has("aria-expanded") || role === "combobox" || role === "menuitem";
+  const select =
+    has("aria-selected") ||
+    role === "option" ||
+    role === "tab" ||
+    role === "treeitem" ||
+    role === "menuitem";
+  const setValue = editable && !password;
+  const action = (verb, available, evidence) => {
+    const row = {
+      action: verb,
+      support: available ? "available" : "unknown",
+      evidence: available ? evidence : "no_markup_evidence",
+    };
+    return row;
+  };
+  const actions = [
+    action("invoke", invoke, role === "button" ? "role_button" : "role_markup"),
+    action("toggle", toggle, has("aria-checked") ? "aria_checked" : "role_checkbox"),
+    action("expand", expand, has("aria-expanded") ? "aria_expanded" : "role_expand"),
+    action(
+      "collapse",
+      expand,
+      has("aria-expanded") ? "aria_expanded" : "role_expand"
+    ),
+    action(
+      "select",
+      select,
+      has("aria-selected") ? "aria_selected" : "role_selection"
+    ),
+    action("set_value", setValue, "editable_surface"),
+  ];
+  const disabled =
+    el.disabled === true ||
+    has("disabled") ||
+    attr("aria-disabled") === "true" ||
+    has("inert");
+  const state = { enabled: !disabled, offscreen: null, read_only: null };
+  if (editable) {
+    state.read_only = has("readonly") || attr("aria-readonly") === "true";
+  }
+  const ariaChecked = attr("aria-checked");
+  if (ariaChecked === "true") {
+    state.checked = "checked";
+  } else if (ariaChecked === "false") {
+    state.checked = "unchecked";
+  } else if (ariaChecked === "mixed") {
+    state.checked = "mixed";
+  } else if (tag === "INPUT" && typeof el.checked === "boolean") {
+    state.checked = el.checked ? "checked" : "unchecked";
+  }
+  const ariaExpanded = attr("aria-expanded");
+  if (ariaExpanded === "true") {
+    state.expanded = "expanded";
+  } else if (ariaExpanded === "false") {
+    state.expanded = "collapsed";
+  }
+  const ariaSelected = attr("aria-selected");
+  if (ariaSelected === "true") {
+    state.selected = true;
+  } else if (ariaSelected === "false") {
+    state.selected = false;
+  }
+  const notes = ["dom_advertised_not_proven"];
+  if (disabled) {
+    notes.push("disabled");
+  }
+  return {
+    source: "dom",
+    actions: actions,
+    state: state,
+    notes: notes.slice(0, 3),
+  };
 }
 
 function isPostcheckRendered(el) {

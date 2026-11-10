@@ -1,0 +1,178 @@
+{
+  "url": "https://example.test/find-cases",
+  "title": "Find cases fixture",
+  "main_text": "Find cases fixture",
+  "doc": "7a1b",
+  "snap": "feedface",
+  "elements": [
+    {
+      "id": "chr:0",
+      "role": "Button",
+      "text": "Sign in",
+      "rectCss": {
+        "left": 100,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:1",
+      "role": "Hyperlink",
+      "text": "Create account",
+      "rectCss": {
+        "left": 240,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:2",
+      "role": "Edit",
+      "text": "Forgot password",
+      "rectCss": {
+        "left": 380,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:3",
+      "role": "Button",
+      "text": "Search listings",
+      "rectCss": {
+        "left": 520,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:4",
+      "role": "Hyperlink",
+      "text": "Filter results",
+      "rectCss": {
+        "left": 660,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:5",
+      "role": "Edit",
+      "text": "Sort by price",
+      "rectCss": {
+        "left": 800,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:6",
+      "role": "Button",
+      "text": "Next page",
+      "rectCss": {
+        "left": 100,
+        "top": 100,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:7",
+      "role": "Hyperlink",
+      "text": "Previous page",
+      "rectCss": {
+        "left": 240,
+        "top": 100,
+        "width": 120,
+        "height": 32
+      }
+    }
+  ],
+  "cases": [
+    {
+      "name": "role_button",
+      "role": "button",
+      "text": null,
+      "expected": [
+        "chr:0",
+        "chr:3",
+        "chr:6"
+      ]
+    },
+    {
+      "name": "role_hyperlink",
+      "role": "hyperlink",
+      "text": null,
+      "expected": [
+        "chr:1",
+        "chr:4",
+        "chr:7"
+      ]
+    },
+    {
+      "name": "role_edit",
+      "role": "edit",
+      "text": null,
+      "expected": [
+        "chr:2",
+        "chr:5"
+      ]
+    },
+    {
+      "name": "text_sign",
+      "role": null,
+      "text": "sign",
+      "expected": [
+        "chr:0"
+      ]
+    },
+    {
+      "name": "text_page",
+      "role": null,
+      "text": "page",
+      "expected": [
+        "chr:6",
+        "chr:7"
+      ]
+    },
+    {
+      "name": "role_and_text",
+      "role": "button",
+      "text": "page",
+      "expected": [
+        "chr:6"
+      ]
+    },
+    {
+      "name": "text_absent",
+      "role": null,
+      "text": "zzz-nothing",
+      "expected": []
+    }
+  ],
+  "cards": [],
+  "metrics": {
+    "screenX": 0,
+    "screenY": 0,
+    "outerWidth": 1200,
+    "outerHeight": 900,
+    "innerWidth": 1200,
+    "innerHeight": 900,
+    "devicePixelRatio": 1,
+    "clientWidth": 1200,
+    "clientHeight": 900
+  },
+  "assess_v": 1,
+  "tab": 12,
+  "window": 45,
+  "frame": 0,
+  "retained": 8,
+  "stored": true,
+  "fallback": false
+}

@@ -1318,6 +1318,7 @@ function forward(port, msg) {
   if (
     op !== "snapshot" &&
     op !== "resolve" &&
+    op !== "query" &&
     op !== "assess" &&
     op !== "postcheck" &&
     op !== "binding" &&

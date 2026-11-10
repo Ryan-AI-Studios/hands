@@ -82,6 +82,61 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
+    /// Read-only search inside an already-bound snapshot scope, and exact drill-down. `--within <sref1:…>` lists matching stored nodes (Chrome document snapshot or one frame's snapshot; a bounded UIA window/subtree walk). `--ref <sref1:…>` describes one element through the 0123 resolve with an opt-in 0128 assessment and read-only capability evidence. ANDed filters: `--role`, `--text`, `--rect-css l,t,w,h` (Chrome), `--rect x,y,w,h` (UIA), `--subtree` (root is the scope ref's own element), `--depth` (UIA). `ok:true` means the scope was read, not that a target is live or clickable. `coverage.page_complete` is always false: zero matches means "no match in this snapshot/scope", never "absent". Chrome list returns `rect_css` only; capability evidence is not authority; a disabled/hidden control is absent from the stored walk. No input, no lease, no cooldown, no JSONL, no inner model.
+    Find {
+        #[arg(
+            long,
+            help = "scope ref sref1:c… (Chrome stored snapshot/frame) or sref1:u… (UIA window/subtree)"
+        )]
+        within: Option<String>,
+        #[arg(long, help = "UIA window pid, unique title, or hwnd:<hex>")]
+        window: Option<String>,
+        #[arg(
+            long = "ref",
+            help = "exact element ref sref1:… (drill-down, not a list)"
+        )]
+        r#ref: Option<String>,
+        #[arg(long, help = "case-insensitive exact role filter")]
+        role: Option<String>,
+        #[arg(long, help = "case-insensitive substring filter (max 64 chars)")]
+        text: Option<String>,
+        #[arg(long, help = "UIA physical rect x,y,w,h (intersect)")]
+        rect: Option<String>,
+        #[arg(
+            long = "rect-css",
+            help = "Chrome CSS rect left,top,width,height (intersect)"
+        )]
+        rect_css: Option<String>,
+        #[arg(long, help = "narrow to the scope ref's own element descendants")]
+        subtree: bool,
+        #[arg(long, help = "UIA relative depth bound 1..8 (default 3)")]
+        depth: Option<u32>,
+        #[arg(long, help = "page size 1..100 (default 20)")]
+        limit: Option<usize>,
+        #[arg(long, help = "page offset after the exact match count")]
+        offset: Option<usize>,
+        #[arg(
+            long = "no-caps",
+            help = "exact mode: skip the read-only capability probe"
+        )]
+        no_caps: bool,
+        #[arg(long, help = "exact mode: include the opt-in 0128 DOM assessment")]
+        assess: bool,
+        #[arg(
+            long = "budget-ms",
+            help = "Chrome scan budget 1..300 ms (default 150)"
+        )]
+        budget_ms: Option<u64>,
+        #[arg(
+            long = "max-nodes",
+            help = "node cap 1..4000 (default 1500 UIA / 4000 Chrome)"
+        )]
+        max_nodes: Option<usize>,
+        #[arg(long = "timeout-ms", help = "UIA deadline 1..2000 ms (default 800)")]
+        timeout_ms: Option<u64>,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
     /// Bézier-move and left-click a UIA id, Chrome `chr:`/`sref1:c` id, grid cell, or pixel. `uia:` is a RuntimeId; `sref1:u` is its snapshot-bound form; `chr:` is a page-local walk index (dies on navigation; re-observe), `sref1:c` is snapshot-bound and stale-safe. Prefer `ref` (`sref1:`); `id` is legacy and not stale-safe. Point must be inside the intended window's true client or an owned popup (no `--window` on click; activate first). Out-of-client is `ok:false` (named refusal, cooldown), not SendInput. `ok:true` means delivered; `miss` (`no_change` / `focus_lost`) is the effect signal. `navigated:true` is a Chrome caption change or loading interstitial, or a non-Chrome http(s) UIA Document URL change — `miss` omitted, no retry; `chr:` ids died, re-observe. Chrome soft-routes with the same caption stay `no_change`. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on `focus_lost`. Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default. The `point` object carries the shared PointContract; a transform-invalid `chr:` refuses `ok:false` with `verified:false`, `physical:null` and a named `reason`, and never calls offer/SendInput. `verified` semantics: on `ok:true`, dispatch delivered and effect unproven; pre-dispatch refusals carry the target reason and send nothing (the `verified` key is omitted); a post-dispatch freeze or post-dispatch failure sets `verified:false` because input may already have been sent. `--require-interactable` opts in to refusing a blocked/unknown `chr:` before fence/offer/SendInput; `interactable_checked:true` marks that this binary honoured the flag.
     Click {
         #[arg(
@@ -577,6 +632,43 @@ async fn main() {
             }
             hittest_main(element_id, grid, x, y, samples, session_id)
         }
+        Command::Find {
+            within,
+            window,
+            r#ref,
+            role,
+            text,
+            rect,
+            rect_css,
+            subtree,
+            depth,
+            limit,
+            offset,
+            no_caps,
+            assess,
+            budget_ms,
+            max_nodes,
+            timeout_ms,
+            session_id,
+        } => find_main(hands::find::FindRequest {
+            session_id,
+            within,
+            window,
+            r#ref,
+            role,
+            text,
+            rect,
+            rect_css,
+            subtree,
+            depth,
+            limit,
+            offset,
+            no_caps,
+            assess,
+            budget_ms,
+            max_nodes,
+            timeout_ms,
+        }),
         other => {
             if let Err(err) = dpi {
                 fail(err);
@@ -914,7 +1006,8 @@ fn input_main(command: Command) -> Result<(), HandsError> {
         | Command::NativeHostManifest { .. }
         | Command::NativeHostDoctor
         | Command::ElevationStatus
-        | Command::Hittest { .. } => {
+        | Command::Hittest { .. }
+        | Command::Find { .. } => {
             unreachable!()
         }
     };
@@ -998,6 +1091,16 @@ fn hittest_main(
         samples,
     })?;
     let json = hands::hittest::serialize(&envelope)?;
+    println!("{json}");
+    if !envelope.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn find_main(req: hands::find::FindRequest) -> Result<(), HandsError> {
+    let envelope = hands::find::run(req)?;
+    let json = hands::find::serialize(&envelope)?;
     println!("{json}");
     if !envelope.ok {
         std::process::exit(1);

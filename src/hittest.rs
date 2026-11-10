@@ -1640,8 +1640,10 @@ mod tests {
             css_point: CssPoint::new(50.0, 20.0),
             contract,
             hwnd: Some(0x1234),
+            href: None,
             map: None,
             assessment: None,
+            capability: None,
             identity: None,
         };
         chrome::set_resolve_stub(Some(hit));

@@ -141,9 +141,14 @@ pub struct ChromeHit {
     pub css_point: CssPoint,
     pub contract: PointContract,
     pub hwnd: Option<isize>,
+    /// Page href from the scoped resolve reply when the stored payload carried one.
+    pub href: Option<String>,
     pub(crate) map: Option<ViewportMap>,
     /// Optional DOM assessment returned by the same resolve reply (`assess:true`).
     pub assessment: Option<Assessment>,
+    /// Optional read-only DOM capability block returned by the same resolve reply (`caps:true`).
+    /// Kept as raw JSON so `find` owns the capability vocabulary without a module cycle.
+    pub capability: Option<serde_json::Value>,
     /// Scoped/legacy identity report for the resolved element.
     pub identity: Option<IdentityReport>,
 }
@@ -778,8 +783,10 @@ fn hit_from_raw(
         css_point: node.rect_css.center(),
         contract,
         hwnd,
+        href: None,
         map: Some(map),
         assessment,
+        capability: None,
         identity: Some(IdentityReport::legacy()),
     })
 }
@@ -1162,6 +1169,17 @@ pub fn resolve_ref_request(
     assess: bool,
     samples: Option<u32>,
 ) -> serde_json::Value {
+    resolve_ref_request_caps(r, assess, samples, false)
+}
+
+/// Same request with the additive `caps:true` read-only capability flag. Without the flag
+/// the reply stays byte-identical to the pre-0125 resolve (test-pinned).
+pub fn resolve_ref_request_caps(
+    r: &SnapshotRef,
+    assess: bool,
+    samples: Option<u32>,
+    caps: bool,
+) -> serde_json::Value {
     match r {
         SnapshotRef::Chrome {
             tab,
@@ -1184,6 +1202,9 @@ pub fn resolve_ref_request(
                 if let Some(samples) = samples {
                     req["samples"] = serde_json::Value::from(samples);
                 }
+            }
+            if caps {
+                req["caps"] = serde_json::Value::Bool(true);
             }
             req
         }
@@ -1208,10 +1229,31 @@ fn error_token(reply: &serde_json::Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Query-path error classification. The SW's kebab `unsupported-op` short-circuit and the
+/// secondary `empty` port-close both mean "this extension does not answer `query`"; neither is a
+/// malformed reply. `empty` is mapped here only for the query path so the Completed resolve
+/// contract keeps `protocol_error` for its own port-close case.
+pub(crate) fn query_error_token(token: &str) -> (IdentityState, String) {
+    if token == "empty" {
+        return (IdentityState::Unknown, "unsupported_op".to_string());
+    }
+    classify_ref_error(token)
+}
+
+#[cfg(test)]
+#[allow(clippy::result_large_err)]
+pub(crate) fn query_reply_for_test(
+    reply: &serde_json::Value,
+    r: &SnapshotRef,
+) -> Result<QueryReply, IdentityReport> {
+    query_reply_from_json(reply, r)
+}
+
 fn classify_ref_error(token: &str) -> (IdentityState, String) {
     let token = match token {
         "no-content" => "no_content",
         "no-tab" => "no_tab",
+        "unsupported-op" => "unsupported_op",
         other => other,
     };
     let state = match token {
@@ -1247,7 +1289,9 @@ fn classify_ref_error(token: &str) -> (IdentityState, String) {
         | "frame_probe_timeout"
         | "frame_depth_exceeded"
         | "frame_link_missing"
-        | "frame_budget_exceeded" => IdentityState::Unknown,
+        | "frame_budget_exceeded"
+        | "no_snapshot"
+        | "unsupported_op" => IdentityState::Unknown,
         _ => IdentityState::Unknown,
     };
     let reason = match token {
@@ -1263,6 +1307,8 @@ fn classify_ref_error(token: &str) -> (IdentityState, String) {
         | "window_not_focused"
         | "tab_hidden"
         | "tab_unavailable"
+        | "no_snapshot"
+        | "unsupported_op"
         | "stale_document"
         | "stale_snapshot"
         | "stale_element"
@@ -1575,8 +1621,13 @@ pub(crate) fn hit_from_scoped_reply(
         css_point: node.rect_css.center(),
         contract,
         hwnd,
+        href: reply
+            .get("href")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         map: Some(map),
         assessment,
+        capability: reply.get("capability").cloned().filter(|v| !v.is_null()),
         identity: Some(IdentityReport::exact_chrome(r).with_window(report_window)),
     })
 }
@@ -1667,6 +1718,386 @@ pub(crate) fn set_binding_sequence(sequence: Vec<Result<BindingEvidence, Identit
     BINDING_SEQUENCE.with(|c| *c.borrow_mut() = sequence);
 }
 
+/// One stored-node row of a scoped Chrome list query.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueryRow {
+    pub id: String,
+    pub idx: Option<u32>,
+    pub role: String,
+    pub text: Option<String>,
+    pub rect_css: Option<CssRect>,
+    pub key_ok: Option<bool>,
+    pub connected: bool,
+    pub depth: Option<u32>,
+    pub href: Option<String>,
+}
+
+/// Parsed scoped Chrome list reply. Every failure is an [`IdentityReport`]; nothing guesses.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueryReply {
+    pub tab: Option<u32>,
+    pub window: Option<u32>,
+    pub frame: Option<u32>,
+    pub doc: String,
+    pub snap: String,
+    pub retained: usize,
+    pub examined: usize,
+    pub budget_hit: bool,
+    pub matched_total: usize,
+    pub matches: Vec<QueryRow>,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub fixture: bool,
+}
+
+/// Read-only list query over the **stored** snapshot only. It never sends `op:"snapshot"`, never
+/// walks, and never replaces the record. `subtree` sends the scope ref's own resolved integer.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+pub fn query_scope(
+    r: &SnapshotRef,
+    role: Option<&str>,
+    text: Option<&str>,
+    rect_css: Option<CssRect>,
+    subtree: bool,
+    limit: usize,
+    offset: usize,
+    budget_ms: u64,
+    max_nodes: usize,
+) -> Result<QueryReply, IdentityReport> {
+    let (tab, frame, doc, snap, idx) = chrome_ref_parts(r)?;
+    if let Some(path) = snapshot_env() {
+        let raw = load_fixture_raw(&path)
+            .map_err(|_| IdentityReport::chrome_failure(r, IdentityState::Unknown, "host_down"))?;
+        return fixture_query(
+            &raw, r, role, text, rect_css, subtree, limit, offset, max_nodes,
+        );
+    }
+    let mut req = serde_json::json!({
+        "op": "query",
+        "v": 1,
+        "tab": tab,
+        "frame": frame,
+        "doc": doc,
+        "snap": snap,
+        "limit": limit,
+        "offset": offset,
+        "budgetMs": budget_ms,
+        "maxNodes": max_nodes,
+    });
+    if let Some(role) = role {
+        req["role"] = serde_json::Value::from(role);
+    }
+    if let Some(text) = text {
+        req["text"] = serde_json::Value::from(text);
+    }
+    if let Some(rect) = rect_css {
+        req["rectCss"] = serde_json::to_value(rect).unwrap_or(serde_json::Value::Null);
+    }
+    if subtree {
+        req["subtreeRoot"] = serde_json::Value::from(idx);
+    }
+    let reply = pipe_request(&req).map_err(|err| {
+        let text = err.to_string();
+        let reason = if text.contains("client timed out after") {
+            "resolve_timeout"
+        } else {
+            "host_down"
+        };
+        IdentityReport::chrome_failure(r, IdentityState::Unknown, reason)
+    })?;
+    query_reply_from_json(&reply, r)
+}
+
+#[allow(clippy::result_large_err)]
+fn query_reply_from_json(
+    reply: &serde_json::Value,
+    r: &SnapshotRef,
+) -> Result<QueryReply, IdentityReport> {
+    let (tab, frame, doc, snap, _idx) = chrome_ref_parts(r)?;
+    let report_window = reply
+        .get("window")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    if let Some(token) = error_token(reply) {
+        let (state, reason) = query_error_token(&token);
+        return Err(IdentityReport::chrome_failure(r, state, &reason).with_window(report_window));
+    }
+    let echo_u32 = |key: &str| {
+        reply
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    let echo_str = |key: &str| reply.get(key).and_then(|v| v.as_str());
+    if echo_str("doc") != Some(doc) {
+        return Err(IdentityReport::chrome_failure(
+            r,
+            IdentityState::Stale,
+            "stale_document",
+        ));
+    }
+    if echo_str("snap") != Some(snap) {
+        return Err(IdentityReport::chrome_failure(
+            r,
+            IdentityState::Stale,
+            "stale_snapshot",
+        ));
+    }
+    if echo_u32("frame") != Some(frame) {
+        return Err(IdentityReport::chrome_failure(
+            r,
+            IdentityState::Unknown,
+            "protocol_error",
+        ));
+    }
+    match reply.get("active").and_then(|v| v.as_bool()) {
+        Some(true) => {}
+        Some(false) => {
+            return Err(IdentityReport::chrome_failure(
+                r,
+                IdentityState::Unknown,
+                "tab_not_active",
+            ));
+        }
+        None => {
+            return Err(IdentityReport::chrome_failure(
+                r,
+                IdentityState::Unknown,
+                "protocol_error",
+            ));
+        }
+    }
+    match reply.get("focused").and_then(|v| v.as_bool()) {
+        Some(true) => {}
+        Some(false) => {
+            return Err(IdentityReport::chrome_failure(
+                r,
+                IdentityState::Unknown,
+                "window_not_focused",
+            ));
+        }
+        None => {
+            return Err(IdentityReport::chrome_failure(
+                r,
+                IdentityState::Unknown,
+                "protocol_error",
+            ));
+        }
+    }
+    match reply.get("visibilityState").and_then(|v| v.as_str()) {
+        Some("visible") => {}
+        Some(_) => {
+            return Err(IdentityReport::chrome_failure(
+                r,
+                IdentityState::Unknown,
+                "tab_hidden",
+            ));
+        }
+        None => {
+            return Err(IdentityReport::chrome_failure(
+                r,
+                IdentityState::Unknown,
+                "protocol_error",
+            ));
+        }
+    }
+    if reply.get("fallback").and_then(|v| v.as_bool()) == Some(true) {
+        // A named-tab query is never served by the active-tab fallback.
+        return Err(IdentityReport::chrome_failure(
+            r,
+            IdentityState::Unknown,
+            "protocol_error",
+        ));
+    }
+    let retained = reply
+        .get("retained")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| {
+            IdentityReport::chrome_failure(r, IdentityState::Unknown, "protocol_error")
+        })?;
+    let examined = reply
+        .get("examined")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| {
+            IdentityReport::chrome_failure(r, IdentityState::Unknown, "protocol_error")
+        })?;
+    let matched_total = reply
+        .get("matchedTotal")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| {
+            IdentityReport::chrome_failure(r, IdentityState::Unknown, "protocol_error")
+        })?;
+    let budget_hit = reply
+        .get("budgetHit")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| {
+            IdentityReport::chrome_failure(r, IdentityState::Unknown, "protocol_error")
+        })?;
+    let rows: Vec<RawQueryRow> = reply
+        .get("matches")
+        .cloned()
+        .filter(|v| !v.is_null())
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| IdentityReport::chrome_failure(r, IdentityState::Unknown, "protocol_error"))?
+        .ok_or_else(|| {
+            IdentityReport::chrome_failure(r, IdentityState::Unknown, "protocol_error")
+        })?;
+    Ok(QueryReply {
+        tab: Some(tab),
+        window: report_window,
+        frame: Some(frame),
+        doc: doc.to_string(),
+        snap: snap.to_string(),
+        retained,
+        examined,
+        budget_hit,
+        matched_total,
+        matches: rows.into_iter().map(QueryRow::from).collect(),
+        url: echo_str("url").map(str::to_string),
+        title: echo_str("title").map(str::to_string),
+        fixture: false,
+    })
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct RawQueryRow {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    idx: Option<u32>,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default, rename = "rectCss")]
+    rect_css: Option<CssRect>,
+    #[serde(default, rename = "keyOk")]
+    key_ok: Option<bool>,
+    #[serde(default)]
+    connected: Option<bool>,
+    #[serde(default)]
+    depth: Option<u32>,
+    #[serde(default)]
+    href: Option<String>,
+}
+
+impl From<RawQueryRow> for QueryRow {
+    fn from(raw: RawQueryRow) -> Self {
+        let connected = raw.connected.unwrap_or(true);
+        Self {
+            id: raw.id,
+            idx: raw.idx,
+            role: raw.role,
+            text: raw.text,
+            rect_css: raw.rect_css,
+            // A detached node is never `key_ok:true`; the ref will refuse at resolve.
+            key_ok: if connected { raw.key_ok } else { Some(false) },
+            connected,
+            depth: raw.depth,
+            href: raw.href,
+        }
+    }
+}
+
+/// Fixture-mode query: the fixture snapshot is already the stored walk, so filtering it is the
+/// same predicate without a live DOM. Containment is unknowable here and is named, never guessed.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+fn fixture_query(
+    raw: &RawSnapshot,
+    r: &SnapshotRef,
+    role_want: Option<&str>,
+    text_want: Option<&str>,
+    rect_css: Option<CssRect>,
+    subtree: bool,
+    limit: usize,
+    offset: usize,
+    max_nodes: usize,
+) -> Result<QueryReply, IdentityReport> {
+    let (tab, frame, doc, snap, _idx) = chrome_ref_parts(r)?;
+    if raw.doc.as_deref() != Some(doc) {
+        return Err(IdentityReport::chrome_failure(
+            r,
+            IdentityState::Stale,
+            "stale_document",
+        ));
+    }
+    if raw.snap.as_deref() != Some(snap) {
+        return Err(IdentityReport::chrome_failure(
+            r,
+            IdentityState::Stale,
+            "stale_snapshot",
+        ));
+    }
+    if subtree {
+        return Err(IdentityReport::chrome_failure(
+            r,
+            IdentityState::Unknown,
+            "fixture_unavailable",
+        ));
+    }
+    let mut matched: Vec<QueryRow> = Vec::new();
+    let retained = raw.retained.unwrap_or(raw.elements.len());
+    let scope_nodes: Vec<&RawNode> = raw
+        .elements
+        .iter()
+        .filter(|el| el.frame.unwrap_or(0) == frame)
+        .take(max_nodes)
+        .collect();
+    for el in &scope_nodes {
+        let role = el.role.clone().unwrap_or_default();
+        let id = el.id.clone().unwrap_or_default();
+        let idx = el
+            .idx
+            .or_else(|| id.strip_prefix("chr:").and_then(|n| n.parse::<u32>().ok()));
+        if !crate::find::chrome_row_matches(
+            &role,
+            el.text.as_deref(),
+            Some(el.rect_css),
+            role_want,
+            text_want,
+            rect_css,
+        ) {
+            continue;
+        }
+        matched.push(QueryRow {
+            id,
+            idx,
+            role,
+            text: el.text.clone(),
+            rect_css: Some(el.rect_css),
+            key_ok: Some(true),
+            connected: true,
+            depth: None,
+            href: None,
+        });
+    }
+    let matched_total = matched.len();
+    let matches = matched
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    Ok(QueryReply {
+        tab: Some(tab),
+        window: raw.window,
+        frame: Some(frame),
+        doc: doc.to_string(),
+        snap: snap.to_string(),
+        retained,
+        examined: scope_nodes.len(),
+        budget_hit: false,
+        matched_total,
+        matches,
+        url: raw.url.clone(),
+        title: raw.title.clone(),
+        fixture: true,
+    })
+}
+
 /// Scoped Chrome resolve. Live mode requires the current foreground HWND to be the intended
 /// Chrome window; a scoped request is never served by whatever tab is in front.
 #[allow(clippy::result_large_err)]
@@ -1675,6 +2106,29 @@ pub fn try_resolve_ref(
     hwnd: Option<isize>,
     assess: bool,
     samples: Option<u32>,
+) -> Result<ChromeHit, IdentityReport> {
+    resolve_ref_full(r, hwnd, assess, samples, false)
+}
+
+/// Read-only `find --ref` resolve that additionally asks for the additive `caps:true` DOM
+/// capability block. Never dispatched by an actuation path.
+#[allow(clippy::result_large_err)]
+pub fn try_resolve_ref_with_caps(
+    r: &SnapshotRef,
+    hwnd: Option<isize>,
+    assess: bool,
+    samples: Option<u32>,
+) -> Result<ChromeHit, IdentityReport> {
+    resolve_ref_full(r, hwnd, assess, samples, true)
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_ref_full(
+    r: &SnapshotRef,
+    hwnd: Option<isize>,
+    assess: bool,
+    samples: Option<u32>,
+    caps: bool,
 ) -> Result<ChromeHit, IdentityReport> {
     #[cfg(test)]
     {
@@ -1685,7 +2139,7 @@ pub fn try_resolve_ref(
     if let Some(path) = snapshot_env() {
         let raw = load_fixture_raw(&path)
             .map_err(|_| IdentityReport::chrome_failure(r, IdentityState::Unknown, "host_down"))?;
-        return scoped_fixture_hit(&raw, r, hwnd, assess);
+        return scoped_fixture_hit(&raw, r, hwnd, assess, caps);
     }
     let Some(hwnd) = hwnd else {
         return Err(IdentityReport::chrome_failure(
@@ -1697,7 +2151,7 @@ pub fn try_resolve_ref(
     // Do not short-circuit on a non-Chrome foreground: a background Chrome window behind
     // Notepad must resolve through the extension reply and come back as `window_not_focused`
     // / `tab_not_active`, not `not_chrome`.
-    let req = resolve_ref_request(r, assess, samples);
+    let req = resolve_ref_request_caps(r, assess, samples, caps);
     let reply = pipe_request(&req).map_err(|err| {
         let text = err.to_string();
         let reason = if text.contains("client timed out after") {
@@ -1724,6 +2178,7 @@ fn scoped_fixture_hit(
     r: &SnapshotRef,
     hwnd: Option<isize>,
     assess: bool,
+    caps: bool,
 ) -> Result<ChromeHit, IdentityReport> {
     let (tab, frame, doc, snap, idx) = chrome_ref_parts(r)?;
     let node = if frame > 0 {
@@ -1787,7 +2242,48 @@ fn scoped_fixture_hit(
     if assess && let Some(a) = &raw.assessment {
         reply["assessment"] = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
     }
+    if caps {
+        let role = node.role.clone().unwrap_or_else(|| "Other".into());
+        reply["capability"] = fixture_capability(&role);
+    }
     hit_from_scoped_reply(&reply, r, hwnd, true, assess)
+}
+
+/// Fixture-only DOM capability evidence: role markup, no live attributes. The Node harness and
+/// the live extension own the real attribute predicates; this keeps fixture mode honest about
+/// what a role alone can say (never `unavailable`).
+fn fixture_capability(role: &str) -> serde_json::Value {
+    let role = role.to_ascii_lowercase();
+    let invoke = matches!(
+        role.as_str(),
+        "button" | "hyperlink" | "tabitem" | "menuitem" | "checkbox" | "radiobutton" | "combobox"
+    );
+    let toggle = matches!(role.as_str(), "checkbox" | "radiobutton");
+    let select = matches!(
+        role.as_str(),
+        "tabitem" | "menuitem" | "option" | "listitem"
+    );
+    let set_value = matches!(role.as_str(), "edit" | "combobox");
+    let action = |verb: &str, available: bool, evidence: &str| {
+        serde_json::json!({
+            "action": verb,
+            "support": if available { "available" } else { "unknown" },
+            "evidence": if available { evidence } else { "no_markup_evidence" },
+        })
+    };
+    serde_json::json!({
+        "source": "dom",
+        "actions": [
+            action("invoke", invoke, "role_button"),
+            action("toggle", toggle, "role_checkbox"),
+            action("expand", false, "no_markup_evidence"),
+            action("collapse", false, "no_markup_evidence"),
+            action("select", select, "role_selection"),
+            action("set_value", set_value, "editable_role"),
+        ],
+        "state": {"enabled": true},
+        "notes": ["dom_advertised_not_proven"],
+    })
 }
 
 /// Frame pre-dispatch probe evidence. A missing chain means the frame geometry is unavailable;
@@ -4639,7 +5135,8 @@ mod tests {
             }],
             ..RawSnapshot::default()
         };
-        let hit = scoped_fixture_hit(&raw, &r, Some(0x1234), false).expect("fixture frame ref");
+        let hit =
+            scoped_fixture_hit(&raw, &r, Some(0x1234), false, false).expect("fixture frame ref");
         assert_eq!(hit.css_rect.left, 50.0);
         assert_eq!(hit.css_rect.top, 80.0);
     }

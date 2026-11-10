@@ -39,7 +39,7 @@ use crate::input;
 use crate::logs::{self, LogFence, LogTarget};
 use crate::space::{ensure_dpi, virtual_screen};
 use crate::target::{ResolvedTarget, Target, TargetOutcome};
-use crate::uia;
+use crate::uia::{self, ResolvedElement, ScopedFailure};
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 3000;
 pub const MIN_TIMEOUT_MS: u64 = 500;
@@ -1198,6 +1198,163 @@ fn set_value(element: &IUIAutomationElement, text: &str) -> SemanticResult {
     };
     // `state_after` is never set for value writes and never logged.
     delivered_readback(after == text, None)
+}
+
+// ---------------------------------------------------------------- read-only capability probe (0125)
+
+/// Read-only pattern/state evidence for one resolved UIA element. `Some(true)` = the pattern
+/// interface was returned; `Some(false)` = a null pattern / `UIA_E_NOTSUPPORTED`; `None` = the
+/// query failed for another reason (unknown, never a guess). No mutating call is made.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapabilityProbe {
+    pub invoke: Option<bool>,
+    pub toggle: Option<bool>,
+    pub expand_collapse: Option<bool>,
+    pub selection_item: Option<bool>,
+    pub value: Option<bool>,
+    pub enabled: Option<bool>,
+    pub offscreen: Option<bool>,
+    pub read_only: Option<bool>,
+    pub toggle_state: Option<String>,
+    pub expand_state: Option<String>,
+    pub selected: Option<bool>,
+    /// Any pattern query failed with an unclassified (e.g. access-denied) HRESULT.
+    pub denied: bool,
+}
+
+/// Resolve the 0123 `ridh`+`fp` target and probe the **same** COM element on **one** STA worker
+/// with one caller deadline. Never `GetRootElement`, never `resolve_on(&[i32])`, never a mutating
+/// method, never `CurrentValue`.
+#[allow(clippy::result_large_err)]
+pub(crate) fn probe_scoped_target(
+    hwnd: isize,
+    ridh: &str,
+    fp: &str,
+    deadline: Duration,
+) -> Result<(ResolvedElement, CapabilityProbe), ScopedFailure> {
+    let ridh = ridh.to_string();
+    let fp = fp.to_string();
+    let Some(slot) = uia::WorkerSlot::acquire() else {
+        return Err(ScopedFailure::unknown("provider_timeout"));
+    };
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("hands-uia-probe".into())
+        .spawn(move || {
+            let _slot = slot;
+            let _ = tx.send(sta_probe_scoped_target(hwnd, &ridh, &fp));
+        })
+        .map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(_) => Err(ScopedFailure::unknown("provider_timeout")),
+    }
+}
+
+fn sta_probe_scoped_target(
+    hwnd: isize,
+    ridh: &str,
+    fp: &str,
+) -> Result<(ResolvedElement, CapabilityProbe), ScopedFailure> {
+    let _sta = uia::StaGuard::enter().map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    let automation =
+        uia::create_automation().map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    let walker = unsafe { automation.ControlViewWalker() }
+        .map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    let (element, resolved) = uia::resolve_scoped_com(&automation, &walker, hwnd, ridh, fp)?;
+    let probe = probe_element(&element);
+    Ok((resolved, probe))
+}
+
+fn pattern_available<T: windows::core::Interface>(
+    element: &IUIAutomationElement,
+    pattern_id: UIA_PATTERN_ID,
+    denied: &mut bool,
+) -> Option<bool> {
+    match unsafe { element.GetCurrentPatternAs::<T>(pattern_id) } {
+        Ok(_) => Some(true),
+        Err(err) => match err.code().0 as u32 {
+            // Null pattern (`Error::empty`, code 0) and UIA_E_NOTSUPPORTED.
+            0 | 0x8004_0204 => Some(false),
+            _ => {
+                *denied = true;
+                None
+            }
+        },
+    }
+}
+
+fn probe_element(element: &IUIAutomationElement) -> CapabilityProbe {
+    let mut probe = CapabilityProbe::default();
+    probe.invoke = pattern_available::<IUIAutomationInvokePattern>(
+        element,
+        UIA_InvokePatternId,
+        &mut probe.denied,
+    );
+    probe.toggle = pattern_available::<IUIAutomationTogglePattern>(
+        element,
+        UIA_TogglePatternId,
+        &mut probe.denied,
+    );
+    probe.expand_collapse = pattern_available::<IUIAutomationExpandCollapsePattern>(
+        element,
+        UIA_ExpandCollapsePatternId,
+        &mut probe.denied,
+    );
+    probe.selection_item = pattern_available::<IUIAutomationSelectionItemPattern>(
+        element,
+        UIA_SelectionItemPatternId,
+        &mut probe.denied,
+    );
+    probe.value = pattern_available::<IUIAutomationValuePattern>(
+        element,
+        UIA_ValuePatternId,
+        &mut probe.denied,
+    );
+    probe.enabled = unsafe { element.CurrentIsEnabled() }
+        .ok()
+        .map(|v| v.as_bool());
+    probe.offscreen = unsafe { element.CurrentIsOffscreen() }
+        .ok()
+        .map(|v| v.as_bool());
+    if probe.value == Some(true)
+        && let Ok(pattern) =
+            unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
+    {
+        // Read-only flag only: the value itself is never read.
+        probe.read_only = unsafe { pattern.CurrentIsReadOnly() }
+            .ok()
+            .map(|v| v.as_bool());
+    }
+    if probe.toggle == Some(true)
+        && let Ok(pattern) = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
+        }
+        && let Ok(state) = unsafe { pattern.CurrentToggleState() }
+    {
+        probe.toggle_state = Some(toggle_state_name(state).to_string());
+    }
+    if probe.expand_collapse == Some(true)
+        && let Ok(pattern) = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(
+                UIA_ExpandCollapsePatternId,
+            )
+        }
+        && let Ok(state) = unsafe { pattern.CurrentExpandCollapseState() }
+    {
+        probe.expand_state = Some(expand_state_name(state).to_string());
+    }
+    if probe.selection_item == Some(true)
+        && let Ok(pattern) = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                UIA_SelectionItemPatternId,
+            )
+        }
+        && let Ok(selected) = unsafe { pattern.CurrentIsSelected() }
+    {
+        probe.selected = Some(selected.as_bool());
+    }
+    probe
 }
 
 fn toggle_state_name(state: ToggleState) -> &'static str {

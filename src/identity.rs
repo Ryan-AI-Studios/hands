@@ -566,6 +566,26 @@ pub fn runtime_id_hash(ids: &[i32]) -> String {
     format!("{:08x}", fnv1a32(dotted.as_bytes()))
 }
 
+/// The one UIA `sref1:` formula, shared by `observe` ref stamping and `find` rows so a
+/// query ref is byte-identical to the observe ref for the same element. `role`/`text`/
+/// `unnamed` are the element's **own** attributes; an empty RuntimeId cannot make a ref.
+pub fn uia_ref_from_parts(
+    hwnd: u64,
+    role: &str,
+    text: Option<&str>,
+    unnamed: Option<bool>,
+    runtime_id: &[i32],
+) -> Option<String> {
+    if hwnd == 0 || runtime_id.is_empty() {
+        return None;
+    }
+    let fp = fingerprint_hex(role, text, unnamed);
+    Some(format!(
+        "sref1:u.{hwnd:x}.{fp}.{}",
+        runtime_id_hash(runtime_id)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

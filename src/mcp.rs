@@ -87,6 +87,60 @@ pub struct HittestParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FindParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Scope ref `sref1:c…` (Chrome document/frame snapshot) or `sref1:u…` (UIA window/subtree).
+    #[serde(default)]
+    pub within: Option<String>,
+    /// UIA window selector: pid, unique exact title then unique substring, or `hwnd:<hex>`.
+    #[serde(default)]
+    pub window: Option<String>,
+    /// Exact element ref `sref1:…` (drill-down, not a list).
+    #[serde(default, rename = "ref")]
+    pub ref_id: Option<String>,
+    /// Case-insensitive exact role filter.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Case-insensitive substring filter (max 64 chars).
+    #[serde(default)]
+    pub text: Option<String>,
+    /// UIA physical rect `x,y,w,h` (intersect).
+    #[serde(default)]
+    pub rect: Option<String>,
+    /// Chrome CSS rect `left,top,width,height` (intersect).
+    #[serde(default)]
+    pub rect_css: Option<String>,
+    /// Narrow to the scope ref's own element descendants.
+    #[serde(default)]
+    pub subtree: bool,
+    /// UIA relative depth bound 1..8 (default 3).
+    #[serde(default)]
+    pub depth: Option<u32>,
+    /// Page size 1..100 (default 20).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Page offset after the exact match count.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Exact mode: skip the read-only capability probe.
+    #[serde(default)]
+    pub no_caps: bool,
+    /// Exact mode: include the opt-in 0128 DOM assessment.
+    #[serde(default)]
+    pub assess: bool,
+    /// Chrome scan budget 1..300 ms (default 150).
+    #[serde(default)]
+    pub budget_ms: Option<u64>,
+    /// Node cap 1..4000 (default 1500 UIA / 4000 Chrome).
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+    /// UIA deadline 1..2000 ms (default 800).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UiaActionParams {
     #[serde(default)]
     pub session_id: Option<String>,
@@ -320,6 +374,16 @@ impl HandsServer {
         Parameters(params): Parameters<HittestParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(run_hittest(params))
+    }
+
+    #[tool(
+        description = "Read-only scoped snapshot search and exact drill-down. within=<sref1:c…> lists matching stored nodes from one Chrome document snapshot (or one frame's snapshot, routed by frameId; HANDS_FRAMES=0 is a per-process switch that refuses a nonzero frame with frame_unsupported), never a re-walk. within=<sref1:u…> or window=<pid|title|hwnd:hex> runs a bounded UIA control-view walk rooted at that window (never the desktop root). ref=<sref1:…> describes one element through the 0123 resolve, with an opt-in 0128 assessment (assess) and read-only capability evidence (no_caps disables). Filters are ANDed: role (case-insensitive exact; UIA also accepts the canonical English control type), text (substring, max 64), rect_css (Chrome CSS space), rect (UIA physical), subtree (the scope ref's own element is the root), depth (UIA). ok:true means the scope was read; it is never proof a target is live, clickable or that an action would succeed. coverage.page_complete is always false and scope_complete/matches_total are honest bounds: zero matches means no match in this snapshot/scope, never absent. A detached node is returned with key_ok:false and reason stale_element. matches_truncated covers both the limit page and the 4096-byte budget with a derivable dropped count. Chrome list returns rect_css only (no physical point); exact mode returns a physical rect only from an existing valid 0129 contract. Capability evidence is not authority: the fence/lease/High-IL/challenge checks still run on the real dispatch surface, and find never dispatches, focuses or takes the lease. A disabled/hidden/aria-hidden control is excluded from the stored walk and is not findable (documented, not lifted). Chrome list needs an active/focused/visible tab while a UIA window read does not (deliberate asymmetry). Page text/roles are untrusted, capped and never logged. An old extension answers unsupported_op (reload 0.4.0+); an old installed server may not expose this tool (refresh the installed/elevated exe)."
+    )]
+    fn find(
+        &self,
+        Parameters(params): Parameters<FindParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(run_find(params))
     }
 
     #[tool(
@@ -620,6 +684,35 @@ fn run_hittest(params: HittestParams) -> CallToolResult {
     };
     match crate::hittest::run(req)
         .and_then(|env| crate::hittest::serialize(&env).map(|json| (env.ok, json)))
+    {
+        Ok((true, json)) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Ok((false, json)) => CallToolResult::error(vec![ContentBlock::text(json)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.tool_message())]),
+    }
+}
+
+fn run_find(params: FindParams) -> CallToolResult {
+    let req = crate::find::FindRequest {
+        session_id: params.session_id,
+        within: params.within,
+        window: params.window,
+        r#ref: params.ref_id,
+        role: params.role,
+        text: params.text,
+        rect: params.rect,
+        rect_css: params.rect_css,
+        subtree: params.subtree,
+        depth: params.depth,
+        limit: params.limit,
+        offset: params.offset,
+        no_caps: params.no_caps,
+        assess: params.assess,
+        budget_ms: params.budget_ms,
+        max_nodes: params.max_nodes,
+        timeout_ms: params.timeout_ms,
+    };
+    match crate::find::run(req)
+        .and_then(|env| crate::find::serialize(&env).map(|json| (env.ok, json)))
     {
         Ok((true, json)) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Ok((false, json)) => CallToolResult::error(vec![ContentBlock::text(json)]),

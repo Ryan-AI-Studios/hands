@@ -19,6 +19,7 @@ pub mod elevation;
 pub mod error;
 pub mod extract;
 pub mod fence;
+pub mod find;
 pub mod foreground;
 pub mod frames;
 pub mod hid;

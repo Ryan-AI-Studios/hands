@@ -10,7 +10,7 @@ use crate::extract::{
     filter_nodes,
 };
 use crate::foreground;
-use crate::identity::{SnapshotBinding, SnapshotRef, element_fingerprint, runtime_id_hash};
+use crate::identity::{SnapshotBinding, SnapshotRef, uia_ref_from_parts};
 use crate::logs;
 use crate::session::resolve_session_id_from_os;
 use crate::space::{Rect, Space, ensure_dpi, virtual_screen};
@@ -924,11 +924,7 @@ fn stamp_snapshot_refs(
             if ids.is_empty() {
                 continue;
             }
-            let fp = format!(
-                "{:08x}",
-                element_fingerprint(&el.role, el.text.as_deref(), el.unnamed)
-            );
-            el.sref = Some(format!("sref1:u.{hwnd:x}.{fp}.{}", runtime_id_hash(&ids)));
+            el.sref = uia_ref_from_parts(hwnd, &el.role, el.text.as_deref(), el.unnamed, &ids);
         }
     }
 }

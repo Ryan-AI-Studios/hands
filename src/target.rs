@@ -209,7 +209,7 @@ impl Target {
             }
             Self::Scoped(r) => match r {
                 SnapshotRef::Chrome { frame, .. } => {
-                    if *frame != 0 {
+                    if *frame != 0 && !crate::frames::enabled() {
                         return Ok(TargetOutcome::Identity {
                             target: self.clone(),
                             report: IdentityReport::chrome_failure(
@@ -566,6 +566,44 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finish_chr_has_no_frame_arithmetic() {
+        let src = include_str!("target.rs");
+        let start = src.find("fn finish_chr(").expect("finish_chr");
+        let end = src.find("fn invalid_from(").expect("invalid_from");
+        let body = &src[start..end];
+        assert!(!body.contains("content_left"), "{body}");
+        assert!(!body.contains("content_top"), "{body}");
+        assert!(!body.contains("crate::frames"), "{body}");
+        assert!(!body.contains("compose_"), "{body}");
+        assert!(body.contains("contract_for"), "finish_chr maps once");
+    }
+
+    #[test]
+    fn finish_chr_maps_a_composed_frame_hit_once() {
+        let map = valid_map();
+        let composed = CssRect {
+            left: 50.0,
+            top: 80.0,
+            width: 100.0,
+            height: 40.0,
+        };
+        let contract = contract_for(&map, composed.center());
+        let mut hit = stub_chr("sref1:c.c.3.9f3a.a1b2c3d4.4", contract, Some(0x1234));
+        hit.css_rect = composed;
+        hit.css_point = composed.center();
+        hit.map = Some(map);
+        let space = Space::new(0, 0, 1920, 1080).expect("space");
+        let id = hit.id.clone();
+        let reason = finish_chr(&id, &mut hit, space).expect("finish_chr");
+        assert!(reason.is_none(), "{reason:?}");
+        assert_eq!(
+            hit.css_point,
+            composed.center(),
+            "finish_chr must not compose a second frame offset"
+        );
+    }
 
     #[test]
     fn parse_accepts_each_kind() {

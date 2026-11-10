@@ -18,6 +18,9 @@ use crate::uia;
 
 pub const ENVELOPE_MAX_BYTES: usize = 16_384;
 pub const DEFAULT_ENVELOPE_MAX_BYTES: usize = 4096;
+/// Under 4 KiB pressure a default envelope keeps at least this many interactive elements;
+/// frames/cards/main_text are trimmed first (0131 DoD-8 retained-element floor).
+const RETAINED_ELEMENT_FLOOR: usize = 6;
 pub const OBSERVE_SCHEMA: &str = "hands.observe/v1";
 
 const CONTROL_LEXICON: &[&str] = &[
@@ -690,6 +693,24 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         virtual_screen: Some(space.as_rect()),
         popup_rect: snap.popup_rect,
     };
+    // Frame rows survive a non-storing observe on `ChromeMap`, so a late frame still holds
+    // the challenge/yield state for the solver and `challenge --watch`.
+    let frames_transient = chrome.as_ref().is_some_and(|map| {
+        map.frames_transient
+            || map.frame_rows.iter().any(|row| {
+                row.status != "ok"
+                    && matches!(
+                        row.reason.as_deref(),
+                        Some(
+                            "frame_late"
+                                | "frame_budget_exceeded"
+                                | "frame_cap_exceeded"
+                                | "frame_link_missing"
+                                | "frame_geometry_unavailable"
+                        )
+                    )
+            })
+    });
     let fusion_t = Instant::now();
     let (mut extract, mut elements, elements_total, _) =
         fuse_maps(req.detail, &snap.title, &snap.nodes, chrome, opts);
@@ -709,7 +730,7 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         &extract.main_text,
         &elements,
     );
-    let challenge = challenge::apply_observe(&session_id, hit);
+    let challenge = challenge::apply_observe_with_frames(&session_id, hit, frames_transient);
     let fg_preview_path = maybe_fg_preview(
         req.fg_preview,
         &paths,
@@ -833,6 +854,39 @@ fn stamp_snapshot_refs(
         .and_then(|h| u64::try_from(h).ok())
         .filter(|h| *h > 0);
     for el in elements {
+        if el.frame.is_some_and(|frame| frame > 0) {
+            // Per-frame binding keyed on `Element.frame`, never a prefix scan. A frame element
+            // keeps its `sref1:` id and gains the same `ref` only when that frame's doc/snap is
+            // a valid pair; otherwise both stay non-`chr` and unresolved.
+            let Some(binding) = binding else {
+                continue;
+            };
+            let frame = el.frame.unwrap_or(0);
+            let Some(frame_binding) = binding.frame_binding(frame) else {
+                continue;
+            };
+            let Ok(parsed) = SnapshotRef::parse(&el.id) else {
+                continue;
+            };
+            let SnapshotRef::Chrome {
+                frame: parsed_frame,
+                doc: parsed_doc,
+                snap: parsed_snap,
+                ..
+            } = &parsed
+            else {
+                continue;
+            };
+            if *parsed_frame == frame
+                && parsed_doc == &frame_binding.doc
+                && parsed_snap == &frame_binding.snap
+            {
+                let token = parsed.to_string();
+                el.id = token.clone();
+                el.sref = Some(token);
+            }
+            continue;
+        }
         if let Some(rest) = el.id.strip_prefix("chr:") {
             let (Some(tab), true) = (tab, chrome_ready) else {
                 continue;
@@ -984,6 +1038,12 @@ fn cap_default_envelope_with_client(
         return envelope;
     }
     envelope.elements_truncated = true;
+    // `snapshot.frames[]` trims before interactive elements (0131 DoD-8). Keep unavailable
+    // reasons and every frame id still referenced by a retained element.
+    trim_frames_for_budget(&mut envelope);
+    if serialized_len(&envelope) <= DEFAULT_ENVELOPE_MAX_BYTES {
+        return envelope;
+    }
     let keep_hwnd = keep_window_hwnd(&envelope).map(str::to_string);
     let windows_floor = if envelope.windows_total > 0 { 1 } else { 0 };
     while envelope.windows.len() > windows_floor
@@ -1028,6 +1088,34 @@ fn cap_default_envelope_with_client(
         shrink_main_text_to_fit(&mut envelope, DEFAULT_ENVELOPE_MAX_BYTES);
     }
     envelope
+}
+
+fn trim_frames_for_budget(envelope: &mut ObserveEnvelope) {
+    let Some(binding) = envelope.snapshot.as_mut() else {
+        return;
+    };
+    if binding.frames.is_empty() {
+        return;
+    }
+    let referenced: Vec<u32> = envelope.elements.iter().filter_map(|el| el.frame).collect();
+    let mut kept = Vec::new();
+    let mut dropped = false;
+    for row in binding.frames.drain(..) {
+        let keep = row.status != "ok" || row.frame.is_some_and(|f| referenced.contains(&f));
+        if keep {
+            kept.push(row);
+        } else {
+            dropped = true;
+        }
+    }
+    if kept.len() > 8 {
+        // Unavailable reasons survive; referenced ok rows come next.
+        kept.sort_by_key(|row| usize::from(row.status == "ok"));
+        dropped = true;
+        kept.truncate(8);
+    }
+    binding.frames = kept;
+    binding.frames_truncated |= dropped;
 }
 
 fn role_eq_any(role: &str, names: &[&str]) -> bool {
@@ -1190,7 +1278,9 @@ fn pack_file_dialog_hit_list(envelope: &mut ObserveEnvelope) {
 }
 
 fn pop_non_reserved_elements(envelope: &mut ObserveEnvelope) {
-    while serialized_len(envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
+    while serialized_len(envelope) > DEFAULT_ENVELOPE_MAX_BYTES
+        && envelope.elements.len() > RETAINED_ELEMENT_FLOOR
+    {
         let dialog_ids = dialog_id_set(envelope);
         let viewport = envelope.viewport;
         let Some(idx) = envelope
@@ -1207,7 +1297,9 @@ fn pop_non_reserved_elements(envelope: &mut ObserveEnvelope) {
 fn pop_reserved_non_dialog_from_end(envelope: &mut ObserveEnvelope) {
     let dialog_ids = dialog_id_set(envelope);
     let viewport = envelope.viewport;
-    while serialized_len(envelope) > DEFAULT_ENVELOPE_MAX_BYTES {
+    while serialized_len(envelope) > DEFAULT_ENVELOPE_MAX_BYTES
+        && envelope.elements.len() > RETAINED_ELEMENT_FLOOR
+    {
         let Some(idx) = envelope.elements.iter().rposition(|el| {
             is_reserved_control_parts(el, &dialog_ids, viewport) && !dialog_ids.contains(&el.id)
         }) else {
@@ -1835,6 +1927,8 @@ mod tests {
             },
             elements: (0..n)
                 .map(|i| Element {
+                    frame: None,
+                    challenge_vendor: true,
                     id: format!("uia:9.{i}"),
                     role: "Button".into(),
                     text: Some("x".repeat(64)),
@@ -1957,11 +2051,16 @@ mod tests {
             }
         }
         let chrome = chrome::ChromeMap {
+            frame_rows: Vec::new(),
+            frames_transient: false,
+            tab: None,
             url: Some("https://cars.com/search".into()),
             title: "Cars.com".into(),
             main_text: "from chrome".into(),
             elements: (0..3)
                 .map(|i| Element {
+                    frame: None,
+                    challenge_vendor: true,
                     id: format!("chr:{i}"),
                     role: "Hyperlink".into(),
                     text: Some("c".into()),
@@ -2074,6 +2173,8 @@ mod tests {
         raw.elements.insert(
             0,
             Element {
+                frame: None,
+                challenge_vendor: true,
                 id: "chr:0".into(),
                 role: "Edit".into(),
                 text: Some("search".into()),
@@ -2238,6 +2339,9 @@ mod tests {
             );
         }
         raw.snapshot = Some(SnapshotBinding {
+            frames: Vec::new(),
+            frames_total: 0,
+            frames_truncated: false,
             tab: Some(12),
             window: Some(45),
             frame: 0,
@@ -2337,6 +2441,77 @@ mod tests {
     }
 
     #[test]
+    fn frame_rows_trim_before_elements_and_keep_a_floor() {
+        let mut raw = fat_envelope(20);
+        raw.extract.main_text = "M".repeat(3000);
+        let mut binding = SnapshotBinding {
+            tab: Some(12),
+            window: Some(45),
+            frame: 0,
+            hwnd: None,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            retained: 20,
+            source: "live".into(),
+            fallback: false,
+            reason: None,
+            frames: Vec::new(),
+            frames_total: 0,
+            frames_truncated: false,
+        };
+        binding.frames = (1..=12)
+            .map(|frame| crate::identity::FrameBinding {
+                frame: Some(frame),
+                parent: None,
+                doc: if frame == 2 {
+                    String::new()
+                } else {
+                    "cafe".into()
+                },
+                snap: if frame == 2 {
+                    String::new()
+                } else {
+                    "00112233".into()
+                },
+                retained: 4,
+                status: if frame == 2 { "unavailable" } else { "ok" }.into(),
+                reason: if frame == 2 {
+                    Some("frame_late".into())
+                } else {
+                    None
+                },
+                origin: Some("https://widget.test".into()),
+            })
+            .collect();
+        binding.frames_total = 12;
+        raw.snapshot = Some(binding);
+        for (i, el) in raw.elements.iter_mut().enumerate() {
+            if i < 8 {
+                el.frame = Some(i as u32 + 1);
+            }
+        }
+        let capped = cap_default_envelope(raw);
+        let json = serialize_envelope(&capped).unwrap();
+        assert!(json.len() <= DEFAULT_ENVELOPE_MAX_BYTES, "{}", json.len());
+        let frames = capped.snapshot.as_ref().expect("binding").frames.clone();
+        assert!(
+            frames
+                .iter()
+                .any(|row| row.reason.as_deref() == Some("frame_late")),
+            "unavailable reasons survive"
+        );
+        assert!(
+            frames.len() < 12,
+            "unreferenced ok rows trim before elements"
+        );
+        assert!(
+            capped.elements.len() >= RETAINED_ELEMENT_FLOOR,
+            "retained-element floor, got {}",
+            capped.elements.len()
+        );
+    }
+
+    #[test]
     fn dom_envelope_with_sref_fits_16kib() {
         let mut raw = fat_envelope(400);
         for (i, el) in raw.elements.iter_mut().enumerate() {
@@ -2351,6 +2526,9 @@ mod tests {
     #[test]
     fn chrome_elements_emit_sref() {
         let binding = SnapshotBinding {
+            frames: Vec::new(),
+            frames_total: 0,
+            frames_truncated: false,
             tab: Some(12),
             window: Some(45),
             frame: 0,
@@ -2364,6 +2542,8 @@ mod tests {
         };
         let mut elements = vec![
             Element {
+                frame: None,
+                challenge_vendor: true,
                 id: "chr:0".into(),
                 role: "Button".into(),
                 text: Some("Go".into()),
@@ -2378,6 +2558,8 @@ mod tests {
                 sref: None,
             },
             Element {
+                frame: None,
+                challenge_vendor: true,
                 id: "uia:1.2".into(),
                 role: "Button".into(),
                 text: Some("UIA".into()),
@@ -2408,6 +2590,9 @@ mod tests {
     #[test]
     fn old_extension_omits_sref_and_reports_binding() {
         let binding = SnapshotBinding {
+            frames: Vec::new(),
+            frames_total: 0,
+            frames_truncated: false,
             tab: Some(12),
             window: Some(45),
             frame: 0,
@@ -2420,6 +2605,8 @@ mod tests {
             reason: Some("unbound_extension".into()),
         };
         let mut elements = vec![Element {
+            frame: None,
+            challenge_vendor: true,
             id: "chr:0".into(),
             role: "Button".into(),
             text: Some("Go".into()),
@@ -2440,6 +2627,8 @@ mod tests {
     #[test]
     fn uia_elements_emit_sref() {
         let mut elements = vec![Element {
+            frame: None,
+            challenge_vendor: true,
             id: "uia:1.2".into(),
             role: "Button".into(),
             text: Some("UIA".into()),
@@ -2492,6 +2681,9 @@ mod tests {
     #[test]
     fn fallback_snapshot_emits_no_refs() {
         let binding = SnapshotBinding {
+            frames: Vec::new(),
+            frames_total: 0,
+            frames_truncated: false,
             tab: Some(12),
             window: Some(45),
             frame: 0,
@@ -2504,6 +2696,8 @@ mod tests {
             reason: None,
         };
         let mut elements = vec![Element {
+            frame: None,
+            challenge_vendor: true,
             id: "chr:0".into(),
             role: "Button".into(),
             text: Some("Go".into()),
@@ -2571,6 +2765,8 @@ mod tests {
     fn dialog_ids_stay_legacy() {
         let mut extract = Extract::default();
         let mut elements = vec![Element {
+            frame: None,
+            challenge_vendor: true,
             id: "chr:0".into(),
             role: "Button".into(),
             text: Some("Accept all cookies".into()),
@@ -3235,6 +3431,8 @@ mod tests {
 
     fn dialog_el(id: &str, text: &str, rect: Rect) -> Element {
         Element {
+            frame: None,
+            challenge_vendor: true,
             id: id.into(),
             role: "Button".into(),
             text: Some(text.into()),
@@ -3335,11 +3533,16 @@ mod tests {
     #[test]
     fn dense_chrome_cap_still_promotes_uia_continue_as() {
         let chrome = chrome::ChromeMap {
+            frame_rows: Vec::new(),
+            frames_transient: false,
+            tab: None,
             url: Some("https://cars.com/search".into()),
             title: "Cars.com".into(),
             main_text: "listings".into(),
             elements: (0..crate::extract::DEFAULT_ELEMENT_CAP)
                 .map(|i| Element {
+                    frame: None,
+                    challenge_vendor: true,
                     id: format!("chr:{i}"),
                     role: if i % 2 == 0 {
                         "Button".into()
@@ -3486,6 +3689,9 @@ mod tests {
             },
         );
         let chrome = chrome::ChromeMap {
+            frame_rows: Vec::new(),
+            frames_transient: false,
+            tab: None,
             url: Some("https://cars.com/search".into()),
             title: "Cars.com".into(),
             main_text: "listings".into(),
@@ -3556,6 +3762,8 @@ mod tests {
         raw.elements.splice(
             0..0,
             raw.extract.dialogs.iter().map(|d| Element {
+                frame: None,
+                challenge_vendor: true,
                 id: d.id.clone(),
                 role: d.role.clone(),
                 text: Some(d.text.clone()),
@@ -3677,6 +3885,8 @@ mod tests {
     fn stamp_grid_negative_origin_is_not_g00() {
         let space = Space::new(-1920, 0, 3840, 1080).unwrap();
         let mut elements = vec![Element {
+            frame: None,
+            challenge_vendor: true,
             id: "chr:origin".into(),
             role: "Edit".into(),
             text: Some("origin".into()),
@@ -3719,6 +3929,8 @@ mod tests {
     #[test]
     fn empty_grid_omitted_from_serialized_json() {
         let el = Element {
+            frame: None,
+            challenge_vendor: true,
             id: "chr:0".into(),
             role: "Edit".into(),
             text: Some("Search".into()),
@@ -3743,6 +3955,8 @@ mod tests {
     #[test]
     fn unnamed_omitted_unless_true_and_cell_px_is_const() {
         let named = Element {
+            frame: None,
+            challenge_vendor: true,
             id: "uia:1".into(),
             role: "Button".into(),
             text: Some("Search".into()),
@@ -3759,6 +3973,8 @@ mod tests {
         let raw = serde_json::to_value(&named).unwrap();
         assert!(raw.get("unnamed").is_none(), "{raw}");
         let blank = Element {
+            frame: None,
+            challenge_vendor: true,
             id: "uia:2".into(),
             role: "CheckBox".into(),
             text: None,
@@ -4135,14 +4351,18 @@ mod tests {
     }
 
     #[test]
-    fn all_frames_still_false_and_no_dwm() {
+    fn all_frames_policy_and_envelope_caps() {
         let manifest = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/extension/manifest.json"
         ));
         assert!(
-            manifest.contains("\"all_frames\": false"),
-            "all_frames must stay false"
+            manifest.contains("\"all_frames\": true"),
+            "ADR 0002 turns frame observation on"
+        );
+        assert!(
+            manifest.contains("\"match_about_blank\": true"),
+            "about:blank frames inherit the parent origin"
         );
         assert_eq!(crate::extract::DEFAULT_ELEMENT_CAP, 250);
         assert_eq!(VIEWPORT_ENVELOPE_ELEMENT_CAP, 20);
@@ -4307,10 +4527,15 @@ mod tests {
     #[test]
     fn electron_chrome_widget_win_1_does_not_fuse_amazon_title_2026_09_03() {
         let chrome = chrome::ChromeMap {
+            frame_rows: Vec::new(),
+            frames_transient: false,
+            tab: None,
             url: Some("https://www.amazon.com/checkout".into()),
             title: "Place Your Order - Amazon Checkout".into(),
             main_text: "order summary".into(),
             elements: vec![Element {
+                frame: None,
+                challenge_vendor: true,
                 id: "chr:0".into(),
                 role: "Button".into(),
                 text: Some("Place your order".into()),
@@ -4357,10 +4582,15 @@ mod tests {
         assert!(!els.iter().any(|e| e.id.starts_with("chr:")));
         assert!(els.iter().any(|e| e.id == "uia:1.9"));
         let chrome = chrome::ChromeMap {
+            frame_rows: Vec::new(),
+            frames_transient: false,
+            tab: None,
             url: Some("https://www.amazon.com/checkout".into()),
             title: "Place Your Order - Amazon Checkout".into(),
             main_text: "order summary".into(),
             elements: vec![Element {
+                frame: None,
+                challenge_vendor: true,
                 id: "chr:0".into(),
                 role: "Button".into(),
                 text: Some("Place your order".into()),
@@ -4816,6 +5046,8 @@ mod tests {
 
     fn shopping_el(id: &str, role: &str, text: &str, y: i32) -> Element {
         Element {
+            frame: None,
+            challenge_vendor: true,
             id: id.into(),
             role: role.into(),
             text: Some(text.into()),
@@ -5164,6 +5396,8 @@ mod tests {
 
     fn unnamed_container(id: &str, role: &str) -> Element {
         Element {
+            frame: None,
+            challenge_vendor: true,
             id: id.into(),
             role: role.into(),
             text: None,
@@ -5176,6 +5410,8 @@ mod tests {
 
     fn body_button(id: &str, label: &str) -> Element {
         Element {
+            frame: None,
+            challenge_vendor: true,
             id: id.into(),
             role: "Button".into(),
             text: Some(label.into()),
@@ -5243,6 +5479,8 @@ mod tests {
 
     fn file_dialog_el(id: &str, role: &str, text: &str, y: i32) -> Element {
         Element {
+            frame: None,
+            challenge_vendor: true,
             id: id.into(),
             role: role.into(),
             text: Some(text.into()),
@@ -5476,6 +5714,8 @@ mod tests {
         let mut edit = unnamed_container("uia:edit", "Edit");
         edit.text = None;
         let icon = Element {
+            frame: None,
+            challenge_vendor: true,
             id: "uia:icon".into(),
             role: "Button".into(),
             text: None,
@@ -5514,6 +5754,8 @@ mod tests {
                 unnamed_container("uia:doc", "Document"),
                 body_button("uia:a", "Alpha"),
                 Element {
+                    frame: None,
+                    challenge_vendor: true,
                     id: "uia:dlg".into(),
                     role: "Button".into(),
                     text: Some("Continue as guest".into()),
@@ -5592,6 +5834,8 @@ mod tests {
     #[test]
     fn prefer_actionable_rest_puts_body_buttons_before_other_tail() {
         let filler = Element {
+            frame: None,
+            challenge_vendor: true,
             id: "uia:text".into(),
             role: "Text".into(),
             text: Some("caption".into()),
@@ -5771,6 +6015,8 @@ mod tests {
     fn prefer_actionable_survives_fat_text_rest() {
         let mut els: Vec<Element> = (0..25)
             .map(|i| Element {
+                frame: None,
+                challenge_vendor: true,
                 id: format!("uia:text:{i}"),
                 role: "Text".into(),
                 text: Some(format!("row {i}")),
@@ -5972,6 +6218,8 @@ mod tests {
             h: 80,
         };
         let popup_el = Element {
+            frame: None,
+            challenge_vendor: true,
             id: "uia:popup.1".into(),
             role: "ListItem".into(),
             text: Some("Suggestion".into()),

@@ -49,7 +49,12 @@ impl SolveBackend for ComputerUseBackend {
 }
 
 pub fn computer_use_actions(envelope: &ObserveEnvelope) -> Result<SolveActions, HandsError> {
+    // A frame cannot steer actuation: only a top-frame element or an element whose owning
+    // frame is vendor-classified may be selected. A decoy frame ordered first is skipped.
     let el = envelope.elements.iter().find(|e| {
+        if e.frame.is_some() && !e.challenge_vendor {
+            return false;
+        }
         let t = e.text.as_deref().unwrap_or("");
         contains_phrase(t, "i'm not a robot") || contains_phrase(t, "i am not a robot")
     });
@@ -701,6 +706,8 @@ mod tests {
 
     fn robot_el() -> Element {
         Element {
+            frame: None,
+            challenge_vendor: true,
             id: "chr:0".into(),
             role: "button".into(),
             text: Some("I'm not a robot".into()),
@@ -714,6 +721,61 @@ mod tests {
             unnamed: None,
             sref: None,
         }
+    }
+
+    fn decoy_el() -> Element {
+        Element {
+            frame: Some(3),
+            challenge_vendor: false,
+            id: "sref1:c.c.3.aaaa.bbbbbbbb.0".into(),
+            role: "button".into(),
+            text: Some("I'm not a robot".into()),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 20,
+            },
+            grid: None,
+            unnamed: None,
+            sref: None,
+        }
+    }
+
+    fn vendor_frame_el() -> Element {
+        Element {
+            frame: Some(3),
+            challenge_vendor: true,
+            id: "sref1:c.c.3.cafe.00112233.0".into(),
+            role: "button".into(),
+            text: Some("I'm not a robot".into()),
+            rect: Rect {
+                x: 300,
+                y: 400,
+                w: 40,
+                h: 20,
+            },
+            grid: None,
+            unnamed: None,
+            sref: None,
+        }
+    }
+
+    #[test]
+    fn vendor_frame_control_is_selectable() {
+        let env = stub_observe(true, false, vec![vendor_frame_el()], "Challenge");
+        let actions = computer_use_actions(&env).expect("vendor frame control");
+        assert_eq!(actions.clicks, vec![(320, 410)]);
+    }
+
+    #[test]
+    fn decoy_non_vendor_frame_is_not_clicked() {
+        let env = stub_observe(true, false, vec![decoy_el(), robot_el()], "Challenge");
+        let actions = computer_use_actions(&env).expect("eligible top control");
+        assert_eq!(actions.clicks, vec![(120, 210)], "top control is selected");
+        let only_decoy = stub_observe(true, false, vec![decoy_el()], "Challenge");
+        let err = computer_use_actions(&only_decoy).expect_err("no eligible control");
+        assert!(err.to_string().contains("no challenge control"), "{err}");
     }
 
     #[test]

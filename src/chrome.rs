@@ -96,6 +96,13 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone)]
 pub struct ChromeMap {
+    /// Frame rows from the same reply, retained even for a non-storing observe so the
+    /// challenge/solver path can hold a transient frame miss without minting refs.
+    pub(crate) frame_rows: Vec<crate::identity::FrameBinding>,
+    pub(crate) frames_transient: bool,
+    /// Chrome tab id from the same reply. Kept even for a non-storing snapshot so hittest point
+    /// mode can issue an explicit frame assess.
+    pub(crate) tab: Option<u32>,
     pub url: Option<String>,
     pub title: String,
     pub main_text: String,
@@ -222,6 +229,24 @@ struct RawNode {
     rect_css: CssRect,
     #[serde(default, rename = "href")]
     _href: Option<String>,
+    /// Nonzero Chrome frame id; absent/0 is the top frame.
+    #[serde(default)]
+    frame: Option<u32>,
+    /// Walk index in the owning frame document (used by fixture frame refs).
+    #[serde(default)]
+    idx: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RawTop {
+    #[serde(default)]
+    frame: Option<u32>,
+    #[serde(default)]
+    metrics: ChromeMetrics,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -296,6 +321,13 @@ struct RawSnapshot {
     stored: Option<bool>,
     #[serde(default)]
     fallback: Option<bool>,
+    /// Frame rows (links and restricted statuses) from the extension's opt-in fan-out.
+    #[serde(default)]
+    frames: Vec<crate::frames::RawFrameLink>,
+    #[serde(default)]
+    frames_total: Option<usize>,
+    #[serde(default)]
+    frames_truncated: Option<bool>,
 }
 
 /// Fixture/diagnostic **listing** origin using the legacy `outer-inner` formula.
@@ -804,6 +836,46 @@ fn valid_lower_hex(raw: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+fn frame_bindings(rows: &[crate::frames::RawFrameLink]) -> Vec<crate::identity::FrameBinding> {
+    let mut frames = Vec::new();
+    for row in rows.iter().take(12) {
+        let frame = row.frame.filter(|f| *f > 0);
+        let ok = row.is_ok()
+            && row.doc.as_deref().is_some_and(|d| valid_lower_hex(d, 4))
+            && row.snap.as_deref().is_some_and(|s| valid_lower_hex(s, 8));
+        if frame.is_none() && row.reason.is_none() {
+            continue;
+        }
+        frames.push(crate::identity::FrameBinding {
+            frame,
+            parent: row.parent.filter(|p| *p > 0),
+            doc: if ok {
+                row.doc.clone().unwrap_or_default()
+            } else {
+                String::new()
+            },
+            snap: if ok {
+                row.snap.clone().unwrap_or_default()
+            } else {
+                String::new()
+            },
+            retained: row.retained.unwrap_or(0),
+            status: if ok { "ok" } else { "unavailable" }.into(),
+            reason: if ok {
+                None
+            } else {
+                Some(
+                    row.reason
+                        .clone()
+                        .unwrap_or_else(|| "frame_geometry_unavailable".into()),
+                )
+            },
+            origin: row.origin.as_deref().and_then(crate::frames::valid_origin),
+        });
+    }
+    frames
+}
+
 fn snapshot_binding(
     raw: &RawSnapshot,
     hwnd: Option<isize>,
@@ -824,6 +896,12 @@ fn snapshot_binding(
     let doc = raw.doc.clone().filter(|d| valid_lower_hex(d, 4));
     let snap = raw.snap.clone().filter(|s| valid_lower_hex(s, 8));
     let retained = raw.retained.unwrap_or(raw.elements.len());
+    let frames = frame_bindings(&raw.frames);
+    let frames_total = raw
+        .frames_total
+        .unwrap_or(raw.frames.len())
+        .max(frames.len());
+    let frames_truncated = raw.frames_truncated.unwrap_or(false) || raw.frames.len() > frames.len();
     if let (Some(tab), Some(doc), Some(snap)) = (tab, doc, snap) {
         return Some(SnapshotBinding {
             tab: Some(tab),
@@ -836,6 +914,9 @@ fn snapshot_binding(
             source: source.into(),
             fallback,
             reason: None,
+            frames,
+            frames_total,
+            frames_truncated,
         });
     }
     // An agent-facing Chrome walk with an old/quiet extension still gets an honest block;
@@ -851,25 +932,61 @@ fn snapshot_binding(
         source: source.into(),
         fallback,
         reason: Some("unbound_extension".into()),
+        frames,
+        frames_total,
+        frames_truncated,
     })
 }
 
 fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: String) -> ChromeMap {
     let map = map_for_raw(&raw, hwnd, fixture, obs);
-    let snapshot = snapshot_binding(&raw, hwnd, fixture);
+    let mut snapshot = snapshot_binding(&raw, hwnd, fixture);
+    let link_rows = raw.frames.clone();
+    let frame_rows = frame_bindings(&raw.frames);
+    let frames_transient = raw
+        .frames
+        .iter()
+        .any(|row| !row.is_ok() && row.is_transient());
+    let mut dropped_frames: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for (i, node) in raw.elements.into_iter().enumerate() {
-        let Some(rect) = map_rect_unbounded(&map, node.rect_css) else {
+        let frame = node.frame.filter(|f| *f > 0).unwrap_or(0);
+        let composed = if frame > 0 {
+            // Composition happens here for an aggregated snapshot: the node rect is
+            // frame-local; the map is the top-frame viewport.
+            match crate::frames::compose_rect(&link_rows, frame, node.rect_css) {
+                Ok(rect) => rect,
+                Err(_) => {
+                    dropped_frames.push(frame);
+                    continue;
+                }
+            }
+        } else {
+            node.rect_css
+        };
+        let Some(rect) = map_rect_unbounded(&map, composed) else {
             continue;
         };
-        let id = node
-            .id
-            .as_deref()
-            .and_then(canonical_chr)
-            .unwrap_or_else(|| format!("chr:{i}"));
+        let id = if frame > 0 {
+            // `chr:` is top-frame-only. A stored child carries its sref1 token; a non-storing
+            // internal read carries a ref-less `frame:N:idx`. Both stay observable so solver
+            // detection and target selection can see frame content; only the former mints a ref.
+            let fallback = format!("frame:{frame}:{}", node.idx.unwrap_or(i as u32));
+            match node.id.as_deref() {
+                Some(id) if !id.trim().is_empty() && !id.starts_with("chr:") => id.to_string(),
+                _ => fallback,
+            }
+        } else {
+            node.id
+                .as_deref()
+                .and_then(canonical_chr)
+                .unwrap_or_else(|| format!("chr:{i}"))
+        };
         let (text, unnamed) =
             crate::extract::name_fields(node.text.as_deref().unwrap_or(""), false);
         elements.push(Element {
+            challenge_vendor: frame == 0 || frame_is_vendor(&link_rows, frame),
+            frame: (frame > 0).then_some(frame),
             id,
             role: node.role.unwrap_or_else(|| "Other".into()),
             text,
@@ -931,7 +1048,24 @@ fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: Strin
     identity.url = raw.url.clone().filter(|s| !s.trim().is_empty());
     identity.title = raw.title.clone().unwrap_or_default();
     identity.assess_v = raw.assess_v;
+    // A frame whose only elements were clipped must not stay `ok` with no rows: name the
+    // frame `frame_not_visible` rather than silently dropping every child element.
+    if let Some(binding) = snapshot.as_mut() {
+        for row in &mut binding.frames {
+            if let Some(frame) = row.frame
+                && row.status == "ok"
+                && dropped_frames.contains(&frame)
+                && !elements.iter().any(|el| el.frame == Some(frame))
+            {
+                row.status = "unavailable".into();
+                row.reason = Some("frame_not_visible".into());
+            }
+        }
+    }
     ChromeMap {
+        frame_rows,
+        frames_transient,
+        tab: raw.tab,
         url: raw.url.filter(|s| !s.trim().is_empty()),
         title: raw.title.unwrap_or_default(),
         main_text: raw.main_text.unwrap_or_default(),
@@ -950,6 +1084,13 @@ fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: Strin
         identity: Some(identity),
         snapshot,
     }
+}
+
+fn frame_is_vendor(rows: &[crate::frames::RawFrameLink], frame: u32) -> bool {
+    rows.iter()
+        .find(|row| row.frame == Some(frame))
+        .and_then(|row| row.url.as_deref())
+        .is_some_and(|url| crate::challenge::vendor_url(url).is_some())
 }
 
 fn canonical_chr(id: &str) -> Option<String> {
@@ -1074,13 +1215,39 @@ fn classify_ref_error(token: &str) -> (IdentityState, String) {
         other => other,
     };
     let state = match token {
-        "stale_document" | "stale_snapshot" | "stale_element" | "stale_identity"
-        | "not_visible" | "identity_mismatch" | "window_mismatch" => IdentityState::Stale,
-        "duplicate_runtime_id" | "duplicate_identity" => IdentityState::Ambiguous,
-        "tab_unavailable" | "no_tab" | "no_content" | "not_chrome" | "host_down"
-        | "resolve_timeout" | "protocol_error" | "frame_unsupported" | "window_unreadable"
-        | "unbound_extension" | "provider_timeout" | "tab_not_active" | "window_not_focused"
-        | "tab_hidden" => IdentityState::Unknown,
+        "stale_document"
+        | "stale_snapshot"
+        | "stale_element"
+        | "stale_identity"
+        | "not_visible"
+        | "identity_mismatch"
+        | "window_mismatch"
+        | "frame_unavailable"
+        | "frame_document_changed"
+        | "frame_not_visible" => IdentityState::Stale,
+        "duplicate_runtime_id" | "duplicate_identity" | "frame_link_ambiguous" => {
+            IdentityState::Ambiguous
+        }
+        "tab_unavailable"
+        | "no_tab"
+        | "no_content"
+        | "not_chrome"
+        | "host_down"
+        | "resolve_timeout"
+        | "protocol_error"
+        | "frame_unsupported"
+        | "window_unreadable"
+        | "unbound_extension"
+        | "provider_timeout"
+        | "tab_not_active"
+        | "window_not_focused"
+        | "tab_hidden"
+        | "frame_geometry_unavailable"
+        | "frame_occluded"
+        | "frame_probe_timeout"
+        | "frame_depth_exceeded"
+        | "frame_link_missing"
+        | "frame_budget_exceeded" => IdentityState::Unknown,
         _ => IdentityState::Unknown,
     };
     let reason = match token {
@@ -1105,7 +1272,17 @@ fn classify_ref_error(token: &str) -> (IdentityState, String) {
         | "duplicate_identity"
         | "identity_mismatch"
         | "window_mismatch"
-        | "unbound_extension" => token,
+        | "unbound_extension"
+        | "frame_unavailable"
+        | "frame_document_changed"
+        | "frame_geometry_unavailable"
+        | "frame_not_visible"
+        | "frame_occluded"
+        | "frame_probe_timeout"
+        | "frame_depth_exceeded"
+        | "frame_link_ambiguous"
+        | "frame_link_missing"
+        | "frame_budget_exceeded" => token,
         _ => "protocol_error",
     };
     (state, reason.to_string())
@@ -1216,26 +1393,138 @@ pub(crate) fn hit_from_scoped_reply(
             }
         }
     }
-    let node: RawNode = serde_json::from_value(reply.clone())
+    let mut node: RawNode = serde_json::from_value(reply.clone())
         .map_err(|_| IdentityReport::chrome_failure(r, IdentityState::Unknown, "protocol_error"))?;
-    let metrics: ChromeMetrics = reply
-        .get("metrics")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| IdentityReport::chrome_failure(r, IdentityState::Unknown, "protocol_error"))?
-        .ok_or_else(|| {
-            IdentityReport::chrome_failure(r, IdentityState::Unknown, "protocol_error")
-        })?;
+    let (metrics, top_url, top_title, frame_rows) = if frame > 0 {
+        // The map is always built from the top frame. A child's 300x250 metrics would match
+        // no top viewport anchor (`no_viewport_anchor`) and must never build the map.
+        let top: RawTop = reply
+            .get("top")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| frame_geometry(r))?
+            .ok_or_else(|| frame_geometry(r))?;
+        if top.frame != Some(0) {
+            return Err(frame_geometry(r));
+        }
+        let chain: Vec<crate::frames::FrameLink> = reply
+            .get("chain")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| frame_geometry(r))?
+            .ok_or_else(|| frame_geometry(r))?;
+        if chain.is_empty() || chain.len() > crate::frames::MAX_FRAME_DEPTH {
+            return Err(frame_geometry(r));
+        }
+        let mut rows = Vec::new();
+        let mut current = frame;
+        for (i, link) in chain.iter().enumerate() {
+            let Some(parent) = link.parent else {
+                return Err(frame_geometry(r));
+            };
+            rows.push(crate::frames::RawFrameLink {
+                frame: Some(current),
+                status: Some("ok".into()),
+                link: Some(link.clone()),
+                ..Default::default()
+            });
+            current = parent;
+            if current == 0 {
+                if i + 1 != chain.len() {
+                    return Err(frame_geometry(r));
+                }
+                break;
+            }
+        }
+        if current != 0 {
+            return Err(frame_geometry(r));
+        }
+        // Child metrics are geometry evidence only; compare the target content box to the
+        // child's own layout viewport (scrollbar-inclusive, as `innerWidth` is).
+        let child_metrics: ChromeMetrics = reply
+            .get("metrics")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| frame_geometry(r))?
+            .ok_or_else(|| frame_geometry(r))?;
+        if child_metrics.inner_width.is_finite()
+            && child_metrics.inner_width > 0.0
+            && (chain[0].content_width - child_metrics.inner_width).abs() > 1.0
+        {
+            return Err(frame_geometry(r));
+        }
+        if child_metrics.inner_height.is_finite()
+            && child_metrics.inner_height > 0.0
+            && (chain[0].content_height - child_metrics.inner_height).abs() > 1.0
+        {
+            return Err(frame_geometry(r));
+        }
+        let composed = crate::frames::compose_rect(&rows, frame, node.rect_css)
+            .map_err(|err| frame_report(r, err))?;
+        let unclipped = crate::frames::compose_rect_unclipped(&rows, frame, node.rect_css)
+            .map_err(|err| frame_report(r, err))?;
+        if (unclipped.width - composed.width).abs() > 0.01
+            || (unclipped.height - composed.height).abs() > 0.01
+        {
+            // A clipped sliver must be refused, not clicked at the centre of what remains.
+            return Err(frame_report(r, crate::frames::FrameError::NotVisible));
+        }
+        node.rect_css = composed;
+        remember_frame_chain(&r.to_string(), &chain);
+        (top.metrics, top.url, top.title, rows)
+    } else {
+        let metrics: ChromeMetrics = reply
+            .get("metrics")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| {
+                IdentityReport::chrome_failure(r, IdentityState::Unknown, "protocol_error")
+            })?
+            .ok_or_else(|| {
+                IdentityReport::chrome_failure(r, IdentityState::Unknown, "protocol_error")
+            })?;
+        (
+            metrics,
+            reply
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            reply
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            Vec::new(),
+        )
+    };
+    let mut assessment = if assess {
+        reply
+            .get("assessment")
+            .cloned()
+            .filter(|v| !v.is_null())
+            .map(|value| {
+                serde_json::from_value(value).unwrap_or_else(|_| {
+                    Assessment::unknown(
+                        raw_node_rect(reply).center(),
+                        raw_node_rect(reply),
+                        "assessment_unavailable",
+                    )
+                })
+            })
+    } else {
+        None
+    };
+    if frame > 0
+        && let Some(assessment) = assessment.as_mut()
+    {
+        compose_assessment(assessment, &frame_rows, frame).map_err(|err| frame_report(r, err))?;
+    }
     let raw = RawSnapshot {
-        url: reply
-            .get("url")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        title: reply
-            .get("title")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        url: top_url,
+        title: top_title,
         main_text: None,
         elements: vec![node],
         cards: Vec::new(),
@@ -1246,23 +1535,7 @@ pub(crate) fn hit_from_scoped_reply(
         zip: None,
         radius: None,
         cards_walked: None,
-        assessment: if assess {
-            reply
-                .get("assessment")
-                .cloned()
-                .filter(|v| !v.is_null())
-                .map(|value| {
-                    serde_json::from_value(value).unwrap_or_else(|_| {
-                        Assessment::unknown(
-                            raw_node_rect(reply).center(),
-                            raw_node_rect(reply),
-                            "assessment_unavailable",
-                        )
-                    })
-                })
-        } else {
-            None
-        },
+        assessment,
         assess_v: reply
             .get("assess_v")
             .and_then(|v| v.as_u64())
@@ -1275,6 +1548,9 @@ pub(crate) fn hit_from_scoped_reply(
         retained: Some(idx as usize + 1),
         stored: None,
         fallback: reply.get("fallback").and_then(|v| v.as_bool()),
+        frames: frame_rows,
+        frames_total: None,
+        frames_truncated: None,
     };
     let node = raw.elements[0].clone();
     let obs = make_observe_id(&raw, hwnd, 1);
@@ -1305,6 +1581,43 @@ pub(crate) fn hit_from_scoped_reply(
     })
 }
 
+/// Compose the child's assessment point/rect (and advisory blocker rects) into top-frame CSS
+/// once, through the same validated chain as the element. `validate_assessment` then compares
+/// the composed point to the composed contract, not a child-local one.
+fn compose_assessment(
+    assessment: &mut Assessment,
+    rows: &[crate::frames::RawFrameLink],
+    frame: u32,
+) -> Result<(), crate::frames::FrameError> {
+    assessment.selected_point =
+        crate::frames::compose_point(rows, frame, assessment.selected_point)?;
+    assessment.target_rect_css =
+        crate::frames::compose_rect(rows, frame, assessment.target_rect_css)?;
+    for blocker in &mut assessment.blocked_by {
+        if let Some(rect) = blocker.rect_css {
+            blocker.rect_css = crate::frames::compose_rect(rows, frame, rect).ok();
+        }
+    }
+    if let Some(blocker) = assessment.clipped_by.as_mut()
+        && let Some(rect) = blocker.rect_css
+    {
+        blocker.rect_css = crate::frames::compose_rect(rows, frame, rect).ok();
+    }
+    Ok(())
+}
+
+fn frame_geometry(r: &SnapshotRef) -> IdentityReport {
+    IdentityReport::chrome_failure(r, IdentityState::Unknown, "frame_geometry_unavailable")
+}
+
+fn frame_report(r: &SnapshotRef, err: crate::frames::FrameError) -> IdentityReport {
+    let state = match err {
+        crate::frames::FrameError::NotVisible => IdentityState::Stale,
+        _ => IdentityState::Unknown,
+    };
+    IdentityReport::chrome_failure(r, state, err.token())
+}
+
 fn raw_node_rect(reply: &serde_json::Value) -> CssRect {
     reply
         .get("rectCss")
@@ -1329,6 +1642,14 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static BINDING_SEQUENCE: std::cell::RefCell<Vec<Result<BindingEvidence, IdentityReport>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static FRAME_BINDING_STUB: std::cell::RefCell<
+        Option<Result<FrameBindingEvidence, IdentityReport>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_frame_binding_stub(stub: Option<Result<FrameBindingEvidence, IdentityReport>>) {
+    FRAME_BINDING_STUB.with(|c| *c.borrow_mut() = stub);
 }
 
 #[cfg(test)]
@@ -1405,11 +1726,26 @@ fn scoped_fixture_hit(
     assess: bool,
 ) -> Result<ChromeHit, IdentityReport> {
     let (tab, frame, doc, snap, idx) = chrome_ref_parts(r)?;
-    let node = raw
-        .elements
-        .iter()
-        .find(|n| n.id.as_deref().and_then(canonical_chr) == Some(format!("chr:{idx}")))
-        .ok_or_else(|| IdentityReport::chrome_failure(r, IdentityState::Stale, "stale_element"))?;
+    let node = if frame > 0 {
+        // Fixture parity: a frame node resolves by its owning frame and walk index (or exact
+        // id), never by `canonical_chr` (a frame node's id is an `sref1:` token).
+        raw.elements
+            .iter()
+            .find(|n| {
+                n.frame == Some(frame)
+                    && (n.idx == Some(idx) || n.id.as_deref() == Some(&r.to_string()))
+            })
+            .ok_or_else(|| {
+                IdentityReport::chrome_failure(r, IdentityState::Stale, "stale_element")
+            })?
+    } else {
+        raw.elements
+            .iter()
+            .find(|n| n.id.as_deref().and_then(canonical_chr) == Some(format!("chr:{idx}")))
+            .ok_or_else(|| {
+                IdentityReport::chrome_failure(r, IdentityState::Stale, "stale_element")
+            })?
+    };
     let mut reply = serde_json::json!({
         "id": node.id,
         "role": node.role,
@@ -1428,10 +1764,241 @@ fn scoped_fixture_hit(
         "visibilityState": "visible",
         "assess_v": raw.assess_v,
     });
+    if frame > 0 {
+        let Some(chain) = crate::frames::chain_for(&raw.frames, frame) else {
+            return Err(frame_geometry(r));
+        };
+        let target = chain[0].clone();
+        // The child reply's metrics are evidence only; the synthetic pair matches the measured
+        // content box so the size check exercises the same predicate as a live reply.
+        reply["metrics"] = serde_json::json!({
+            "innerWidth": target.content_width,
+            "innerHeight": target.content_height,
+            "devicePixelRatio": raw.metrics.device_pixel_ratio,
+        });
+        reply["top"] = serde_json::json!({
+            "frame": 0,
+            "metrics": raw.metrics,
+            "url": raw.url,
+            "title": raw.title,
+        });
+        reply["chain"] = serde_json::to_value(&chain).unwrap_or(serde_json::Value::Null);
+    }
     if assess && let Some(a) = &raw.assessment {
         reply["assessment"] = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
     }
     hit_from_scoped_reply(&reply, r, hwnd, true, assess)
+}
+
+/// Frame pre-dispatch probe evidence. A missing chain means the frame geometry is unavailable;
+/// a different document means the child navigated.
+#[derive(Debug, Clone)]
+pub struct FrameBindingEvidence {
+    pub frame: u32,
+    pub doc: String,
+    pub snap: Option<String>,
+    pub chain_present: bool,
+}
+
+// Process-local resolve-time chain, keyed by the exact ref. The pre-dispatch `frame_binding`
+// re-read compares against it so a moved/resized iframe is refused before the pointer moves.
+thread_local! {
+    static FRAME_CHAINS: std::cell::RefCell<
+        std::collections::HashMap<String, Vec<crate::frames::FrameLink>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn remember_frame_chain(key: &str, chain: &[crate::frames::FrameLink]) {
+    FRAME_CHAINS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if map.len() >= 32 {
+            map.clear();
+        }
+        map.insert(key.to_string(), chain.to_vec());
+    });
+}
+
+fn cached_frame_chain(key: &str) -> Option<Vec<crate::frames::FrameLink>> {
+    FRAME_CHAINS.with(|cell| cell.borrow().get(key).cloned())
+}
+
+fn clip_matches(a: &[crate::frames::ClipRect], b: &[crate::frames::ClipRect]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).all(|(a, b)| {
+        (a.left - b.left).abs() <= 1.0
+            && (a.top - b.top).abs() <= 1.0
+            && (a.width - b.width).abs() <= 1.0
+            && (a.height - b.height).abs() <= 1.0
+    })
+}
+
+/// 1 CSS px tolerance for a moved/resized/clipped/re-flagged frame chain (spec §3.5.12).
+fn frame_chains_match(
+    expected: &[crate::frames::FrameLink],
+    fresh: &[crate::frames::FrameLink],
+) -> bool {
+    if expected.len() != fresh.len() {
+        return false;
+    }
+    expected.iter().zip(fresh).all(|(a, b)| {
+        a.parent == b.parent
+            && (a.content_left - b.content_left).abs() <= 1.0
+            && (a.content_top - b.content_top).abs() <= 1.0
+            && (a.content_width - b.content_width).abs() <= 1.0
+            && (a.content_height - b.content_height).abs() <= 1.0
+            && a.transform_ok == b.transform_ok
+            && a.visible == b.visible
+            && a.hit_ok == b.hit_ok
+            && a.onscreen == b.onscreen
+            && clip_matches(&a.clip, &b.clip)
+    })
+}
+
+/// Distinct `frame_binding` re-read immediately before `move_to` (0131 DoD-5). It never uses
+/// the observe-time chain and never falls back to the top-frame `binding` op.
+#[allow(clippy::result_large_err)]
+pub fn verify_frame_binding(
+    tab: u32,
+    frame: u32,
+    doc: &str,
+    snap: &str,
+    idx: u32,
+) -> Result<FrameBindingEvidence, IdentityReport> {
+    #[cfg(test)]
+    {
+        if let Some(stub) = FRAME_BINDING_STUB.with(|c| c.borrow().clone()) {
+            return stub;
+        }
+    }
+    let r = SnapshotRef::Chrome {
+        tab,
+        frame,
+        doc: doc.to_string(),
+        snap: snap.to_string(),
+        idx,
+    };
+    let reply = pipe_request(&serde_json::json!({
+        "op": "frame_binding",
+        "tab": tab,
+        "frame": frame,
+        "doc": doc,
+        "snap": snap,
+        "idx": idx,
+    }))
+    .map_err(|err| {
+        let text = err.to_string();
+        let reason = if text.contains("client timed out after") {
+            "frame_probe_timeout"
+        } else {
+            "frame_unavailable"
+        };
+        IdentityReport::chrome_failure(&r, IdentityState::Unknown, reason)
+    })?;
+    if let Some(token) = error_token(&reply) {
+        let (state, reason) = classify_ref_error(&token);
+        return Err(IdentityReport::chrome_failure(&r, state, &reason));
+    }
+    let echo_tab = reply
+        .get("tab")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    let echo_frame = reply
+        .get("frame")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    if echo_tab != Some(tab) || echo_frame != Some(frame) {
+        return Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Unknown,
+            "protocol_error",
+        ));
+    }
+    if reply.get("connected").and_then(|v| v.as_bool()) != Some(true) {
+        return Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Unknown,
+            "frame_unavailable",
+        ));
+    }
+    let echo_idx = reply
+        .get("idx")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    if echo_idx != Some(idx) {
+        return Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Unknown,
+            "protocol_error",
+        ));
+    }
+    if !reply.get("rectCss").is_some_and(|v| !v.is_null()) {
+        return Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Stale,
+            "stale_element",
+        ));
+    }
+    let echo_doc = reply.get("doc").and_then(|v| v.as_str()).unwrap_or("");
+    if echo_doc != doc {
+        return Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Stale,
+            "frame_document_changed",
+        ));
+    }
+    // The requested snapshot is part of the binding: a child that re-stored a different
+    // snapshot between resolve and move must not be clicked at the old coordinates.
+    if reply.get("snap").and_then(|v| v.as_str()) != Some(snap) {
+        return Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Stale,
+            "stale_snapshot",
+        ));
+    }
+    let chain_present = reply.get("chain").is_some_and(|v| !v.is_null());
+    if !chain_present {
+        return Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Unknown,
+            "frame_geometry_unavailable",
+        ));
+    }
+    // Fail closed: a chain that was not cached from the resolve cannot be compared, so the
+    // frame geometry is unverifiable (`frame_geometry_unavailable`), never accepted.
+    let Some(expected) = cached_frame_chain(&r.to_string()) else {
+        return Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Unknown,
+            "frame_geometry_unavailable",
+        ));
+    };
+    let fresh: Vec<crate::frames::FrameLink> = reply
+        .get("chain")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| {
+            IdentityReport::chrome_failure(&r, IdentityState::Unknown, "frame_geometry_unavailable")
+        })?
+        .unwrap_or_default();
+    if !frame_chains_match(&expected, &fresh) {
+        return Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Unknown,
+            "frame_geometry_unavailable",
+        ));
+    }
+    Ok(FrameBindingEvidence {
+        frame,
+        doc: echo_doc.to_string(),
+        snap: reply
+            .get("snap")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        chain_present,
+    })
 }
 
 /// Final pre-dispatch tabs/windows probe. No content-script read.
@@ -1541,6 +2108,10 @@ fn pipe_snapshot_inner(
     }
     if !store {
         req["store"] = serde_json::Value::Bool(false);
+    }
+    if crate::frames::enabled() {
+        // Opt-in fan-out: only a client that understands `snapshot.frames[]` sets this.
+        req["frames"] = serde_json::Value::Bool(true);
     }
     #[cfg(test)]
     {
@@ -1715,6 +2286,14 @@ pub struct AssessReply {
     pub at_point: AtPoint,
     pub css: Option<CssPoint>,
     pub identity: PageIdentity,
+    /// Top point-assess hit an iframe; the extension named its owning frame and local point.
+    pub iframe_frame: Option<u32>,
+    pub local_css: Option<CssPoint>,
+    /// Child frame echoed by a frame-scoped assess.
+    pub frame: Option<u32>,
+    /// Fresh top metrics and chain carried beside a frame-scoped assess.
+    pub top_metrics: Option<ChromeMetrics>,
+    pub frame_chain: Vec<crate::frames::FrameLink>,
 }
 
 /// Distinguishes a real host/transport failure from a malformed/unsupported reply.
@@ -1744,6 +2323,17 @@ pub(crate) fn assess_calls() -> usize {
 }
 
 #[cfg(test)]
+thread_local! {
+    static ASSESS_SEQUENCE: std::cell::RefCell<Vec<Result<AssessReply, AssessError>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_assess_sequence(sequence: Vec<Result<AssessReply, AssessError>>) {
+    ASSESS_SEQUENCE.with(|c| *c.borrow_mut() = sequence);
+}
+
+#[cfg(test)]
 pub(crate) fn reset_assess_calls() {
     ASSESS_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1751,14 +2341,48 @@ pub(crate) fn reset_assess_calls() {
 /// `{op:"assess", css, mode:"point", samples}`. Only called after the snapshot advertises
 /// `assess_v >= 1`; an old service worker would silently drop the op and stall the host.
 pub fn assess_at(css: CssPoint, samples: u32) -> Result<AssessReply, AssessError> {
-    #[cfg(test)]
-    ASSESS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let req = serde_json::json!({
+    assess_with_request(serde_json::json!({
         "op": "assess",
         "css": {"x": css.x, "y": css.y},
         "mode": "point",
         "samples": samples,
-    });
+    }))
+}
+
+/// Explicit `{tab, frameId}` point assess for a linked frame (0131 DoD-6). The SW routes to
+/// the child, reads fresh top metrics and chain, and returns the child's local assessment.
+pub fn assess_at_frame(
+    tab: u32,
+    frame: u32,
+    css: CssPoint,
+    samples: u32,
+) -> Result<AssessReply, AssessError> {
+    assess_with_request(serde_json::json!({
+        "op": "assess",
+        "tab": tab,
+        "frame": frame,
+        "css": {"x": css.x, "y": css.y},
+        "mode": "point",
+        "samples": samples,
+    }))
+}
+
+fn assess_with_request(req: serde_json::Value) -> Result<AssessReply, AssessError> {
+    #[cfg(test)]
+    {
+        ASSESS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let next = ASSESS_SEQUENCE.with(|c| {
+            let mut sequence = c.borrow_mut();
+            if sequence.is_empty() {
+                None
+            } else {
+                Some(sequence.remove(0))
+            }
+        });
+        if let Some(result) = next {
+            return result;
+        }
+    }
     let reply = pipe_request(&req).map_err(|err| {
         let text = err.to_string();
         if text.contains("client timed out after") {
@@ -1810,6 +2434,36 @@ pub fn assess_at(css: CssPoint, samples: u32) -> Result<AssessReply, AssessError
         at_point,
         css,
         identity,
+        iframe_frame: reply
+            .get("iframe_frame")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
+        local_css: reply
+            .get("local_css")
+            .cloned()
+            .filter(|v| !v.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|err| AssessError::Unavailable(format!("Chrome assess local_css: {err}")))?,
+        frame: reply
+            .get("frame")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
+        top_metrics: reply
+            .get("top")
+            .and_then(|top| top.get("metrics"))
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|err| AssessError::Unavailable(format!("Chrome assess top: {err}")))?,
+        frame_chain: reply
+            .get("chain")
+            .cloned()
+            .filter(|v| !v.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|err| AssessError::Unavailable(format!("Chrome assess chain: {err}")))?
+            .unwrap_or_default(),
     })
 }
 
@@ -2874,6 +3528,9 @@ mod tests {
         ));
         assert_eq!(
             SnapshotOutcome::Map(Box::new(ChromeMap {
+                frame_rows: Vec::new(),
+                frames_transient: false,
+                tab: None,
                 url: None,
                 title: String::new(),
                 main_text: String::new(),
@@ -2938,6 +3595,8 @@ mod tests {
             title: Some("Example".into()),
             main_text: None,
             elements: vec![RawNode {
+                frame: None,
+                idx: None,
                 id: Some("chr:0".into()),
                 role: Some("Button".into()),
                 text: Some("Go".into()),
@@ -3093,6 +3752,8 @@ mod tests {
             title: None,
             main_text: None,
             elements: vec![RawNode {
+                frame: None,
+                idx: None,
                 id: Some("chr:7".into()),
                 role: Some("Button".into()),
                 text: Some("Go".into()),
@@ -3255,9 +3916,579 @@ mod tests {
         true
     }
 
+    fn frame_ref() -> SnapshotRef {
+        SnapshotRef::Chrome {
+            tab: 12,
+            frame: 3,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 4,
+        }
+    }
+
+    fn frame_link_json(parent: u32, width: f64, height: f64) -> serde_json::Value {
+        serde_json::json!({
+            "parent": parent,
+            "content_left": 40.0,
+            "content_top": 60.0,
+            "content_width": width,
+            "content_height": height,
+            "clip": [{"left": 40.0, "top": 60.0, "width": width, "height": height}],
+            "transform_ok": true,
+            "visible": true,
+            "hit_ok": true,
+            "onscreen": true,
+            "viewport_w": 1920.0,
+            "viewport_h": 1080.0
+        })
+    }
+
+    fn top_metrics_json() -> serde_json::Value {
+        serde_json::json!({
+            "screenX": 0.0,
+            "screenY": 0.0,
+            "outerWidth": 1920.0,
+            "outerHeight": 1080.0,
+            "innerWidth": 1920.0,
+            "innerHeight": 1080.0,
+            "devicePixelRatio": 1.0,
+            "clientWidth": 1920.0,
+            "clientHeight": 1080.0
+        })
+    }
+
+    fn frame_reply(r: &SnapshotRef, child_width: f64) -> serde_json::Value {
+        let SnapshotRef::Chrome {
+            tab,
+            frame,
+            doc,
+            snap,
+            idx,
+        } = r
+        else {
+            unreachable!()
+        };
+        serde_json::json!({
+            "id": r.to_string(),
+            "role": "Button",
+            "text": "Sign in",
+            "rectCss": {"left": 10.0, "top": 20.0, "width": 100.0, "height": 40.0},
+            "metrics": {"innerWidth": child_width, "innerHeight": 250.0, "devicePixelRatio": 1.0},
+            "url": "https://widget.test/",
+            "title": "Widget",
+            "tab": tab,
+            "frame": frame,
+            "doc": doc,
+            "snap": snap,
+            "idx": idx,
+            "active": true,
+            "focused": true,
+            "visibilityState": "visible",
+            "assess_v": 1,
+            "top": {"frame": 0, "metrics": top_metrics_json(), "url": "https://top.test/", "title": "Top"},
+            "chain": [frame_link_json(0, 300.0, 250.0)]
+        })
+    }
+
+    #[test]
+    fn frame_resolve_uses_top_metrics_and_composes_once() {
+        let r = frame_ref();
+        let reply = frame_reply(&r, 300.0);
+        let hit = hit_from_scoped_reply(&reply, &r, Some(0x1234), true, false).expect("frame hit");
+        assert_eq!(hit.css_rect.left, 50.0);
+        assert_eq!(hit.css_rect.top, 80.0);
+        assert_eq!(hit.css_point.x, 100.0);
+        assert_eq!(
+            hit.map.as_ref().and_then(|m| m.page.inner_width),
+            Some(1920.0),
+            "the map is built from top metrics, never the 300x250 child viewport"
+        );
+        assert_eq!(
+            hit.identity.as_ref().map(|i| i.state),
+            Some(IdentityState::Exact)
+        );
+    }
+
+    #[test]
+    fn frame_assessment_composes_once_into_top_space() {
+        let r = frame_ref();
+        let mut reply = frame_reply(&r, 300.0);
+        reply["assessment"] = serde_json::json!({
+            "interactable": true,
+            "selected_point": {"x": 60.0, "y": 40.0},
+            "target_rect_css": {"left": 10.0, "top": 20.0, "width": 100.0, "height": 40.0},
+            "visible_fraction": 1.0,
+            "onscreen_fraction": 1.0,
+            "samples": 25,
+            "samples_hit": 25,
+            "confidence": "high"
+        });
+        let hit = hit_from_scoped_reply(&reply, &r, Some(0x1234), true, true).expect("frame hit");
+        let assessment = hit.assessment.expect("assessment");
+        assert_eq!(assessment.selected_point, CssPoint::new(100.0, 100.0));
+        assert_eq!(assessment.target_rect_css.left, 50.0);
+        assert_eq!(assessment.target_rect_css.top, 80.0);
+        assert!(
+            crate::hittest::validate_assessment(&hit.contract, &assessment).is_ok(),
+            "the composed assessment matches the composed contract"
+        );
+    }
+
+    #[test]
+    fn frame_resolve_refuses_a_clipped_sliver() {
+        let r = frame_ref();
+        let mut reply = frame_reply(&r, 300.0);
+        // Child-local top 280 translates to 340; the 250-high content box clips it.
+        reply["rectCss"] = serde_json::json!({
+            "left": 10.0,
+            "top": 280.0,
+            "width": 100.0,
+            "height": 40.0
+        });
+        let err = hit_from_scoped_reply(&reply, &r, Some(0x1234), true, false).unwrap_err();
+        assert_eq!(err.reason.as_deref(), Some("frame_not_visible"));
+        assert_eq!(err.state, IdentityState::Stale);
+    }
+
+    #[test]
+    fn frame_resolve_refuses_size_mismatch_and_missing_chain() {
+        let r = frame_ref();
+        let mut reply = frame_reply(&r, 500.0);
+        let err = hit_from_scoped_reply(&reply, &r, Some(0x1234), true, false).unwrap_err();
+        assert_eq!(err.reason.as_deref(), Some("frame_geometry_unavailable"));
+
+        reply = frame_reply(&r, 300.0);
+        reply.as_object_mut().unwrap().remove("chain");
+        let err = hit_from_scoped_reply(&reply, &r, Some(0x1234), true, false).unwrap_err();
+        assert_eq!(err.reason.as_deref(), Some("frame_geometry_unavailable"));
+    }
+
+    #[test]
+    fn frame_resolve_refuses_non_top_metrics() {
+        let r = frame_ref();
+        let mut reply = frame_reply(&r, 300.0);
+        reply["top"]["frame"] = serde_json::json!(3);
+        let err = hit_from_scoped_reply(&reply, &r, Some(0x1234), true, false).unwrap_err();
+        assert_eq!(err.reason.as_deref(), Some("frame_geometry_unavailable"));
+    }
+
+    #[test]
+    fn map_from_raw_composes_frame_nodes_and_quarantines_chr() {
+        let raw = RawSnapshot {
+            tab: Some(12),
+            window: Some(45),
+            frame: Some(0),
+            doc: Some("9f3a".into()),
+            snap: Some("a1b2c3d4".into()),
+            retained: Some(10),
+            stored: Some(true),
+            metrics: serde_json::from_value(top_metrics_json()).expect("metrics"),
+            elements: vec![RawNode {
+                frame: Some(3),
+                idx: Some(4),
+                id: Some(frame_ref().to_string()),
+                role: Some("Button".into()),
+                text: Some("Sign in".into()),
+                rect_css: CssRect {
+                    left: 10.0,
+                    top: 20.0,
+                    width: 100.0,
+                    height: 40.0,
+                },
+                _href: None,
+            }],
+            frames: vec![crate::frames::RawFrameLink {
+                frame: Some(3),
+                status: Some("ok".into()),
+                origin: Some("https://widget.test".into()),
+                doc: Some("cafe".into()),
+                snap: Some("00112233".into()),
+                retained: Some(6),
+                url: Some("https://widget.test/login".into()),
+                link: Some(crate::frames::FrameLink {
+                    parent: Some(0),
+                    content_left: 40.0,
+                    content_top: 60.0,
+                    content_width: 300.0,
+                    content_height: 250.0,
+                    clip: vec![crate::frames::ClipRect {
+                        left: 40.0,
+                        top: 60.0,
+                        width: 300.0,
+                        height: 250.0,
+                    }],
+                    transform_ok: true,
+                    visible: true,
+                    hit_ok: true,
+                    onscreen: true,
+                    viewport_w: 1920.0,
+                    viewport_h: 1080.0,
+                    ..crate::frames::FrameLink::default()
+                }),
+                ..crate::frames::RawFrameLink::default()
+            }],
+            ..RawSnapshot::default()
+        };
+        let map = map_from_raw(raw, Some(0x1234), true, "obs".into());
+        assert_eq!(map.elements.len(), 1);
+        assert_eq!(map.elements[0].frame, Some(3));
+        assert_eq!(map.elements[0].id, frame_ref().to_string());
+        let binding = map.snapshot.expect("binding");
+        assert_eq!(binding.frames.len(), 1);
+        assert_eq!(binding.frames[0].status, "ok");
+        assert_eq!(binding.frames[0].doc, "cafe");
+        assert_eq!(
+            binding.frame_binding(3).map(|f| f.snap.as_str()),
+            Some("00112233")
+        );
+    }
+
+    #[test]
+    fn map_from_raw_omits_a_frame_node_without_a_link() {
+        let raw = RawSnapshot {
+            tab: Some(12),
+            window: Some(45),
+            frame: Some(0),
+            doc: Some("9f3a".into()),
+            snap: Some("a1b2c3d4".into()),
+            retained: Some(1),
+            stored: Some(true),
+            metrics: serde_json::from_value(top_metrics_json()).expect("metrics"),
+            elements: vec![RawNode {
+                frame: Some(3),
+                idx: Some(0),
+                id: Some(frame_ref().to_string()),
+                role: Some("Button".into()),
+                text: Some("Sign in".into()),
+                rect_css: CssRect {
+                    left: 10.0,
+                    top: 20.0,
+                    width: 100.0,
+                    height: 40.0,
+                },
+                _href: None,
+            }],
+            ..RawSnapshot::default()
+        };
+        let map = map_from_raw(raw, Some(0x1234), true, "obs".into());
+        assert!(map.elements.is_empty(), "no fake frame rect is emitted");
+    }
+
+    #[test]
+    fn fully_clipped_child_elements_name_the_frame_not_visible() {
+        let raw = RawSnapshot {
+            tab: Some(12),
+            window: Some(45),
+            frame: Some(0),
+            doc: Some("9f3a".into()),
+            snap: Some("a1b2c3d4".into()),
+            retained: Some(10),
+            stored: Some(true),
+            metrics: serde_json::from_value(top_metrics_json()).expect("metrics"),
+            elements: vec![RawNode {
+                frame: Some(3),
+                idx: Some(0),
+                id: Some(frame_ref().to_string()),
+                role: Some("Button".into()),
+                text: Some("Outside".into()),
+                rect_css: CssRect {
+                    left: 400.0,
+                    top: 10.0,
+                    width: 50.0,
+                    height: 20.0,
+                },
+                _href: None,
+            }],
+            frames: vec![crate::frames::RawFrameLink {
+                frame: Some(3),
+                status: Some("ok".into()),
+                doc: Some("cafe".into()),
+                snap: Some("00112233".into()),
+                link: Some(crate::frames::FrameLink {
+                    parent: Some(0),
+                    content_left: 40.0,
+                    content_top: 60.0,
+                    content_width: 300.0,
+                    content_height: 250.0,
+                    clip: vec![crate::frames::ClipRect {
+                        left: 40.0,
+                        top: 60.0,
+                        width: 300.0,
+                        height: 250.0,
+                    }],
+                    transform_ok: true,
+                    visible: true,
+                    hit_ok: true,
+                    onscreen: true,
+                    viewport_w: 1920.0,
+                    viewport_h: 1080.0,
+                    ..crate::frames::FrameLink::default()
+                }),
+                ..crate::frames::RawFrameLink::default()
+            }],
+            ..RawSnapshot::default()
+        };
+        let map = map_from_raw(raw, Some(0x1234), true, "obs".into());
+        assert!(
+            map.elements.is_empty(),
+            "the fully clipped element is not clickable"
+        );
+        let binding = map.snapshot.expect("binding");
+        assert_eq!(binding.frames[0].status, "unavailable");
+        assert_eq!(
+            binding.frames[0].reason.as_deref(),
+            Some("frame_not_visible")
+        );
+    }
+
+    #[test]
+    fn evil_cloudflare_path_is_not_a_frame_vendor() {
+        let rows = vec![crate::frames::RawFrameLink {
+            frame: Some(3),
+            url: Some("https://evil.example/cdn-cgi/challenge-platform/x".into()),
+            ..crate::frames::RawFrameLink::default()
+        }];
+        assert!(
+            !frame_is_vendor(&rows, 3),
+            "an arbitrary host with the Cloudflare path is not a frame vendor"
+        );
+        let rows = vec![crate::frames::RawFrameLink {
+            frame: Some(3),
+            url: Some("https://evil.example/x@google.com/recaptcha".into()),
+            ..crate::frames::RawFrameLink::default()
+        }];
+        assert!(
+            !frame_is_vendor(&rows, 3),
+            "an @ in the path cannot change the vendor host"
+        );
+        let rows = vec![crate::frames::RawFrameLink {
+            frame: Some(3),
+            url: Some("https://challenges.cloudflare.com/turnstile".into()),
+            ..crate::frames::RawFrameLink::default()
+        }];
+        assert!(frame_is_vendor(&rows, 3));
+    }
+
+    #[test]
+    fn non_storing_frame_late_row_holds_the_yield_state() {
+        let raw = serde_json::json!({
+            "stored": false,
+            "tab": 12,
+            "window": 45,
+            "frame": 0,
+            "metrics": {},
+            "frames": [
+                {"status": "unavailable", "reason": "frame_late"},
+                {"status": "unavailable", "reason": "frame_geometry_unavailable"}
+            ]
+        });
+        let map = map_from_raw_json(&raw.to_string(), None, "obs".into());
+        assert!(
+            map.snapshot.is_none(),
+            "store:false drops the snapshot binding"
+        );
+        assert!(
+            map.frames_transient,
+            "the transient row survives store:false"
+        );
+        assert_eq!(map.frame_rows.len(), 2);
+        assert_eq!(map.frame_rows[0].reason.as_deref(), Some("frame_late"));
+    }
+
+    #[test]
+    fn non_storing_frame_content_reaches_detection_and_selection() {
+        let raw = RawSnapshot {
+            tab: Some(12),
+            window: Some(45),
+            frame: Some(0),
+            stored: Some(false),
+            metrics: serde_json::from_value(top_metrics_json()).expect("metrics"),
+            elements: vec![RawNode {
+                frame: Some(3),
+                idx: Some(0),
+                id: Some("frame:3:0".into()),
+                role: Some("Button".into()),
+                text: Some("I'm not a robot".into()),
+                rect_css: CssRect {
+                    left: 10.0,
+                    top: 20.0,
+                    width: 100.0,
+                    height: 40.0,
+                },
+                _href: None,
+            }],
+            frames: vec![crate::frames::RawFrameLink {
+                frame: Some(3),
+                status: Some("ok".into()),
+                origin: Some("https://www.google.com".into()),
+                url: Some("https://www.google.com/recaptcha/api2/anchor".into()),
+                link: Some(crate::frames::FrameLink {
+                    parent: Some(0),
+                    content_left: 40.0,
+                    content_top: 60.0,
+                    content_width: 300.0,
+                    content_height: 250.0,
+                    clip: vec![crate::frames::ClipRect {
+                        left: 40.0,
+                        top: 60.0,
+                        width: 300.0,
+                        height: 250.0,
+                    }],
+                    transform_ok: true,
+                    visible: true,
+                    hit_ok: true,
+                    onscreen: true,
+                    viewport_w: 1920.0,
+                    viewport_h: 1080.0,
+                    ..crate::frames::FrameLink::default()
+                }),
+                ..crate::frames::RawFrameLink::default()
+            }],
+            ..RawSnapshot::default()
+        };
+        let map = map_from_raw(raw, Some(0x1234), true, "obs".into());
+        assert_eq!(map.elements.len(), 1, "non-storing frame element survives");
+        assert_eq!(map.elements[0].frame, Some(3));
+        assert_eq!(map.elements[0].id, "frame:3:0");
+        assert!(map.elements[0].sref.is_none(), "no agent ref is minted");
+        assert!(map.elements[0].challenge_vendor, "vendor frame is eligible");
+        let hit = crate::challenge::detect_from_extract(
+            "Top",
+            Some("https://top.test/"),
+            "",
+            &map.elements,
+        );
+        assert!(hit.present, "frame challenge text arms detection: {hit:?}");
+    }
+
+    #[test]
+    fn fixture_frame_ref_resolves_by_frame_and_idx() {
+        let r = frame_ref();
+        let raw = RawSnapshot {
+            tab: Some(12),
+            window: Some(45),
+            frame: Some(0),
+            doc: Some("9f3a".into()),
+            snap: Some("a1b2c3d4".into()),
+            retained: Some(10),
+            stored: Some(true),
+            metrics: serde_json::from_value(top_metrics_json()).expect("metrics"),
+            elements: vec![RawNode {
+                frame: Some(3),
+                idx: Some(4),
+                id: Some(r.to_string()),
+                role: Some("Button".into()),
+                text: Some("Sign in".into()),
+                rect_css: CssRect {
+                    left: 10.0,
+                    top: 20.0,
+                    width: 100.0,
+                    height: 40.0,
+                },
+                _href: None,
+            }],
+            frames: vec![crate::frames::RawFrameLink {
+                frame: Some(3),
+                status: Some("ok".into()),
+                link: Some(crate::frames::FrameLink {
+                    parent: Some(0),
+                    content_left: 40.0,
+                    content_top: 60.0,
+                    content_width: 300.0,
+                    content_height: 250.0,
+                    clip: vec![crate::frames::ClipRect {
+                        left: 40.0,
+                        top: 60.0,
+                        width: 300.0,
+                        height: 250.0,
+                    }],
+                    transform_ok: true,
+                    visible: true,
+                    hit_ok: true,
+                    onscreen: true,
+                    viewport_w: 1920.0,
+                    viewport_h: 1080.0,
+                    ..crate::frames::FrameLink::default()
+                }),
+                ..crate::frames::RawFrameLink::default()
+            }],
+            ..RawSnapshot::default()
+        };
+        let hit = scoped_fixture_hit(&raw, &r, Some(0x1234), false).expect("fixture frame ref");
+        assert_eq!(hit.css_rect.left, 50.0);
+        assert_eq!(hit.css_rect.top, 80.0);
+    }
+
+    #[test]
+    fn frame_chain_consistency_tolerance_is_one_px() {
+        let base = crate::frames::FrameLink {
+            parent: Some(0),
+            content_left: 40.0,
+            content_top: 60.0,
+            content_width: 300.0,
+            content_height: 250.0,
+            clip: vec![crate::frames::ClipRect {
+                left: 40.0,
+                top: 60.0,
+                width: 300.0,
+                height: 250.0,
+            }],
+            transform_ok: true,
+            visible: true,
+            hit_ok: true,
+            onscreen: true,
+            viewport_w: 1920.0,
+            viewport_h: 1080.0,
+            ..crate::frames::FrameLink::default()
+        };
+        let mut fresh = base.clone();
+        assert!(frame_chains_match(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&fresh)
+        ));
+        fresh.content_left += 0.9;
+        assert!(frame_chains_match(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&fresh)
+        ));
+        fresh.content_left += 1.0;
+        assert!(!frame_chains_match(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&fresh)
+        ));
+        let mut hidden = base.clone();
+        hidden.visible = false;
+        assert!(!frame_chains_match(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&hidden)
+        ));
+    }
+
+    #[test]
+    fn frame_error_tokens_map_to_stale_or_unknown() {
+        assert_eq!(
+            classify_ref_error("frame_not_visible"),
+            (IdentityState::Stale, "frame_not_visible".into())
+        );
+        assert_eq!(
+            classify_ref_error("frame_geometry_unavailable"),
+            (IdentityState::Unknown, "frame_geometry_unavailable".into())
+        );
+        assert_eq!(
+            classify_ref_error("frame_occluded"),
+            (IdentityState::Unknown, "frame_occluded".into())
+        );
+        assert_eq!(
+            classify_ref_error("frame_document_changed"),
+            (IdentityState::Stale, "frame_document_changed".into())
+        );
+    }
+
     #[test]
     fn malformed_assessment_is_unknown_not_ok_false() {
         let raw = RawNode {
+            frame: None,
+            idx: None,
             id: Some("chr:0".into()),
             role: Some("Button".into()),
             text: Some("Go".into()),
@@ -3352,6 +4583,8 @@ mod tests {
             ..RawSnapshot::default()
         };
         raw.elements = vec![RawNode {
+            frame: None,
+            idx: None,
             id: Some("chr:7".into()),
             role: Some("Button".into()),
             text: Some("Go".into()),
@@ -3505,6 +4738,28 @@ mod tests {
     }
 
     #[test]
+    fn frame_binding_probe_surfaces_named_failures() {
+        set_frame_binding_stub(Some(Err(IdentityReport::chrome_failure(
+            &frame_ref(),
+            IdentityState::Stale,
+            "frame_document_changed",
+        ))));
+        let report = verify_frame_binding(12, 3, "9f3a", "a1b2c3d4", 4).expect_err("changed");
+        set_frame_binding_stub(None);
+        assert_eq!(report.state, IdentityState::Stale);
+        assert_eq!(report.reason.as_deref(), Some("frame_document_changed"));
+
+        set_frame_binding_stub(Some(Err(IdentityReport::chrome_failure(
+            &frame_ref(),
+            IdentityState::Unknown,
+            "frame_geometry_unavailable",
+        ))));
+        let report = verify_frame_binding(12, 3, "9f3a", "a1b2c3d4", 4).expect_err("missing chain");
+        set_frame_binding_stub(None);
+        assert_eq!(report.reason.as_deref(), Some("frame_geometry_unavailable"));
+    }
+
+    #[test]
     fn binding_probe_returns_active_focused() {
         set_binding_stub(Some(Ok(BindingEvidence {
             tab: 12,
@@ -3609,7 +4864,21 @@ mod tests {
         assert!(named.contains("withTabEvidence"));
         assert!(!named.contains("tabs.query"));
         assert!(src.contains("windowType: \"normal\""));
-        assert!(src.contains("chrome.tabs.sendMessage"));
+        // Every content-script message goes through the one frame-routed helper.
+        assert_eq!(
+            src.matches("tabs.sendMessage(").count(),
+            1,
+            "exactly one tabs.sendMessage call"
+        );
+        let send_start = src.find("function sendToFrame(").expect("sendToFrame");
+        let send_end = src
+            .find("function withTabEvidence(")
+            .expect("withTabEvidence");
+        let send = &src[send_start..send_end];
+        assert!(
+            send.contains("chrome.tabs.sendMessage(tabId, msg, { frameId: frameId }, callback)"),
+            "the single call carries an explicit frameId"
+        );
     }
 
     #[test]

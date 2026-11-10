@@ -226,7 +226,7 @@ pub fn detect(input: &DetectInput<'_>) -> DetectHit {
 
     let mut host_classified = false;
     if let Some(host) = host.as_deref()
-        && let Some((kind, reason)) = match_host(host, &path)
+        && let Some((kind, reason)) = match_host(host, &path, HostScope::TopPage)
     {
         push_cand(&mut cands, kind, reason, 0);
         host_classified = true;
@@ -273,9 +273,12 @@ pub fn detect(input: &DetectInput<'_>) -> DetectHit {
     let host_hit = host_classified;
     let vendor_on_token_surface = vendor_token_hit(&token_surfaces);
     let recaptcha_chrome = vendor_on_token_surface == Some(ChallengeKind::Recaptcha)
-        || host
-            .as_deref()
-            .is_some_and(|h| matches!(match_host(h, &path), Some((ChallengeKind::Recaptcha, _))));
+        || host.as_deref().is_some_and(|h| {
+            matches!(
+                match_host(h, &path, HostScope::TopPage),
+                Some((ChallengeKind::Recaptcha, _))
+            )
+        });
     let cf_on_any = surfaces_have_token(&all_surfaces, "cloudflare");
     let turnstile_on_any = surfaces_have_token(&all_surfaces, "turnstile");
 
@@ -366,7 +369,16 @@ fn host_is_cloudflare(host: Option<&str>) -> bool {
     host.is_some_and(|h| h == "cloudflare.com" || h.ends_with(".cloudflare.com"))
 }
 
-fn match_host(host: &str, path: &str) -> Option<(ChallengeKind, String)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostScope {
+    /// The top document: includes the Cloudflare interstitial and funcaptcha host rules.
+    TopPage,
+    /// A frame: only the vendor hosts in spec §3.8. The any-host Cloudflare interstitial and
+    /// `funcaptcha.com` are deliberately excluded.
+    Frame,
+}
+
+fn match_host(host: &str, path: &str, scope: HostScope) -> Option<(ChallengeKind, String)> {
     let host = normalize_host(host);
     if host == "recaptcha.net" || host.ends_with(".recaptcha.net") || host == "recaptcha.google.com"
     {
@@ -381,22 +393,24 @@ fn match_host(host: &str, path: &str) -> Option<(ChallengeKind, String)> {
     if host == "challenges.cloudflare.com" {
         return Some((ChallengeKind::Turnstile, host));
     }
-    if (host == "cloudflare.com" || host.ends_with(".cloudflare.com"))
-        && path.contains("/cdn-cgi/challenge-platform")
-    {
-        return Some((
-            ChallengeKind::Turnstile,
-            "/cdn-cgi/challenge-platform".into(),
-        ));
-    }
-    if path.contains("/cdn-cgi/challenge-platform") {
-        return Some((
-            ChallengeKind::Interstitial,
-            "/cdn-cgi/challenge-platform".into(),
-        ));
-    }
-    if host == "funcaptcha.com" || host.ends_with(".funcaptcha.com") {
-        return Some((ChallengeKind::Funcaptcha, host));
+    if scope == HostScope::TopPage {
+        if (host == "cloudflare.com" || host.ends_with(".cloudflare.com"))
+            && path.contains("/cdn-cgi/challenge-platform")
+        {
+            return Some((
+                ChallengeKind::Turnstile,
+                "/cdn-cgi/challenge-platform".into(),
+            ));
+        }
+        if path.contains("/cdn-cgi/challenge-platform") {
+            return Some((
+                ChallengeKind::Interstitial,
+                "/cdn-cgi/challenge-platform".into(),
+            ));
+        }
+        if host == "funcaptcha.com" || host.ends_with(".funcaptcha.com") {
+            return Some((ChallengeKind::Funcaptcha, host));
+        }
     }
     if host == "arkoselabs.com"
         || host.ends_with(".arkoselabs.com")
@@ -413,42 +427,48 @@ fn host_and_path(raw: &str) -> (Option<String>, String) {
         return (None, String::new());
     }
     let lower = trimmed.to_ascii_lowercase();
-    let after_scheme = if let Some(i) = lower.find("://") {
-        &trimmed[i + 3..]
-    } else {
-        trimmed
+    // A scheme separator is only valid at a scheme position. A `://` inside a data: body or
+    // a query string is not a scheme.
+    let after_scheme = match lower.find("://") {
+        Some(i)
+            if i > 0
+                && lower.as_bytes()[0].is_ascii_alphabetic()
+                && lower[..i]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')) =>
+        {
+            &trimmed[i + 3..]
+        }
+        _ => trimmed,
     };
-    let after_user = if let Some(at) = after_scheme.find('@') {
-        &after_scheme[at + 1..]
+    // Authority ends at the first `/`, `?` or `#`; an `@` after that is path/query data and
+    // must never change the host.
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    if authority.contains('\\') {
+        return (None, String::new());
+    }
+    // Strip userinfo only inside the authority. rfind is conservative for malformed input.
+    let host_port = if let Some(at) = authority.rfind('@') {
+        &authority[at + 1..]
     } else {
-        after_scheme
+        authority
     };
-    let host_end = after_user
-        .find(|c: char| c == '/' || c == '?' || c == '#' || c == ':' || c.is_whitespace())
-        .unwrap_or(after_user.len());
-    let host_raw = after_user[..host_end].trim();
+    let host_end = host_port
+        .find(|c: char| c == ':' || c.is_whitespace())
+        .unwrap_or(host_port.len());
+    let host_raw = host_port[..host_end].trim();
     if host_raw.is_empty() || !host_raw.contains('.') {
         return (None, String::new());
     }
-    // Host stops at `:`; skip `:` + ASCII digits (port) then take `/` path.
-    let after_host = if host_end < after_user.len() {
-        &after_user[host_end..]
-    } else {
-        ""
-    };
-    let after_port = if let Some(rest) = after_host.strip_prefix(':') {
-        let digit_len = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        &rest[digit_len..]
-    } else {
-        after_host
-    };
-    let path = if after_port.starts_with('/') {
-        let path_end = after_port
+    let remainder = &after_scheme[authority_end..];
+    let path = if remainder.starts_with('/') {
+        let path_end = remainder
             .find(|c: char| c == '?' || c == '#' || c.is_whitespace())
-            .unwrap_or(after_port.len());
-        after_port[..path_end].to_ascii_lowercase()
+            .unwrap_or(remainder.len());
+        remainder[..path_end].to_ascii_lowercase()
     } else {
         String::new()
     };
@@ -479,7 +499,17 @@ impl ChallengeMachine {
     }
 
     pub fn observe(&mut self, hit: &DetectHit) -> bool {
+        self.observe_frames(hit, false)
+    }
+
+    /// `frames_transient` holds an existing challenge/yield counter across a frame fan-out that
+    /// did not complete (frame_late / budget / missing / geometry). A complete observe with a
+    /// definitive `present:false` still clears.
+    pub fn observe_frames(&mut self, hit: &DetectHit, frames_transient: bool) -> bool {
         if !hit.present {
+            if frames_transient && (self.present || self.yielded) {
+                return false;
+            }
             *self = Self::new();
             return false;
         }
@@ -564,8 +594,16 @@ pub fn reset_for_test() {
 }
 
 pub fn apply_observe(session_id: &str, hit: DetectHit) -> ChallengeInfo {
+    apply_observe_with_frames(session_id, hit, false)
+}
+
+pub fn apply_observe_with_frames(
+    session_id: &str,
+    hit: DetectHit,
+    frames_transient: bool,
+) -> ChallengeInfo {
     let mut g = lock();
-    let just_yielded = g.observe(&hit);
+    let just_yielded = g.observe_frames(&hit, frames_transient);
     if just_yielded && crate::attach::current_identity() == crate::attach::Identity::Research {
         g.suppress_yield_keep_attempts();
         lease::set_challenge_hold(g.hold());
@@ -604,8 +642,11 @@ pub fn detect_from_extract(
     main_text: &str,
     elements: &[Element],
 ) -> DetectHit {
+    // Only the top frame or a vendor-classified frame may arm detection. Non-vendor frame
+    // text (ads/marketing copy) is observed data, never a challenge surface.
     let pairs: Vec<(&str, &str)> = elements
         .iter()
+        .filter(|e| e.frame.is_none() || e.challenge_vendor)
         .map(|e| (e.role.as_str(), e.text.as_deref().unwrap_or("")))
         .collect();
     detect(&DetectInput {
@@ -614,6 +655,17 @@ pub fn detect_from_extract(
         main_text,
         elements: &pairs,
     })
+}
+
+/// Path-aware vendor classification for one frame URL (0131). The URL is internal only:
+/// callers must never serialize it. Origin-only matching is insufficient because
+/// `www.google.com/recaptcha/api2/anchor` and `www.google.com/search` share an origin.
+pub fn vendor_url(url: &str) -> Option<ChallengeKind> {
+    let (host, path) = host_and_path(url);
+    // Single classifier: the same `match_host` table as the top page, scoped to the §3.8
+    // frame vendor list. The any-host Cloudflare interstitial and `funcaptcha.com` are
+    // deliberately out of frame scope.
+    match_host(host?.as_str(), &path, HostScope::Frame).map(|(kind, _)| kind)
 }
 
 pub fn watch_timeout_ms() -> u64 {
@@ -1429,6 +1481,92 @@ mod tests {
     }
 
     #[test]
+    fn transient_frame_fan_out_holds_attempts_then_clears() {
+        let mut m = ChallengeMachine::new();
+        assert!(!m.observe(&present_hit()));
+        m.note_actuation();
+        assert!(!m.observe(&present_hit()));
+        assert_eq!(m.info().attempts, 1);
+        // A transient frame miss is unknown, not a definitive `present:false`: hold.
+        assert!(!m.observe_frames(&DetectHit::clear(), true));
+        assert_eq!(m.info().attempts, 1);
+        assert!(m.hold());
+        // A complete observe with a definitive clear still resets.
+        assert!(!m.observe_frames(&DetectHit::clear(), false));
+        assert_eq!(m.info().attempts, 0);
+        assert!(!m.hold());
+    }
+
+    #[test]
+    fn vendor_url_is_path_aware_and_lookalike_safe() {
+        assert!(vendor_url("https://www.google.com/recaptcha/api2/anchor").is_some());
+        assert!(vendor_url("https://www.google.com/search?q=captcha").is_none());
+        assert!(vendor_url("https://recaptcha.evil.example/").is_none());
+        assert!(vendor_url("https://google.com.evil.example/recaptcha").is_none());
+        assert!(vendor_url("https://challenges.cloudflare.com/turnstile").is_some());
+        assert!(vendor_url("https://hcaptcha.com/").is_some());
+        assert!(vendor_url("https://arkoselabs.com/").is_some());
+        assert!(
+            vendor_url("https://evil.example/cdn-cgi/challenge-platform/x").is_none(),
+            "an arbitrary host with the Cloudflare path is not a frame vendor"
+        );
+        assert!(vendor_url("https://google.com.evil.example/recaptcha").is_none());
+        // P3-1: an `@` outside the authority is path/query data, never userinfo.
+        assert!(vendor_url("https://evil.example/x@google.com/recaptcha").is_none());
+        assert!(vendor_url("https://evil.example?q=@google.com/recaptcha").is_none());
+        assert!(vendor_url("https://evil.example/x@@google.com/recaptcha").is_none());
+        assert!(vendor_url("https://evil.example/x%40google.com/recaptcha").is_none());
+        assert!(vendor_url("https://user:pass@google.com/recaptcha").is_some());
+        // L-9: a `://` inside a data: body/query is not a scheme; a backslash in the
+        // authority is not a host separator.
+        assert!(vendor_url("data:text/html,https://google.com/recaptcha").is_none());
+        assert!(vendor_url("evil.example?x=https://google.com/recaptcha").is_none());
+        assert!(vendor_url("https://evil.example\\x@google.com/recaptcha").is_none());
+        // P3-3: frame scope excludes the top-page-only funcaptcha/cdn-cgi rules.
+        assert!(vendor_url("https://funcaptcha.com/").is_none());
+        assert!(vendor_url("https://cloudflare.com/cdn-cgi/challenge-platform/x").is_none());
+        assert!(
+            match_host("funcaptcha.com", "", HostScope::TopPage).is_some(),
+            "the top-page rule still exists"
+        );
+        assert_eq!(
+            vendor_url("https://www.google.com/recaptcha/api2/anchor"),
+            match_host("google.com", "/recaptcha", HostScope::Frame).map(|(kind, _)| kind)
+        );
+    }
+
+    #[test]
+    fn non_vendor_frame_copy_does_not_arm_detection() {
+        let mut el = Element {
+            frame: Some(3),
+            challenge_vendor: false,
+            id: "sref1:c.c.3.9f3a.a1b2c3d4.0".into(),
+            role: "Button".into(),
+            text: Some("I'm not a robot".into()),
+            rect: crate::space::Rect {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 20,
+            },
+            grid: None,
+            unnamed: None,
+            sref: None,
+        };
+        let hit = detect_from_extract("Top", Some("https://top.test/"), "", &[el.clone()]);
+        assert!(
+            !hit.present,
+            "ad-frame marketing copy must not arm detection"
+        );
+        el.challenge_vendor = true;
+        let hit = detect_from_extract("Top", Some("https://top.test/"), "", &[el]);
+        assert!(
+            hit.present,
+            "a vendor-classified frame is a detection input"
+        );
+    }
+
+    #[test]
     fn machine_two_cycles_then_yield() {
         let mut m = ChallengeMachine::new();
         m.observe(&present_hit());
@@ -1599,6 +1737,36 @@ mod tests {
     }
 
     #[test]
+    fn watch_does_not_report_gone_on_a_transient_frame() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        apply_observe("s-frame-hold", present_hit());
+        let info = apply_observe_with_frames("s-frame-hold", DetectHit::clear(), true);
+        assert!(info.present, "a frame_late observe is unknown, not gone");
+        let clock = FakeClock {
+            now: Cell::new(Instant::now()),
+        };
+        let (watched, elapsed) = watch_until_gone(
+            &clock,
+            Duration::from_millis(1_000),
+            Duration::from_millis(1_000),
+            || {
+                Ok(apply_observe_with_frames(
+                    "s-frame-hold",
+                    DetectHit::clear(),
+                    true,
+                ))
+            },
+        )
+        .unwrap();
+        assert!(
+            watched.present,
+            "watch must not report gone while the frame is late"
+        );
+        assert!(elapsed >= 1_000);
+    }
+
+    #[test]
     fn watch_stops_when_ui_gone() {
         let clock = FakeClock {
             now: Cell::new(Instant::now()),
@@ -1766,11 +1934,43 @@ mod tests {
             "challenge.rs must not import the pick module"
         );
 
-        let manifest = include_str!("../extension/manifest.json");
-        assert!(
-            manifest.contains("\"all_frames\": false"),
-            "all_frames must stay false"
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../extension/manifest.json")).expect("manifest");
+        assert_eq!(manifest["manifest_version"], serde_json::json!(3));
+        assert_eq!(manifest["version"], serde_json::json!("0.3.0"));
+        assert_eq!(
+            manifest["permissions"],
+            serde_json::json!(["nativeMessaging"])
         );
+        assert_eq!(
+            manifest["host_permissions"],
+            serde_json::json!(["<all_urls>"])
+        );
+        let scripts = manifest["content_scripts"].as_array().expect("scripts");
+        assert_eq!(scripts[0]["all_frames"], serde_json::json!(true));
+        assert_eq!(scripts[0]["match_about_blank"], serde_json::json!(true));
+        assert_eq!(scripts[0]["world"], serde_json::json!("ISOLATED"));
+        assert_eq!(scripts[0]["run_at"], serde_json::json!("document_idle"));
+        assert!(
+            scripts[0].get("match_origin_as_fallback").is_none(),
+            "data:/blob: frames are out of scope for ADR 0002 v1"
+        );
+        for missing in [
+            "webNavigation",
+            "scripting",
+            "tabs",
+            "debugger",
+            "webRequest",
+        ] {
+            assert!(
+                !manifest["permissions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == missing),
+                "manifest must not add {missing}"
+            );
+        }
     }
 
     #[test]

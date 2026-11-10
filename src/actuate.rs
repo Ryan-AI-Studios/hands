@@ -1043,26 +1043,100 @@ fn scoped_binding_refusal(
 }
 
 fn scoped_binding_report(target: &Target) -> Result<Option<IdentityReport>, HandsError> {
-    let Target::Scoped(r @ SnapshotRef::Chrome { tab, .. }) = target else {
+    let Target::Scoped(
+        r @ SnapshotRef::Chrome {
+            tab,
+            frame,
+            doc,
+            snap,
+            idx,
+            ..
+        },
+    ) = target
+    else {
         return Ok(None);
     };
     // `evidence.window` is corroboration only: a window drag/move keeps the tab-id binding
     // valid (spec §3.3), so only active/focused gate the dispatch.
     match chrome::verify_binding(*tab) {
-        Ok(evidence) if evidence.active && evidence.focused => Ok(None),
+        Ok(evidence) if evidence.active && evidence.focused => {}
         Ok(evidence) => {
             let reason = if !evidence.active {
                 "tab_not_active"
             } else {
                 "window_not_focused"
             };
-            Ok(Some(IdentityReport::chrome_failure(
+            return Ok(Some(IdentityReport::chrome_failure(
                 r,
                 IdentityState::Unknown,
                 reason,
-            )))
+            )));
         }
-        Err(report) => Ok(Some(report)),
+        Err(report) => return Ok(Some(report)),
+    }
+    if *frame > 0 {
+        return match chrome::verify_frame_binding(*tab, *frame, doc, snap, *idx) {
+            Ok(evidence)
+                if evidence.doc == *doc && evidence.snap.as_deref() == Some(snap.as_str()) =>
+            {
+                Ok(None)
+            }
+            Ok(evidence) if evidence.doc != *doc => Ok(Some(IdentityReport::chrome_failure(
+                r,
+                IdentityState::Stale,
+                "frame_document_changed",
+            ))),
+            Ok(_) => Ok(Some(IdentityReport::chrome_failure(
+                r,
+                IdentityState::Stale,
+                "stale_snapshot",
+            ))),
+            Err(report) => Ok(Some(report)),
+        };
+    }
+    Ok(None)
+}
+
+/// Pre-move frame re-read: a frame that was removed or navigated refuses before the pointer
+/// moves. This is the distinct `frame_binding` op, never the top-frame `binding` branch.
+fn frame_binding_refusal(
+    session_id: &str,
+    info: &ActuateTarget,
+    target: &Target,
+) -> Result<Option<ActuateEnvelope>, HandsError> {
+    let Target::Scoped(
+        r @ SnapshotRef::Chrome {
+            tab,
+            frame,
+            doc,
+            snap,
+            idx,
+            ..
+        },
+    ) = target
+    else {
+        return Ok(None);
+    };
+    if *frame == 0 {
+        return Ok(None);
+    }
+    match chrome::verify_frame_binding(*tab, *frame, doc, snap, *idx) {
+        Ok(evidence) if evidence.doc == *doc && evidence.snap.as_deref() == Some(snap.as_str()) => {
+            Ok(None)
+        }
+        Ok(evidence) if evidence.doc != *doc => refuse_identity(
+            session_id.to_string(),
+            info.clone(),
+            IdentityReport::chrome_failure(r, IdentityState::Stale, "frame_document_changed"),
+        )
+        .map(Some),
+        Ok(_) => refuse_identity(
+            session_id.to_string(),
+            info.clone(),
+            IdentityReport::chrome_failure(r, IdentityState::Stale, "stale_snapshot"),
+        )
+        .map(Some),
+        Err(report) => refuse_identity(session_id.to_string(), info.clone(), report).map(Some),
     }
 }
 
@@ -1317,6 +1391,10 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     let mut rng = Rng::from_time();
     let roi = settle::default_roi(space, Some(resolved.rect), (resolved.x, resolved.y));
     let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
+    // Immediately before the pointer moves: re-read the child doc/snap and the fresh chain.
+    if let Some(env) = frame_binding_refusal(&session_id, &info, &resolved.target)? {
+        return Ok(env);
+    }
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
         return fail_with_point(
             session_id,
@@ -6636,6 +6714,96 @@ mod tests {
         let helper = &src[helper_start..helper_end];
         assert!(helper.contains("tab_not_active"));
         assert!(helper.contains("window_not_focused"));
+    }
+
+    #[test]
+    fn frame_binding_refusal_checks_doc_and_skips_top() {
+        let r = SnapshotRef::Chrome {
+            tab: 12,
+            frame: 3,
+            doc: "c0a6".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 0,
+        };
+        let target = Target::Scoped(r.clone());
+        let info = ActuateTarget {
+            kind: "element".into(),
+            id: Some(r.to_string()),
+            x: 10,
+            y: 20,
+        };
+        chrome::set_frame_binding_stub(Some(Ok(chrome::FrameBindingEvidence {
+            frame: 3,
+            doc: "ffff".into(),
+            snap: None,
+            chain_present: true,
+        })));
+        let env = frame_binding_refusal("s-frame", &info, &target)
+            .expect("probe")
+            .expect("refusal");
+        assert!(!env.ok);
+        assert_eq!(
+            env.identity.as_ref().and_then(|i| i.reason.as_deref()),
+            Some("frame_document_changed")
+        );
+
+        chrome::set_frame_binding_stub(Some(Ok(chrome::FrameBindingEvidence {
+            frame: 3,
+            doc: "c0a6".into(),
+            snap: Some("a1b2c3d4".into()),
+            chain_present: true,
+        })));
+        assert!(
+            frame_binding_refusal("s-frame", &info, &target)
+                .expect("probe")
+                .is_none()
+        );
+
+        chrome::set_frame_binding_stub(Some(Ok(chrome::FrameBindingEvidence {
+            frame: 3,
+            doc: "c0a6".into(),
+            snap: Some("deadbeef".into()),
+            chain_present: true,
+        })));
+        let env = frame_binding_refusal("s-frame", &info, &target)
+            .expect("probe")
+            .expect("refusal");
+        assert_eq!(
+            env.identity.as_ref().and_then(|i| i.reason.as_deref()),
+            Some("stale_snapshot")
+        );
+
+        let top = Target::Scoped(SnapshotRef::Chrome {
+            tab: 12,
+            frame: 0,
+            doc: "c0a6".into(),
+            snap: "a1b2c3d4".into(),
+            idx: 0,
+        });
+        chrome::set_frame_binding_stub(Some(Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Unknown,
+            "frame_geometry_unavailable",
+        ))));
+        assert!(
+            frame_binding_refusal("s-frame", &info, &top)
+                .expect("top probe")
+                .is_none()
+        );
+        chrome::set_frame_binding_stub(None);
+    }
+
+    #[test]
+    fn click_checks_frame_binding_before_move() {
+        let src = include_str!("actuate.rs");
+        let start = src.find("fn click_inner(").expect("click_inner");
+        let end = src.find("fn dispatch_blind_click(").expect("blind");
+        let body = &src[start..end];
+        let frame = body
+            .find("frame_binding_refusal")
+            .expect("frame binding probe");
+        let move_to = body.find("input::move_to").expect("move_to");
+        assert!(frame < move_to, "frame_binding must precede move_to");
     }
 
     #[test]

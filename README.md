@@ -433,8 +433,25 @@ composed descendant at the centre), `false` (an overlay/clip/iframe would receiv
 `blocked_by`/`clipped_by`), or `null` (unknown: invalid transform, stale tab, closed shadow,
 cross-frame, timeout, point mismatch). `ok:true` means the query ran; `interactable:false` is not a
 command failure (exit 0). It reports click interception, not visual occlusion (`pointer-events:none`
-is not a blocker), and does not model native-window occlusion. Top frame only; iframe interiors are
-named, never entered. No input, no lease, no cooldown, no JSONL row. `click --require-interactable`
+is not a blocker), and does not model native-window occlusion. Frame observation is on
+(`all_frames:true`, `match_about_blank:true`, no new permission). A frame element carries `frame:N`
+and `id`=`ref`=`sref1:c.<tab>.<frame>.<doc>.<snap>.<idx>`; legacy `chr:` is top-frame-only.
+`hittest --element-id <frame ref>` enters a linked frame and composes through the parent chain;
+`hittest --x/--y` enters a cross-frame hit explicitly, with parent clipping and per-level
+visibility/occlusion. Unlinked/invalid geometry is `null` with a named `frame_*` reason, never a
+guessed point. `snapshot.frames[]` reports `ok` or `unavailable` with `restricted_scheme`,
+`sandboxed_no_scripts`, `fenced_frame`, `no_content_script`, `frame_late`, `frame_cap_exceeded`,
+`frame_budget_exceeded`, `frame_link_missing`, `frame_link_ambiguous`, or
+`frame_geometry_unavailable`; an un-injected frame has no fabricated `frame` id. `origin` is
+untrusted hostname text (scheme+host+port, no path). `HANDS_FRAMES=0` is a per-process CLI switch
+(no `frames` field; nonzero refs refuse `frame_unsupported`); the true rollback is the manifest
+revert + extension reload. Compatibility: an old client + new extension receives the top-only 0123
+shape (fan-out is opt-in); a new client + old extension refuses frame refs `frame_unsupported`; an
+old installed native host is a byte pump. The research identity may solve frame challenge content;
+daily Chrome keeps the two-try yield and has no solve path. Only a top-frame or
+`match_host`-classified frame element can arm detection or be selected. `frame_binding` is a
+distinct pre-move probe; the top `binding` branch is unchanged. No input, no lease, no cooldown, no
+JSONL row. `click --require-interactable`
 opts in to refusing a blocked/unknown `chr:` before fence/offer/SendInput; the refusal keeps a valid
 `point` and carries `interactable_checked:true` (an old server that ignores the flag omits it -
 refresh the installed/elevated exe before relying on it). Do not retry the same blocked point; clear

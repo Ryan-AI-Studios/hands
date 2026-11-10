@@ -27,6 +27,8 @@ pub enum StopReason {
     UnknownKey,
     BadSteps,
     Cooldown,
+    /// A click step declared a postcondition that was not satisfied.
+    PostconditionFailed,
 }
 
 impl StopReason {
@@ -41,6 +43,7 @@ impl StopReason {
             Self::UnknownKey => "unknown_key",
             Self::BadSteps => "bad_steps",
             Self::Cooldown => "cooldown",
+            Self::PostconditionFailed => "postcondition_failed",
         }
     }
 }
@@ -55,6 +58,8 @@ pub enum SequenceStep {
         grid: Option<String>,
         x: Option<i32>,
         y: Option<i32>,
+        /// Opt-in DOM postcondition (click only).
+        postcondition: Option<crate::outcome::Postcondition>,
     },
     Hover {
         element_id: Option<String>,
@@ -122,6 +127,14 @@ pub struct ExecutedStep {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<crate::identity::IdentityReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<crate::outcome::Delivery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effect: Option<crate::outcome::Effect>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<crate::outcome::Verdict>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<crate::outcome::RetryInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,6 +186,12 @@ pub struct StepOutcome {
     pub window: Option<String>,
     pub reason: Option<String>,
     pub identity: Option<crate::identity::IdentityReport>,
+    pub delivery: Option<crate::outcome::Delivery>,
+    pub effect: Option<crate::outcome::Effect>,
+    pub verdict: Option<crate::outcome::Verdict>,
+    pub retry: Option<crate::outcome::RetryInfo>,
+    pub postcondition_state: Option<crate::outcome::PostconditionState>,
+    pub postcondition_requested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +340,10 @@ pub fn sequence_with(
                         settled: None,
                         reason: None,
                         identity: None,
+                        delivery: None,
+                        effect: None,
+                        verdict: None,
+                        retry: None,
                     });
                     if hooks.record_steps {
                         record_step(&session_id, "observe", true, None, None)?;
@@ -339,6 +362,10 @@ pub fn sequence_with(
                         settled: None,
                         reason: None,
                         identity: None,
+                        delivery: None,
+                        effect: None,
+                        verdict: None,
+                        retry: None,
                     });
                     if hooks.record_steps {
                         record_step(
@@ -396,6 +423,10 @@ pub fn sequence_with(
                     settled: None,
                     reason: None,
                     identity: None,
+                    delivery: None,
+                    effect: None,
+                    verdict: None,
+                    retry: None,
                 });
                 if hooks.record_steps {
                     record_step(&session_id, step.tool(), false, Some(&msg), type_len(step))?;
@@ -573,12 +604,24 @@ fn parse_one(tool: &str, obj: &serde_json::Map<String, Value>) -> Result<Sequenc
             let window = req_string(obj, "window")?;
             Ok(SequenceStep::Activate { window })
         }
-        "click" => Ok(SequenceStep::Click {
-            element_id: opt_string(obj, "element_id"),
-            grid: opt_string(obj, "grid"),
-            x: opt_i32(obj, "x"),
-            y: opt_i32(obj, "y"),
-        }),
+        "click" => {
+            let postcondition = match obj.get("postcondition") {
+                Some(value) if !value.is_null() => {
+                    let condition: crate::outcome::Postcondition =
+                        serde_json::from_value(value.clone()).map_err(|_| ())?;
+                    condition.validate().map_err(|_| ())?;
+                    Some(condition)
+                }
+                _ => None,
+            };
+            Ok(SequenceStep::Click {
+                element_id: opt_string(obj, "element_id"),
+                grid: opt_string(obj, "grid"),
+                x: opt_i32(obj, "x"),
+                y: opt_i32(obj, "y"),
+                postcondition,
+            })
+        }
         "hover" => Ok(SequenceStep::Hover {
             element_id: opt_string(obj, "element_id"),
             grid: opt_string(obj, "grid"),
@@ -707,6 +750,13 @@ fn classify_failure(step: &SequenceStep, outcome: &StepOutcome) -> Option<StopRe
                 Some(StopReason::FocusLost)
             } else if !outcome.ok {
                 Some(StopReason::PrerequisiteFailed)
+            } else if outcome.postcondition_requested
+                && outcome.postcondition_state
+                    != Some(crate::outcome::PostconditionState::Satisfied)
+            {
+                // A declared condition that did not hold is the only new stop rule; a step
+                // with no postcondition keeps `no_change`/`reobserve` informational.
+                Some(StopReason::PostconditionFailed)
             } else {
                 None
             }
@@ -754,6 +804,10 @@ fn compact_row(step: &SequenceStep, outcome: &StepOutcome) -> ExecutedStep {
         },
         reason: outcome.reason.clone(),
         identity: outcome.identity.clone(),
+        delivery: outcome.delivery,
+        effect: outcome.effect,
+        verdict: outcome.verdict,
+        retry: outcome.retry.clone(),
     }
 }
 
@@ -881,6 +935,7 @@ fn bad_steps_envelope(session_id: &str, raw_len: usize, fail: ParseFail) -> Sequ
 }
 
 fn from_actuate(env: ActuateEnvelope) -> StepOutcome {
+    let outcome = env.outcome.as_ref();
     StepOutcome {
         ok: env.ok,
         frozen: env.frozen,
@@ -896,6 +951,12 @@ fn from_actuate(env: ActuateEnvelope) -> StepOutcome {
         name: None,
         window: None,
         identity: env.identity,
+        delivery: env.delivery,
+        effect: outcome.map(|o| o.effect),
+        verdict: outcome.map(|o| o.verdict),
+        retry: outcome.map(|o| o.retry.clone()),
+        postcondition_state: outcome.and_then(|o| o.postcondition.as_ref().map(|p| p.state)),
+        postcondition_requested: outcome.is_some_and(|o| o.postcondition.is_some()),
     }
 }
 
@@ -915,6 +976,12 @@ fn from_activate(env: ActivateEnvelope) -> StepOutcome {
         window: env.window.map(|w| format!("hwnd:{}", w.hwnd)),
         reason: env.reason,
         identity: None,
+        delivery: None,
+        effect: None,
+        verdict: None,
+        retry: None,
+        postcondition_state: None,
+        postcondition_requested: false,
     }
 }
 
@@ -929,8 +996,17 @@ fn click_req(session_id: &str, step: &SequenceStep) -> ActuateRequest {
             grid,
             x,
             y,
-        }
-        | SequenceStep::Hover {
+            postcondition,
+        } => ActuateRequest {
+            session_id: Some(session_id.into()),
+            element_id: element_id.clone(),
+            grid: grid.clone(),
+            x: *x,
+            y: *y,
+            postcondition: postcondition.clone(),
+            ..ActuateRequest::default()
+        },
+        SequenceStep::Hover {
             element_id,
             grid,
             x,
@@ -1451,6 +1527,13 @@ mod tests {
                     settled: Some(true),
                     reason: None,
                     identity: None,
+                    delivery: Some(crate::outcome::Delivery::Delivered),
+                    effect: Some(crate::outcome::Effect::Unconfirmed),
+                    verdict: Some(crate::outcome::Verdict::Unconfirmed),
+                    retry: Some(crate::outcome::RetryInfo::new(
+                        crate::outcome::RetryDisposition::Reobserve,
+                        "effect_unproven",
+                    )),
                 })
                 .collect(),
             fence: None,
@@ -1681,6 +1764,153 @@ mod tests {
             identity: Some(crate::identity::IdentityReport::legacy()),
             ..StepOutcome::default()
         }
+    }
+
+    // ------------------------------------------------------------ 0124 outcome
+
+    #[test]
+    fn click_step_accepts_postcondition() {
+        let parsed = parse_steps(&json!([
+            {"tool":"click","element_id":"sref1:c.12.0.9f3a.a1b2c3d4.7","postcondition":{"kind":"dialog_present","wait_ms":100}}
+        ]))
+        .expect("parse");
+        match &parsed[0] {
+            SequenceStep::Click { postcondition, .. } => {
+                let condition = postcondition.as_ref().expect("postcondition");
+                assert_eq!(
+                    condition.kind,
+                    crate::outcome::PostconditionKind::DialogPresent
+                );
+                assert_eq!(condition.wait_ms, 100);
+            }
+            other => panic!("click step: {other:?}"),
+        }
+        // Closed grammar: an unknown field or an invalid n is a parse failure, never a silent
+        // drop.
+        assert!(
+            parse_steps(&json!([
+                {"tool":"click","postcondition":{"kind":"dialog_present","selector":"#x"}}
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_steps(&json!([
+                {"tool":"click","postcondition":{"kind":"count_at_least","role":"button","n":51}}
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn postcondition_failed_aborts_step() {
+        let mut hooks = test_hooks();
+        hooks.click = |_, _| {
+            Ok(StepOutcome {
+                ok: true,
+                foregrounded: Some(true),
+                postcondition_requested: true,
+                postcondition_state: Some(crate::outcome::PostconditionState::Unsatisfied),
+                delivery: Some(crate::outcome::Delivery::Delivered),
+                effect: Some(crate::outcome::Effect::Unconfirmed),
+                verdict: Some(crate::outcome::Verdict::Unconfirmed),
+                ..StepOutcome::default()
+            })
+        };
+        let env = run_hooks(
+            "seq-0124-postcondition",
+            json!([
+                {"tool":"click","element_id":"chr:0","postcondition":{"kind":"dialog_present"}},
+                {"tool":"click","element_id":"chr:1"}
+            ]),
+            hooks,
+        );
+        assert_eq!(env.stop_reason, StopReason::PostconditionFailed);
+        assert_eq!(env.failed_step_index, Some(0));
+        assert_eq!(tools(&env), vec!["click"]);
+    }
+
+    #[test]
+    fn reobserve_without_postcondition_does_not_abort() {
+        let mut hooks = test_hooks();
+        hooks.click = |_, _| {
+            Ok(StepOutcome {
+                ok: true,
+                foregrounded: Some(true),
+                miss: Some("no_change".into()),
+                delivery: Some(crate::outcome::Delivery::Delivered),
+                verdict: Some(crate::outcome::Verdict::Unconfirmed),
+                retry: Some(crate::outcome::RetryInfo::new(
+                    crate::outcome::RetryDisposition::Reobserve,
+                    "scoped_ref_no_auto_retry",
+                )),
+                ..StepOutcome::default()
+            })
+        };
+        let env = run_hooks(
+            "seq-0124-reobserve",
+            json!([
+                {"tool":"click","element_id":"sref1:c.12.0.9f3a.a1b2c3d4.7"},
+                {"tool":"wait_settle"}
+            ]),
+            hooks,
+        );
+        assert_eq!(env.stop_reason, StopReason::Completed);
+        assert_eq!(env.executed_steps.len(), 2);
+        assert!(env.executed_steps[0].retry.is_some());
+    }
+
+    #[test]
+    fn scoped_focus_lost_aborts_without_reoffer() {
+        let mut hooks = test_hooks();
+        hooks.click = |_, _| {
+            Ok(StepOutcome {
+                ok: true,
+                foregrounded: Some(true),
+                miss: Some("focus_lost".into()),
+                ..StepOutcome::default()
+            })
+        };
+        let env = run_hooks(
+            "seq-0124-focus-lost",
+            json!([{"tool":"click","element_id":"sref1:c.12.0.9f3a.a1b2c3d4.7"}]),
+            hooks,
+        );
+        assert_eq!(env.stop_reason, StopReason::FocusLost);
+    }
+
+    #[test]
+    fn sequence_rows_carry_outcome_within_budget() {
+        let mut hooks = test_hooks();
+        hooks.click = |_, _| {
+            Ok(StepOutcome {
+                ok: true,
+                foregrounded: Some(true),
+                settled: Some(true),
+                id: Some("sref1:c.12.0.9f3a.a1b2c3d4.7".into()),
+                delivery: Some(crate::outcome::Delivery::Delivered),
+                effect: Some(crate::outcome::Effect::Unconfirmed),
+                verdict: Some(crate::outcome::Verdict::Unconfirmed),
+                retry: Some(crate::outcome::RetryInfo::new(
+                    crate::outcome::RetryDisposition::Reobserve,
+                    "effect_unproven",
+                )),
+                ..StepOutcome::default()
+            })
+        };
+        let env = run_hooks(
+            "seq-0124-budget",
+            json!([
+                {"tool":"click","element_id":"chr:0"},
+                {"tool":"click","element_id":"chr:1"},
+                {"tool":"click","element_id":"chr:2"},
+                {"tool":"click","element_id":"chr:3"}
+            ]),
+            hooks,
+        );
+        let json = serialize_envelope(&env).expect("serialize");
+        assert!(json.len() < ENVELOPE_MAX_BYTES, "{} bytes", json.len());
+        assert!(json.contains("\"delivery\":\"delivered\""));
+        assert!(json.contains("\"retry\""));
     }
 
     #[test]

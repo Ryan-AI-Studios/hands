@@ -62,6 +62,9 @@ pub struct ClickParams {
     /// `chr:` only: refuse a blocked/unknown target before fence/offer/SendInput.
     #[serde(default)]
     pub require_interactable: bool,
+    /// Opt-in DOM postcondition (click only). Closed grammar; evaluated after dispatch.
+    #[serde(default)]
+    pub postcondition: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -107,6 +110,9 @@ pub struct TypeParams {
     /// Skip the focused edit-leaf guard. Does not verify effect and does not reach elevated windows.
     #[serde(default)]
     pub blind: bool,
+    /// Click only; any value is refused rather than silently dropped.
+    #[serde(default)]
+    pub postcondition: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -114,6 +120,9 @@ pub struct KeyParams {
     pub name: String,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Click only; any value is refused rather than silently dropped.
+    #[serde(default)]
+    pub postcondition: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -131,6 +140,9 @@ pub struct ScrollParams {
     pub x: Option<i32>,
     #[serde(default)]
     pub y: Option<i32>,
+    /// Click only; any value is refused rather than silently dropped.
+    #[serde(default)]
+    pub postcondition: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -311,17 +323,23 @@ impl HandsServer {
     }
 
     #[tool(
-        description = "Bézier-move and left-click a UIA id, Chrome `chr:`/`sref1:c` id, grid cell, or pixel. uia:/sref1:u is UIA identity; chr: is a page-local walk index (dies on navigation; re-observe), sref1:c is snapshot-bound and stale-safe. Prefer ref (`sref1:`); id is legacy and not stale-safe. Point must be inside the intended window's true client or an owned popup (no --window on click; activate first). Out-of-client is ok:false (named refusal, cooldown), not SendInput. ok:true means delivered; miss (no_change / focus_lost) is the effect signal. navigated:true is a Chrome caption change or loading interstitial, or a non-Chrome http(s) UIA Document URL change — miss is omitted, no retry; chr: ids died, re-observe. Chrome soft-routes with the same caption stay no_change. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on focus_lost. Honor loop_suspected / cooldown_ms; frozen means yield the task. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default. Opt-in blind:true skips hit_test for a same-IL UIA-opaque surface (explicit x/y or grid only); ok:true then serializes verified:false (dispatch only, not effect); does not reach elevated windows; lower-assurance (no Money/Messages classifier); activate first; confirm category blind on desktop (once/session recommended). require_interactable is chr:/sref1:c only and refuses a blocked/unknown target before fence/offer/SendInput; interactable_checked:true marks that this binary honoured the flag (an old server may silently ignore it). The `point` object carries the shared PointContract; a transform-invalid `chr:` refuses ok:false with `verified:false`, `physical:null`, and a named `reason`, and never calls offer/SendInput. `verified` semantics: on ok:true, dispatch delivered and effect unproven; pre-dispatch refusals carry the target reason and send nothing (the verified key is omitted); a post-dispatch freeze or post-dispatch failure sets verified:false because input may already have been sent."
+        description = "Bézier-move and left-click a UIA id, Chrome `chr:`/`sref1:c` id, grid cell, or pixel. uia:/sref1:u is UIA identity; chr: is a page-local walk index (dies on navigation; re-observe), sref1:c is snapshot-bound and stale-safe. Prefer ref (`sref1:`); id is legacy and not stale-safe. Point must be inside the intended window's true client or an owned popup (no --window on click; activate first). Out-of-client is ok:false (named refusal, cooldown), not SendInput. ok:true means delivered; miss (no_change / focus_lost) is the effect signal. navigated:true is a Chrome caption change or loading interstitial, or a non-Chrome http(s) UIA Document URL change — miss is omitted, no retry; chr: ids died, re-observe. Chrome soft-routes with the same caption stay no_change. Settle baseline is post-hover ROI pixel-diff; one retry on miss, re-offer on focus_lost. Honor loop_suspected / cooldown_ms; frozen means yield the task. Pixel x/y are virtual-screen (may be negative). Research identity may use owner HID when HANDS_HID_PORT is set; daily Chrome stays SendInput; do not hide LLMHF_INJECTED on Default. Opt-in blind:true skips hit_test for a same-IL UIA-opaque surface (explicit x/y or grid only); ok:true then serializes verified:false (dispatch only, not effect); does not reach elevated windows; lower-assurance (no Money/Messages classifier); activate first; confirm category blind on desktop (once/session recommended). require_interactable is chr:/sref1:c only and refuses a blocked/unknown target before fence/offer/SendInput; interactable_checked:true marks that this binary honoured the flag (an old server may silently ignore it). The `point` object carries the shared PointContract; a transform-invalid `chr:` refuses ok:false with `verified:false`, `physical:null`, and a named `reason`, and never calls offer/SendInput. `verified` semantics: on ok:true, dispatch delivered and effect unproven; pre-dispatch refusals carry the target reason and send nothing (the verified key is omitted); a post-dispatch freeze or post-dispatch failure sets verified:false because input may already have been sent. Opt-in `postcondition` (click only) is a closed flat object `{kind, value?, ref?, role?, n?, wait_ms?}` evaluated after dispatch: url_prefix/url_equals/url_changed/title_equals/title_changed/element_present/element_absent/focus_editable/dialog_present/count_at_least; `wait_ms` 0..=2000; `postcondition_checked:true` marks it. The envelope carries one `delivery` (delivered/undelivered/unknown) and a versioned `outcome` (effect/verdict/retry); ok:true is delivery only, `retry` is guidance and nothing auto-retries. A sref1: click never auto-retries (reobserve); a legacy chr:/uia:/grid/pixel miss keeps one retry and reports unsafe."
     )]
     fn click(
         &self,
         Parameters(params): Parameters<ClickParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        Ok(run_actuate(actuate::click(click_req(params))))
+        let postcondition = match parse_postcondition(params.postcondition.clone()) {
+            Ok(value) => value,
+            Err(err) => return Ok(run_actuate(Err(err))),
+        };
+        let mut req = click_req(params);
+        req.postcondition = postcondition;
+        Ok(run_actuate(actuate::click(req)))
     }
 
     #[tool(
-        description = "Semantic UIA action on a `uia:` or `sref1:u` element: invoke | toggle | expand | collapse | select | set-value. Requires `uia:` or `sref1:u` (grid/pixel/chr are refused) and a resolved native window handle. No pointer move, no SetForegroundWindow, no SendInput; the fence runs on target evidence only and refuses unnamed targets. ok:true means the pattern call succeeded — not proof of effect; `delivery` is delivered / undelivered / unknown, and ok:true with delivery:unknown means \"call returned success, effect unproven\". `invoke` is dispatch-only (verified:false). `set-value` replaces text, admits only Edit/Document/ComboBox roles, and never logs the value (len only). `toggle` with value on|off|true|false|checked|unchecked is idempotent; omitted flips. No outcome is ever retried or downgraded to physical input. Honor loop_suspected / cooldown_ms; frozen means yield the task."
+        description = "Semantic UIA action on a `uia:` or `sref1:u` element: invoke | toggle | expand | collapse | select | set-value. Requires `uia:` or `sref1:u` (grid/pixel/chr are refused) and a resolved native window handle. No pointer move, no SetForegroundWindow, no SendInput; the fence runs on target evidence only and refuses unnamed targets. ok:true means the pattern call succeeded — not proof of effect; `delivery` is delivered / undelivered / unknown, and ok:true with delivery:unknown means \"call returned success, effect unproven\". `invoke` is dispatch-only (verified:false). `set-value` replaces text, admits only Edit/Document/ComboBox roles, and never logs the value (len only). `toggle` with value on|off|true|false|checked|unchecked is idempotent; omitted flips. No outcome is ever retried or downgraded to physical input. `delivery` is the single delivery truth shared with physical actions; the additive `outcome` block (v:1, effect, verdict, retry) makes a state read-back confirmed/retry.none, a dispatch-only invoke unconfirmed/reobserve, a timeout or worker loss unknown/unsafe, and slot exhaustion undelivered/wait (`worker_saturated`). Honor loop_suspected / cooldown_ms; frozen means yield the task."
     )]
     fn uia_action(
         &self,
@@ -344,6 +362,9 @@ impl HandsServer {
         &self,
         Parameters(params): Parameters<ClickParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Some(err) = reject_postcondition(params.postcondition.clone()) {
+            return Ok(run_actuate(Err(err)));
+        }
         Ok(run_actuate(actuate::hover(click_req(params))))
     }
 
@@ -355,6 +376,9 @@ impl HandsServer {
         &self,
         Parameters(params): Parameters<TypeParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Some(err) = reject_postcondition(params.postcondition.clone()) {
+            return Ok(run_actuate(Err(err)));
+        }
         Ok(run_actuate(actuate::type_text(ActuateRequest {
             session_id: params.session_id,
             text: Some(params.text),
@@ -370,6 +394,9 @@ impl HandsServer {
         &self,
         Parameters(params): Parameters<KeyParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Some(err) = reject_postcondition(params.postcondition.clone()) {
+            return Ok(run_actuate(Err(err)));
+        }
         Ok(run_actuate(actuate::key(ActuateRequest {
             session_id: params.session_id,
             name: Some(params.name),
@@ -384,6 +411,9 @@ impl HandsServer {
         &self,
         Parameters(params): Parameters<ScrollParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Some(err) = reject_postcondition(params.postcondition.clone()) {
+            return Ok(run_actuate(Err(err)));
+        }
         Ok(run_actuate(actuate::scroll(ActuateRequest {
             session_id: params.session_id,
             element_id: params.element_id,
@@ -556,8 +586,27 @@ fn click_req(params: ClickParams) -> ActuateRequest {
         y: params.y,
         blind: params.blind,
         require_interactable: params.require_interactable,
+        postcondition: None,
         ..ActuateRequest::default()
     }
+}
+
+fn parse_postcondition(
+    value: Option<serde_json::Value>,
+) -> Result<Option<crate::outcome::Postcondition>, HandsError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let condition: crate::outcome::Postcondition = serde_json::from_value(value)
+        .map_err(|err| HandsError::Input(format!("postcondition JSON: {err}")))?;
+    condition.validate().map_err(HandsError::Input)?;
+    Ok(Some(condition))
+}
+
+fn reject_postcondition(value: Option<serde_json::Value>) -> Option<HandsError> {
+    value
+        .is_some()
+        .then(|| HandsError::Input("postcondition is click only".into()))
 }
 
 fn run_hittest(params: HittestParams) -> CallToolResult {
@@ -891,5 +940,55 @@ mod tests {
         let main = include_str!("main.rs");
         assert!(main.contains("sref1:"));
         assert!(main.contains("legacy and not stale-safe"));
+    }
+
+    // ------------------------------------------------------------ 0124 outcome
+
+    #[test]
+    fn click_schema_has_postcondition() {
+        let schema = schemars::schema_for!(ClickParams);
+        let json = serde_json::to_string(&schema).expect("schema");
+        assert!(json.contains("postcondition"), "{json}");
+        // Flat object, not a nested oneOf.
+        assert!(!json.contains("oneOf"));
+        assert!(json.contains("require_interactable"));
+    }
+
+    #[test]
+    fn hover_rejects_postcondition() {
+        let err = reject_postcondition(Some(serde_json::json!({"kind":"dialog_present"})));
+        assert!(err.is_some());
+        let message = err.expect("error").tool_message();
+        assert!(message.contains("postcondition is click only"), "{message}");
+        assert!(reject_postcondition(None).is_none());
+    }
+
+    #[test]
+    fn no_verify_outcome_tool() {
+        let token = ["verify", "_outcome"].concat();
+        for src in [
+            include_str!("mcp.rs"),
+            include_str!("main.rs"),
+            include_str!("dotask/mod.rs"),
+        ] {
+            let production = match src.find("mod tests") {
+                Some(index) => &src[..index],
+                None => src,
+            };
+            assert!(!production.contains(&token), "no {token} tool exists");
+        }
+        assert!(
+            include_str!("outcome.rs").contains("pub fn derive_verdict"),
+            "verdict is derived, not a tool"
+        );
+    }
+
+    #[test]
+    fn click_description_names_delivery_effect_retry() {
+        let src = include_str!("mcp.rs");
+        assert!(src.contains("delivery"));
+        assert!(src.contains("effect"));
+        assert!(src.contains("retry"));
+        assert!(src.contains("postcondition"));
     }
 }

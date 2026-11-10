@@ -1319,6 +1319,7 @@ function forward(port, msg) {
     op !== "snapshot" &&
     op !== "resolve" &&
     op !== "assess" &&
+    op !== "postcheck" &&
     op !== "binding" &&
     op !== "frame_binding"
   ) {
@@ -1326,6 +1327,11 @@ function forward(port, msg) {
     return;
   }
   if (op === "binding" && msg.tab == null) {
+    post(port, { error: "protocol_error" });
+    return;
+  }
+  if (op === "postcheck" && msg.tab == null) {
+    // A postcondition is never evaluated against whatever tab is in front.
     post(port, { error: "protocol_error" });
     return;
   }

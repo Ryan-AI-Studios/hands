@@ -32,6 +32,7 @@ pub mod logs;
 pub mod mcp;
 pub mod native_host;
 pub mod observe;
+pub mod outcome;
 pub mod pick;
 pub mod point;
 pub mod preprocess;
@@ -50,6 +51,7 @@ pub use extract::{Detail, Element, Extract};
 pub use observe::{
     ObserveEnvelope, ObserveRequest, ObserveScope, ObserveView, observe, serialize_envelope,
 };
+pub use outcome::{Delivery, Effect, OutcomeInfo, RetryInfo, Verdict};
 pub use pick::{GroundRequest, PickEnvelope, PickRequest, run_ground, run_pick, serialize_pick};
 pub use sequence::SequenceEnvelope;
 pub use session::resolve_session_id;

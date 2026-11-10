@@ -60,3 +60,47 @@ Selector: `hwnd:` (optional `0x`) is deterministic and works for a live handle e
 - Virtual-screen coordinates can have negative origins. DPI is per-monitor aware.
 - Observe does not launch Chrome and does not call Gemma.
 - Daily Chrome: no Playwright/CDP, no CAPTCHA solver, no HID stealth.
+
+## Outcome and retry (0124)
+
+Every action envelope carries **one top-level `delivery`** (physical and semantic) and a versioned
+`outcome` block (`v: 1`, `effect`, `verdict`, `retry`, optional `postcondition`).
+
+- `delivery`: `delivered` (dispatch accepted), `undelivered` (known nothing sent), `unknown` (a
+  send may have happened and the effect is unproven). **`ok: true` means delivered, not done.**
+- `effect`: `confirmed` (a declared postcondition held at check time, or a semantic read-back
+  matched), `observed` (a cheap signal changed: caption/URL, but no declared condition),
+  `unconfirmed`, `failed` (only an exact postcondition still unsatisfied after the caller's
+  `wait_ms` deadline), `not_evaluated`.
+- `verdict`: a pure projection of `delivery` + `effect` (`confirmed` / `unconfirmed` / `failed` /
+  `unknown` / `not_attempted`). It is a summary; the underlying fields are authoritative.
+  `verdict: unconfirmed` on a no-effect tool (`hover` / `type` / `key` / `scroll`) is not a defect.
+- `retry.disposition`: `none`, `safe` (caller-fixable non-delivery; still never automatic),
+  `wait` (time/owner/UI-gated: cooldown, freeze/takeover, challenge - wait, do not retry now),
+  `reobserve` (observe again before acting), `unsafe` (a dispatch happened and delivery is
+  unknown, or a second dispatch already happened - do not repeat without new intent). No code
+  path auto-retries from this value; `retry` is guidance only.
+- **Scoped refs never auto-retry.** A `sref1:` click that misses (`no_change` / `focus_lost`)
+  sends exactly one click and reports `reobserve` / `scoped_ref_no_auto_retry`. Legacy
+  `chr:` / `uia:` / grid / pixel keep the existing 0013 one-retry and report
+  `unsafe` / `auto_retry_exhausted`. Re-observe instead of replaying a scoped ref.
+- **A postcondition is evidence after dispatch, never authority.** It cannot bypass the confirm
+  fence, lease, Pause/Break, High-IL refusal or a challenge yield. `confirmed` means the declared
+  end state held at check time, not that the click caused it. An absent, timed-out, unavailable
+  or not-yet-met read never becomes `failed` and never makes a retry safe.
+- Click-only opt-in: `--postcondition '<json>'` or `--postcondition-file <path>` (CLI),
+  `postcondition: {...}` (MCP / sequence / `do_task`). Kinds: `url_prefix`, `url_equals`,
+  `url_changed`, `title_equals`, `title_changed`, `element_present`, `element_absent`,
+  `focus_editable`, `dialog_present`, `count_at_least` (role + n 1..=50). `wait_ms` is 0..=2000;
+  `0` means one immediate read after settle. `postcondition_checked: true` proves this binary
+  understood the flag - an old installed server omits it, so refresh the exe before relying on
+  it. `url_changed` / `title_changed` are relative to the clicked ref's stored snapshot; a
+  mismatched `snap` is `unavailable` (`baseline_mismatch`). `element_present` / `element_absent`
+  follow the stored node's connected + rendered state, not identity (0123 R13). Positive-only
+  kinds (`dialog_present`, `count_at_least`) cannot prove absence under closed shadow roots; use
+  a dialog's `element_absent` ref. Postconditions are top-frame only; a frame ref is
+  `unavailable` (`frame_postcondition_out_of_scope`).
+- `verify_outcome` is deliberately **not** a tool: `verdict` is derived from `delivery` + `effect`
+  (0124 spec §3.7). Do not add a second truth.
+- **Bridge honesty.** `mcp --bridge` is a byte pump. A response lost after dispatch is a transport
+  error with no envelope; treat a missing envelope as `unknown`, never as success.

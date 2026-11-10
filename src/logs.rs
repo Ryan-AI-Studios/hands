@@ -64,6 +64,25 @@ pub struct Event {
     pub blind: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<ActionMeta>,
+    /// Additive 0124 outcome. Closed tokens only; never a value/URL/title/text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<LogOutcome>,
+}
+
+/// Redacted outcome row. `postcondition` carries kind/state/reason only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LogOutcome {
+    pub delivery: String,
+    pub effect: String,
+    pub verdict: String,
+    pub retry: String,
+    pub retry_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postcondition_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postcondition_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postcondition_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,6 +255,7 @@ fn pause_event(session_id: &str) -> Event {
         attempt: None,
         blind: false,
         action: None,
+        outcome: None,
     }
 }
 
@@ -260,6 +280,7 @@ fn stop_event(session_id: &str, from_tool: bool) -> Event {
         attempt: None,
         blind: false,
         action: None,
+        outcome: None,
     }
 }
 
@@ -457,6 +478,7 @@ pub fn record_yield(session_id: &str, reason: &str) -> Result<(), HandsError> {
         attempt: None,
         blind: false,
         action: None,
+        outcome: None,
     })
 }
 
@@ -507,6 +529,7 @@ pub fn record_observe_row(session_id: &str, observe: LogObserve) -> Result<(), H
         attempt: None,
         blind: false,
         action: None,
+        outcome: None,
     })
 }
 
@@ -547,6 +570,7 @@ pub fn record_confirm(
         attempt: None,
         blind: false,
         action: None,
+        outcome: None,
     })
 }
 
@@ -561,6 +585,52 @@ pub fn record_actuate(
     type_len: Option<usize>,
     key: Option<&str>,
     blind: bool,
+) -> Result<(), HandsError> {
+    record_actuate_inner(
+        session_id, tool, ok, error, target, fence, type_len, key, blind, None,
+    )
+}
+
+/// Same row as [`record_actuate`] plus the additive 0124 outcome block.
+#[allow(clippy::too_many_arguments)]
+pub fn record_actuate_with_outcome(
+    session_id: &str,
+    tool: &str,
+    ok: bool,
+    error: Option<&str>,
+    target: Option<LogTarget>,
+    fence: Option<LogFence>,
+    type_len: Option<usize>,
+    key: Option<&str>,
+    blind: bool,
+    outcome: LogOutcome,
+) -> Result<(), HandsError> {
+    record_actuate_inner(
+        session_id,
+        tool,
+        ok,
+        error,
+        target,
+        fence,
+        type_len,
+        key,
+        blind,
+        Some(outcome),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_actuate_inner(
+    session_id: &str,
+    tool: &str,
+    ok: bool,
+    error: Option<&str>,
+    target: Option<LogTarget>,
+    fence: Option<LogFence>,
+    type_len: Option<usize>,
+    key: Option<&str>,
+    blind: bool,
+    outcome: Option<LogOutcome>,
 ) -> Result<(), HandsError> {
     let refuse = fence.is_some();
     let stop = tool == "stop" && !refuse;
@@ -591,6 +661,7 @@ pub fn record_actuate(
         attempt: None,
         blind,
         action: None,
+        outcome,
     })
 }
 
@@ -607,6 +678,52 @@ pub fn record_uia_action(
     error: Option<&str>,
     target: Option<LogTarget>,
     fence: Option<LogFence>,
+) -> Result<(), HandsError> {
+    record_uia_action_inner(
+        session_id, action, delivery, verified, len, ok, error, target, fence, None,
+    )
+}
+
+/// Same row as [`record_uia_action`] plus the additive 0124 outcome block.
+#[allow(clippy::too_many_arguments)]
+pub fn record_uia_action_with_outcome(
+    session_id: &str,
+    action: &str,
+    delivery: &str,
+    verified: bool,
+    len: Option<usize>,
+    ok: bool,
+    error: Option<&str>,
+    target: Option<LogTarget>,
+    fence: Option<LogFence>,
+    outcome: LogOutcome,
+) -> Result<(), HandsError> {
+    record_uia_action_inner(
+        session_id,
+        action,
+        delivery,
+        verified,
+        len,
+        ok,
+        error,
+        target,
+        fence,
+        Some(outcome),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_uia_action_inner(
+    session_id: &str,
+    action: &str,
+    delivery: &str,
+    verified: bool,
+    len: Option<usize>,
+    ok: bool,
+    error: Option<&str>,
+    target: Option<LogTarget>,
+    fence: Option<LogFence>,
+    outcome: Option<LogOutcome>,
 ) -> Result<(), HandsError> {
     let kind = if fence.is_some() { "refuse" } else { "tool" };
     record(Event {
@@ -634,6 +751,7 @@ pub fn record_uia_action(
             verified,
             len,
         }),
+        outcome,
     })
 }
 
@@ -920,6 +1038,7 @@ mod tests {
             attempt: None,
             blind: false,
             action: None,
+            outcome: None,
         }
     }
 
@@ -1212,6 +1331,7 @@ mod tests {
                     attempt: None,
                     blind: false,
                     action: None,
+                    outcome: None,
                 });
             }
             let env = read_tail("s-fat", Some(200)).unwrap();
@@ -1263,6 +1383,7 @@ mod tests {
             attempt: None,
             blind: false,
             action: None,
+            outcome: None,
         }
     }
 
@@ -1287,6 +1408,7 @@ mod tests {
             attempt: None,
             blind: false,
             action: None,
+            outcome: None,
         }
     }
 
@@ -1576,5 +1698,92 @@ mod tests {
         assert!(ev.client.is_none());
         assert!(ev.cooldown_ms.is_none());
         assert!(ev.attempt.is_none());
+    }
+
+    // ------------------------------------------------------------ 0124 outcome
+
+    #[test]
+    fn outcome_logged_without_values() {
+        let outcome = LogOutcome {
+            delivery: "delivered".into(),
+            effect: "unconfirmed".into(),
+            verdict: "unconfirmed".into(),
+            retry: "reobserve".into(),
+            retry_reason: "effect_unproven".into(),
+            postcondition_kind: Some("url_equals".into()),
+            postcondition_state: Some("unavailable".into()),
+            postcondition_reason: Some("protocol_error".into()),
+        };
+        let event = Event {
+            schema: LOGS_SCHEMA.into(),
+            ts: "2026-11-10T00:00:00".into(),
+            session_id: "s-0124".into(),
+            kind: "tool".into(),
+            tool: Some("click".into()),
+            ok: Some(true),
+            error: None,
+            target: None,
+            fence: None,
+            confirm: None,
+            observe: None,
+            type_meta: None,
+            key: None,
+            yield_info: None,
+            client: None,
+            cooldown_ms: None,
+            attempt: None,
+            blind: false,
+            action: None,
+            outcome: Some(outcome),
+        };
+        let json = serde_json::to_string(&event).expect("json");
+        assert!(json.contains("\"effect\":\"unconfirmed\""));
+        assert!(json.contains("\"retry_reason\":\"effect_unproven\""));
+        assert!(json.contains("\"postcondition_kind\":\"url_equals\""));
+        // No value/URL/title/page text is ever logged.
+        for forbidden in ["https://", "innerText", "\"value\"", "\"title\"", "\"url\""] {
+            assert!(
+                !json.contains(forbidden),
+                "logs must not contain {forbidden}: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_still_logs_len_only() {
+        let event = Event {
+            schema: LOGS_SCHEMA.into(),
+            ts: "2026-11-10T00:00:00".into(),
+            session_id: "s-0124".into(),
+            kind: "tool".into(),
+            tool: Some("type".into()),
+            ok: Some(true),
+            error: None,
+            target: None,
+            fence: None,
+            confirm: None,
+            observe: None,
+            type_meta: Some(TypeMeta { len: 12 }),
+            key: None,
+            yield_info: None,
+            client: None,
+            cooldown_ms: None,
+            attempt: None,
+            blind: false,
+            action: None,
+            outcome: None,
+        };
+        let json = serde_json::to_string(&event).expect("json");
+        assert!(json.contains("\"len\":12"));
+        assert!(!json.contains("hunter2"));
+    }
+
+    #[test]
+    fn schema_stays_v1_with_additive_outcome() {
+        assert_eq!(LOGS_SCHEMA, "hands.logs/v1");
+        let line =
+            r#"{"schema":"hands.logs/v1","ts":"t","session_id":"s","kind":"tool","ok":true}"#;
+        let old: Event = serde_json::from_str(line).expect("old row still parses");
+        assert!(old.outcome.is_none());
     }
 }

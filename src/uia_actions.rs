@@ -85,36 +85,24 @@ impl SemanticAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Delivery {
-    Delivered,
-    Undelivered,
-    Unknown,
-}
-
-impl Delivery {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Delivered => "delivered",
-            Self::Undelivered => "undelivered",
-            Self::Unknown => "unknown",
-        }
-    }
-}
+/// 0122's delivery vocabulary now lives in `crate::outcome` so the physical tools and the
+/// semantic action share exactly one truth. Re-exported here for existing imports.
+pub use crate::outcome::Delivery;
 
 /// Flattened into `ActuateEnvelope`; `None` keeps every non-semantic envelope
-/// byte-identical.
+/// byte-identical. `delivery` moved to the top-level envelope in 0124 (wire key unchanged);
+/// `error_code` is the closed code, kept off the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticInfo {
     pub action: String,
-    pub delivery: Delivery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify: Option<String>,
     #[serde(default)]
     pub foreground_changed: bool,
     #[serde(default)]
     pub pointer_moved: bool,
+    #[serde(skip)]
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -380,12 +368,15 @@ fn base_envelope(
         identity: None,
         semantic: Some(SemanticInfo {
             action: action.as_str().to_string(),
-            delivery: Delivery::Undelivered,
             verify: None,
             foreground_changed: false,
             pointer_moved: false,
+            error_code: None,
         }),
         post_dispatch: false,
+        delivery: Some(Delivery::Undelivered),
+        outcome: None,
+        refusal: None,
     }
 }
 
@@ -425,10 +416,10 @@ fn identity_refusal(
     env.identity = Some(report);
     env.semantic = Some(SemanticInfo {
         action: action.as_str().to_string(),
-        delivery: Delivery::Undelivered,
         verify: Some(VERIFY_UNAVAILABLE.to_string()),
         foreground_changed: false,
         pointer_moved: false,
+        error_code: env.error.clone(),
     });
     env
 }
@@ -443,6 +434,10 @@ fn refusal(
     let mut env = base_envelope(session_id, target, action);
     env.error = Some(code.to_string());
     env.fence = fence_info;
+    env.delivery = Some(Delivery::Undelivered);
+    if let Some(info) = env.semantic.as_mut() {
+        info.error_code = Some(code.to_string());
+    }
     env
 }
 
@@ -451,12 +446,13 @@ fn refusal(
 /// the helper's own error/fence/challenge prose survives untouched.
 fn mark_refused(mut env: ActuateEnvelope, action: SemanticAction) -> ActuateEnvelope {
     env.verified = false;
+    env.delivery = Some(Delivery::Undelivered);
     env.semantic = Some(SemanticInfo {
         action: action.as_str().to_string(),
-        delivery: Delivery::Undelivered,
         verify: None,
         foreground_changed: false,
         pointer_moved: false,
+        error_code: env.error.clone(),
     });
     env
 }
@@ -480,12 +476,13 @@ fn dispatched_envelope(
     result: SemanticResult,
 ) -> ActuateEnvelope {
     let mut env = base_envelope(session_id, target, action);
+    env.delivery = Some(result.delivery);
     env.semantic = Some(SemanticInfo {
         action: action.as_str().to_string(),
-        delivery: result.delivery,
         verify: Some(result.verify.to_string()),
         foreground_changed: result.foreground_changed,
         pointer_moved: result.pointer_moved,
+        error_code: result.error.as_ref().map(|err| err.code.to_string()),
     });
     if let Some((state, reason)) = result.identity
         && let Some(id) = env.target.id.as_deref()
@@ -582,8 +579,50 @@ pub fn uia_action(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     // Every `Ok` exit settles the session cooldown exactly once (physical
     // parity: `click` wraps `click_inner` in `after_actuate`).
     actuate::settle_cooldown("uia-action", &mut out);
+    classify_semantic(&mut out);
+    let out = actuate::shrink_envelope(out);
     log_outcome(&out, &req);
     Ok(out)
+}
+
+/// One semantic outcome, classified from the already-emitted 0122 facts. No second read-back
+/// and no retry: `worker_saturated` is a pre-dispatch non-delivery, everything else keeps the
+/// semantic delivery truth.
+fn classify_semantic(env: &mut ActuateEnvelope) {
+    let Some(info) = env.semantic.as_ref() else {
+        return;
+    };
+    let facts = crate::outcome::SemanticFacts {
+        delivery: env.delivery.unwrap_or(Delivery::Undelivered),
+        verified: env.verified,
+        verify: info.verify.clone(),
+        dispatched: true,
+        code: info.error_code.clone(),
+    };
+    let input = crate::outcome::OutcomeInputs {
+        tool: "uia-action".to_string(),
+        ok: env.ok,
+        post_dispatch: env.post_dispatch,
+        miss: None,
+        navigated: false,
+        retried: false,
+        blind: false,
+        identity: env.identity.clone(),
+        semantic: Some(facts),
+        postcondition: None,
+        postcondition_wait_ms: 0,
+        refusal: env.refusal,
+    };
+    let classification = crate::outcome::classify_outcome(&input);
+    env.delivery = Some(classification.delivery);
+    env.outcome = Some(crate::outcome::OutcomeInfo {
+        v: crate::outcome::OutcomeInfo::VERSION,
+        effect: classification.effect,
+        verdict: classification.verdict,
+        retry: classification.retry,
+        postcondition: None,
+        postcondition_checked: None,
+    });
 }
 
 fn log_outcome(env: &ActuateEnvelope, req: &ActuateRequest) {
@@ -591,7 +630,7 @@ fn log_outcome(env: &ActuateEnvelope, req: &ActuateRequest) {
         return;
     };
     let action = info.action.clone();
-    let delivery = info.delivery.as_str();
+    let delivery = env.delivery.unwrap_or(Delivery::Undelivered).as_str();
     let len = if action == "set-value" {
         req.value.as_ref().map(|value| value.len())
     } else {
@@ -609,17 +648,47 @@ fn log_outcome(env: &ActuateEnvelope, req: &ActuateRequest) {
         name: fence.name.clone(),
         role: fence.role.clone(),
     });
-    let _ = logs::record_uia_action(
-        &env.session_id,
-        &action,
-        delivery,
-        env.verified,
-        len,
-        env.ok,
-        env.error.as_deref(),
-        Some(target),
-        fence,
-    );
+    let outcome = env.outcome.as_ref().map(|outcome| logs::LogOutcome {
+        delivery: delivery.to_string(),
+        effect: outcome.effect.as_str().to_string(),
+        verdict: outcome.verdict.as_str().to_string(),
+        retry: outcome.retry.disposition.as_str().to_string(),
+        retry_reason: outcome.retry.reason.clone(),
+        postcondition_kind: outcome.postcondition.as_ref().map(|p| p.kind.clone()),
+        postcondition_state: outcome
+            .postcondition
+            .as_ref()
+            .map(|p| p.state.as_str().to_string()),
+        postcondition_reason: outcome
+            .postcondition
+            .as_ref()
+            .and_then(|p| p.reason.clone()),
+    });
+    let _ = match outcome {
+        Some(outcome) => logs::record_uia_action_with_outcome(
+            &env.session_id,
+            &action,
+            delivery,
+            env.verified,
+            len,
+            env.ok,
+            env.error.as_deref(),
+            Some(target),
+            fence,
+            outcome,
+        ),
+        None => logs::record_uia_action(
+            &env.session_id,
+            &action,
+            delivery,
+            env.verified,
+            len,
+            env.ok,
+            env.error.as_deref(),
+            Some(target),
+            fence,
+        ),
+    };
 }
 
 fn run(
@@ -827,7 +896,10 @@ where
     F: FnOnce() -> SemanticResult + Send + 'static,
 {
     let Some(slot) = uia::WorkerSlot::acquire() else {
-        return SemanticResult::unknown("provider_timeout");
+        // Distinct from a timeout: nothing was spawned, so nothing was dispatched.
+        let mut result = SemanticResult::refusal("worker_saturated");
+        result.delivery = Delivery::Undelivered;
+        return result;
     };
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -1426,10 +1498,7 @@ mod tests {
         let env_out = run_with(&env, &backend, &request("invoke", None));
         assert!(!env_out.ok);
         assert_eq!(env_out.error.as_deref(), Some("no_target_hwnd"));
-        assert_eq!(
-            env_out.semantic.expect("semantic").delivery,
-            Delivery::Undelivered
-        );
+        assert_eq!(env_out.delivery, Some(Delivery::Undelivered));
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1455,10 +1524,7 @@ mod tests {
         let backend = FakeBackend::default();
         let env_out = run_with(&env, &backend, &request("invoke", None));
         assert!(!env_out.ok);
-        assert_eq!(
-            env_out.semantic.expect("semantic").delivery,
-            Delivery::Undelivered
-        );
+        assert_eq!(env_out.delivery, Some(Delivery::Undelivered));
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1477,7 +1543,7 @@ mod tests {
         let env_out = run_with(&env, &backend, &request("invoke", None));
         let info = env_out.semantic.expect("semantic");
         assert_eq!(info.action, "invoke");
-        assert_eq!(info.delivery, Delivery::Undelivered);
+        assert_eq!(env_out.delivery, Some(Delivery::Undelivered));
         assert!(env_out.fence.is_some());
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
     }
@@ -1500,10 +1566,7 @@ mod tests {
         let backend = FakeBackend::default();
         let env_out = run_with(&env, &backend, &request("invoke", None));
         assert!(!env_out.ok);
-        assert_eq!(
-            env_out.semantic.expect("semantic").delivery,
-            Delivery::Undelivered
-        );
+        assert_eq!(env_out.delivery, Some(Delivery::Undelivered));
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1662,7 +1725,7 @@ mod tests {
         let info = env_out.semantic.expect("semantic");
         assert!(env_out.ok);
         assert!(!env_out.verified);
-        assert_eq!(info.delivery, Delivery::Delivered);
+        assert_eq!(env_out.delivery, Some(Delivery::Delivered));
         assert_eq!(info.verify.as_deref(), Some(VERIFY_UNAVAILABLE));
     }
 
@@ -1718,7 +1781,7 @@ mod tests {
         let info = env_out.semantic.expect("semantic");
         assert!(env_out.ok);
         assert!(!env_out.verified);
-        assert_eq!(info.delivery, Delivery::Unknown);
+        assert_eq!(env_out.delivery, Some(Delivery::Unknown));
         assert_eq!(info.verify.as_deref(), Some(VERIFY_READBACK));
     }
 
@@ -1769,7 +1832,7 @@ mod tests {
         let info = env_out.semantic.expect("semantic");
         assert!(env_out.ok);
         assert!(env_out.verified);
-        assert_eq!(info.delivery, Delivery::Delivered);
+        assert_eq!(env_out.delivery, Some(Delivery::Delivered));
         assert_eq!(info.verify.as_deref(), Some(VERIFY_READBACK));
     }
 
@@ -1803,10 +1866,7 @@ mod tests {
         let env_out = run_with(&env, &backend, &request("set-value", Some("new name")));
         assert!(!env_out.ok);
         assert_eq!(env_out.error.as_deref(), Some("read_only"));
-        assert_eq!(
-            env_out.semantic.expect("semantic").delivery,
-            Delivery::Undelivered
-        );
+        assert_eq!(env_out.delivery, Some(Delivery::Undelivered));
     }
 
     #[test]
@@ -1986,10 +2046,7 @@ mod tests {
         let env_out = run_with(&env, &backend, &request("invoke", None));
         assert!(!env_out.ok);
         assert_eq!(env_out.error.as_deref(), Some("stale_target"));
-        assert_eq!(
-            env_out.semantic.expect("semantic").delivery,
-            Delivery::Undelivered
-        );
+        assert_eq!(env_out.delivery, Some(Delivery::Undelivered));
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -2017,7 +2074,7 @@ mod tests {
         let back: ActuateEnvelope = serde_json::from_str(&json).expect("deserialize");
         let info = back.semantic.expect("semantic");
         assert_eq!(info.action, "toggle");
-        assert_eq!(info.delivery, Delivery::Delivered);
+        assert_eq!(back.delivery, Some(Delivery::Delivered));
     }
 
     #[test]
@@ -2177,7 +2234,8 @@ mod tests {
         assert!(out.identity.is_some());
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
         let semantic = out.semantic.expect("semantic");
-        assert_eq!(semantic.delivery, Delivery::Undelivered);
+        assert_eq!(semantic.action, "invoke");
+        assert_eq!(out.delivery, Some(Delivery::Undelivered));
     }
 
     #[test]
@@ -2205,8 +2263,8 @@ mod tests {
         assert_eq!(identity.state, crate::identity::IdentityState::Stale);
         assert_eq!(identity.reason.as_deref(), Some("stale_identity"));
         assert_eq!(
-            out.semantic.as_ref().map(|s| s.delivery),
-            Some(Delivery::Undelivered)
+            out.semantic.as_ref().map(|_| out.delivery),
+            Some(Some(Delivery::Undelivered))
         );
         crate::actuate::settle_cooldown("uia-action", &mut out);
         assert_eq!(

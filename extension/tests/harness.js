@@ -241,6 +241,8 @@ function installSnapshot(context, node, doc, snap) {
       nodes: [__node],
       keys: [snapshotKey(__node, keyPayload(__node, 0))],
       retained: 1,
+      url: location.href,
+      title: document.title,
     };`,
     Object.assign(context, { __doc: doc, __snap: snap })
   );
@@ -2378,6 +2380,98 @@ function frameSourceLocksTests() {
   assert.ok(!content.includes(["all_frames", ": true"].join("")));
 }
 
+function postcheckTests() {
+  const context = contentContext({ title: "Start", href: "https://example.test/a" });
+  const node = element({ tag: "BUTTON" });
+  installSnapshot(context, node, "aaaa", "11111111");
+
+  const check = (message) =>
+    listenerResolve(context, Object.assign({ op: "postcheck", frame: 0 }, message));
+
+  // Exact current-state kinds.
+  assert.equal(check({ kind: "url_equals", value: "https://example.test/a" }).state, "satisfied");
+  assert.equal(check({ kind: "url_equals", value: "https://example.test/b" }).state, "unsatisfied");
+  assert.equal(check({ kind: "url_prefix", value: "https://example.test/" }).state, "satisfied");
+  assert.equal(check({ kind: "title_equals", value: "Other" }).state, "unsatisfied");
+
+  // Snapshot-relative kinds need the clicked ref's doc/snap.
+  let reply = check({ kind: "url_changed", doc: "aaaa", snap: "11111111" });
+  assert.equal(reply.state, "unsatisfied");
+  reply = check({ kind: "url_changed", doc: "bbbb", snap: "11111111" });
+  assert.equal(reply.state, "unavailable");
+  assert.equal(reply.reason, "baseline_mismatch");
+
+  // Stored-node presence/absence.
+  assert.equal(
+    check({ kind: "element_present", doc: "aaaa", snap: "11111111", idx: 0 }).state,
+    "satisfied"
+  );
+  reply = check({ kind: "element_present", doc: "zzzz", snap: "11111111", idx: 0 });
+  assert.equal(reply.state, "unavailable");
+  assert.equal(reply.reason, "stale_document");
+  reply = check({ kind: "element_absent", doc: "aaaa", snap: "22222222", idx: 0 });
+  assert.equal(reply.state, "unavailable");
+  assert.equal(reply.reason, "stale_snapshot");
+
+  const detached = element({ tag: "DIV", isConnected: false });
+  installSnapshot(context, detached, "aaaa", "33333333");
+  assert.equal(
+    check({ kind: "element_absent", doc: "aaaa", snap: "33333333", idx: 0 }).state,
+    "satisfied"
+  );
+
+  // Positive-only kinds report unavailable, never unsatisfied.
+  assert.equal(check({ kind: "dialog_present" }).state, "unavailable");
+  assert.equal(check({ kind: "focus_editable" }).state, "unavailable");
+  assert.equal(check({ kind: "count_at_least", role: "button", n: 51 }).reason, "invalid_condition");
+  assert.equal(check({ kind: "count_at_least", role: "Button", n: 2 }).reason, "invalid_condition");
+
+  // Booleans/states only: never text, URL, title or a value.
+  reply = check({ kind: "url_equals", value: "https://example.test/a" });
+  const allowed = new Set([
+    "state",
+    "reason",
+    "doc",
+    "snap",
+    "visibilityState",
+    "tab",
+    "window",
+    "active",
+    "focused",
+    "fallback",
+  ]);
+  for (const key of Object.keys(reply)) {
+    assert.ok(allowed.has(key), "postcheck reply carries only closed fields, saw " + key);
+  }
+  assert.ok(!JSON.stringify(reply).includes("https://example.test/a"));
+
+  // Never walks or retires the stored snapshot.
+  const before = vm.runInContext("lastSnapshot.snap", context);
+  check({ kind: "element_present", doc: "aaaa", snap: "33333333", idx: 0 });
+  assert.equal(vm.runInContext("lastSnapshot.snap", context), before);
+
+  // Source locks: read-only, boolean-only postcheck path.
+  const content = fs.readFileSync(path.join(root, "content.js"), "utf8");
+  const start = content.indexOf("function buildPostcheck(");
+  const end = content.indexOf("function parseChrId(");
+  assert.ok(start > 0 && end > start);
+  const body = content.slice(start, end);
+  assert.ok(!body.includes(["element", ".click("].join("")));
+  assert.ok(!body.includes(["dispatch", "Event("].join("")));
+  assert.ok(!body.includes("innerText"), "postcheck never reads page text");
+  assert.ok(!body.includes("MutationObserver"));
+  assert.ok(!body.includes("localStorage"));
+
+  const sw = fs.readFileSync(path.join(root, "sw.js"), "utf8");
+  assert.ok(sw.includes('op !== "postcheck"'), "postcheck is in the SW allowlist");
+  assert.ok(
+    sw.includes('op === "postcheck" && msg.tab == null'),
+    "postcheck requires a named tab"
+  );
+  const request = fs.readFileSync(path.join(root, "..", "src", "chrome.rs"), "utf8");
+  assert.ok(request.includes('"frame": 0'), "postcheck request pins frame:0");
+}
+
 function main() {
   contentTests();
   swTests();
@@ -2390,6 +2484,7 @@ function main() {
   frameNestedTests();
   frameBindingOpsTests();
   frameContentTests();
+  postcheckTests();
   frameSourceLocksTests();
   process.stdout.write("extension harness: ok\n");
 }

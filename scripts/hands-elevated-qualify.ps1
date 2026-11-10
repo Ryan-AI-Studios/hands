@@ -827,14 +827,18 @@ try {
             # The desk must be idle >= 2 s so a prior case's fresh stop cannot leak in. The harness
             # gap is a precondition; the desk.jsonl mtime is the desk-side bound (N3). Both are
             # recorded, and either one below 2 s is a timing miss.
+            # 0127 L1: the desk-side stat is read AFTER the idle sleep, so a desk write during the
+            # window is visible as a small gap; the desk-side `< 2000` branch is now reachable.
+            # Branch-coverage note: the harness-side `< 2000` guard on $sinceLastAction is
+            # unreachable by construction (the fixed 2200 ms sleep). It is kept as a guard against
+            # a future edit that shortens the sleep, and is not a measured bound.
             $idleStart = Get-Date
-            $deskLogWriteBefore = $null
-            if (Test-Path -LiteralPath $deskLog) {
-                $deskLogWriteBefore = (Get-Item -LiteralPath $deskLog).LastWriteTime
-            }
             Start-Sleep -Milliseconds 2200
             $sinceLastAction = [int]((Get-Date) - $idleStart).TotalMilliseconds
-            $deskLogGap = if ($null -ne $deskLogWriteBefore) { [int]((Get-Date) - $deskLogWriteBefore).TotalMilliseconds } else { $null }
+            $deskLogGap = $null
+            if (Test-Path -LiteralPath $deskLog) {
+                $deskLogGap = [int]((Get-Date) - (Get-Item -LiteralPath $deskLog).LastWriteTime).TotalMilliseconds
+            }
             $evidence.steps.Add([ordered]@{
                     step                 = "stop-idle-gate"
                     since_last_action_ms = $sinceLastAction

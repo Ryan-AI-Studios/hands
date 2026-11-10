@@ -7,6 +7,7 @@ pub mod actuate;
 pub mod allows;
 pub mod attach;
 pub mod bezier;
+pub mod build_identity;
 pub mod capture;
 pub mod challenge;
 pub mod changes;

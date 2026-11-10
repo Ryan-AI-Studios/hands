@@ -427,10 +427,19 @@ fn host_and_path(raw: &str) -> (Option<String>, String) {
         return (None, String::new());
     }
     let lower = trimmed.to_ascii_lowercase();
-    let after_scheme = if let Some(i) = lower.find("://") {
-        &trimmed[i + 3..]
-    } else {
-        trimmed
+    // A scheme separator is only valid at a scheme position. A `://` inside a data: body or
+    // a query string is not a scheme.
+    let after_scheme = match lower.find("://") {
+        Some(i)
+            if i > 0
+                && lower.as_bytes()[0].is_ascii_alphabetic()
+                && lower[..i]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')) =>
+        {
+            &trimmed[i + 3..]
+        }
+        _ => trimmed,
     };
     // Authority ends at the first `/`, `?` or `#`; an `@` after that is path/query data and
     // must never change the host.
@@ -438,6 +447,9 @@ fn host_and_path(raw: &str) -> (Option<String>, String) {
         .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
     let authority = &after_scheme[..authority_end];
+    if authority.contains('\\') {
+        return (None, String::new());
+    }
     // Strip userinfo only inside the authority. rfind is conservative for malformed input.
     let host_port = if let Some(at) = authority.rfind('@') {
         &authority[at + 1..]
@@ -1505,6 +1517,11 @@ mod tests {
         assert!(vendor_url("https://evil.example/x@@google.com/recaptcha").is_none());
         assert!(vendor_url("https://evil.example/x%40google.com/recaptcha").is_none());
         assert!(vendor_url("https://user:pass@google.com/recaptcha").is_some());
+        // L-9: a `://` inside a data: body/query is not a scheme; a backslash in the
+        // authority is not a host separator.
+        assert!(vendor_url("data:text/html,https://google.com/recaptcha").is_none());
+        assert!(vendor_url("evil.example?x=https://google.com/recaptcha").is_none());
+        assert!(vendor_url("https://evil.example\\x@google.com/recaptcha").is_none());
         // P3-3: frame scope excludes the top-page-only funcaptcha/cdn-cgi rules.
         assert!(vendor_url("https://funcaptcha.com/").is_none());
         assert!(vendor_url("https://cloudflare.com/cdn-cgi/challenge-platform/x").is_none());

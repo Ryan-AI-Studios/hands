@@ -494,6 +494,7 @@ function reportFrameLink(token, origin, point) {
       op: "frame_link",
       token: token,
       origin: typeof origin === "string" ? origin : "",
+      slot: known.slot,
       link: link,
     });
   } catch (_err) {}
@@ -512,6 +513,16 @@ function onFrameMessage(event) {
   if (!match) {
     return;
   }
+  // Report iframe identity even if the link measurement/report later fails, so the SW can
+  // dedupe the parent element row by slot without dropping a distinct same-origin sibling.
+  try {
+    framePort.postMessage({
+      op: "frame_slot",
+      token: token,
+      origin: typeof event.origin === "string" ? event.origin : "",
+      slot: match.slot,
+    });
+  } catch (_err) {}
   if (knownFrameTokens.size >= 64 && !knownFrameTokens.has(token)) {
     const oldest = knownFrameTokens.keys().next();
     if (!oldest.done) {

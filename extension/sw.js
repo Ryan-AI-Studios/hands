@@ -250,6 +250,24 @@ function registerFramePort(port) {
       }
       return;
     }
+    if (op === "frame_slot") {
+      const token = typeof msg.token === "string" ? msg.token : "";
+      const target = tokenIndex.get(token);
+      if (
+        target &&
+        target.tab === entry.tab &&
+        target.frameId !== entry.frameId &&
+        Number.isInteger(msg.slot) &&
+        msg.slot >= 0
+      ) {
+        const origin = normalizeOrigin(msg.origin);
+        const expected = normalizeOrigin(target.origin);
+        if (origin && expected && origin === expected) {
+          target.slot = msg.slot;
+        }
+      }
+      return;
+    }
     if (op === "frame_link") {
       acceptFrameLink(entry, msg);
     }
@@ -406,6 +424,11 @@ function acceptFrameLink(parentEntry, msg) {
   if (target.frameId === parentEntry.frameId) {
     return;
   }
+  // The parent that owns the matched iframe reports its slot. Record it even if the link is
+  // later rejected/ambiguous, so the frame's own parent element row is deduped by identity.
+  if (Number.isInteger(msg.slot) && msg.slot >= 0) {
+    target.slot = msg.slot;
+  }
   const origin = normalizeOrigin(msg.origin);
   const expected = normalizeOrigin(target.origin);
   if (!origin || !expected || origin !== expected) {
@@ -496,6 +519,14 @@ function collectFrameRows(tabId, frameElements) {
     if (entry.frameId === 0) {
       continue;
     }
+    // Identity carried from the parent's contentWindow match (link pass), independent of
+    // whether the link ultimately validated. This is the exact iframe slot to dedupe.
+    if (Number.isInteger(entry.slot)) {
+      linkedSlots.add(entry.slot);
+    }
+    if (entry.link && Number.isInteger(entry.link.slot)) {
+      linkedSlots.add(entry.link.slot);
+    }
     const origin = clampOrigin(entry.origin);
     if (entry.budget) {
       const row = {
@@ -562,18 +593,8 @@ function collectFrameRows(tabId, frameElements) {
       row.url = entry.url;
     }
   }
-  // Suppress at most one parent iframe row per registered-but-unlinked child of that origin.
-  // A distinct same-origin un-injected iframe must still get its own row.
-  const unlinkedByOrigin = new Map();
-  for (const entry of frames.values()) {
-    if (entry.frameId === 0 || (entry.link && entry.linkState === "ok")) {
-      continue;
-    }
-    const origin = clampOrigin(entry.origin);
-    if (origin) {
-      unlinkedByOrigin.set(origin, (unlinkedByOrigin.get(origin) || 0) + 1);
-    }
-  }
+  // Dedupe by iframe identity/slot. A distinct same-origin un-injected iframe is never
+  // suppressed just because another frame shares its origin.
   const seen = Array.isArray(frameElements) ? frameElements : [];
   for (const item of seen) {
     if (!item || typeof item.reason !== "string") {
@@ -582,12 +603,8 @@ function collectFrameRows(tabId, frameElements) {
     if (Number.isInteger(item.slot) && linkedSlots.has(item.slot)) {
       continue;
     }
-    const origin = clampOrigin(item.origin);
-    if (origin && (unlinkedByOrigin.get(origin) || 0) > 0) {
-      unlinkedByOrigin.set(origin, unlinkedByOrigin.get(origin) - 1);
-      continue;
-    }
     const row = { status: "unavailable", reason: item.reason };
+    const origin = clampOrigin(item.origin);
     if (origin) row.origin = origin;
     rows.push(row);
   }
@@ -939,8 +956,12 @@ function finishFrameSnapshot(out, tab, port, msg) {
   const commitBy = Date.now() + budget;
   setTimeout(finalize, budget);
   const known = frameRegistry.get(tab.id);
-  if (!known || known.size <= 1) {
-    // A top-only page needs no announce/measure settle.
+  const hasChild = known
+    ? [...known.values()].some((entry) => entry.frameId !== 0)
+    : false;
+  if (!hasChild) {
+    // A top-only page needs no announce/measure settle. A pruned top port plus a registered
+    // child still counts as a child.
     finalize();
     return;
   }

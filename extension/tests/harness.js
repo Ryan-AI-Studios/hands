@@ -899,26 +899,51 @@ function frameOptOutTests() {
     assert.equal(topReply.frames_truncated, undefined);
   }
 
-  // m-3: an unlinked registered child must not also get a `no_content_script` row.
+  // P4-1: a registered-unlinked iframe whose src redirects to another origin must dedupe by
+  // its own slot, not by origin; a distinct same-origin un-injected sibling keeps its row.
   {
     const h = frameHarness();
     const top = h.addFrame({ frameId: 0 });
-    const child = h.addFrame({ frameId: 3, origin: "https://late.test" });
+    const child = h.addFrame({ frameId: 3, origin: "https://same.test" });
     child.__parentCtx = top;
-    const iframe = element({
+    const linkedIframe = element({
       tag: "IFRAME",
-      attrs: { src: "https://late.test/" },
+      attrs: { src: "https://ads.test/redirect" },
       rect: { left: 5, top: 5, width: 300, height: 200 },
     });
+    linkedIframe.contentWindow = child.window;
+    const unlinkedIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://same.test/other" },
+      rect: { left: 5, top: 250, width: 300, height: 200 },
+    });
     const rootEl = element({ tag: "DIV" });
-    attach(rootEl, iframe);
+    attach(rootEl, linkedIframe);
+    attach(rootEl, unlinkedIframe);
     top.document.documentElement = rootEl;
+    top.__elementAt = () => linkedIframe;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "Redirected" });
+    // Keep the slot report but drop the link report: #a stays frame_link_missing with its
+    // identity known; #b must still be named.
+    const token = h.sw.registry(12).get(3).token;
+    const originalPost = top.__port.postMessage;
+    top.__port.postMessage = (msg) => {
+      if (msg.op === "frame_link" && msg.token === token) return;
+      originalPost.call(top.__port, msg);
+    };
     const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
-    const lateRows = reply.frames.filter((row) => row.frame === 3);
-    assert.equal(lateRows.length, 1, "one registered row");
+    assert.equal(reply.frames.length, 2, "exactly two distinct child rows");
+    const registered = reply.frames.find((row) => row.frame === 3);
+    assert.equal(registered.reason, "frame_link_missing");
     assert.ok(
-      !reply.frames.some((row) => row.reason === "no_content_script"),
-      "the same iframe is not also reported as no_content_script"
+      reply.frames.some(
+        (row) => row.reason === "no_content_script" && row.origin === "https://same.test"
+      ),
+      "the distinct same-origin un-injected sibling keeps its row"
+    );
+    assert.ok(
+      !reply.frames.some((row) => row.origin === "https://ads.test"),
+      "the registered iframe's seen row is deduped by slot"
     );
   }
 
@@ -978,6 +1003,33 @@ function frameOptOutTests() {
       (el) => el.frame === 8 || String(el.id || "").startsWith("frame:")
     );
     assert.equal(leaked, undefined, "a stored observe drops a failed-commit frame element");
+  }
+
+  // L-8: a committed reply with a malformed doc/snap must not leak a ref-less frame id.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 10, origin: "https://badcommit.test" });
+    child.__parentCtx = top;
+    const iframe = element({ tag: "IFRAME", rect: { left: 5, top: 5, width: 300, height: 200 } });
+    iframe.contentWindow = child.window;
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, iframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = () => iframe;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "Target" });
+    h.sw.setContent(12, 10, (msg, cb) => {
+      if (msg.op === "frame_commit") {
+        cb({ committed: true, doc: "zzzz", snap: "bad", retained: 1 });
+        return;
+      }
+      child.__listener(msg, null, (reply) => cb(reply));
+    });
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    const leaked = reply.elements.find(
+      (el) => el.frame === 10 || String(el.id || "").startsWith("frame:")
+    );
+    assert.equal(leaked, undefined, "malformed committed doc/snap never mints a frame id");
   }
 
   // M-3: if the top walk already consumed the client budget, fan-out is skipped honestly.

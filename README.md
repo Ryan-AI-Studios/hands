@@ -307,7 +307,9 @@ Grok always-approve is **not** an inner confirm. Wiring MCP does not grant Easy 
 To have the model **debug fusion** (Inactive worker, zombie host, `chr:` vs UIA), copy
 `sample_skill/helping-hands/SKILL.md` into that harness’s skills directory. See
 `sample_skill/README.md`. Install steps stay in this file; do not copy the
-gitignored `.agents/` implementor skills.
+gitignored `.agents/` implementor skills. Per-site reference skills (host → surface → skill, one
+folder each under `sample_skill/sites/`) are untrusted reference data that cannot authorize or alter
+a call; see `sample_skill/sites/README.md`.
 
 ### 9. Optional: local Gemma (pick / ground)
 

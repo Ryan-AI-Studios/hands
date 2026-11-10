@@ -319,12 +319,13 @@ pub fn logs_dir() -> Result<PathBuf, HandsError> {
 
 /// Create a Hands-owned directory with the existing medium mandatory label.
 ///
-/// `%LOCALAPPDATA%\hands` (and its `logs` child) can be created by the High-IL server on a
-/// clean profile. A plain `create_dir_all` from a High token produces a High-labelled
-/// directory with `SYSTEM_MANDATORY_LABEL_NO_WRITE_UP`, which silently blocks a later medium
+/// `%LOCALAPPDATA%\hands` (and its `logs` child) is written by several Hands processes. A plain
+/// `create_dir_all` stores **no label ACE**, so the effective level is only the implicit default;
+/// under a labelled or inheritable-High parent (or if a tool sets a High label) the directory can be
+/// High-labelled with `SYSTEM_MANDATORY_LABEL_NO_WRITE_UP`, which silently blocks a later medium
 /// `hands stop` from writing `stop-request.json` (the mandatory label overrides the DACL).
-/// Creating each missing directory with the descriptor the desk mutex and pipe already use
-/// keeps the directory writable from medium at any creator integrity level.
+/// Creating each missing directory with the descriptor the desk mutex and pipe already use makes the
+/// Medium label explicit at any creator integrity level.
 ///
 /// The label ACE is non-inheriting on purpose: High-written log files stay High and
 /// medium-written stop/allow files stay medium. Existing directories are left exactly as
@@ -1031,6 +1032,13 @@ pub(crate) fn with_test_env<T>(f: impl FnOnce() -> T) -> T {
     tests::with_test_env(f)
 }
 
+/// Test-only: read the mandatory-label RID of a path (S-1-16-<rid>). Shared with the allows
+/// label test so both creation paths are held to the same read-back.
+#[cfg(test)]
+pub(crate) fn dir_label_rid(path: &Path) -> Option<u32> {
+    tests::dir_label_rid(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1558,7 +1566,7 @@ mod tests {
     }
 
     /// Mandatory-label RID of a path (S-1-16-<rid>), read from its SACL label ACE.
-    fn dir_label_rid(dir: &Path) -> Option<u32> {
+    pub(super) fn dir_label_rid(dir: &Path) -> Option<u32> {
         use std::os::windows::ffi::OsStrExt;
         use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
         use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
@@ -1635,17 +1643,16 @@ mod tests {
             "the created logs child must carry a Medium mandatory label"
         );
 
-        // Control: a plain create_dir_all is exactly what the helper replaces.
+        // Control: a plain create_dir_all is exactly what the helper replaces. Unconditional
+        // (0126 F-o1): a plain create leaves no explicit label ACE at any creator IL, so the
+        // helper is provably what applies Medium.
         let plain = root.join("plain");
         std::fs::create_dir_all(&plain).unwrap();
-        let creator = crate::elevation::process_integrity_rid().unwrap();
-        if creator >= crate::elevation::HIGH_IL_RID {
-            assert_ne!(
-                dir_label_rid(&plain),
-                Some(MEDIUM_RID),
-                "a High creator's plain create must not be Medium: the helper is what applies the label"
-            );
-        }
+        assert_ne!(
+            dir_label_rid(&plain),
+            Some(MEDIUM_RID),
+            "a plain create_dir_all must not be Medium-labelled: the helper is what applies the label"
+        );
 
         // An existing directory is left exactly as it is (no retroactive relabel).
         let before = dir_label_rid(&plain);

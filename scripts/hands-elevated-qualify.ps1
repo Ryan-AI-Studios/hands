@@ -77,10 +77,14 @@ $verdictTokens = @(
 )
 $evidenceFields = @(
     "case", "client_il", "bridge_status", "target", "steps", "artifact",
-    "verdict", "limitations", "generated_at", "build"
+    "verdict", "effect", "limitations", "generated_at", "build"
 )
 $confirmPolicy = "once-only: only after a tool returns a fence, only with -GrantOnceOnFence, mode=once, the exact returned domain and category, never persist, never session"
-$fixedTemplate = 'Write-Output {0} | Out-File -Encoding ascii "$env:TEMP\hands-qual-{0}.txt"'
+# Fixed command template. A plain elevated write is NOT High-labelled (0126 F-B1): Windows stores a
+# mandatory label only when one is set explicitly or inherited from an inheritable label ACE, and
+# %TEMP% has none. The target therefore sets the label itself in the same fixed template, before the
+# harness reads it back. `icacls /setintegritylevel High` needs no operator input.
+$fixedTemplate = 'Write-Output {0} | Out-File -Encoding ascii "$env:TEMP\hands-qual-{0}.txt"; icacls "$env:TEMP\hands-qual-{0}.txt" /setintegritylevel High'
 # Fixed in-flight stop filler: <= 32 chars and '#'-prefixed so an accidental Enter is inert.
 # > 32 chars would take TypePath::Clipboard and skip the per-code-unit lease::poll().
 $stopFiller = "#ELEVQ-" + $Nonce.Substring($Nonce.Length - 8)
@@ -146,17 +150,88 @@ function Get-ClientIntegrity {
     return "unknown"
 }
 
-function Get-MandatoryLabel([string]$Path) {
-    # Prefer a SID-based read (SDDL carries the SID even on a localized OS). A label read that
-    # cannot be resolved returns "unknown", which never passes as High (fail closed).
-    try {
-        $sddl = (Get-Acl -LiteralPath $Path -Audit).Sddl
-        if ($sddl -match $highLabelSid) { return "high" }
-        if ($sddl -match $mediumLabelSid) { return "medium" }
-        if ($sddl -match "S-1-16-4096") { return "low" }
-    } catch {
-        # SACL read can be denied; fall through to icacls (label ACEs are world-readable).
+$script:labelReaderReady = $false
+$script:labelReaderSource = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class HandsMandatoryLabel
+{
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetNamedSecurityInfoW(
+        string objectName, int objectType, uint securityInfo,
+        IntPtr owner, IntPtr group, IntPtr dacl, out IntPtr sacl, out IntPtr securityDescriptor);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetSecurityDescriptorSacl(
+        IntPtr securityDescriptor, out bool saclPresent, out IntPtr sacl, out bool saclDefaulted);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetAce(IntPtr acl, uint aceIndex, out IntPtr ace);
+
+    [DllImport("advapi32.dll")]
+    private static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+
+    [DllImport("advapi32.dll")]
+    private static extern IntPtr GetSidSubAuthority(IntPtr sid, uint subAuthority);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr handle);
+
+    // LABEL_SECURITY_INFORMATION = 0x10, SE_FILE_OBJECT = 1. The SID starts 8 bytes into a
+    // SYSTEM_MANDATORY_LABEL_ACE (4-byte ACE_HEADER + 4-byte mask).
+    public static string MandatoryLabelSid(string path)
+    {
+        IntPtr sacl, sd;
+        uint status = GetNamedSecurityInfoW(path, 1, 0x10, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out sacl, out sd);
+        if (status != 0) { return null; }
+        try
+        {
+            bool present, defaulted;
+            IntPtr acl;
+            if (!GetSecurityDescriptorSacl(sd, out present, out acl, out defaulted) || !present || acl == IntPtr.Zero) { return null; }
+            IntPtr ace;
+            if (!GetAce(acl, 0, out ace) || ace == IntPtr.Zero) { return null; }
+            IntPtr sid = new IntPtr(ace.ToInt64() + 8);
+            byte count = Marshal.ReadByte(GetSidSubAuthorityCount(sid));
+            if (count == 0) { return null; }
+            int rid = Marshal.ReadInt32(GetSidSubAuthority(sid, (uint)(count - 1)));
+            return "S-1-16-" + rid.ToString();
+        }
+        finally { LocalFree(sd); }
     }
+}
+'@
+
+function Initialize-LabelReader {
+    if ($script:labelReaderReady) { return $true }
+    try {
+        Add-Type -TypeDefinition $script:labelReaderSource -ErrorAction Stop
+        $script:labelReaderReady = $true
+        return $true
+    } catch {
+        # Fail closed: the caller falls back to the icacls text, then "unknown".
+        return $false
+    }
+}
+
+function Get-MandatoryLabel([string]$Path) {
+    # Primary: the SACL label RID through GetNamedSecurityInfoW (language-independent).
+    if (Initialize-LabelReader) {
+        try {
+            $sid = [HandsMandatoryLabel]::MandatoryLabelSid($Path)
+            if ($null -ne $sid) {
+                if ($sid -eq $highLabelSid) { return "high" }
+                if ($sid -eq $mediumLabelSid) { return "medium" }
+                if ($sid -eq "S-1-16-4096") { return "low" }
+                return "other:$sid"
+            }
+        } catch {
+            # Fall through to the text fallback.
+        }
+    }
+    # Fallback: the icacls label line (English only). An unresolved label stays "unknown", which
+    # can never pass the High gate.
     $text = (& icacls.exe $Path 2>$null | Out-String)
     $line = ($text -split "`r?`n" | Where-Object { $_ -match "Mandatory Label" } | Select-Object -First 1)
     if ($line -match "High") { return "high" }
@@ -216,16 +291,21 @@ function Receive-McpId($Bridge, [int]$Id, [int]$TimeoutMs = 15000) {
     }
 }
 
-function Stop-OwnBridge($Bridge) {
+function Stop-OwnBridge($Bridge, [switch]$KillNow) {
     if ($null -eq $Bridge) { return }
-    try { $Bridge.Writer.Close() } catch { }
+    if (-not $KillNow.IsPresent) {
+        try { $Bridge.Writer.Close() } catch { }
+    }
     try {
-        if (-not $Bridge.Process.HasExited) {
-            if (-not $Bridge.Process.WaitForExit(3000)) {
-                # The only allowed kill: the bridge child this script spawned itself.
-                # Never the task, the High server, or another hands.exe.
-                Stop-Process -Id $Bridge.Pid -Force -ErrorAction SilentlyContinue
-            }
+        # The lifecycle disconnect is the pid kill itself (0126 F-l2), not a stdin-EOF exit.
+        $needsKill = $KillNow.IsPresent
+        if (-not $needsKill -and -not $Bridge.Process.HasExited) {
+            $needsKill = -not $Bridge.Process.WaitForExit(3000)
+        }
+        if ($needsKill) {
+            # The only allowed kill: the bridge child this script spawned itself.
+            # Never the task, the High server, or another hands.exe.
+            Stop-Process -Id $Bridge.Pid -Force -ErrorAction SilentlyContinue
         }
     } catch {
         # The process handle may already be gone; no other process is ever terminated.
@@ -415,6 +495,35 @@ function Get-ArtifactState([string]$Path, [string]$Expected) {
     return $state
 }
 
+function Get-DeskLogPath {
+    if ($env:HANDS_LOGS_DIR -and $env:HANDS_LOGS_DIR.Trim()) {
+        return (Join-Path $env:HANDS_LOGS_DIR "desk.jsonl")
+    }
+    return (Join-Path $env:LOCALAPPDATA "hands\logs\desk.jsonl")
+}
+
+function Assert-ForegroundTarget($Bridge, $Counter, $Steps, $Evidence, [string]$Label) {
+    # R5 (0126 F-M2): re-resolve and compare immediately before input. A mismatch refuses with a
+    # named failure and sends nothing; it is never a note.
+    $observe = Get-ObserveEnvelope $Bridge $Counter "observe-before-$Label" @{} $Steps $Label
+    $target = Get-Prop $observe "target_window"
+    if ($null -eq $target) {
+        throw "target-binding: observe did not resolve -Window $Window before $Label; no input was sent"
+    }
+    $fresh = Get-TargetIdentity $observe
+    foreach ($field in @("pid", "hwnd", "class")) {
+        $expected = Get-Prop $Evidence.target $field
+        $actual = Get-Prop $fresh $field
+        if ("$expected" -ne "$actual") {
+            throw "target-binding: $field changed before $Label (expected '$expected', got '$actual'); no input was sent"
+        }
+    }
+    if ((Get-Prop $target "foreground") -ne $true) {
+        throw "target-binding: -Window $Window is not the foreground window before $Label; no input was sent"
+    }
+    return $fresh
+}
+
 # --- medium-shell gate -----------------------------------------------------------------
 # client_il comes from this script's own label line, never from the bridge.
 $clientIl = Get-ClientIntegrity
@@ -427,6 +536,7 @@ if ($clientIl -ne "medium") {
         steps            = @()
         artifact         = $null
         verdict          = "NOT_RUN"
+        effect           = $null
         limitations      = @("driving shell must be medium ($mediumLabelSid); got $clientIl; the script refuses to drive from a non-medium shell")
         generated_at     = (Get-Date).ToString("o")
         build            = $null
@@ -454,9 +564,20 @@ $evidence = [ordered]@{
     steps         = (New-Object System.Collections.ArrayList)
     artifact      = $null
     verdict       = "NOT_RUN"
+    effect        = $null
     limitations   = @()
     generated_at  = (Get-Date).ToString("o")
     build         = $build
+}
+
+# `stop` is the last case of a session (plan Phase 3). A marker from an earlier stop run makes a
+# later non-stop case refuse instead of silently mixing stop freshness into another cell (F-l4).
+$stopMarker = Join-Path $EvidenceDir "stop-case-completed.json"
+if ($Case -ne "stop" -and (Test-Path -LiteralPath $stopMarker)) {
+    $evidence.limitations += "a stop case already ran in this evidence dir; stop must be the last case of a session - run each session in a fresh evidence dir and re-run stop last"
+    $null = Save-Evidence $evidence
+    Write-Host "REFUSED: stop already ran for this evidence dir; run $Case in a fresh session."
+    exit 2
 }
 
 $artifactPath = Join-Path $env:TEMP ("hands-qual-{0}.txt" -f $Nonce)
@@ -536,8 +657,9 @@ try {
             # activate -> click (or a recorded UNSUPPORTED click cell) -> type -> preview -> enter -> artifact
             $activate = Invoke-Tool $bridge $counter "activate" @{ window = $Window }
             $evidence.steps.Add((Get-StepRecord "activate" $activate)) | Out-Null
-            if (-not (Get-Prop $activate.Payload "foregrounded")) {
-                $evidence.limitations += "activate did not report foregrounded:true; the click/type cells cannot be evidence"
+            if ((Get-Prop $activate.Payload "foregrounded") -ne $true) {
+                # F-M2: a failed activate is a named refusal, never a note that still types.
+                throw "activate-not-foregrounded: activate did not report foregrounded:true; the console cells cannot run"
             }
             Start-Sleep -Milliseconds 400
             # Human-read evidence for the activate cell (O3): the target must be in front.
@@ -556,18 +678,22 @@ try {
                 Start-Sleep -Milliseconds 200
             }
 
+            $null = Assert-ForegroundTarget $bridge $counter $evidence.steps $evidence "type"
             $type = Invoke-WithOptionalOnceConfirm $bridge $counter "type" @{ text = $templateText } $evidence.steps
             if (-not (Get-Prop $type.Payload "ok")) {
                 $evidence.verdict = "FAILED"
+                $evidence.effect = if ((Get-Prop $type.Payload "post_dispatch") -eq $true) { "unknown" } else { "not_attempted" }
                 $evidence.limitations += "type refused: $(Get-Prop $type.Payload 'error')"
                 break
             }
 
             $null = Get-ObserveEnvelope $bridge $counter "observe-pre-submit" @{ fg_preview = $true } $evidence.steps "pre-submit"
 
+            $null = Assert-ForegroundTarget $bridge $counter $evidence.steps $evidence "key-enter"
             $enter = Invoke-WithOptionalOnceConfirm $bridge $counter "key" @{ name = "enter" } $evidence.steps
             if (-not (Get-Prop $enter.Payload "ok")) {
                 $evidence.verdict = "FAILED"
+                $evidence.effect = if ((Get-Prop $enter.Payload "post_dispatch") -eq $true) { "unknown" } else { "not_attempted" }
                 $evidence.limitations += "key enter refused: $(Get-Prop $enter.Payload 'error')"
                 break
             }
@@ -582,17 +708,23 @@ try {
             if ($artifact.exists -and $artifact.content_matches -and $artifact.mandatory_label -eq "high") {
                 # Target-created artifact with the exact nonce and a High label: genuine effect.
                 $evidence.verdict = "OBSERVED_EFFECT"
+                $evidence.effect = "observed"
             } elseif ($artifact.exists -and $artifact.content_matches) {
                 $evidence.verdict = "FAILED"
-                $evidence.limitations += "artifact matched but its mandatory label is '$($artifact.mandatory_label)', not High: the target was not proven elevated"
+                $evidence.effect = "unknown"
+                $evidence.limitations += "artifact matched but its mandatory label is '$($artifact.mandatory_label)', not High: the target was not proven elevated (the fixed template must set the label)"
             } else {
                 $evidence.verdict = "FAILED"
+                $evidence.effect = "unknown"
                 $evidence.limitations += "artifact absent or wrong content after Enter; ok:true is not effect"
             }
         }
         "terminal" {
             $activate = Invoke-Tool $bridge $counter "activate" @{ window = $Window }
             $evidence.steps.Add((Get-StepRecord "activate" $activate)) | Out-Null
+            if ((Get-Prop $activate.Payload "foregrounded") -ne $true) {
+                throw "activate-not-foregrounded: activate did not report foregrounded:true; the terminal cells cannot run"
+            }
             Start-Sleep -Milliseconds 400
             $null = Get-ObserveEnvelope $bridge $counter "observe-post-activate" @{ fg_preview = $true } $evidence.steps "post-activate"
 
@@ -603,40 +735,79 @@ try {
                 Start-Sleep -Milliseconds 200
             }
 
+            $null = Assert-ForegroundTarget $bridge $counter $evidence.steps $evidence "type"
             $type = Invoke-WithOptionalOnceConfirm $bridge $counter "type" @{ text = $templateText } $evidence.steps
             if (Get-Prop $type.Payload "ok") {
                 $null = Get-ObserveEnvelope $bridge $counter "observe-pre-submit" @{ fg_preview = $true } $evidence.steps "pre-submit"
+                $null = Assert-ForegroundTarget $bridge $counter $evidence.steps $evidence "key-enter"
                 $enter = Invoke-WithOptionalOnceConfirm $bridge $counter "key" @{ name = "enter" } $evidence.steps
                 Start-Sleep -Milliseconds 800
                 $artifact = Get-ArtifactState $artifactPath $Nonce
                 $evidence.artifact = $artifact
                 if ($artifact.exists -and $artifact.content_matches -and $artifact.mandatory_label -eq "high") {
                     $evidence.verdict = "OBSERVED_EFFECT"
+                    $evidence.effect = "observed"
                 } else {
                     $evidence.verdict = "DELIVERED_UNVERIFIED"
+                    $evidence.effect = "unknown"
                     $evidence.limitations += "type was delivered but no High-labelled artifact with the exact nonce was read back"
                 }
             } else {
                 $errorText = "$(Get-Prop $type.Payload 'error')"
-                $evidence.verdict = "UNSUPPORTED"
-                $evidence.limitations += "Windows Terminal input is not qualified on this head: $errorText"
-                $evidence.steps.Add([ordered]@{
-                        step          = "terminal-observed-role"
-                        target_class  = $evidence.target.class
-                        target_title  = $evidence.target.title
-                        element_role  = if ($null -ne $clickable) { $clickable.Role } else { $null }
-                        refusal       = $errorText
-                    }) | Out-Null
+                if ($errorText -match "focused control is not an edit, combo, or document") {
+                    # Only the 0115 focus gate is the designed UNSUPPORTED result (F-m2).
+                    $evidence.verdict = "UNSUPPORTED"
+                    $evidence.effect = "not_attempted"
+                    $evidence.limitations += "Windows Terminal input is not qualified on this head: $errorText"
+                    $evidence.steps.Add([ordered]@{
+                            step          = "terminal-observed-role"
+                            target_class  = $evidence.target.class
+                            target_title  = $evidence.target.title
+                            element_role  = if ($null -ne $clickable) { $clickable.Role } else { $null }
+                            refusal       = $errorText
+                        }) | Out-Null
+                } else {
+                    $evidence.verdict = "FAILED"
+                    $evidence.effect = if ((Get-Prop $type.Payload "post_dispatch") -eq $true) { "unknown" } else { "not_attempted" }
+                    $evidence.limitations += "type refused for a reason other than the 0115 focus gate: $errorText"
+                }
             }
         }
         "stop" {
-            # The desk must be idle >= 2 s so a prior case's fresh stop cannot leak in.
-            $deskLog = Join-Path $env:LOCALAPPDATA "hands\logs\desk.jsonl"
+            # Focus the target first (F-M2) so the in-flight type is a real send, not a refusal.
+            $activate = Invoke-Tool $bridge $counter "activate" @{ window = $Window }
+            $evidence.steps.Add((Get-StepRecord "activate" $activate)) | Out-Null
+            if ((Get-Prop $activate.Payload "foregrounded") -ne $true) {
+                throw "activate-not-foregrounded: activate did not report foregrounded:true; the stop cell cannot run"
+            }
+            Start-Sleep -Milliseconds 300
+            $clickable = Get-FirstClickableRef $observe
+            if ($null -ne $clickable) {
+                $click = Invoke-Tool $bridge $counter "click" @{ element_id = $clickable.Ref }
+                $evidence.steps.Add((Get-StepRecord "click" $click)) | Out-Null
+                Start-Sleep -Milliseconds 200
+            }
+
+            $deskLog = Get-DeskLogPath
             $deskStopRowsBefore = 0
             if (Test-Path -LiteralPath $deskLog) {
                 $deskStopRowsBefore = @(Get-Content -LiteralPath $deskLog -Tail 50 | Where-Object { $_ -match '"stop"' }).Count
             }
+            # The desk must be idle >= 2 s so a prior case's fresh stop cannot leak in. Measure the
+            # gap (F-l4); the sleep is the floor, not the evidence.
+            $idleStart = Get-Date
             Start-Sleep -Milliseconds 2200
+            $idleMs = [int]((Get-Date) - $idleStart).TotalMilliseconds
+            $evidence.steps.Add([ordered]@{
+                    step     = "stop-idle-gate"
+                    idle_ms  = $idleMs
+                    required = 2000
+                    last_case = $true
+                }) | Out-Null
+            if ($idleMs -lt 2000) {
+                throw "timing-miss: only $idleMs ms of desk idle before the stop cell; the stop must start from >= 2 s (retry)"
+            }
+            $null = Assert-ForegroundTarget $bridge $counter $evidence.steps $evidence "stop-type"
             $typeId = $counter.Next
             $counter.Next = $typeId + 1
             # Write the type request WITHOUT waiting: the stop must land inside the send window,
@@ -698,14 +869,28 @@ try {
                 # partial prefix needs the owner's human-read screenshot before this cell can be
                 # promoted to OBSERVED_EFFECT.
                 $evidence.verdict = "DELIVERED_UNVERIFIED"
+                $evidence.effect = "unknown"
                 $evidence.limitations += "owner must read the after-stop PNG for a strict partial prefix of '$stopFiller' and promote this cell; the script never self-certifies pixels"
+                $evidence.limitations += "bounded retries are manual: fail this case at most 3 times, then record NOT_RUN; a timing miss is never an abort"
             } elseif ($frozen -eq $true) {
-                $evidence.verdict = "DELIVERED_UNVERIFIED"
-                $evidence.limitations += "frozen envelope without post_dispatch/delivery:unknown; record this as unverified, not an abort"
+                # A pre-dispatch frozen refusal is a timing miss (§2.4), never DELIVERED_UNVERIFIED.
+                $evidence.verdict = "NOT_RUN"
+                $evidence.effect = "not_attempted"
+                $evidence.limitations += "timing miss: the stop landed before dispatch (frozen without post_dispatch/delivery:unknown); retry up to 3 attempts"
             } else {
                 $evidence.verdict = "NOT_RUN"
+                $evidence.effect = "unknown"
                 $evidence.limitations += "timing miss: the stop landed before dispatch or after completion; retry up to 3 attempts and never count it as an abort"
             }
+            # The stop case is the last case of a session: leave a marker that other cases refuse to
+            # follow (F-l4).
+            if (-not (Test-Path -LiteralPath $EvidenceDir)) {
+                New-Item -ItemType Directory -Path $EvidenceDir -Force | Out-Null
+            }
+            [System.IO.File]::WriteAllText(
+                $stopMarker,
+                ("{{""case"":""stop"",""at"":""{0}""}}" -f (Get-Date).ToString("o"))
+            )
             Write-Host "STOP-RESULT: frozen=$frozen delivery=$delivery post_dispatch=$postDispatch stop_rows=$($stopRows.Count)"
         }
         "lifecycle" {
@@ -713,8 +898,13 @@ try {
             # not an immediate pre-dispatch refusal.
             $activate = Invoke-Tool $bridge $counter "activate" @{ window = $Window }
             $evidence.steps.Add((Get-StepRecord "activate" $activate)) | Out-Null
+            if ((Get-Prop $activate.Payload "foregrounded") -ne $true) {
+                throw "activate-not-foregrounded: activate did not report foregrounded:true; the lifecycle disconnect cells cannot run"
+            }
             Start-Sleep -Milliseconds 300
-            # Disconnect mid-type: terminate ONLY the bridge child this script spawned.
+            $null = Assert-ForegroundTarget $bridge $counter $evidence.steps $evidence "lifecycle-type"
+            # Disconnect mid-type: terminate ONLY the bridge child this script spawned, by pid
+            # (F-l2: the kill is the named method, not a stdin-EOF exit).
             $typeId = $counter.Next
             $counter.Next = $typeId + 1
             Send-McpLine $bridge @{
@@ -725,7 +915,7 @@ try {
             }
             Start-Sleep -Milliseconds 200
             $ownPid = $bridge.Pid
-            Stop-OwnBridge $bridge
+            Stop-OwnBridge $bridge -KillNow
             $transportError = $null
             try {
                 $null = Receive-McpId $bridge $typeId 5000
@@ -733,11 +923,12 @@ try {
                 $transportError = "$($_.Exception.Message)"
             }
             $evidence.steps.Add([ordered]@{
-                    step            = "disconnect-mid-type"
-                    bridge_pid      = $ownPid
-                    transport       = if ($transportError) { "failed" } else { "unexpectedly-answered" }
-                    transport_error = $transportError
-                    effect          = "unknown"
+                    step              = "disconnect-mid-type"
+                    bridge_pid        = $ownPid
+                    disconnect_method = "own-bridge-pid-kill"
+                    transport         = if ($transportError) { "failed" } else { "unexpectedly-answered" }
+                    transport_error   = $transportError
+                    effect            = "unknown"
                 }) | Out-Null
             $bridge = $null
 
@@ -746,6 +937,7 @@ try {
             $bridge = $second
             $counter = New-BridgeCounter
             $null = Connect-PrivilegedBridge $bridge $counter
+            $null = Assert-ForegroundTarget $bridge $counter $evidence.steps $evidence "lifecycle-enter"
             $enterId = $counter.Next
             $counter.Next = $enterId + 1
             Send-McpLine $bridge @{
@@ -756,7 +948,7 @@ try {
             }
             Start-Sleep -Milliseconds 150
             $ownPid2 = $bridge.Pid
-            Stop-OwnBridge $bridge
+            Stop-OwnBridge $bridge -KillNow
             $transportError2 = $null
             try {
                 $null = Receive-McpId $bridge $enterId 5000
@@ -764,11 +956,12 @@ try {
                 $transportError2 = "$($_.Exception.Message)"
             }
             $evidence.steps.Add([ordered]@{
-                    step            = "disconnect-after-enter"
-                    bridge_pid      = $ownPid2
-                    transport       = if ($transportError2) { "failed" } else { "unexpectedly-answered" }
-                    transport_error = $transportError2
-                    effect          = "unknown"
+                    step              = "disconnect-after-enter"
+                    bridge_pid        = $ownPid2
+                    disconnect_method = "own-bridge-pid-kill"
+                    transport         = if ($transportError2) { "failed" } else { "unexpectedly-answered" }
+                    transport_error   = $transportError2
+                    effect            = "unknown"
                 }) | Out-Null
             $bridge = $null
 
@@ -792,20 +985,32 @@ try {
                 # The response was already buffered when the bridge died: a timing miss, not a
                 # product failure and never a pass.
                 $evidence.verdict = "NOT_RUN"
+                $evidence.effect = "unknown"
                 $evidence.limitations += "a disconnect cell answered before the kill (timing miss); retry the cell instead of counting it"
             } elseif ($failed.Count -ge 2) {
                 # Transport failure with an unknown effect is the DoD-7 outcome, not a success claim.
+                # Reconnect/revoke remain NOT_RUN owner steps, so the top verdict stays non-pass.
                 $evidence.verdict = "DELIVERED_UNVERIFIED"
+                $evidence.effect = "unknown"
+                $evidence.limitations += "disconnect effect is UNKNOWN, never 'nothing was sent'; reconnect and revoke are owner cells and remain NOT_RUN"
             } else {
                 $evidence.verdict = "FAILED"
+                $evidence.effect = "unknown"
                 $evidence.limitations += "a disconnect cell did not reach a bridge child; no transport failure was observed"
             }
         }
     }
 } catch {
     if (-not $script:abortRecorded) {
-        $evidence.limitations += "harness error: $($_.Exception.Message)"
-        if ($evidence.verdict -eq "NOT_RUN") { $evidence.verdict = "FAILED" }
+        $message = "$($_.Exception.Message)"
+        $evidence.limitations += "harness error: $message"
+        # A failed activate / a measured idle shortfall is an environment/timing miss, not a
+        # product failure. A target-binding mismatch or any other error is a failure.
+        if ($message -like "activate-not-foregrounded:*" -or $message -like "timing-miss:*") {
+            $evidence.verdict = "NOT_RUN"
+        } else {
+            $evidence.verdict = "FAILED"
+        }
     }
 } finally {
     if ($null -ne $bridge) { Stop-OwnBridge $bridge }
@@ -814,5 +1019,8 @@ try {
 }
 
 Write-Host "VERDICT: $($evidence.verdict)"
-if ($evidence.verdict -in @("FAILED", "NOT_RUN")) { exit 1 }
+# Only a positive qualification token is a pass. DELIVERED_UNVERIFIED / NOT_RUN / FAILED exit
+# non-zero (0126 F-m1/F-l3) so a wrapper cannot read a gap as success.
+$passVerdicts = @("OBSERVED_EFFECT", "REFUSED_EXPECTED", "UNSUPPORTED", "RECORDED")
+if ($evidence.verdict -notin $passVerdicts) { exit 1 }
 exit 0

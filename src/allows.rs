@@ -162,7 +162,8 @@ fn acquire_session_lock() -> SessionLock {
         })
         .unwrap_or_else(|_| std::env::temp_dir().join("hands-session-allows.lock"));
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        // R3: never leave %LOCALAPPDATA%\hands High-labelled on a clean profile (0126 F-M1).
+        let _ = crate::logs::ensure_private_dir(dir);
     }
     // Wait for a live holder. Steal only a stale lock (crashed process).
     const STALE: Duration = Duration::from_secs(5);
@@ -196,7 +197,8 @@ fn wipe_marker_path() -> Result<PathBuf, HandsError> {
 fn write_wipe_marker() -> Result<(), HandsError> {
     let path = wipe_marker_path()?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
+        // R3: the medium-labelled root the stop file also needs (0126 F-M1).
+        crate::logs::ensure_private_dir(dir)
             .map_err(|err| HandsError::Fence(format!("create wipe dir: {err}")))?;
     }
     std::fs::write(&path, b"wiped")
@@ -620,7 +622,8 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), HandsError> {
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(dir)
+        // R3: the allows root must be Medium-labelled at any creator IL (0126 F-M1).
+        crate::logs::ensure_private_dir(dir)
             .map_err(|err| HandsError::Fence(format!("create dir {}: {err}", dir.display())))?;
     }
     let tmp_name = format!(
@@ -928,5 +931,28 @@ mod tests {
                 AllowHit::Persist
             );
         });
+    }
+
+    #[test]
+    fn allows_writes_create_a_medium_labelled_root() {
+        // 0126 F-M1: the session-allows/persist root is the same %LOCALAPPDATA%\hands the stop
+        // file needs. A High-first clean profile must not leave it High-labelled + NO_WRITE_UP.
+        const MEDIUM_RID: u32 = 0x2000;
+        let root =
+            std::env::temp_dir().join(format!("hands-allows-label-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let hands = root.join("hands");
+        let path = hands.join("session-allows.json");
+        atomic_write(&path, b"{}").expect("atomic_write");
+        assert!(path.exists(), "{}", path.display());
+        assert_eq!(
+            crate::logs::dir_label_rid(&hands),
+            Some(MEDIUM_RID),
+            "the allows root must be created Medium-labelled, not with a plain create_dir_all"
+        );
+        // A second write into the existing directory is a no-op and does not relabel.
+        atomic_write(&path, b"{}").expect("atomic_write again");
+        assert_eq!(crate::logs::dir_label_rid(&hands), Some(MEDIUM_RID));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -91,8 +91,13 @@ fn qualify_inspect_reports_a_fixed_template_and_no_actuation() {
     let template = json["fixed_template"].as_str().expect("template");
     assert!(template.contains("Out-File -Encoding ascii"), "{template}");
     assert!(template.contains("hands-qual-"), "{template}");
+    // The target must set the High label itself (F-B1): a plain elevated write is not labelled.
+    assert!(
+        template.contains("icacls") && template.contains("/setintegritylevel High"),
+        "the fixed template must set the High label from the target: {template}"
+    );
     let nonce = json["nonce"].as_str().expect("nonce");
-    assert_eq!(template.matches(nonce).count(), 2, "{template}");
+    assert_eq!(template.matches(nonce).count(), 3, "{template}");
     assert!(
         stdout.contains("\"actuation\":false"),
         "-Inspect must declare no actuation:\n{stdout}"
@@ -252,6 +257,11 @@ fn qualify_never_persists_or_registers_or_reads_secrets() {
     for banned in [
         "Register-ScheduledTask",
         "Unregister-ScheduledTask",
+        "Set-ScheduledTask",
+        "Enable-ScheduledTask",
+        "Disable-ScheduledTask",
+        "Start-ScheduledTask",
+        "Stop-ScheduledTask",
         "schtasks",
         "Start-Process",
         "-Verb RunAs",
@@ -266,6 +276,21 @@ fn qualify_never_persists_or_registers_or_reads_secrets() {
         assert!(
             !code.contains(banned),
             "the harness must not contain the executable token {banned}"
+        );
+    }
+    // Case-insensitive, so `runas` and the `start` process alias cannot slip in either (F-l7).
+    let lower = code.to_ascii_lowercase();
+    for banned in ["runas", "start-process"] {
+        assert!(
+            !lower.contains(banned),
+            "banned (case-insensitive): {banned}"
+        );
+    }
+    for line in code.lines() {
+        let trimmed = line.trim_start().to_ascii_lowercase();
+        assert!(
+            !trimmed.starts_with("start "),
+            "the `start` alias must not be used as a command: {line}"
         );
     }
     assert!(
@@ -402,4 +427,233 @@ fn qualify_kills_only_its_own_bridge_child() {
         code.contains("$Bridge.Pid = $process.Id") || code.contains("Pid = $process.Id"),
         "the harness must record the pid it spawned"
     );
+}
+
+/// Mandatory-label RID of a path (S-1-16-<rid>), read from the SACL label ACE. This is the reader
+/// the harness needs: an unlabelled file returns `None`, never a guessed High.
+fn label_rid(path: &std::path::Path) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        ACL, GetAce, GetSecurityDescriptorSacl, GetSidSubAuthority, GetSidSubAuthorityCount,
+        LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SYSTEM_MANDATORY_LABEL_ACE,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    let mut sacl: *mut ACL = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            Some(&raw mut sacl),
+            &raw mut sd,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let mut present = windows::core::BOOL::default();
+    let mut defaulted = windows::core::BOOL::default();
+    let mut label_acl: *mut ACL = std::ptr::null_mut();
+    let mut rid = None;
+    if unsafe {
+        GetSecurityDescriptorSacl(sd, &raw mut present, &raw mut label_acl, &raw mut defaulted)
+    }
+    .is_ok()
+        && present.as_bool()
+        && !label_acl.is_null()
+    {
+        let mut ace = std::ptr::null_mut();
+        if unsafe { GetAce(label_acl, 0, &raw mut ace) }.is_ok() {
+            let label = unsafe { &*ace.cast::<SYSTEM_MANDATORY_LABEL_ACE>() };
+            let sid = PSID(std::ptr::from_ref(&label.SidStart).cast_mut().cast());
+            unsafe {
+                let count = *GetSidSubAuthorityCount(sid);
+                if count > 0 {
+                    rid = Some(*GetSidSubAuthority(sid, u32::from(count) - 1));
+                }
+            }
+        }
+    }
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+    rid
+}
+
+/// Every input call must be preceded (within `window` chars) by a foreground/target bind.
+fn assert_bound_before(code: &str, call: &str, guard: &str, window: usize) {
+    let mut search_from = 0;
+    while let Some(found) = code[search_from..].find(call) {
+        let at = search_from + found;
+        let before = &code[..at];
+        let guard_at = before
+            .rfind(guard)
+            .unwrap_or_else(|| panic!("{call} at {at} has no preceding {guard}"));
+        assert!(
+            at - guard_at <= window,
+            "{call} at {at} is not bound: last {guard} at {guard_at}"
+        );
+        search_from = at + call.len();
+    }
+}
+
+#[test]
+fn high_label_set_step_is_present_and_the_reader_reads_it() {
+    // F-B1: a plain elevated write is NOT High-labelled, so the target's fixed template must set the
+    // label itself, and the harness must read that label back rather than guess.
+    let dir = temp_evidence_dir();
+    let (json, _) = inspect("console", "hwnd:1", &dir);
+    let template = json["fixed_template"].as_str().expect("template");
+    let write_at = template.find("Out-File").expect("write step");
+    let label_at = template
+        .find("/setintegritylevel High")
+        .expect("label-set step in the fixed template");
+    assert!(
+        write_at < label_at,
+        "the target must write the artifact then set its High label: {template}"
+    );
+
+    let raw = source();
+    assert!(
+        raw.contains("GetNamedSecurityInfoW") && raw.contains("MandatoryLabelSid"),
+        "the label reader must read the SACL label RID, not parse a guess"
+    );
+    assert!(
+        raw.contains("LABEL_SECURITY_INFORMATION = 0x10"),
+        "the reader must name the label security information class"
+    );
+
+    // The reader itself: a plain temp file has no explicit label, and the same set step the
+    // template uses makes the reader return the real High RID.
+    let path = std::env::temp_dir().join(format!("hands-label-{}.txt", uuid::Uuid::new_v4()));
+    std::fs::write(&path, b"PROBE").expect("write probe");
+    assert_eq!(
+        label_rid(&path),
+        None,
+        "a plain write must not read as High (this is the F-B1 fact)"
+    );
+    let out = Command::new("icacls")
+        .arg(&path)
+        .args(["/setintegritylevel", "High"])
+        .output()
+        .expect("icacls");
+    assert!(
+        out.status.success(),
+        "icacls set High failed (the harness needs a High-IL context): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        label_rid(&path),
+        Some(0x3000),
+        "the reader must read the High label the template sets"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn qualify_binds_the_foreground_target_before_every_input() {
+    let code = code_only();
+    assert!(
+        code.contains("function Assert-ForegroundTarget"),
+        "the harness must re-resolve the target before input"
+    );
+    assert!(
+        code.contains("target-binding:"),
+        "a binding mismatch must be a named failure"
+    );
+    assert!(
+        code.contains("throw \"activate-not-foregrounded:"),
+        "a failed activate must refuse, not continue"
+    );
+    // Every type/key dispatch (tool or direct line) is bound within the same block.
+    assert_bound_before(
+        &code,
+        "Invoke-WithOptionalOnceConfirm $bridge $counter \"type\"",
+        "Assert-ForegroundTarget $bridge",
+        900,
+    );
+    assert_bound_before(
+        &code,
+        "Invoke-WithOptionalOnceConfirm $bridge $counter \"key\"",
+        "Assert-ForegroundTarget $bridge",
+        900,
+    );
+    assert_bound_before(
+        &code,
+        "params  = @{ name = \"type\"; arguments = @{ text = $stopFiller } }",
+        "Assert-ForegroundTarget $bridge",
+        900,
+    );
+    assert_bound_before(
+        &code,
+        "params  = @{ name = \"key\"; arguments = @{ name = \"enter\" } }",
+        "Assert-ForegroundTarget $bridge",
+        900,
+    );
+    // The stop case must activate + click before the in-flight type (F-M2).
+    let stop = code
+        .split("\"stop\" {")
+        .nth(1)
+        .expect("stop case")
+        .split("\"lifecycle\" {")
+        .next()
+        .expect("stop case end");
+    assert!(stop.contains("\"activate\""), "stop must activate");
+    assert!(
+        stop.contains("Invoke-Tool $bridge $counter \"click\""),
+        "stop must click the target before typing"
+    );
+}
+
+#[test]
+fn qualify_stop_and_lifecycle_cells_are_bounded_and_named() {
+    let code = squeezed(&code_only());
+    // F-l4: honour HANDS_LOGS_DIR, measure idle, enforce last-case.
+    assert!(code.contains("function Get-DeskLogPath"));
+    assert!(code.contains("$env:HANDS_LOGS_DIR"));
+    assert!(code.contains("idle_ms = $idleMs"));
+    assert!(code.contains("stop-case-completed.json"));
+    assert!(
+        code.contains("stop must be the last case of a session"),
+        "the harness must refuse a case after stop"
+    );
+    // F-l2: the lifecycle disconnect is the named own-bridge pid kill.
+    assert!(code.contains("disconnect_method = \"own-bridge-pid-kill\""));
+    assert!(code.contains("Stop-OwnBridge $bridge -KillNow"));
+    // F-m1 / F-l3: a frozen-only (pre-dispatch) refusal is NOT_RUN, not DELIVERED_UNVERIFIED.
+    let pre = code
+        .find("the stop landed before dispatch (frozen without post_dispatch/delivery:unknown)")
+        .expect("pre-dispatch timing-miss branch");
+    let prior = &code[pre - 400.min(pre)..pre];
+    assert!(
+        prior.contains("$evidence.verdict = \"NOT_RUN\""),
+        "a pre-dispatch frozen refusal must map to NOT_RUN"
+    );
+    // A non-pass verdict exits non-zero.
+    assert!(
+        code.contains("$passVerdicts = @(\"OBSERVED_EFFECT\", \"REFUSED_EXPECTED\", \"UNSUPPORTED\", \"RECORDED\")"),
+        "only positive tokens may exit zero"
+    );
+    assert!(code.contains("if ($evidence.verdict -notin $passVerdicts) { exit 1 }"));
+    // F-m2: only the 0115 focus gate maps to UNSUPPORTED in the terminal case.
+    let gate = code
+        .find("focused control is not an edit, combo, or document")
+        .expect("focus-gate guard");
+    let unsupported = code[gate..]
+        .find("$evidence.verdict = \"UNSUPPORTED\"")
+        .expect("UNSUPPORTED assignment");
+    assert!(
+        unsupported <= 400,
+        "UNSUPPORTED must stay inside the focus-gate guard"
+    );
+    // F-l1: the reader prefers the SACL reader and falls back to the label text.
+    assert!(code.contains("[HandsMandatoryLabel]::MandatoryLabelSid"));
+    assert!(code.contains("Mandatory Label"));
 }

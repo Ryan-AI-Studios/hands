@@ -8065,8 +8065,9 @@ mod tests {
         static LEFTUP_SENDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    /// A second writer (not this process) drops a fresh stop request mid-type. This is the
-    /// file path a medium `hands stop` uses, not an in-process freeze.
+    /// A second writer drops a fresh stop request mid-type. This writes the same
+    /// `HANDS_STOP_REQUEST_PATH` file a medium `hands stop` writes; the cross-process proof is owner
+    /// cell O8 (0126 F-l5).
     fn second_writer_stop_send(_: &[INPUT]) -> Result<(), HandsError> {
         let n = SECOND_WRITER_SENDS.with(|c| {
             let n = c.get() + 1;
@@ -8534,6 +8535,29 @@ mod tests {
                 TYPE_SENDS.with(|c| c.get()),
                 2,
                 "one Enter press is one down + one up after the once allow"
+            );
+
+            // Once is consumed: a third Enter must fence again and send nothing (0126 F-l6).
+            TYPE_SENDS.with(|c| c.set(0));
+            let consumed = key(ActuateRequest {
+                session_id: Some(session.into()),
+                name: Some("enter".into()),
+                ..ActuateRequest::default()
+            })
+            .expect("key envelope");
+            assert!(
+                !consumed.ok,
+                "a consumed once allow must not authorize a second Enter: {consumed:?}"
+            );
+            assert_eq!(
+                consumed.fence.as_ref().map(|f| f.category.as_str()),
+                Some("messages"),
+                "{consumed:?}"
+            );
+            assert_eq!(
+                TYPE_SENDS.with(|c| c.get()),
+                0,
+                "a consumed once allow must send nothing"
             );
         });
         lease::reset_for_test();

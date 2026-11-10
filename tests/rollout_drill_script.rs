@@ -47,9 +47,14 @@ fn rollout_drill_swaps_and_restores_with_recorded_hashes() {
     );
 
     let temp_dir = json["temp_dir"].as_str().expect("temp dir");
+    let temp_path = std::path::Path::new(temp_dir);
+    let mut temp_roots = vec![std::env::temp_dir()];
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        temp_roots.push(std::path::PathBuf::from(local).join("Temp"));
+    }
     assert!(
-        std::path::Path::new(temp_dir).starts_with(std::env::temp_dir()),
-        "the drill ran outside the temp folder: {temp_dir}"
+        temp_roots.iter().any(|root| temp_path.starts_with(root)),
+        "the drill ran outside a temp folder: {temp_dir}"
     );
     assert!(
         !std::path::Path::new(temp_dir).exists(),

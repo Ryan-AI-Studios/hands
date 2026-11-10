@@ -1,11 +1,12 @@
 const HOST_NAME = "com.helpinghands.host";
 const FRAME_PORT_NAME = "hands-frame";
 const FRAME_PORT_CAP = 32;
-const FRAME_ROW_CAP = 12;
-const ANNOUNCE_STEP_MS = 60;
-const LINK_SETTLE_MS = 60;
+const FRAME_ROW_CAP = 12; // including frame 0
+const ANNOUNCE_STEP_MS = 40;
+const LINK_SETTLE_MS = 40;
 const MEASURE_TIMEOUT_MS = 100;
-const CHILD_SNAPSHOT_TIMEOUT_MS = 80;
+const CHILD_SNAPSHOT_TIMEOUT_MS = 70;
+const FANOUT_BUDGET_MS = 250;
 const FRAME_ELEMENT_CAP = 8;
 
 let hostPort = null;
@@ -15,6 +16,8 @@ let reconnectTimer = null;
 // Entry: {tab, frameId, documentId, documentLifecycle, origin, url, port, token,
 //         doc, link, linkState, linkReason, parent, announced, late}
 const frameRegistry = new Map();
+// Rejected connected ports per tab: a frame-less `frame_cap_exceeded` row must still appear.
+const rejectedPorts = new Map();
 // Token -> entry. Tokens are issued over a private port and never broadcast.
 const tokenIndex = new Map();
 // Token -> pending measurement callbacks (fresh frame_measure).
@@ -171,6 +174,7 @@ function revokeEntry(entry) {
 }
 
 function pruneTab(tabId) {
+  rejectedPorts.delete(tabId);
   const frames = frameRegistry.get(tabId);
   if (!frames) {
     return;
@@ -192,6 +196,7 @@ function registerFramePort(port) {
   const frames = frameTable(tabId);
   const existing = frames.get(frameId);
   if (!existing && frames.size >= FRAME_PORT_CAP) {
+    rejectedPorts.set(tabId, (rejectedPorts.get(tabId) || 0) + 1);
     post(port, { op: "frame_reject", error: "frame_cap_exceeded" });
     try {
       port.disconnect();
@@ -485,7 +490,19 @@ function collectFrameRows(tabId, frameElements) {
       continue;
     }
     const origin = clampOrigin(entry.origin);
-    if (entry.link && entry.linkState === "ok") {
+    if (entry.budget) {
+      const row = {
+        frame: entry.frameId,
+        status: "unavailable",
+        reason: "frame_budget_exceeded",
+      };
+      if (origin) row.origin = origin;
+      if (entry.link) row.link = entry.link;
+      rows.push(row);
+      if (entry.link && Number.isInteger(entry.link.slot)) {
+        linkedSlots.add(entry.link.slot);
+      }
+    } else if (entry.link && entry.linkState === "ok") {
       const row = { frame: entry.frameId, status: "ok" };
       if (entry.link.visible !== true) {
         row.status = "unavailable";
@@ -551,17 +568,45 @@ function collectFrameRows(tabId, frameElements) {
     if (origin) row.origin = origin;
     rows.push(row);
   }
-  // Rank linked/registered frames first; keep unavailable reasons behind them.
+  const rejected = rejectedPorts.get(tabId) || 0;
+  if (rejected > 0) {
+    // A refused 33rd port must not vanish: one frame-less cap row carries the token.
+    rows.push({ status: "unavailable", reason: "frame_cap_exceeded" });
+  }
+  // Rank visible/on-screen linked frames first, then nearest to the top-left, then DOM order.
+  const rank = (row) => {
+    if (row.link && row.status === "ok" && row.link.onscreen === true) return 0;
+    if (row.link) return 1;
+    return 2;
+  };
   rows.sort((a, b) => {
-    const rank = (row) => (row.status === "ok" ? 0 : 1);
-    return rank(a) - rank(b);
+    const byRank = rank(a) - rank(b);
+    if (byRank !== 0) return byRank;
+    const da = a.link ? Math.hypot(a.link.content_left, a.link.content_top) : Infinity;
+    const db = b.link ? Math.hypot(b.link.content_left, b.link.content_top) : Infinity;
+    if (da !== db) return da - db;
+    const sa = a.link && Number.isInteger(a.link.slot) ? a.link.slot : 1e9;
+    const sb = b.link && Number.isInteger(b.link.slot) ? b.link.slot : 1e9;
+    return sa - sb;
   });
-  const total = rows.length;
-  const kept = rows.slice(0, FRAME_ROW_CAP);
+  const childCap = FRAME_ROW_CAP - 1; // frame 0 counts against the cap
+  const totalChildren = rows.length;
+  let kept = rows.slice(0, childCap);
+  const truncated = totalChildren > childCap;
+  const capRow = { status: "unavailable", reason: "frame_cap_exceeded" };
+  const hasCapRow = kept.some((row) => row.reason === "frame_cap_exceeded");
+  if (rejected > 0 && !hasCapRow) {
+    kept = kept.slice(0, Math.max(0, childCap - 1));
+    kept.push(capRow);
+  } else if (truncated && !hasCapRow) {
+    kept = kept.slice(0, Math.max(0, childCap - 1));
+    kept.push(capRow);
+  }
   return {
     frames: kept,
-    frames_total: total,
-    frames_truncated: total > kept.length,
+    // + frame 0; extra refused ports beyond the one cap row still count.
+    frames_total: totalChildren + 1 + Math.max(0, rejected - 1),
+    frames_truncated: truncated || rejected > 0,
   };
 }
 
@@ -621,16 +666,18 @@ function frameBySlot(tabId, slot) {
   return null;
 }
 
-function childSnapshot(entry, stored, detail, callback) {
+function childSnapshot(entry, stored, detail, maxNodes, callback) {
   sendToFrame(
     entry.tab,
     entry.frameId,
     {
       op: "snapshot",
       detail: detail || "default",
-      store: stored,
+      store: false,
+      // A fan-out reply is a candidate; only an accepted reply is committed by the SW.
+      pending: stored === true,
       light: true,
-      max_nodes: 1000,
+      max_nodes: maxNodes,
       frames: false,
       frame: entry.frameId,
     },
@@ -644,7 +691,39 @@ function childSnapshot(entry, stored, detail, callback) {
   );
 }
 
-function collectChildSnapshots(tabId, entries, stored, detail, callback) {
+function commitChildSnapshot(entry, reply, callback) {
+  if (!reply || reply.pending !== true || typeof reply.snap !== "string") {
+    callback(reply);
+    return;
+  }
+  sendToFrame(
+    entry.tab,
+    entry.frameId,
+    { op: "frame_commit", frame: entry.frameId, snap: reply.snap },
+    (commit) => {
+      if (
+        chrome.runtime.lastError ||
+        !commit ||
+        commit.error ||
+        commit.committed !== true
+      ) {
+        callback(null);
+        return;
+      }
+      callback(
+        Object.assign({}, reply, {
+          doc: commit.doc,
+          snap: commit.snap,
+          retained: commit.retained,
+          committed: true,
+          pending: false,
+        })
+      );
+    }
+  );
+}
+
+function collectChildSnapshots(tabId, entries, stored, detail, maxNodes, callback) {
   const replies = new Map();
   if (!entries.length) {
     callback(replies);
@@ -668,15 +747,31 @@ function collectChildSnapshots(tabId, entries, stored, detail, callback) {
       finish();
     }
   };
-  // Discarded late replies use `store:false`? No: the caller decides `stored`; a reply that
-  // arrives after this deadline is simply not merged and did not retire anything new.
   setTimeout(finish, CHILD_SNAPSHOT_TIMEOUT_MS);
   for (const entry of entries) {
-    childSnapshot(entry, stored, detail, (reply) => {
-      if (reply) {
-        replies.set(entry.frameId, reply);
+    childSnapshot(entry, stored, detail, maxNodes, (reply) => {
+      if (finished) {
+        // Late/discarded: never commit, so the child's `lastSnapshot` is untouched.
+        return;
       }
-      done();
+      if (!reply) {
+        done();
+        return;
+      }
+      if (!stored) {
+        replies.set(entry.frameId, reply);
+        done();
+        return;
+      }
+      commitChildSnapshot(entry, reply, (committed) => {
+        if (finished) {
+          return;
+        }
+        if (committed) {
+          replies.set(entry.frameId, committed);
+        }
+        done();
+      });
     });
   }
 }
@@ -686,7 +781,13 @@ function mergeFrameSnapshot(out, tab, msg, replies, frameElements) {
   for (const [frameId, child] of replies) {
     const doc = typeof child.doc === "string" ? child.doc : null;
     const snap = typeof child.snap === "string" ? child.snap : null;
-    const valid = stored && doc && snap && /^[0-9a-f]{4}$/.test(doc) && /^[0-9a-f]{8}$/.test(snap);
+    const valid =
+      stored &&
+      child.committed === true &&
+      doc &&
+      snap &&
+      /^[0-9a-f]{4}$/.test(doc) &&
+      /^[0-9a-f]{8}$/.test(snap);
     const elements = Array.isArray(child.elements) ? child.elements : [];
     for (const el of elements) {
       if (!el || typeof el !== "object") {
@@ -735,25 +836,70 @@ function mergeFrameSnapshot(out, tab, msg, replies, frameElements) {
 function finishFrameSnapshot(out, tab, port, msg) {
   const frameElements = Array.isArray(out.frame_elements) ? out.frame_elements : [];
   delete out.frame_elements;
+  const state = { entries: [], replies: new Map(), done: false };
+  const finalize = () => {
+    if (state.done) {
+      return;
+    }
+    state.done = true;
+    const entries = state.entries.length
+      ? state.entries
+      : [...(frameRegistry.get(tab.id) || new Map()).values()].filter(
+          (entry) => entry.frameId !== 0 && entry.linkState === "ok"
+        );
+    for (const entry of entries) {
+      if (!state.replies.has(entry.frameId)) {
+        entry.budget = true;
+      }
+    }
+    mergeFrameSnapshot(out, tab, msg, state.replies, frameElements);
+    post(port, out);
+  };
+  // One hard fan-out budget: announce + measure + child snapshots share it.
+  setTimeout(finalize, FANOUT_BUDGET_MS);
   announceAndMeasure(tab.id, () => {
     const frames = frameRegistry.get(tab.id) || new Map();
-    const entries = [...frames.values()]
-      .filter((entry) => entry.frameId !== 0 && entry.linkState === "ok")
-      .slice(0, FRAME_ROW_CAP);
+    const entries = [...frames.values()].filter(
+      (entry) => entry.frameId !== 0 && entry.linkState === "ok"
+    );
+    for (const entry of entries) {
+      entry.budget = false;
+    }
+    state.entries = entries;
+    // Top walk keeps its 4000-node cap; the child budget keeps the total under 12000.
+    const maxNodes = Math.max(100, Math.floor(8000 / Math.max(1, entries.length)));
     collectChildSnapshots(
       tab.id,
       entries,
       out.stored !== false,
       msg && msg.detail,
+      maxNodes,
       (replies) => {
-        mergeFrameSnapshot(out, tab, msg, replies, frameElements);
-        post(port, out);
+        for (const [frameId, reply] of replies) {
+          state.replies.set(frameId, reply);
+        }
+        finalize();
       }
     );
   });
 }
 
-function refreshChain(tabId, frameId, callback) {
+function pointFromRect(rect) {
+  if (
+    !rect ||
+    !Number.isFinite(rect.left) ||
+    !Number.isFinite(rect.top) ||
+    !Number.isFinite(rect.width) ||
+    !Number.isFinite(rect.height) ||
+    rect.width <= 0 ||
+    rect.height <= 0
+  ) {
+    return null;
+  }
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
+function refreshChain(tabId, frameId, point, callback) {
   const frames = frameRegistry.get(tabId);
   if (!frames) {
     callback(null);
@@ -783,6 +929,9 @@ function refreshChain(tabId, frameId, callback) {
     current = parent;
   }
   let index = 0;
+  // The point starts in the target frame's local viewport. After each level it is translated
+  // into that parent's viewport, so the next level tests the same click point.
+  let local = point && Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
   const next = () => {
     if (index >= ancestors.length) {
       const chain = [];
@@ -804,15 +953,22 @@ function refreshChain(tabId, frameId, callback) {
       return;
     }
     const token = level.token;
+    const at = local ? { x: local.x, y: local.y } : null;
     // Register the waiter before posting: a fast parent replies in the same turn.
     waitMeasure(token, (link) => {
       if (!link) {
         callback(null);
         return;
       }
+      if (local) {
+        local = {
+          x: link.content_left + local.x,
+          y: link.content_top + local.y,
+        };
+      }
       next();
     });
-    post(parent.port, { op: "frame_measure", tokens: [token] });
+    post(parent.port, { op: "frame_measure", tokens: [token], point: at });
   };
   next();
 }
@@ -825,7 +981,12 @@ function enrichFrameReply(tab, frame, out, port) {
       post(port, out);
       return;
     }
-    refreshChain(tab.id, frame, (chain) => {
+    const point =
+      pointFromRect(out.rectCss) ||
+      (out.css && Number.isFinite(out.css.x) && Number.isFinite(out.css.y)
+        ? { x: out.css.x, y: out.css.y }
+        : null);
+    refreshChain(tab.id, frame, point, (chain) => {
       if (!chain) {
         out.error = "frame_geometry_unavailable";
         post(port, out);
@@ -856,7 +1017,7 @@ function frameBindingRequest(port, tab, msg) {
     sendToFrame(
       tab.id,
       frame,
-      { op: "frame_binding", frame: frame, doc: msg.doc, snap: msg.snap },
+      { op: "frame_binding", frame: frame, doc: msg.doc, snap: msg.snap, idx: msg.idx },
       (reply) => {
         if (chrome.runtime.lastError) {
           post(port, Object.assign({ error: "frame_unavailable" }, evidence));
@@ -870,7 +1031,8 @@ function frameBindingRequest(port, tab, msg) {
           post(port, Object.assign({ error: reply.error }, evidence));
           return;
         }
-        refreshChain(tab.id, frame, (chain) => {
+        const point = pointFromRect(reply.rectCss);
+        refreshChain(tab.id, frame, point, (chain) => {
           const out = copyReply(reply);
           Object.assign(out, evidence);
           out.chain = chain;

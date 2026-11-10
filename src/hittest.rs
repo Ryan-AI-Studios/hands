@@ -589,10 +589,9 @@ fn point_from_frame(
         ));
     }
     let (Some(frame), Some(local)) = (top_reply.iframe_frame, top_reply.local_css) else {
-        return Ok(point_reply_envelope(
-            contract,
-            unknown_at_point("frame_geometry_unavailable"),
-        ));
+        // Keep the informative top `cross_frame` verdict (with the iframe blocker) when the
+        // frame is unlinked; it is still fail-closed, not a guessed point.
+        return Ok(point_reply_envelope(contract, top_reply.at_point));
     };
     if tab == 0 {
         return Ok(point_reply_envelope(
@@ -2160,6 +2159,191 @@ mod tests {
         assert!(!error.contains("blocked_by="), "{error}");
         assert!(env.point.is_some());
         assert!(env.assessment.is_some());
+    }
+
+    fn frame_link(left: f64) -> crate::frames::FrameLink {
+        crate::frames::FrameLink {
+            parent: Some(0),
+            content_left: left,
+            content_top: 60.0,
+            content_width: 300.0,
+            content_height: 250.0,
+            clip: vec![crate::frames::ClipRect {
+                left,
+                top: 60.0,
+                width: 300.0,
+                height: 250.0,
+            }],
+            transform_ok: true,
+            visible: true,
+            hit_ok: true,
+            onscreen: true,
+            viewport_w: 800.0,
+            viewport_h: 600.0,
+            ..crate::frames::FrameLink::default()
+        }
+    }
+
+    fn child_assess(chain: Vec<crate::frames::FrameLink>) -> chrome::AssessReply {
+        chrome::AssessReply {
+            at_point: AtPoint {
+                element: Some(PointBlocker {
+                    kind: BlockerKind::Element,
+                    tag: Some("button".into()),
+                    role: None,
+                    name: None,
+                    rect_css: Some(CssRect {
+                        left: 10.0,
+                        top: 10.0,
+                        width: 20.0,
+                        height: 20.0,
+                    }),
+                    reason: None,
+                }),
+                shadow_path: Vec::new(),
+                interactable: Some(true),
+                reason: None,
+                notes: Vec::new(),
+                confidence: AssessmentConfidence::High,
+                elapsed_ms: None,
+                frame: None,
+            },
+            css: Some(CssPoint::new(10.0, 10.0)),
+            identity: chrome::PageIdentity::default(),
+            iframe_frame: None,
+            local_css: None,
+            frame: Some(3),
+            top_metrics: Some(chrome::ChromeMetrics {
+                inner_width: 800.0,
+                inner_height: 600.0,
+                ..chrome::ChromeMetrics::default()
+            }),
+            frame_chain: chain,
+        }
+    }
+
+    fn top_cross_frame(frame: Option<u32>) -> chrome::AssessReply {
+        chrome::AssessReply {
+            at_point: AtPoint {
+                element: None,
+                shadow_path: Vec::new(),
+                interactable: None,
+                reason: Some("cross_frame".into()),
+                notes: Vec::new(),
+                confidence: AssessmentConfidence::None,
+                elapsed_ms: None,
+                frame: None,
+            },
+            css: Some(CssPoint::new(50.0, 70.0)),
+            identity: chrome::PageIdentity::default(),
+            iframe_frame: frame,
+            local_css: Some(CssPoint::new(10.0, 10.0)),
+            frame: None,
+            top_metrics: None,
+            frame_chain: Vec::new(),
+        }
+    }
+
+    fn point_map() -> chrome::ChromeMap {
+        let mut map = test_map(
+            Some(valid_report(
+                1.0,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 800,
+                    h: 600,
+                },
+            )),
+            None,
+        );
+        map.tab = Some(12);
+        map.identity = Some(chrome::PageIdentity {
+            assess_v: Some(1),
+            ..chrome::PageIdentity::default()
+        });
+        map
+    }
+
+    #[test]
+    fn point_mode_enters_a_linked_frame_and_composes() {
+        chrome::set_assess_sequence(vec![
+            Ok(top_cross_frame(Some(3))),
+            Ok(child_assess(vec![frame_link(40.0)])),
+        ]);
+        let env = point_after_snapshot(
+            chrome::SnapshotOutcome::Map(Box::new(point_map())),
+            PhysicalPoint { x: 50, y: 70 },
+            25,
+        )
+        .expect("point");
+        chrome::set_assess_sequence(Vec::new());
+        let at = env.at_point.expect("at_point");
+        assert_eq!(at.interactable, Some(true));
+        assert_eq!(at.frame, Some(3), "frame provenance is retained");
+        assert_eq!(
+            at.element.expect("element").rect_css.expect("rect").left,
+            50.0
+        );
+    }
+
+    #[test]
+    fn point_mode_refuses_a_frame_point_mismatch() {
+        chrome::set_assess_sequence(vec![
+            Ok(top_cross_frame(Some(3))),
+            Ok(child_assess(vec![frame_link(45.0)])),
+        ]);
+        let env = point_after_snapshot(
+            chrome::SnapshotOutcome::Map(Box::new(point_map())),
+            PhysicalPoint { x: 50, y: 70 },
+            25,
+        )
+        .expect("point");
+        chrome::set_assess_sequence(Vec::new());
+        let at = env.at_point.expect("at_point");
+        assert_eq!(at.interactable, None);
+        assert_eq!(at.reason.as_deref(), Some("frame_geometry_unavailable"));
+    }
+
+    #[test]
+    fn point_mode_unlinked_cross_frame_stays_informative() {
+        chrome::set_assess_sequence(vec![Ok(top_cross_frame(None))]);
+        let env = point_after_snapshot(
+            chrome::SnapshotOutcome::Map(Box::new(point_map())),
+            PhysicalPoint { x: 50, y: 70 },
+            25,
+        )
+        .expect("point");
+        chrome::set_assess_sequence(Vec::new());
+        let at = env.at_point.expect("at_point");
+        assert_eq!(at.interactable, None);
+        assert_eq!(at.reason.as_deref(), Some("cross_frame"));
+    }
+
+    #[test]
+    fn composed_frame_assessment_passes_require_interactable() {
+        let mut resolved = blocked_resolved();
+        let contract = resolved.contract.clone().expect("contract");
+        let css = contract.css.expect("css");
+        let mut assessment = Assessment::unknown(
+            css,
+            CssRect {
+                left: css.x - 10.0,
+                top: css.y - 10.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            "ok",
+        );
+        assessment.interactable = Some(true);
+        assessment.confidence = AssessmentConfidence::High;
+        resolved.assessment = Some(assessment);
+        let refusal =
+            guard_require_interactable("s-frame", &target_info(), &resolved).expect("guard");
+        assert!(
+            refusal.is_none(),
+            "a composed frame assessment must not falsely refuse"
+        );
     }
 
     #[test]

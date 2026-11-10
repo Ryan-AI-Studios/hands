@@ -281,6 +281,28 @@ fn walk_links(
     Err(FrameError::Depth)
 }
 
+/// Translate a frame-local CSS rect into top-frame CSS viewport coordinates **without**
+/// clipping. Used alongside `compose_rect` to detect a clipped target (spec §3.5.11).
+pub fn compose_rect_unclipped(
+    rows: &[RawFrameLink],
+    frame: u32,
+    local: CssRect,
+) -> Result<CssRect, FrameError> {
+    walk_links(
+        rows,
+        frame,
+        |link, rect| {
+            Ok(CssRect {
+                left: link.content_left + rect.left,
+                top: link.content_top + rect.top,
+                width: rect.width,
+                height: rect.height,
+            })
+        },
+        local,
+    )
+}
+
 /// Translate a frame-local CSS rect into top-frame CSS viewport coordinates.
 pub fn compose_rect(
     rows: &[RawFrameLink],

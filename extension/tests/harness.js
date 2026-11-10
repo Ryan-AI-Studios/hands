@@ -89,7 +89,16 @@ function attach(parent, child) {
 function runTimers(timers, limit) {
   const max = limit || 60;
   for (let i = 0; i < max; i += 1) {
-    const index = timers.findIndex((timer) => timer.ms <= 5000);
+    // Virtual clock: run the earliest scheduled delay first, not insertion order.
+    let index = -1;
+    for (let j = 0; j < timers.length; j += 1) {
+      if (timers[j].ms > 5000) {
+        continue;
+      }
+      if (index === -1 || timers[j].ms < timers[index].ms) {
+        index = j;
+      }
+    }
     if (index === -1) {
       return;
     }
@@ -1170,6 +1179,63 @@ function frameLifecycleTests() {
     assert.equal(extra.__frameId, 99);
     const rejected = extra.__port ? true : true;
     assert.ok(rejected);
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.ok(
+      reply.frames.some((row) => row.reason === "frame_cap_exceeded"),
+      "a refused 33rd port still appears as a frame-less cap row"
+    );
+  }
+
+  // F-05: a child that links but never answers the child snapshot is frame_budget_exceeded,
+  // not silently missing or a client timeout.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 9, origin: "https://slow.test" });
+    child.__parentCtx = top;
+    const iframe = element({ tag: "IFRAME", rect: { left: 5, top: 5, width: 300, height: 200 } });
+    iframe.contentWindow = child.window;
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, iframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = () => iframe;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "Target" });
+    h.sw.setContent(12, 9, (msg, cb) => {
+      if (msg.op === "snapshot") {
+        return; // never replies: the fan-out budget must name it
+      }
+      child.__listener(msg, null, (reply) => cb(reply));
+    });
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    const row = rowFor(reply, 9);
+    assert.ok(row);
+    assert.equal(row.reason, "frame_budget_exceeded");
+  }
+
+  // F-07: an on-screen frame ranks before a far off-screen frame that connected first.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const far = h.addFrame({ frameId: 4, origin: "https://far.test" });
+    const near = h.addFrame({ frameId: 5, origin: "https://near.test" });
+    far.__parentCtx = top;
+    near.__parentCtx = top;
+    const farIframe = element({ tag: "IFRAME", rect: { left: 2000, top: 10, width: 300, height: 200 } });
+    farIframe.contentWindow = far.window;
+    const nearIframe = element({ tag: "IFRAME", rect: { left: 10, top: 10, width: 300, height: 200 } });
+    nearIframe.contentWindow = near.window;
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, farIframe);
+    attach(rootEl, nearIframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = (x) => (x < 800 ? nearIframe : farIframe);
+    far.document.documentElement = element({ tag: "BUTTON", innerText: "Far" });
+    near.document.documentElement = element({ tag: "BUTTON", innerText: "Near" });
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    const order = reply.frames
+      .filter((row) => row.frame === 4 || row.frame === 5)
+      .map((row) => row.frame);
+    assert.equal(order.join(","), "5,4", "near/on-screen ranks first");
   }
 
   // E15: a child that never acks is named frame_late, not silently absent.
@@ -1380,6 +1446,27 @@ function frameBindingOpsTests() {
   top.__swPort.postMessage({ op: "frame_measure", tokens: [token] });
   assert.ok(h.sw.calls.posts.length >= postsBefore);
   assert.equal(h.sw.registry(12).get(3).linkState, "ok");
+
+  // F-04: the per-level hit test uses the composed click point, not the box centre. A parent
+  // overlay over the right half leaves the centre clear but must refuse the target point.
+  const overlay = element({ tag: "DIV", rect: { left: 200, top: 0, width: 600, height: 600 } });
+  top.__elementAt = (x) => (x > 200 ? overlay : iframe);
+  top.__swPort.postMessage({
+    op: "frame_measure",
+    tokens: [token],
+    point: { x: 200, y: 100 },
+  });
+  assert.equal(
+    h.sw.registry(12).get(3).link.hit_ok,
+    false,
+    "a partial overlay at the click point refuses the link"
+  );
+  top.__swPort.postMessage({ op: "frame_measure", tokens: [token] });
+  assert.equal(
+    h.sw.registry(12).get(3).link.hit_ok,
+    true,
+    "the centre fallback is clear"
+  );
 }
 
 function frameContentTests() {
@@ -1405,6 +1492,35 @@ function frameContentTests() {
   assert.equal(direct.elements.length, 1);
   const mismatched = listenerResolve(child, { op: "snapshot", frame: 4, store: false });
   assert.equal(mismatched.error, "protocol_error");
+
+  // F-06: a fan-out reply is a candidate until `frame_commit`; an uncommitted (late) reply
+  // never replaces `lastSnapshot`.
+  const pendingCtx = contentContext({ nonce: 0x8888 });
+  vm.runInContext("SELF_FRAME = 3;", pendingCtx);
+  const pendingButton = element({ tag: "BUTTON", innerText: "Target" });
+  pendingCtx.document.documentElement = pendingButton;
+  const candidate = listenerResolve(pendingCtx, {
+    op: "snapshot",
+    store: false,
+    pending: true,
+    light: true,
+  });
+  assert.equal(candidate.pending, true);
+  assert.ok(/^[0-9a-f]{8}$/.test(candidate.snap));
+  assert.equal(vm.runInContext("lastSnapshot", pendingCtx), null, "candidate stores nothing");
+  const commit = listenerResolve(pendingCtx, {
+    op: "frame_commit",
+    frame: 3,
+    snap: candidate.snap,
+  });
+  assert.equal(commit.committed, true);
+  assert.equal(vm.runInContext("lastSnapshot.snap", pendingCtx), candidate.snap);
+  const staleCommit = listenerResolve(pendingCtx, {
+    op: "frame_commit",
+    frame: 3,
+    snap: "00000000",
+  });
+  assert.equal(staleCommit.error, "stale_snapshot");
 
   // frame_binding on an unregistered child is frame_unavailable; a mismatched frame is refused.
   assert.equal(listenerResolve(child, { op: "frame_binding", frame: 3 }).connected, true);

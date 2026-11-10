@@ -1049,6 +1049,7 @@ fn scoped_binding_report(target: &Target) -> Result<Option<IdentityReport>, Hand
             frame,
             doc,
             snap,
+            idx,
             ..
         },
     ) = target
@@ -1074,12 +1075,21 @@ fn scoped_binding_report(target: &Target) -> Result<Option<IdentityReport>, Hand
         Err(report) => return Ok(Some(report)),
     }
     if *frame > 0 {
-        return match chrome::verify_frame_binding(*tab, *frame, doc, snap) {
-            Ok(evidence) if evidence.doc == *doc => Ok(None),
-            Ok(_) => Ok(Some(IdentityReport::chrome_failure(
+        return match chrome::verify_frame_binding(*tab, *frame, doc, snap, *idx) {
+            Ok(evidence)
+                if evidence.doc == *doc && evidence.snap.as_deref() == Some(snap.as_str()) =>
+            {
+                Ok(None)
+            }
+            Ok(evidence) if evidence.doc != *doc => Ok(Some(IdentityReport::chrome_failure(
                 r,
                 IdentityState::Stale,
                 "frame_document_changed",
+            ))),
+            Ok(_) => Ok(Some(IdentityReport::chrome_failure(
+                r,
+                IdentityState::Stale,
+                "stale_snapshot",
             ))),
             Err(report) => Ok(Some(report)),
         };
@@ -1100,6 +1110,7 @@ fn frame_binding_refusal(
             frame,
             doc,
             snap,
+            idx,
             ..
         },
     ) = target
@@ -1109,12 +1120,20 @@ fn frame_binding_refusal(
     if *frame == 0 {
         return Ok(None);
     }
-    match chrome::verify_frame_binding(*tab, *frame, doc, snap) {
-        Ok(evidence) if evidence.doc == *doc => Ok(None),
-        Ok(_) => refuse_identity(
+    match chrome::verify_frame_binding(*tab, *frame, doc, snap, *idx) {
+        Ok(evidence) if evidence.doc == *doc && evidence.snap.as_deref() == Some(snap.as_str()) => {
+            Ok(None)
+        }
+        Ok(evidence) if evidence.doc != *doc => refuse_identity(
             session_id.to_string(),
             info.clone(),
             IdentityReport::chrome_failure(r, IdentityState::Stale, "frame_document_changed"),
+        )
+        .map(Some),
+        Ok(_) => refuse_identity(
+            session_id.to_string(),
+            info.clone(),
+            IdentityReport::chrome_failure(r, IdentityState::Stale, "stale_snapshot"),
         )
         .map(Some),
         Err(report) => refuse_identity(session_id.to_string(), info.clone(), report).map(Some),
@@ -1371,10 +1390,11 @@ fn click_inner(req: ActuateRequest) -> Result<ActuateEnvelope, HandsError> {
     remember_target(resolved.rect);
     let mut rng = Rng::from_time();
     let roi = settle::default_roi(space, Some(resolved.rect), (resolved.x, resolved.y));
+    let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
+    // Immediately before the pointer moves: re-read the child doc/snap and the fresh chain.
     if let Some(env) = frame_binding_refusal(&session_id, &info, &resolved.target)? {
         return Ok(env);
     }
-    let foregrounded = foreground::offer(resolved.hwnd, (resolved.x, resolved.y));
     if let Err(err) = input::move_to(space, resolved.x, resolved.y, &mut rng) {
         return fail_with_point(
             session_id,
@@ -6737,6 +6757,20 @@ mod tests {
             frame_binding_refusal("s-frame", &info, &target)
                 .expect("probe")
                 .is_none()
+        );
+
+        chrome::set_frame_binding_stub(Some(Ok(chrome::FrameBindingEvidence {
+            frame: 3,
+            doc: "c0a6".into(),
+            snap: Some("deadbeef".into()),
+            chain_present: true,
+        })));
+        let env = frame_binding_refusal("s-frame", &info, &target)
+            .expect("probe")
+            .expect("refusal");
+        assert_eq!(
+            env.identity.as_ref().and_then(|i| i.reason.as_deref()),
+            Some("stale_snapshot")
         );
 
         let top = Target::Scoped(SnapshotRef::Chrome {

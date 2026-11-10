@@ -66,6 +66,9 @@ function hex32(n) {
 const DOC_NONCE = (randomU32() & 0xffff).toString(16).padStart(4, "0");
 let snapCounter = randomU32();
 let lastSnapshot = null;
+// A fan-out reply is a candidate until the SW commits it. A late reply is never committed, so
+// it cannot retire the current agent-facing snapshot.
+const pendingSnapshots = new Map();
 
 function nextSnap() {
   snapCounter = (snapCounter + 1) >>> 0;
@@ -116,7 +119,7 @@ function connectFramePort() {
       return;
     }
     if (op === "frame_measure") {
-      measureTokens(msg.tokens);
+      measureTokens(msg.tokens, msg.point);
     }
   });
   port.onDisconnect.addListener(() => {
@@ -397,7 +400,7 @@ function frameSlotOf(el) {
   return els.indexOf(el);
 }
 
-function measureFrameElement(el, slot) {
+function measureFrameElement(el, slot, point) {
   const rect = el.getBoundingClientRect();
   if (!rect) {
     return null;
@@ -435,15 +438,29 @@ function measureFrameElement(el, slot) {
     contentBox.top + contentBox.height > 0;
   let hitOk = false;
   if (contentBox.width > 0 && contentBox.height > 0) {
-    const cx = contentBox.left + contentBox.width / 2;
-    const cy = contentBox.top + contentBox.height / 2;
-    let hit = null;
-    try {
-      hit = deepElementFromPoint(cx, cy);
-    } catch (_err) {
-      hit = null;
+    // Test the composed click point when one is known; the box centre is only the fallback
+    // for an initial (no-target) announce. A partial parent overlay at the click point must
+    // refuse the link even when the frame centre is clear.
+    let localX = contentBox.width / 2;
+    let localY = contentBox.height / 2;
+    if (point && Number.isFinite(point.x) && Number.isFinite(point.y)) {
+      localX = point.x;
+      localY = point.y;
     }
-    hitOk = !!hit && composedContains(el, hit);
+    const inside =
+      localX >= 0 &&
+      localY >= 0 &&
+      localX < contentBox.width &&
+      localY < contentBox.height;
+    if (inside) {
+      let hit = null;
+      try {
+        hit = deepElementFromPoint(contentBox.left + localX, contentBox.top + localY);
+      } catch (_err) {
+        hit = null;
+      }
+      hitOk = !!hit && composedContains(el, hit);
+    }
   }
   return {
     content_left: contentBox.left,
@@ -463,12 +480,12 @@ function measureFrameElement(el, slot) {
   };
 }
 
-function reportFrameLink(token, origin) {
+function reportFrameLink(token, origin, point) {
   const known = knownFrameTokens.get(token);
   if (!known || !framePort) {
     return;
   }
-  const link = measureFrameElement(known.el, known.slot);
+  const link = measureFrameElement(known.el, known.slot, point);
   if (!link) {
     return;
   }
@@ -509,7 +526,7 @@ function onFrameMessage(event) {
   reportFrameLink(token, event.origin);
 }
 
-function measureTokens(tokens) {
+function measureTokens(tokens, point) {
   if (!Array.isArray(tokens)) {
     return;
   }
@@ -522,7 +539,7 @@ function measureTokens(tokens) {
       } catch (_err) {}
       continue;
     }
-    reportFrameLink(token, known.origin);
+    reportFrameLink(token, known.origin, point);
   }
 }
 
@@ -536,6 +553,23 @@ function frameTopReply() {
   };
 }
 
+function frameCommitReply(msg) {
+  const snap = typeof msg.snap === "string" ? msg.snap : "";
+  const pending = pendingSnapshots.get(snap);
+  if (!pending) {
+    return { error: "stale_snapshot" };
+  }
+  pendingSnapshots.delete(snap);
+  lastSnapshot = pending;
+  return {
+    frame: SELF_FRAME,
+    doc: pending.doc,
+    snap: pending.snap,
+    retained: pending.retained,
+    committed: true,
+  };
+}
+
 function frameBindingReply(msg) {
   const frame = Number(msg.frame);
   if (!Number.isInteger(frame) || frame <= 0) {
@@ -544,11 +578,33 @@ function frameBindingReply(msg) {
   if (SELF_FRAME == null || SELF_FRAME !== frame) {
     return { error: "frame_unavailable" };
   }
+  if (msg.doc && msg.doc !== DOC_NONCE) {
+    return { error: "stale_document", doc: DOC_NONCE, snap: lastSnapshot ? lastSnapshot.snap : null };
+  }
   const record = lastSnapshot;
+  if (msg.snap && (!record || msg.snap !== record.snap)) {
+    return {
+      error: "stale_snapshot",
+      doc: DOC_NONCE,
+      snap: record ? record.snap : null,
+    };
+  }
+  let rectCss = null;
+  const idx = Number(msg.idx);
+  if (
+    record &&
+    Number.isInteger(idx) &&
+    idx >= 0 &&
+    idx < record.nodes.length &&
+    idx < record.retained
+  ) {
+    rectCss = cssRect(record.nodes[idx]);
+  }
   return {
     frame: frame,
     doc: DOC_NONCE,
     snap: record ? record.snap : null,
+    rectCss: rectCss,
     connected: true,
   };
 }
@@ -556,7 +612,7 @@ function frameBindingReply(msg) {
 function frameTargetAllowed(msg) {
   const selfFrame = SELF_FRAME == null ? null : SELF_FRAME;
   const frame = msg && msg.frame;
-  if (msg && msg.op === "frame_binding") {
+  if (msg && (msg.op === "frame_binding" || msg.op === "frame_commit")) {
     return Number.isInteger(Number(frame)) && Number(frame) > 0;
   }
   if (msg && msg.op === "frame_top") {
@@ -581,7 +637,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     op !== "resolve" &&
     op !== "assess" &&
     op !== "frame_top" &&
-    op !== "frame_binding"
+    op !== "frame_binding" &&
+    op !== "frame_commit"
   ) {
     return false;
   }
@@ -598,6 +655,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse(frameTopReply());
     } else if (op === "frame_binding") {
       sendResponse(frameBindingReply(msg));
+    } else if (op === "frame_commit") {
+      sendResponse(frameCommitReply(msg));
     } else if (
       msg.v === 1 &&
       msg.doc &&
@@ -640,7 +699,8 @@ function buildSnapshot(msg) {
       keys.push(null);
     }
   }
-  const stored = store !== false;
+  const pending = msg && msg.pending === true;
+  const stored = store !== false && !pending;
   let doc = null;
   let snap = null;
   let retained = nodes.length;
@@ -654,6 +714,24 @@ function buildSnapshot(msg) {
       keys: keys,
       retained: nodes.length,
     };
+  } else if (pending) {
+    // Candidate only: the SW commits it after the fan-out deadline. A discarded late reply
+    // therefore never replaces `lastSnapshot`.
+    doc = DOC_NONCE;
+    snap = nextSnap();
+    if (pendingSnapshots.size >= 8) {
+      const oldest = pendingSnapshots.keys().next();
+      if (!oldest.done) {
+        pendingSnapshots.delete(oldest.value);
+      }
+    }
+    pendingSnapshots.set(snap, {
+      doc: doc,
+      snap: snap,
+      nodes: nodes,
+      keys: keys,
+      retained: nodes.length,
+    });
   } else {
     retained = 0;
   }
@@ -673,10 +751,13 @@ function buildSnapshot(msg) {
   if (light) {
     out.elements = rankFrameElements(elements, metrics).slice(0, FRAME_ELEMENT_CAP);
   }
-  if (stored) {
+  if (stored || pending) {
     out.doc = doc;
     out.snap = snap;
     out.retained = retained;
+  }
+  if (pending) {
+    out.pending = true;
   }
   const selfFrame = SELF_FRAME == null ? 0 : SELF_FRAME;
   if (selfFrame !== 0) {

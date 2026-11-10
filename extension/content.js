@@ -81,7 +81,7 @@ function nextSnap() {
 
 const FRAME_LINK_CAP = 12;
 const FRAME_ELEMENT_CAP = 8;
-const FRAME_MEASURE_DEPTH = 16;
+const FRAME_MEASURE_DEPTH = 64;
 let SELF_FRAME = null;
 let FRAME_TOKEN = null;
 let framePort = null;
@@ -559,6 +559,11 @@ function frameCommitReply(msg) {
   if (!pending) {
     return { error: "stale_snapshot" };
   }
+  if (pending.commit_by != null && Date.now() > pending.commit_by) {
+    // The SW's fan-out budget already expired: a late commit must not replace lastSnapshot.
+    pendingSnapshots.delete(snap);
+    return { error: "stale_snapshot" };
+  }
   pendingSnapshots.delete(snap);
   lastSnapshot = pending;
   return {
@@ -582,28 +587,45 @@ function frameBindingReply(msg) {
     return { error: "stale_document", doc: DOC_NONCE, snap: lastSnapshot ? lastSnapshot.snap : null };
   }
   const record = lastSnapshot;
-  if (msg.snap && (!record || msg.snap !== record.snap)) {
+  if (!record) {
+    return { error: "stale_document", doc: DOC_NONCE, snap: null };
+  }
+  if (msg.snap && msg.snap !== record.snap) {
     return {
       error: "stale_snapshot",
       doc: DOC_NONCE,
-      snap: record ? record.snap : null,
+      snap: record.snap,
     };
   }
-  let rectCss = null;
   const idx = Number(msg.idx);
   if (
-    record &&
-    Number.isInteger(idx) &&
-    idx >= 0 &&
-    idx < record.nodes.length &&
-    idx < record.retained
+    !Number.isInteger(idx) ||
+    idx < 0 ||
+    idx >= record.nodes.length ||
+    idx >= record.retained
   ) {
-    rectCss = cssRect(record.nodes[idx]);
+    return {
+      error: "stale_element",
+      doc: DOC_NONCE,
+      snap: record.snap,
+      idx: idx,
+    };
+  }
+  const rectCss = cssRect(record.nodes[idx]);
+  if (!rectCss) {
+    // The node was removed or became unrendered between resolve and the probe.
+    return {
+      error: "stale_element",
+      doc: DOC_NONCE,
+      snap: record.snap,
+      idx: idx,
+    };
   }
   return {
     frame: frame,
     doc: DOC_NONCE,
-    snap: record ? record.snap : null,
+    snap: record.snap,
+    idx: idx,
     rectCss: rectCss,
     connected: true,
   };
@@ -700,6 +722,9 @@ function buildSnapshot(msg) {
     }
   }
   const pending = msg && msg.pending === true;
+  const commitBy = Number.isFinite(Number(msg && msg.commit_by))
+    ? Number(msg.commit_by)
+    : null;
   const stored = store !== false && !pending;
   let doc = null;
   let snap = null;
@@ -731,6 +756,7 @@ function buildSnapshot(msg) {
       nodes: nodes,
       keys: keys,
       retained: nodes.length,
+      commit_by: commitBy,
     });
   } else {
     retained = 0;

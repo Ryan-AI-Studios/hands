@@ -693,6 +693,24 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
         virtual_screen: Some(space.as_rect()),
         popup_rect: snap.popup_rect,
     };
+    // Frame rows survive a non-storing observe on `ChromeMap`, so a late frame still holds
+    // the challenge/yield state for the solver and `challenge --watch`.
+    let frames_transient = chrome.as_ref().is_some_and(|map| {
+        map.frames_transient
+            || map.frame_rows.iter().any(|row| {
+                row.status != "ok"
+                    && matches!(
+                        row.reason.as_deref(),
+                        Some(
+                            "frame_late"
+                                | "frame_budget_exceeded"
+                                | "frame_cap_exceeded"
+                                | "frame_link_missing"
+                                | "frame_geometry_unavailable"
+                        )
+                    )
+            })
+    });
     let fusion_t = Instant::now();
     let (mut extract, mut elements, elements_total, _) =
         fuse_maps(req.detail, &snap.title, &snap.nodes, chrome, opts);
@@ -706,21 +724,6 @@ pub fn observe(req: ObserveRequest) -> Result<ObserveEnvelope, HandsError> {
     let fusion_ms = fusion_t.elapsed().as_millis() as u64;
     crate::fence::note_last_url(extract.url.as_deref());
     let cards_walked = extract.cards_walked;
-    let frames_transient = snapshot.as_ref().is_some_and(|binding| {
-        binding.frames.iter().any(|row| {
-            row.status != "ok"
-                && matches!(
-                    row.reason.as_deref(),
-                    Some(
-                        "frame_late"
-                            | "frame_budget_exceeded"
-                            | "frame_cap_exceeded"
-                            | "frame_link_missing"
-                            | "frame_geometry_unavailable"
-                    )
-                )
-        })
-    });
     let hit = challenge::detect_from_extract(
         &extract.title,
         extract.url.as_deref(),
@@ -1294,7 +1297,9 @@ fn pop_non_reserved_elements(envelope: &mut ObserveEnvelope) {
 fn pop_reserved_non_dialog_from_end(envelope: &mut ObserveEnvelope) {
     let dialog_ids = dialog_id_set(envelope);
     let viewport = envelope.viewport;
-    while serialized_len(envelope) > DEFAULT_ENVELOPE_MAX_BYTES && envelope.elements.len() > 1 {
+    while serialized_len(envelope) > DEFAULT_ENVELOPE_MAX_BYTES
+        && envelope.elements.len() > RETAINED_ELEMENT_FLOOR
+    {
         let Some(idx) = envelope.elements.iter().rposition(|el| {
             is_reserved_control_parts(el, &dialog_ids, viewport) && !dialog_ids.contains(&el.id)
         }) else {
@@ -2046,6 +2051,8 @@ mod tests {
             }
         }
         let chrome = chrome::ChromeMap {
+            frame_rows: Vec::new(),
+            frames_transient: false,
             tab: None,
             url: Some("https://cars.com/search".into()),
             title: "Cars.com".into(),
@@ -3525,6 +3532,8 @@ mod tests {
     #[test]
     fn dense_chrome_cap_still_promotes_uia_continue_as() {
         let chrome = chrome::ChromeMap {
+            frame_rows: Vec::new(),
+            frames_transient: false,
             tab: None,
             url: Some("https://cars.com/search".into()),
             title: "Cars.com".into(),
@@ -3679,6 +3688,8 @@ mod tests {
             },
         );
         let chrome = chrome::ChromeMap {
+            frame_rows: Vec::new(),
+            frames_transient: false,
             tab: None,
             url: Some("https://cars.com/search".into()),
             title: "Cars.com".into(),
@@ -4515,6 +4526,8 @@ mod tests {
     #[test]
     fn electron_chrome_widget_win_1_does_not_fuse_amazon_title_2026_09_03() {
         let chrome = chrome::ChromeMap {
+            frame_rows: Vec::new(),
+            frames_transient: false,
             tab: None,
             url: Some("https://www.amazon.com/checkout".into()),
             title: "Place Your Order - Amazon Checkout".into(),
@@ -4568,6 +4581,8 @@ mod tests {
         assert!(!els.iter().any(|e| e.id.starts_with("chr:")));
         assert!(els.iter().any(|e| e.id == "uia:1.9"));
         let chrome = chrome::ChromeMap {
+            frame_rows: Vec::new(),
+            frames_transient: false,
             tab: None,
             url: Some("https://www.amazon.com/checkout".into()),
             title: "Place Your Order - Amazon Checkout".into(),

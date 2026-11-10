@@ -7,6 +7,10 @@ const LINK_SETTLE_MS = 40;
 const MEASURE_TIMEOUT_MS = 100;
 const CHILD_SNAPSHOT_TIMEOUT_MS = 70;
 const FANOUT_BUDGET_MS = 250;
+const CLIENT_BUDGET_MS = 400;
+const FANOUT_MARGIN_MS = 40;
+const MIN_FANOUT_MS = 60;
+const CHAIN_BUDGET_MS = 250;
 const FRAME_ELEMENT_CAP = 8;
 
 let hostPort = null;
@@ -363,13 +367,16 @@ function resolveMeasure(token, link) {
   }
 }
 
-function waitMeasure(token, callback) {
+function waitMeasure(token, callback, timeoutMs) {
   let waiters = measureWaiters.get(token);
   if (!waiters) {
     waiters = [];
     measureWaiters.set(token, waiters);
   }
   waiters.push(callback);
+  const timeout = Number.isFinite(timeoutMs)
+    ? Math.max(1, Math.min(MEASURE_TIMEOUT_MS, timeoutMs))
+    : MEASURE_TIMEOUT_MS;
   setTimeout(() => {
     const current = measureWaiters.get(token);
     if (!current) {
@@ -384,7 +391,7 @@ function waitMeasure(token, callback) {
       measureWaiters.delete(token);
     }
     callback(null);
-  }, MEASURE_TIMEOUT_MS);
+  }, timeout);
 }
 
 function acceptFrameLink(parentEntry, msg) {
@@ -555,6 +562,13 @@ function collectFrameRows(tabId, frameElements) {
       row.url = entry.url;
     }
   }
+  const registeredOrigins = new Set();
+  for (const entry of frames.values()) {
+    if (entry.frameId !== 0) {
+      const origin = clampOrigin(entry.origin);
+      if (origin) registeredOrigins.add(origin);
+    }
+  }
   const seen = Array.isArray(frameElements) ? frameElements : [];
   for (const item of seen) {
     if (!item || typeof item.reason !== "string") {
@@ -563,8 +577,13 @@ function collectFrameRows(tabId, frameElements) {
     if (Number.isInteger(item.slot) && linkedSlots.has(item.slot)) {
       continue;
     }
-    const row = { status: "unavailable", reason: item.reason };
     const origin = clampOrigin(item.origin);
+    // A registered but unlinked child already has a registry row; do not add a second
+    // `no_content_script` row for the same origin/slot.
+    if (origin && registeredOrigins.has(origin)) {
+      continue;
+    }
+    const row = { status: "unavailable", reason: item.reason };
     if (origin) row.origin = origin;
     rows.push(row);
   }
@@ -602,11 +621,13 @@ function collectFrameRows(tabId, frameElements) {
     kept = kept.slice(0, Math.max(0, childCap - 1));
     kept.push(capRow);
   }
+  const hasChildren = totalChildren > 0 || rejected > 0;
   return {
     frames: kept,
-    // + frame 0; extra refused ports beyond the one cap row still count.
-    frames_total: totalChildren + 1 + Math.max(0, rejected - 1),
-    frames_truncated: truncated || rejected > 0,
+    // Omit the field entirely on a top-only page so a new-client `frames:true` envelope keeps
+    // the 0123 top-only shape. When present, frame 0 counts against the cap.
+    frames_total: hasChildren ? totalChildren + 1 + Math.max(0, rejected - 1) : 0,
+    frames_truncated: hasChildren ? truncated || rejected > 0 : false,
   };
 }
 
@@ -666,7 +687,7 @@ function frameBySlot(tabId, slot) {
   return null;
 }
 
-function childSnapshot(entry, stored, detail, maxNodes, callback) {
+function childSnapshot(entry, stored, detail, maxNodes, commitBy, callback) {
   sendToFrame(
     entry.tab,
     entry.frameId,
@@ -676,6 +697,7 @@ function childSnapshot(entry, stored, detail, maxNodes, callback) {
       store: false,
       // A fan-out reply is a candidate; only an accepted reply is committed by the SW.
       pending: stored === true,
+      commit_by: commitBy,
       light: true,
       max_nodes: maxNodes,
       frames: false,
@@ -723,13 +745,23 @@ function commitChildSnapshot(entry, reply, callback) {
   );
 }
 
-function collectChildSnapshots(tabId, entries, stored, detail, maxNodes, callback) {
+function collectChildSnapshots(
+  tabId,
+  entries,
+  stored,
+  detail,
+  maxNodes,
+  commitBy,
+  callback
+) {
   const replies = new Map();
   if (!entries.length) {
     callback(replies);
     return;
   }
   let pending = entries.length;
+  let committing = 0;
+  let wantFinish = false;
   let finished = false;
   const finish = () => {
     if (finished) {
@@ -738,18 +770,27 @@ function collectChildSnapshots(tabId, entries, stored, detail, maxNodes, callbac
     finished = true;
     callback(replies);
   };
+  const maybeFinish = () => {
+    if (finished || !wantFinish) {
+      return;
+    }
+    if (pending <= 0 && committing <= 0) {
+      finish();
+    }
+  };
   const done = () => {
     if (finished) {
       return;
     }
     pending -= 1;
-    if (pending <= 0) {
-      finish();
-    }
+    maybeFinish();
   };
-  setTimeout(finish, CHILD_SNAPSHOT_TIMEOUT_MS);
+  setTimeout(() => {
+    wantFinish = true;
+    maybeFinish();
+  }, CHILD_SNAPSHOT_TIMEOUT_MS);
   for (const entry of entries) {
-    childSnapshot(entry, stored, detail, maxNodes, (reply) => {
+    childSnapshot(entry, stored, detail, maxNodes, commitBy, (reply) => {
       if (finished) {
         // Late/discarded: never commit, so the child's `lastSnapshot` is untouched.
         return;
@@ -763,15 +804,23 @@ function collectChildSnapshots(tabId, entries, stored, detail, maxNodes, callbac
         done();
         return;
       }
-      commitChildSnapshot(entry, reply, (committed) => {
-        if (finished) {
+      committing += 1;
+      let settled = false;
+      const settle = (committed) => {
+        if (settled) {
           return;
         }
+        settled = true;
+        committing -= 1;
         if (committed) {
           replies.set(entry.frameId, committed);
         }
         done();
-      });
+        maybeFinish();
+      };
+      commitChildSnapshot(entry, reply, settle);
+      // A commit that never answers must not hold the envelope open.
+      setTimeout(() => settle(null), 30);
     });
   }
 }
@@ -788,6 +837,10 @@ function mergeFrameSnapshot(out, tab, msg, replies, frameElements) {
       snap &&
       /^[0-9a-f]{4}$/.test(doc) &&
       /^[0-9a-f]{8}$/.test(snap);
+    if (stored && !valid) {
+      // An agent-facing observe must not expose a third, ref-less id shape.
+      continue;
+    }
     const elements = Array.isArray(child.elements) ? child.elements : [];
     for (const el of elements) {
       if (!el || typeof el !== "object") {
@@ -828,9 +881,15 @@ function mergeFrameSnapshot(out, tab, msg, replies, frameElements) {
     if (typeof child.snap === "string") row.snap = child.snap;
     if (Number.isInteger(child.retained)) row.retained = child.retained;
   }
-  out.frames = rows.frames;
-  out.frames_total = rows.frames_total;
-  out.frames_truncated = rows.frames_truncated;
+  if (rows.frames_total > 0) {
+    out.frames = rows.frames;
+    out.frames_total = rows.frames_total;
+    out.frames_truncated = rows.frames_truncated;
+  } else {
+    delete out.frames;
+    delete out.frames_total;
+    delete out.frames_truncated;
+  }
 }
 
 function finishFrameSnapshot(out, tab, port, msg) {
@@ -855,8 +914,26 @@ function finishFrameSnapshot(out, tab, port, msg) {
     mergeFrameSnapshot(out, tab, msg, state.replies, frameElements);
     post(port, out);
   };
-  // One hard fan-out budget: announce + measure + child snapshots share it.
-  setTimeout(finalize, FANOUT_BUDGET_MS);
+  const started = Number.isFinite(msg && msg.__handsStarted)
+    ? msg.__handsStarted
+    : Date.now();
+  const elapsed = Math.max(0, Date.now() - started);
+  const remaining = CLIENT_BUDGET_MS - elapsed - FANOUT_MARGIN_MS;
+  if (remaining < MIN_FANOUT_MS) {
+    // The top walk already consumed the client budget: skip fan-out honestly.
+    const entries = [...(frameRegistry.get(tab.id) || new Map()).values()].filter(
+      (entry) => entry.frameId !== 0 && entry.linkState === "ok"
+    );
+    for (const entry of entries) {
+      entry.budget = true;
+    }
+    state.entries = entries;
+    finalize();
+    return;
+  }
+  const budget = Math.min(FANOUT_BUDGET_MS, remaining);
+  const commitBy = Date.now() + budget;
+  setTimeout(finalize, budget);
   announceAndMeasure(tab.id, () => {
     const frames = frameRegistry.get(tab.id) || new Map();
     const entries = [...frames.values()].filter(
@@ -874,6 +951,7 @@ function finishFrameSnapshot(out, tab, port, msg) {
       out.stored !== false,
       msg && msg.detail,
       maxNodes,
+      commitBy,
       (replies) => {
         for (const [frameId, reply] of replies) {
           state.replies.set(frameId, reply);
@@ -929,6 +1007,7 @@ function refreshChain(tabId, frameId, point, callback) {
     current = parent;
   }
   let index = 0;
+  const deadline = Date.now() + CHAIN_BUDGET_MS;
   // The point starts in the target frame's local viewport. After each level it is translated
   // into that parent's viewport, so the next level tests the same click point.
   let local = point && Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
@@ -937,7 +1016,7 @@ function refreshChain(tabId, frameId, point, callback) {
       const chain = [];
       for (const level of ancestors) {
         if (!level.link || level.linkState !== "ok") {
-          callback(null);
+          callback(null, "frame_geometry_unavailable");
           return;
         }
         chain.push(level.link);
@@ -945,29 +1024,43 @@ function refreshChain(tabId, frameId, point, callback) {
       callback(chain);
       return;
     }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      callback(null, "frame_budget_exceeded");
+      return;
+    }
     const level = ancestors[index];
     index += 1;
     const parent = frames.get(level.link.parent);
     if (!parent || !parent.port) {
-      callback(null);
+      callback(null, "frame_geometry_unavailable");
       return;
     }
     const token = level.token;
     const at = local ? { x: local.x, y: local.y } : null;
     // Register the waiter before posting: a fast parent replies in the same turn.
-    waitMeasure(token, (link) => {
-      if (!link) {
-        callback(null);
-        return;
-      }
-      if (local) {
-        local = {
-          x: link.content_left + local.x,
-          y: link.content_top + local.y,
-        };
-      }
-      next();
-    });
+    waitMeasure(
+      token,
+      (link) => {
+        if (!link) {
+          callback(
+            null,
+            Date.now() >= deadline
+              ? "frame_budget_exceeded"
+              : "frame_geometry_unavailable"
+          );
+          return;
+        }
+        if (local) {
+          local = {
+            x: link.content_left + local.x,
+            y: link.content_top + local.y,
+          };
+        }
+        next();
+      },
+      remaining
+    );
     post(parent.port, { op: "frame_measure", tokens: [token], point: at });
   };
   next();
@@ -986,9 +1079,9 @@ function enrichFrameReply(tab, frame, out, port) {
       (out.css && Number.isFinite(out.css.x) && Number.isFinite(out.css.y)
         ? { x: out.css.x, y: out.css.y }
         : null);
-    refreshChain(tab.id, frame, point, (chain) => {
+    refreshChain(tab.id, frame, point, (chain, reason) => {
       if (!chain) {
-        out.error = "frame_geometry_unavailable";
+        out.error = reason || "frame_geometry_unavailable";
         post(port, out);
         return;
       }
@@ -1032,12 +1125,12 @@ function frameBindingRequest(port, tab, msg) {
           return;
         }
         const point = pointFromRect(reply.rectCss);
-        refreshChain(tab.id, frame, point, (chain) => {
+        refreshChain(tab.id, frame, point, (chain, reason) => {
           const out = copyReply(reply);
           Object.assign(out, evidence);
           out.chain = chain;
           if (!chain) {
-            out.error = "frame_geometry_unavailable";
+            out.error = reason || "frame_geometry_unavailable";
           }
           post(port, out);
         });
@@ -1049,6 +1142,11 @@ function frameBindingRequest(port, tab, msg) {
 // ------------------------------------------------------------------ host forward
 
 function forward(port, msg) {
+  if (msg && typeof msg === "object" && !Number.isFinite(msg.__handsStarted)) {
+    // The top walk runs before the SW sees this reply; the frame fan-out must fit the
+    // remainder of the Rust client's 400 ms deadline.
+    msg.__handsStarted = Date.now();
+  }
   const op = msg && msg.op;
   if (
     op !== "snapshot" &&

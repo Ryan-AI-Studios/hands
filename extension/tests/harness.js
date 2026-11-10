@@ -889,6 +889,67 @@ function frameOptOutTests() {
   reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
   assert.ok(Array.isArray(reply.frames), "frames:true opts in");
 
+  // N-1: a top-only page with `frames:true` keeps the 0123 top-only shape (no frame fields).
+  {
+    const topOnly = frameHarness();
+    topOnly.addFrame({ frameId: 0 });
+    const topReply = fanOutSnapshot(topOnly, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(topReply.frames, undefined);
+    assert.equal(topReply.frames_total, undefined);
+    assert.equal(topReply.frames_truncated, undefined);
+  }
+
+  // m-3: an unlinked registered child must not also get a `no_content_script` row.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 3, origin: "https://late.test" });
+    child.__parentCtx = top;
+    const iframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://late.test/" },
+      rect: { left: 5, top: 5, width: 300, height: 200 },
+    });
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, iframe);
+    top.document.documentElement = rootEl;
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    const lateRows = reply.frames.filter((row) => row.frame === 3);
+    assert.equal(lateRows.length, 1, "one registered row");
+    assert.ok(
+      !reply.frames.some((row) => row.reason === "no_content_script"),
+      "the same iframe is not also reported as no_content_script"
+    );
+  }
+
+  // M-3: if the top walk already consumed the client budget, fan-out is skipped honestly.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 7, origin: "https://budget.test" });
+    child.__parentCtx = top;
+    const iframe = element({ tag: "IFRAME", rect: { left: 1, top: 1, width: 300, height: 200 } });
+    iframe.contentWindow = child.window;
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, iframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = () => iframe;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "Target" });
+    fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    const reply = fanOutSnapshot(h, {
+      op: "snapshot",
+      tab: 12,
+      frames: true,
+      __handsStarted: Date.now() - 380,
+    });
+    assert.ok(
+      reply.frames.some(
+        (row) => row.frame === 7 && row.reason === "frame_budget_exceeded"
+      ),
+      "an exhausted client budget skips fan-out"
+    );
+  }
+
   // A non-storing internal observe still carries frame elements for detection, but never
   // mints a resolvable ref or a colliding chr: id.
   const childButton = element({ tag: "BUTTON", innerText: "Target" });
@@ -1358,6 +1419,7 @@ function frameNestedTests() {
   const grandchild = h.addFrame({ frameId: 5, origin: "https://deep.test" });
   child.__parentCtx = top;
   grandchild.__parentCtx = child;
+  grandchild.document.documentElement = element({ tag: "BUTTON", innerText: "Deep" });
 
   const childIframe = element({ tag: "IFRAME", rect: { left: 20, top: 30, width: 400, height: 300 } });
   childIframe.contentWindow = child.window;
@@ -1387,7 +1449,8 @@ function frameNestedTests() {
     tab: 12,
     frame: 5,
     doc: vm.runInContext("DOC_NONCE", grandchild),
-    snap: null,
+    snap: vm.runInContext("lastSnapshot && lastSnapshot.snap", grandchild),
+    idx: 0,
   });
   waitForIdle(h.sw, h.frames);
   const binding = h.sw.lastPost();
@@ -1407,6 +1470,7 @@ function frameBindingOpsTests() {
     innerHeight: 250,
   });
   child.__parentCtx = top;
+  child.document.documentElement = element({ tag: "BUTTON", innerText: "Target" });
   const iframe = element({ tag: "IFRAME", rect: { left: 40, top: 60, width: 300, height: 250 } });
   iframe.contentWindow = child.window;
   const rootEl = element({ tag: "DIV" });
@@ -1428,12 +1492,15 @@ function frameBindingOpsTests() {
     tab: 12,
     frame: 3,
     doc: vm.runInContext("DOC_NONCE", child),
-    snap: null,
+    snap: vm.runInContext("lastSnapshot && lastSnapshot.snap", child),
+    idx: 0,
   });
   waitForIdle(h.sw, h.frames);
   const binding = h.sw.lastPost();
   assert.equal(h.sw.calls.routes[h.sw.calls.routes.length - 1].frameId, 3);
   assert.equal(binding.frame, 3);
+  assert.equal(binding.idx, 0, "the probe echoes idx");
+  assert.ok(binding.rectCss, "the stored node still has a rect");
   assert.equal(binding.tab, 12);
   assert.equal(binding.doc, vm.runInContext("DOC_NONCE", child));
   assert.ok(Array.isArray(binding.chain), "fresh chain returned");
@@ -1522,9 +1589,43 @@ function frameContentTests() {
   });
   assert.equal(staleCommit.error, "stale_snapshot");
 
-  // frame_binding on an unregistered child is frame_unavailable; a mismatched frame is refused.
-  assert.equal(listenerResolve(child, { op: "frame_binding", frame: 3 }).connected, true);
-  assert.equal(listenerResolve(child, { op: "frame_binding", frame: 4 }).error, "frame_unavailable");
+  // m-2: a candidate whose commit window expired must not replace lastSnapshot.
+  const beforeExpired = vm.runInContext("lastSnapshot.snap", pendingCtx);
+  const expired = listenerResolve(pendingCtx, {
+    op: "snapshot",
+    store: false,
+    pending: true,
+    light: true,
+    commit_by: Date.now() - 1,
+  });
+  const expiredCommit = listenerResolve(pendingCtx, {
+    op: "frame_commit",
+    frame: 3,
+    snap: expired.snap,
+  });
+  assert.equal(expiredCommit.error, "stale_snapshot");
+  assert.equal(vm.runInContext("lastSnapshot.snap", pendingCtx), beforeExpired);
+
+  // frame_binding requires a stored snapshot and echoes idx/liveness; a removed/invalid idx
+  // is stale_element, and a mismatched frame is refused.
+  assert.equal(
+    listenerResolve(child, { op: "frame_binding", frame: 3, idx: 0 }).error,
+    "stale_document",
+    "no stored snapshot"
+  );
+  const okBinding = listenerResolve(pendingCtx, { op: "frame_binding", frame: 3, idx: 0 });
+  assert.equal(okBinding.connected, true);
+  assert.equal(okBinding.idx, 0);
+  assert.ok(okBinding.rectCss);
+  assert.equal(
+    listenerResolve(pendingCtx, { op: "frame_binding", frame: 3 }).error,
+    "stale_element",
+    "missing idx is stale"
+  );
+  assert.equal(
+    listenerResolve(pendingCtx, { op: "frame_binding", frame: 4, idx: 0 }).error,
+    "frame_unavailable"
+  );
 
   // A top snapshot with frames:true includes the internal iframe list; frames:false does not.
   const top = contentContext();

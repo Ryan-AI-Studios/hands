@@ -642,9 +642,30 @@ pub fn detect_from_extract(
 /// `www.google.com/recaptcha/api2/anchor` and `www.google.com/search` share an origin.
 pub fn vendor_url(url: &str) -> Option<ChallengeKind> {
     let (host, path) = host_and_path(url);
-    host.as_deref()
-        .and_then(|host| match_host(host, &path))
-        .map(|(kind, _)| kind)
+    let host = normalize_host(host?.as_str());
+    // Frame vendor classification is host/pattern based, per spec §3.8. The top-page
+    // any-host `/cdn-cgi/challenge-platform` interstitial rule is deliberately excluded:
+    // `https://evil.example/cdn-cgi/challenge-platform/x` is not a vendor frame.
+    if host == "recaptcha.net" || host.ends_with(".recaptcha.net") || host == "recaptcha.google.com"
+    {
+        return Some(ChallengeKind::Recaptcha);
+    }
+    if host == "google.com" && path.contains("/recaptcha") {
+        return Some(ChallengeKind::Recaptcha);
+    }
+    if host == "hcaptcha.com" || host.ends_with(".hcaptcha.com") {
+        return Some(ChallengeKind::Hcaptcha);
+    }
+    if host == "challenges.cloudflare.com" {
+        return Some(ChallengeKind::Turnstile);
+    }
+    if host == "arkoselabs.com"
+        || host.ends_with(".arkoselabs.com")
+        || host == "client-api.arkoselabs.com"
+    {
+        return Some(ChallengeKind::Funcaptcha);
+    }
+    None
 }
 
 pub fn watch_timeout_ms() -> u64 {
@@ -1485,6 +1506,11 @@ mod tests {
         assert!(vendor_url("https://challenges.cloudflare.com/turnstile").is_some());
         assert!(vendor_url("https://hcaptcha.com/").is_some());
         assert!(vendor_url("https://arkoselabs.com/").is_some());
+        assert!(
+            vendor_url("https://evil.example/cdn-cgi/challenge-platform/x").is_none(),
+            "an arbitrary host with the Cloudflare path is not a frame vendor"
+        );
+        assert!(vendor_url("https://google.com.evil.example/recaptcha").is_none());
     }
 
     #[test]
@@ -1686,6 +1712,36 @@ mod tests {
         assert!(elapsed >= 1_000);
         assert!(calls.get() >= 2);
         assert!(calls.get() < 10, "must not poll for 120s: {}", calls.get());
+    }
+
+    #[test]
+    fn watch_does_not_report_gone_on_a_transient_frame() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        apply_observe("s-frame-hold", present_hit());
+        let info = apply_observe_with_frames("s-frame-hold", DetectHit::clear(), true);
+        assert!(info.present, "a frame_late observe is unknown, not gone");
+        let clock = FakeClock {
+            now: Cell::new(Instant::now()),
+        };
+        let (watched, elapsed) = watch_until_gone(
+            &clock,
+            Duration::from_millis(1_000),
+            Duration::from_millis(1_000),
+            || {
+                Ok(apply_observe_with_frames(
+                    "s-frame-hold",
+                    DetectHit::clear(),
+                    true,
+                ))
+            },
+        )
+        .unwrap();
+        assert!(
+            watched.present,
+            "watch must not report gone while the frame is late"
+        );
+        assert!(elapsed >= 1_000);
     }
 
     #[test]

@@ -2766,6 +2766,8 @@ mod tests {
         identity: Option<chrome::PageIdentity>,
     ) -> chrome::ChromeMap {
         chrome::ChromeMap {
+            frame_rows: Vec::new(),
+            frames_transient: false,
             tab: None,
             url: Some("https://example.test/".into()),
             title: "Example".into(),

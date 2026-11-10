@@ -96,6 +96,10 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone)]
 pub struct ChromeMap {
+    /// Frame rows from the same reply, retained even for a non-storing observe so the
+    /// challenge/solver path can hold a transient frame miss without minting refs.
+    pub(crate) frame_rows: Vec<crate::identity::FrameBinding>,
+    pub(crate) frames_transient: bool,
     /// Chrome tab id from the same reply. Kept even for a non-storing snapshot so hittest point
     /// mode can issue an explicit frame assess.
     pub(crate) tab: Option<u32>,
@@ -832,28 +836,9 @@ fn valid_lower_hex(raw: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn snapshot_binding(
-    raw: &RawSnapshot,
-    hwnd: Option<isize>,
-    fixture: bool,
-) -> Option<SnapshotBinding> {
-    if raw.stored == Some(false) {
-        return None;
-    }
-    let fallback = raw.fallback.unwrap_or(false);
-    let source = if fixture {
-        "fixture"
-    } else if fallback {
-        "fallback"
-    } else {
-        "live"
-    };
-    let tab = raw.tab.filter(|t| *t > 0);
-    let doc = raw.doc.clone().filter(|d| valid_lower_hex(d, 4));
-    let snap = raw.snap.clone().filter(|s| valid_lower_hex(s, 8));
-    let retained = raw.retained.unwrap_or(raw.elements.len());
+fn frame_bindings(rows: &[crate::frames::RawFrameLink]) -> Vec<crate::identity::FrameBinding> {
     let mut frames = Vec::new();
-    for row in raw.frames.iter().take(12) {
+    for row in rows.iter().take(12) {
         let frame = row.frame.filter(|f| *f > 0);
         let ok = row.is_ok()
             && row.doc.as_deref().is_some_and(|d| valid_lower_hex(d, 4))
@@ -887,6 +872,30 @@ fn snapshot_binding(
             origin: row.origin.as_deref().and_then(crate::frames::valid_origin),
         });
     }
+    frames
+}
+
+fn snapshot_binding(
+    raw: &RawSnapshot,
+    hwnd: Option<isize>,
+    fixture: bool,
+) -> Option<SnapshotBinding> {
+    if raw.stored == Some(false) {
+        return None;
+    }
+    let fallback = raw.fallback.unwrap_or(false);
+    let source = if fixture {
+        "fixture"
+    } else if fallback {
+        "fallback"
+    } else {
+        "live"
+    };
+    let tab = raw.tab.filter(|t| *t > 0);
+    let doc = raw.doc.clone().filter(|d| valid_lower_hex(d, 4));
+    let snap = raw.snap.clone().filter(|s| valid_lower_hex(s, 8));
+    let retained = raw.retained.unwrap_or(raw.elements.len());
+    let frames = frame_bindings(&raw.frames);
     let frames_total = raw
         .frames_total
         .unwrap_or(raw.frames.len())
@@ -930,17 +939,26 @@ fn snapshot_binding(
 
 fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: String) -> ChromeMap {
     let map = map_for_raw(&raw, hwnd, fixture, obs);
-    let snapshot = snapshot_binding(&raw, hwnd, fixture);
-    let frame_rows = raw.frames.clone();
+    let mut snapshot = snapshot_binding(&raw, hwnd, fixture);
+    let link_rows = raw.frames.clone();
+    let frame_rows = frame_bindings(&raw.frames);
+    let frames_transient = raw
+        .frames
+        .iter()
+        .any(|row| !row.is_ok() && row.is_transient());
+    let mut dropped_frames: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for (i, node) in raw.elements.into_iter().enumerate() {
         let frame = node.frame.filter(|f| *f > 0).unwrap_or(0);
         let composed = if frame > 0 {
             // Composition happens here for an aggregated snapshot: the node rect is
             // frame-local; the map is the top-frame viewport.
-            match crate::frames::compose_rect(&frame_rows, frame, node.rect_css) {
+            match crate::frames::compose_rect(&link_rows, frame, node.rect_css) {
                 Ok(rect) => rect,
-                Err(_) => continue,
+                Err(_) => {
+                    dropped_frames.push(frame);
+                    continue;
+                }
             }
         } else {
             node.rect_css
@@ -966,7 +984,7 @@ fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: Strin
         let (text, unnamed) =
             crate::extract::name_fields(node.text.as_deref().unwrap_or(""), false);
         elements.push(Element {
-            challenge_vendor: frame == 0 || frame_is_vendor(&frame_rows, frame),
+            challenge_vendor: frame == 0 || frame_is_vendor(&link_rows, frame),
             frame: (frame > 0).then_some(frame),
             id,
             role: node.role.unwrap_or_else(|| "Other".into()),
@@ -1029,7 +1047,23 @@ fn map_from_raw(raw: RawSnapshot, hwnd: Option<isize>, fixture: bool, obs: Strin
     identity.url = raw.url.clone().filter(|s| !s.trim().is_empty());
     identity.title = raw.title.clone().unwrap_or_default();
     identity.assess_v = raw.assess_v;
+    // A frame whose only elements were clipped must not stay `ok` with no rows: name the
+    // frame `frame_not_visible` rather than silently dropping every child element.
+    if let Some(binding) = snapshot.as_mut() {
+        for row in &mut binding.frames {
+            if let Some(frame) = row.frame
+                && row.status == "ok"
+                && dropped_frames.contains(&frame)
+                && !elements.iter().any(|el| el.frame == Some(frame))
+            {
+                row.status = "unavailable".into();
+                row.reason = Some("frame_not_visible".into());
+            }
+        }
+    }
     ChromeMap {
+        frame_rows,
+        frames_transient,
         tab: raw.tab,
         url: raw.url.filter(|s| !s.trim().is_empty()),
         title: raw.title.unwrap_or_default(),
@@ -1211,7 +1245,8 @@ fn classify_ref_error(token: &str) -> (IdentityState, String) {
         | "frame_occluded"
         | "frame_probe_timeout"
         | "frame_depth_exceeded"
-        | "frame_link_missing" => IdentityState::Unknown,
+        | "frame_link_missing"
+        | "frame_budget_exceeded" => IdentityState::Unknown,
         _ => IdentityState::Unknown,
     };
     let reason = match token {
@@ -1245,7 +1280,8 @@ fn classify_ref_error(token: &str) -> (IdentityState, String) {
         | "frame_probe_timeout"
         | "frame_depth_exceeded"
         | "frame_link_ambiguous"
-        | "frame_link_missing" => token,
+        | "frame_link_missing"
+        | "frame_budget_exceeded" => token,
         _ => "protocol_error",
     };
     (state, reason.to_string())
@@ -1883,6 +1919,24 @@ pub fn verify_frame_binding(
             &r,
             IdentityState::Unknown,
             "frame_unavailable",
+        ));
+    }
+    let echo_idx = reply
+        .get("idx")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    if echo_idx != Some(idx) {
+        return Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Unknown,
+            "protocol_error",
+        ));
+    }
+    if !reply.get("rectCss").is_some_and(|v| !v.is_null()) {
+        return Err(IdentityReport::chrome_failure(
+            &r,
+            IdentityState::Stale,
+            "stale_element",
         ));
     }
     let echo_doc = reply.get("doc").and_then(|v| v.as_str()).unwrap_or("");
@@ -3473,6 +3527,8 @@ mod tests {
         ));
         assert_eq!(
             SnapshotOutcome::Map(Box::new(ChromeMap {
+                frame_rows: Vec::new(),
+                frames_transient: false,
                 tab: None,
                 url: None,
                 title: String::new(),
@@ -4115,6 +4171,51 @@ mod tests {
         };
         let map = map_from_raw(raw, Some(0x1234), true, "obs".into());
         assert!(map.elements.is_empty(), "no fake frame rect is emitted");
+    }
+
+    #[test]
+    fn evil_cloudflare_path_is_not_a_frame_vendor() {
+        let rows = vec![crate::frames::RawFrameLink {
+            frame: Some(3),
+            url: Some("https://evil.example/cdn-cgi/challenge-platform/x".into()),
+            ..crate::frames::RawFrameLink::default()
+        }];
+        assert!(
+            !frame_is_vendor(&rows, 3),
+            "an arbitrary host with the Cloudflare path is not a frame vendor"
+        );
+        let rows = vec![crate::frames::RawFrameLink {
+            frame: Some(3),
+            url: Some("https://challenges.cloudflare.com/turnstile".into()),
+            ..crate::frames::RawFrameLink::default()
+        }];
+        assert!(frame_is_vendor(&rows, 3));
+    }
+
+    #[test]
+    fn non_storing_frame_late_row_holds_the_yield_state() {
+        let raw = serde_json::json!({
+            "stored": false,
+            "tab": 12,
+            "window": 45,
+            "frame": 0,
+            "metrics": {},
+            "frames": [
+                {"status": "unavailable", "reason": "frame_late"},
+                {"status": "unavailable", "reason": "frame_geometry_unavailable"}
+            ]
+        });
+        let map = map_from_raw_json(&raw.to_string(), None, "obs".into());
+        assert!(
+            map.snapshot.is_none(),
+            "store:false drops the snapshot binding"
+        );
+        assert!(
+            map.frames_transient,
+            "the transient row survives store:false"
+        );
+        assert_eq!(map.frame_rows.len(), 2);
+        assert_eq!(map.frame_rows[0].reason.as_deref(), Some("frame_late"));
     }
 
     #[test]

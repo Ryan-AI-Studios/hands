@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use hands::build_identity::BUILD_VERSION;
 use hands::{
     ActuateRequest, Detail, GroundRequest, HandsError, ObserveRequest, ObserveScope, ObserveView,
     PickRequest, actuate, allows, attach, challenge, desk_pipe, dotask, ensure_dpi, host_doctor,
@@ -9,7 +10,7 @@ use hands::{
 #[command(
     name = "hands",
     about = "Windows-first eyes-and-hands MCP/CLI",
-    version
+    version = BUILD_VERSION
 )]
 struct Cli {
     #[command(subcommand)]

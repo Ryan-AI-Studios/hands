@@ -703,3 +703,23 @@ fn qualify_absent_server_pass_is_lifecycle_only() {
         "NOT_RUN must never join the pass tokens"
     );
 }
+
+/// 0127 L1: the desk-side idle stat is read after the 2200 ms sleep, so the `< 2000` gate can
+/// fire. The pre-sleep stat made that branch unreachable.
+#[test]
+fn stop_idle_gate_reads_the_desk_log_after_the_sleep() {
+    let code = code_only();
+    let sleep = code
+        .find("Start-Sleep -Milliseconds 2200")
+        .expect("idle sleep present");
+    let after = &code[sleep..];
+    assert!(
+        after.contains("LastWriteTime"),
+        "the desk-side stat must be taken after the idle sleep"
+    );
+    assert!(
+        !code.contains("deskLogWriteBefore"),
+        "the pre-sleep desk stat must be gone (0127 L1)"
+    );
+    assert!(code.contains("if ($null -ne $deskLogGap -and $deskLogGap -lt 2000)"));
+}

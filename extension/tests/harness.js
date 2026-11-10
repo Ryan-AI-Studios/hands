@@ -77,6 +77,16 @@ function element(options) {
     closest() {
       return null;
     },
+    contains(other) {
+      let cur = other || null;
+      for (let i = 0; i < 256 && cur; i += 1) {
+        if (cur === el) {
+          return true;
+        }
+        cur = cur.parentElement || null;
+      }
+      return false;
+    },
     getRootNode() {
       return { host: el.parentElement || null };
     },
@@ -251,6 +261,55 @@ function installSnapshot(context, node, doc, snap) {
 function scopedResolve(context, message) {
   context.__msg = Object.assign({ v: 1, frame: 0, idx: 0 }, message);
   return vm.runInContext("resolveScoped(__msg)", context);
+}
+
+function queryScoped(context, message) {
+  context.__msg = Object.assign({ v: 1, frame: 0 }, message);
+  return vm.runInContext("queryScoped(__msg)", context);
+}
+
+function installSnapshotNodes(context, nodes, doc, snap) {
+  context.__nodes = nodes;
+  context.__doc = doc;
+  context.__snap = snap;
+  vm.runInContext(
+    `lastSnapshot = {
+      doc: __doc,
+      snap: __snap,
+      nodes: __nodes,
+      keys: __nodes.map((n, i) => snapshotKey(n, keyPayload(n, i))),
+      retained: __nodes.length,
+      url: location.href,
+      title: document.title,
+    };`,
+    context
+  );
+}
+
+function capability(context, node) {
+  context.__capNode = node;
+  return vm.runInContext(
+    "domCapability(__capNode, keyPayload(__capNode, 0))",
+    context
+  );
+}
+
+function actionSupport(cap, verb) {
+  for (const row of cap.actions) {
+    if (row.action === verb) {
+      return row.support;
+    }
+  }
+  return null;
+}
+
+function actionEvidence(cap, verb) {
+  for (const row of cap.actions) {
+    if (row.action === verb) {
+      return row.evidence;
+    }
+  }
+  return null;
 }
 
 function listenerResolve(context, message) {
@@ -2476,6 +2535,224 @@ function postcheckTests() {
   assert.ok(request.includes('"frame": 0'), "postcheck request pins frame:0");
 }
 
+function queryTests() {
+  // DoD-named cases, each driven through the real `queryScoped`/`forward` predicates:
+  // J1 query_returns_matches_in_preorder_with_idx_role_text_rect
+  // J2 query_does_not_replace_last_snapshot
+  // J3 query_stale_doc_and_snap_are_named (+ the no_snapshot record case)
+  // J4 query_subtree_uses_contains
+  // J5 query_budget_truncates_with_budget_hit
+  // J6 query_never_reads_password_text
+  // J7 query_filter_cases_match_fixture
+  // J8 sw_forwards_query_by_tab_and_frame_with_evidence
+  // J9 query_detached_node_reports_stale_element
+  // J1 — pre-order rows with idx/role/text/rect.
+  const context = contentContext();
+  const a = element({ tag: "BUTTON", attrs: { "aria-label": "Sign in" }, rect: { left: 10, top: 20, width: 100, height: 40 } });
+  const b = element({ tag: "A", attrs: { href: "https://example.test/x", "aria-label": "Open" }, rect: { left: 20, top: 80, width: 120, height: 20 } });
+  const c = element({ tag: "INPUT", type: "text", attrs: { type: "text", "aria-label": "Draft" }, rect: { left: 30, top: 140, width: 200, height: 30 } });
+  installSnapshotNodes(context, [a, b, c], "aaaa", "11111111");
+  let reply = queryScoped(context, { doc: "aaaa", snap: "11111111" });
+  assert.equal(reply.error, undefined);
+  assert.equal(reply.examined, 3);
+  assert.equal(reply.matchedTotal, 3);
+  assert.equal(reply.matches.map((m) => m.idx).join(","), "0,1,2");
+  assert.equal(reply.matches.map((m) => m.role).join(","), "Button,Hyperlink,Edit");
+  assert.equal(reply.matches[0].text, "Sign in");
+  assert.equal(reply.matches[0].rectCss.width, 100);
+  assert.equal(reply.matches[0].keyOk, true);
+  assert.equal(reply.matches[0].connected, true);
+  assert.equal(reply.assess_v, undefined, "a list reply never advertises assessment");
+
+  // Filters are ANDed.
+  reply = queryScoped(context, { doc: "aaaa", snap: "11111111", role: "button", text: "sign" });
+  assert.equal(reply.matchedTotal, 1);
+  reply = queryScoped(context, { doc: "aaaa", snap: "11111111", role: "button", text: "open" });
+  assert.equal(reply.matchedTotal, 0);
+  // Limit/offset keep the total exact.
+  reply = queryScoped(context, { doc: "aaaa", snap: "11111111", limit: 1, offset: 1 });
+  assert.equal(reply.matchedTotal, 3);
+  assert.equal(reply.matches.length, 1);
+  assert.equal(reply.matches[0].idx, 1);
+
+  // J2 — a query never replaces the stored snapshot.
+  const before = reply.snap;
+  queryScoped(context, { doc: "aaaa", snap: "11111111", role: "button" });
+  const after = vm.runInContext("lastSnapshot.snap", context);
+  assert.equal(after, before, "query must not re-snapshot");
+
+  // J3 — stale doc/snap are named, and a missing record is `no_snapshot`.
+  reply = queryScoped(context, { doc: "bbbb", snap: "11111111" });
+  assert.equal(reply.error, "stale_document");
+  reply = queryScoped(context, { doc: "aaaa", snap: "22222222" });
+  assert.equal(reply.error, "stale_snapshot");
+  const empty = contentContext();
+  reply = queryScoped(empty, { doc: "aaaa", snap: "11111111" });
+  assert.equal(reply.error, "no_snapshot");
+
+  // J4 — subtree is containment, not an index range.
+  const sub = contentContext();
+  const container = element({ tag: "DIV", attrs: { "aria-label": "Group" }, rect: { left: 0, top: 0, width: 400, height: 400 } });
+  const child1 = attach(container, element({ tag: "BUTTON", attrs: { "aria-label": "Inside one" }, rect: { left: 5, top: 5, width: 50, height: 20 } }));
+  const child2 = attach(container, element({ tag: "BUTTON", attrs: { "aria-label": "Inside two" }, rect: { left: 5, top: 30, width: 50, height: 20 } }));
+  const sibling = element({ tag: "BUTTON", attrs: { "aria-label": "Outside" }, rect: { left: 5, top: 60, width: 50, height: 20 } });
+  installSnapshotNodes(sub, [container, child1, child2, sibling], "cccc", "33333333");
+  reply = queryScoped(sub, { doc: "cccc", snap: "33333333", subtreeRoot: 0 });
+  assert.equal(reply.matches.map((m) => m.idx).join(","), "1,2");
+  reply = queryScoped(sub, { doc: "cccc", snap: "33333333", subtreeRoot: 9 });
+  assert.equal(reply.error, "stale_element");
+
+  // J5 — the scan budget truncates and declares `budgetHit`.
+  const budget = contentContext();
+  const many = [];
+  for (let i = 0; i < 20; i += 1) {
+    many.push(element({ tag: "BUTTON", attrs: { "aria-label": "B" + i } }));
+  }
+  installSnapshotNodes(budget, many, "dddd", "44444444");
+  let tick = 0;
+  budget.Date.now = () => {
+    const value = tick * 10;
+    tick += 1;
+    return value;
+  };
+  reply = queryScoped(budget, { doc: "dddd", snap: "44444444", budgetMs: 20, maxNodes: 100 });
+  assert.equal(reply.budgetHit, true);
+  assert.ok(reply.examined < 20, "budget stops the scan early");
+
+  // J6 — a password value is never read or matched.
+  const secret = contentContext();
+  const password = element({ tag: "INPUT", type: "password", attrs: { type: "password" } });
+  password.value = "hunter2-secret";
+  installSnapshotNodes(secret, [password], "eeee", "55555555");
+  reply = queryScoped(secret, { doc: "eeee", snap: "55555555", text: "hunter2" });
+  assert.equal(reply.matchedTotal, 0, "password value is never a text match");
+  reply = queryScoped(secret, { doc: "eeee", snap: "55555555" });
+  assert.equal(reply.matches[0].text, null, "password text stays null");
+
+  // J9 — a detached node is returned with connected:false and keyOk:false.
+  const detached = contentContext();
+  const gone = element({ tag: "BUTTON", attrs: { "aria-label": "Gone" }, isConnected: false });
+  installSnapshotNodes(detached, [gone], "ffff", "66666666");
+  reply = queryScoped(detached, { doc: "ffff", snap: "66666666" });
+  assert.equal(reply.matches.length, 1, "a detached stored node is counted, never hidden");
+  assert.equal(reply.matches[0].connected, false);
+  assert.equal(reply.matches[0].keyOk, false);
+
+  // J7 — the shared expectations fixture is satisfied by the JS predicate too.
+  const casesPath = path.join(root, "..", "tests", "fixtures", "find-cases.json");
+  const shared = JSON.parse(fs.readFileSync(casesPath, "utf8"));
+  const sharedContext = contentContext();
+  const sharedNodes = shared.elements.map((row) => {
+    const opts = { tag: "BUTTON", innerText: row.text, attrs: { "aria-label": row.text }, rect: row.rectCss };
+    if (row.role === "Hyperlink") {
+      opts.tag = "A";
+      opts.attrs.href = "https://example.test/";
+    } else if (row.role === "Edit") {
+      opts.tag = "INPUT";
+      opts.type = "text";
+      opts.attrs.type = "text";
+    }
+    return element(opts);
+  });
+  installSnapshotNodes(sharedContext, sharedNodes, shared.doc, shared.snap);
+  for (const testCase of shared.cases) {
+    reply = queryScoped(sharedContext, {
+      doc: shared.doc,
+      snap: shared.snap,
+      role: testCase.role || undefined,
+      text: testCase.text || undefined,
+    });
+    assert.equal(
+      reply.matches.map((m) => m.id).join(","),
+      testCase.expected.join(","),
+      "shared case " + testCase.name
+    );
+  }
+
+  // SW — the query op is allowlisted and routed by named tab + frameId with evidence.
+  const sw = fs.readFileSync(path.join(root, "sw.js"), "utf8");
+  assert.ok(sw.includes('op !== "query"'), "query is in the SW allowlist");
+  const swHarness = swContext();
+  reply = swHarness.forward({
+    op: "query",
+    v: 1,
+    tab: 12,
+    frame: 0,
+    doc: "9f3a",
+    snap: "a1b2c3d4",
+    limit: 20,
+    offset: 0,
+  });
+  assert.equal(swHarness.calls.routes[0].op, "query");
+  assert.equal(swHarness.calls.routes[0].frameId, 0);
+  assert.equal(reply.tab, 12);
+  assert.equal(reply.window, 45);
+  assert.equal(reply.active, true);
+  assert.equal(reply.focused, true);
+  assert.equal(reply.fallback, false);
+
+  // An unknown op still short-circuits to kebab `unsupported-op` before content is contacted.
+  const sendsBefore = swHarness.calls.send.length;
+  reply = swHarness.forward({ op: "not-a-thing", tab: 12 });
+  assert.equal(reply.error, "unsupported-op");
+  assert.equal(swHarness.calls.send.length, sendsBefore);
+
+  // Source locks: the query handler never walks, re-snapshots or maps geometry.
+  const content = fs.readFileSync(path.join(root, "content.js"), "utf8");
+  const start = content.indexOf("function queryScoped(");
+  const end = content.indexOf("function nodeContains(");
+  assert.ok(start > 0 && end > start);
+  const body = content.slice(start, end);
+  for (const banned of ["walk(", "buildResolve(", "buildSnapshot(", "nextSnap(", "lastSnapshot ="]) {
+    assert.ok(!body.includes(banned), "queryScoped must not contain " + banned);
+  }
+  assert.ok(content.includes("reply.capability = domCapability"), "caps:true resolve block exists");
+  const domStart = content.indexOf("function domCapability(");
+  const domBody = content.slice(domStart);
+  assert.ok(!domBody.includes(".click("), "capability probe never clicks");
+  assert.ok(!domBody.includes(".focus("), "capability probe never focuses");
+  assert.ok(!domBody.includes("el.value"), "capability probe never reads a value");
+}
+
+function capabilityTests() {
+  const ctx = contentContext();
+  // A bare list item is not a verb-bearing control: no invoke and no select over-claim.
+  const bareLi = element({ tag: "LI", attrs: { "aria-label": "Item" } });
+  let cap = capability(ctx, bareLi);
+  assert.equal(actionSupport(cap, "invoke"), "unknown", "bare <li> invoke");
+  assert.equal(actionSupport(cap, "select"), "unknown", "bare <li> select");
+
+  // An explicit role=option is a selection item.
+  const option = element({ tag: "LI", attrs: { role: "option", "aria-label": "Choice" } });
+  cap = capability(ctx, option);
+  assert.equal(actionSupport(cap, "select"), "available");
+  assert.equal(actionEvidence(cap, "select"), "role_selection");
+
+  // menuitem alone does not advertise expand/collapse; aria-expanded does.
+  const menuItem = element({ tag: "DIV", attrs: { role: "menuitem", "aria-label": "Open" } });
+  cap = capability(ctx, menuItem);
+  assert.equal(actionSupport(cap, "expand"), "unknown", "menuitem without aria-expanded");
+  const expandedItem = element({
+    tag: "DIV",
+    attrs: { role: "menuitem", "aria-label": "Open", "aria-expanded": "true" },
+  });
+  cap = capability(ctx, expandedItem);
+  assert.equal(actionSupport(cap, "expand"), "available");
+  assert.equal(actionEvidence(cap, "expand"), "aria_expanded");
+
+  // Button / checkbox / edit / password evidence stays as declared.
+  cap = capability(ctx, element({ tag: "BUTTON", attrs: { "aria-label": "Go" } }));
+  assert.equal(actionEvidence(cap, "invoke"), "role_button");
+  cap = capability(ctx, element({ tag: "INPUT", type: "checkbox", attrs: { type: "checkbox" } }));
+  assert.equal(actionEvidence(cap, "toggle"), "role_checkbox");
+  cap = capability(ctx, element({ tag: "INPUT", type: "text", attrs: { type: "text", "aria-label": "Name" } }));
+  assert.equal(actionEvidence(cap, "set_value"), "editable_role");
+  const password = element({ tag: "INPUT", type: "password", attrs: { type: "password" } });
+  password.value = "hunter2-secret";
+  cap = capability(ctx, password);
+  assert.equal(actionSupport(cap, "set_value"), "unknown", "password never set_value");
+}
+
 function main() {
   contentTests();
   swTests();
@@ -2489,6 +2766,8 @@ function main() {
   frameBindingOpsTests();
   frameContentTests();
   postcheckTests();
+  queryTests();
+  capabilityTests();
   frameSourceLocksTests();
   process.stdout.write("extension harness: ok\n");
 }

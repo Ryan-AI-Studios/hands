@@ -860,8 +860,10 @@ mod tests {
             css_point: CssPoint::new(60.0, 60.0),
             contract,
             hwnd,
+            href: None,
             map: None,
             assessment: None,
+            capability: None,
             identity: None,
         }
     }
@@ -1007,8 +1009,10 @@ mod tests {
             css_point: CssPoint::new(60.0, 60.0),
             contract,
             hwnd: Some(0x1234),
+            href: None,
             map: Some(map),
             assessment: None,
+            capability: None,
             identity: Some(crate::identity::IdentityReport::exact_chrome(r)),
         }
     }

@@ -8,6 +8,8 @@ This directory is the **product git root**. Planning, ADRs, and conductor tracks
 
 **Sideload is you.** The binary never clicks Developer Mode, never writes HKCU, and never edits a local LLM router.
 
+**Scoped `find`.** After `observe` mints an `sref1:` ref, `hands find --within <ref>` searches that stored snapshot (or one frame's snapshot, or a bounded UIA window/subtree) by role/text/rect without re-walking the screen; `hands find --ref <ref>` drills into one element with the 0123 identity, opt-in 0128 assessment, and read-only capability evidence. It is read-only (no input, lease, cooldown, JSONL or inner model), reports honest `coverage.page_complete:false` bounds, and never claims a zero match means absence. Chrome list returns `rect_css` only; capability is evidence, not authority. See `docs/AGENT-CONTRACT.md` for the limits (disabled/hidden controls are excluded from the stored walk, and `HANDS_FRAMES=0` is per-process).
+
 Licensed under MIT (`LICENSE`).
 
 ### Disclaimer — use at your own risk

@@ -274,6 +274,20 @@ pub fn same_top_level(a: Option<isize>, b: Option<isize>) -> bool {
 type ForegroundHwndHook = fn() -> Option<isize>;
 
 #[cfg(test)]
+type RelatedToRootHook = fn(isize, isize) -> bool;
+
+#[cfg(test)]
+thread_local! {
+    static RELATED_TO_ROOT_HOOK: std::cell::Cell<Option<RelatedToRootHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_related_to_root_hook(hook: Option<RelatedToRootHook>) {
+    RELATED_TO_ROOT_HOOK.with(|c| c.set(hook));
+}
+
+#[cfg(test)]
 thread_local! {
     static FG_HWND_HOOK: std::cell::Cell<Option<ForegroundHwndHook>> =
         const { std::cell::Cell::new(None) };
@@ -444,7 +458,12 @@ pub fn root_hwnd(hwnd: isize) -> Option<isize> {
 }
 
 /// Owned popup or same top-level root as `root`.
+/// True when `hwnd` is `root` or belongs to the same top-level window chain (owned popup).
 pub fn related_to_root(hwnd: isize, root: isize) -> bool {
+    #[cfg(test)]
+    if let Some(hook) = RELATED_TO_ROOT_HOOK.with(|c| c.get()) {
+        return hook(hwnd, root);
+    }
     if same_top_level(Some(hwnd), Some(root)) {
         return true;
     }

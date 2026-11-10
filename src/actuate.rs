@@ -5049,8 +5049,10 @@ mod tests {
             css_point: css,
             contract,
             hwnd: Some(0x10),
+            href: None,
             map: Some(map),
             assessment: Some(assessment),
+            capability: None,
             identity: None,
         }));
         let env = click(ActuateRequest {
@@ -5747,8 +5749,10 @@ mod tests {
                 css_point: css.center(),
                 contract,
                 hwnd: Some(0x1234),
+                href: None,
                 map: Some(map),
                 assessment: None,
+                capability: None,
                 identity: None,
             },
             css,
@@ -7489,8 +7493,10 @@ mod tests {
             css_point: css.center(),
             contract,
             hwnd: Some(0x1234),
+            href: None,
             map: Some(map),
             assessment: None,
+            capability: None,
             identity: Some(IdentityReport::exact_chrome(&r)),
         };
         (r, hit)

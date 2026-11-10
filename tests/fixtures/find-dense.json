@@ -1,0 +1,748 @@
+{
+  "url": "https://example.test/find-dense",
+  "title": "Find dense fixture",
+  "main_text": "Find dense fixture",
+  "elements": [
+    {
+      "id": "chr:0",
+      "idx": 0,
+      "role": "Button",
+      "text": "Button action control number 0 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 100,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:1",
+      "idx": 1,
+      "role": "Hyperlink",
+      "text": "Open result link number 1 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 240,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:2",
+      "idx": 2,
+      "role": "Edit",
+      "text": "Draft text field 2",
+      "rectCss": {
+        "left": 380,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:3",
+      "idx": 3,
+      "role": "Button",
+      "text": "Button action control number 3 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 520,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:4",
+      "idx": 4,
+      "role": "Hyperlink",
+      "text": "Open result link number 4 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 660,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:5",
+      "idx": 5,
+      "role": "Edit",
+      "text": "Draft text field 5",
+      "rectCss": {
+        "left": 800,
+        "top": 40,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:6",
+      "idx": 6,
+      "role": "Button",
+      "text": "Button action control number 6 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 100,
+        "top": 100,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:7",
+      "idx": 7,
+      "role": "Hyperlink",
+      "text": "Open result link number 7 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 240,
+        "top": 100,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:8",
+      "idx": 8,
+      "role": "Edit",
+      "text": "Draft text field 8",
+      "rectCss": {
+        "left": 380,
+        "top": 100,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:9",
+      "idx": 9,
+      "role": "Button",
+      "text": "Button action control number 9 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 520,
+        "top": 100,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:10",
+      "idx": 10,
+      "role": "Hyperlink",
+      "text": "Open result link number 10 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 660,
+        "top": 100,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:11",
+      "idx": 11,
+      "role": "Edit",
+      "text": "Draft text field 11",
+      "rectCss": {
+        "left": 800,
+        "top": 100,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:12",
+      "idx": 12,
+      "role": "Button",
+      "text": "Button action control number 12 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 100,
+        "top": 160,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:13",
+      "idx": 13,
+      "role": "Hyperlink",
+      "text": "Open result link number 13 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 240,
+        "top": 160,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:14",
+      "idx": 14,
+      "role": "Edit",
+      "text": "Draft text field 14",
+      "rectCss": {
+        "left": 380,
+        "top": 160,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:15",
+      "idx": 15,
+      "role": "Button",
+      "text": "Button action control number 15 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 520,
+        "top": 160,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:16",
+      "idx": 16,
+      "role": "Hyperlink",
+      "text": "Open result link number 16 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 660,
+        "top": 160,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:17",
+      "idx": 17,
+      "role": "Edit",
+      "text": "Draft text field 17",
+      "rectCss": {
+        "left": 800,
+        "top": 160,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:18",
+      "idx": 18,
+      "role": "Button",
+      "text": "Button action control number 18 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 100,
+        "top": 220,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:19",
+      "idx": 19,
+      "role": "Hyperlink",
+      "text": "Open result link number 19 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 240,
+        "top": 220,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:20",
+      "idx": 20,
+      "role": "Edit",
+      "text": "Draft text field 20",
+      "rectCss": {
+        "left": 380,
+        "top": 220,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:21",
+      "idx": 21,
+      "role": "Button",
+      "text": "Button action control number 21 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 520,
+        "top": 220,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:22",
+      "idx": 22,
+      "role": "Hyperlink",
+      "text": "Open result link number 22 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 660,
+        "top": 220,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:23",
+      "idx": 23,
+      "role": "Edit",
+      "text": "Draft text field 23",
+      "rectCss": {
+        "left": 800,
+        "top": 220,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:24",
+      "idx": 24,
+      "role": "Button",
+      "text": "Button action control number 24 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 100,
+        "top": 280,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:25",
+      "idx": 25,
+      "role": "Hyperlink",
+      "text": "Open result link number 25 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 240,
+        "top": 280,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:26",
+      "idx": 26,
+      "role": "Edit",
+      "text": "Draft text field 26",
+      "rectCss": {
+        "left": 380,
+        "top": 280,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:27",
+      "idx": 27,
+      "role": "Button",
+      "text": "Button action control number 27 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 520,
+        "top": 280,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:28",
+      "idx": 28,
+      "role": "Hyperlink",
+      "text": "Open result link number 28 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 660,
+        "top": 280,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:29",
+      "idx": 29,
+      "role": "Edit",
+      "text": "Draft text field 29",
+      "rectCss": {
+        "left": 800,
+        "top": 280,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:30",
+      "idx": 30,
+      "role": "Button",
+      "text": "Button action control number 30 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 100,
+        "top": 340,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:31",
+      "idx": 31,
+      "role": "Hyperlink",
+      "text": "Open result link number 31 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 240,
+        "top": 340,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:32",
+      "idx": 32,
+      "role": "Edit",
+      "text": "Draft text field 32",
+      "rectCss": {
+        "left": 380,
+        "top": 340,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:33",
+      "idx": 33,
+      "role": "Button",
+      "text": "Button action control number 33 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 520,
+        "top": 340,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:34",
+      "idx": 34,
+      "role": "Hyperlink",
+      "text": "Open result link number 34 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 660,
+        "top": 340,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:35",
+      "idx": 35,
+      "role": "Edit",
+      "text": "Draft text field 35",
+      "rectCss": {
+        "left": 800,
+        "top": 340,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:36",
+      "idx": 36,
+      "role": "Button",
+      "text": "Button action control number 36 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 100,
+        "top": 400,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:37",
+      "idx": 37,
+      "role": "Hyperlink",
+      "text": "Open result link number 37 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 240,
+        "top": 400,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:38",
+      "idx": 38,
+      "role": "Edit",
+      "text": "Draft text field 38",
+      "rectCss": {
+        "left": 380,
+        "top": 400,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:39",
+      "idx": 39,
+      "role": "Button",
+      "text": "Button action control number 39 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 520,
+        "top": 400,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:40",
+      "idx": 40,
+      "role": "Hyperlink",
+      "text": "Open result link number 40 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 660,
+        "top": 400,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:41",
+      "idx": 41,
+      "role": "Edit",
+      "text": "Draft text field 41",
+      "rectCss": {
+        "left": 800,
+        "top": 400,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:42",
+      "idx": 42,
+      "role": "Button",
+      "text": "Button action control number 42 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 100,
+        "top": 460,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:43",
+      "idx": 43,
+      "role": "Hyperlink",
+      "text": "Open result link number 43 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 240,
+        "top": 460,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:44",
+      "idx": 44,
+      "role": "Edit",
+      "text": "Draft text field 44",
+      "rectCss": {
+        "left": 380,
+        "top": 460,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:45",
+      "idx": 45,
+      "role": "Button",
+      "text": "Button action control number 45 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 520,
+        "top": 460,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:46",
+      "idx": 46,
+      "role": "Hyperlink",
+      "text": "Open result link number 46 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 660,
+        "top": 460,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:47",
+      "idx": 47,
+      "role": "Edit",
+      "text": "Draft text field 47",
+      "rectCss": {
+        "left": 800,
+        "top": 460,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:48",
+      "idx": 48,
+      "role": "Button",
+      "text": "Button action control number 48 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 100,
+        "top": 520,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:49",
+      "idx": 49,
+      "role": "Hyperlink",
+      "text": "Open result link number 49 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 240,
+        "top": 520,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:50",
+      "idx": 50,
+      "role": "Edit",
+      "text": "Draft text field 50",
+      "rectCss": {
+        "left": 380,
+        "top": 520,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:51",
+      "idx": 51,
+      "role": "Button",
+      "text": "Button action control number 51 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 520,
+        "top": 520,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:52",
+      "idx": 52,
+      "role": "Hyperlink",
+      "text": "Open result link number 52 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 660,
+        "top": 520,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:53",
+      "idx": 53,
+      "role": "Edit",
+      "text": "Draft text field 53",
+      "rectCss": {
+        "left": 800,
+        "top": 520,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:54",
+      "idx": 54,
+      "role": "Button",
+      "text": "Button action control number 54 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 100,
+        "top": 580,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:55",
+      "idx": 55,
+      "role": "Hyperlink",
+      "text": "Open result link number 55 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 240,
+        "top": 580,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:56",
+      "idx": 56,
+      "role": "Edit",
+      "text": "Draft text field 56",
+      "rectCss": {
+        "left": 380,
+        "top": 580,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:57",
+      "idx": 57,
+      "role": "Button",
+      "text": "Button action control number 57 with a deliberately long label for bytes",
+      "rectCss": {
+        "left": 520,
+        "top": 580,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:58",
+      "idx": 58,
+      "role": "Hyperlink",
+      "text": "Open result link number 58 for the dense snapshot fixture",
+      "rectCss": {
+        "left": 660,
+        "top": 580,
+        "width": 120,
+        "height": 32
+      }
+    },
+    {
+      "id": "chr:59",
+      "idx": 59,
+      "role": "Edit",
+      "text": "Draft text field 59",
+      "rectCss": {
+        "left": 800,
+        "top": 580,
+        "width": 120,
+        "height": 32
+      }
+    }
+  ],
+  "cards": [],
+  "metrics": {
+    "screenX": 0,
+    "screenY": 0,
+    "outerWidth": 1200,
+    "outerHeight": 900,
+    "innerWidth": 1200,
+    "innerHeight": 900,
+    "devicePixelRatio": 1,
+    "clientWidth": 1200,
+    "clientHeight": 900
+  },
+  "assess_v": 1,
+  "tab": 12,
+  "window": 45,
+  "frame": 0,
+  "doc": "7a1b",
+  "snap": "feedface",
+  "retained": 60,
+  "stored": true,
+  "fallback": false
+}

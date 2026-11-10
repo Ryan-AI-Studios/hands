@@ -64,21 +64,21 @@ pub struct ScopedFailure {
 }
 
 impl ScopedFailure {
-    fn stale(reason: &'static str) -> Self {
+    pub(crate) fn stale(reason: &'static str) -> Self {
         Self {
             state: IdentityState::Stale,
             reason,
         }
     }
 
-    fn ambiguous(reason: &'static str) -> Self {
+    pub(crate) fn ambiguous(reason: &'static str) -> Self {
         Self {
             state: IdentityState::Ambiguous,
             reason,
         }
     }
 
-    fn unknown(reason: &'static str) -> Self {
+    pub(crate) fn unknown(reason: &'static str) -> Self {
         Self {
             state: IdentityState::Unknown,
             reason,
@@ -673,6 +673,313 @@ pub fn resolve_scoped(
     }
 }
 
+// ---------------------------------------------------------------- bounded list query (0125)
+
+/// One serializable row of a bounded UIA list query. `value` is never present: this walk never
+/// reads `CurrentValue`.
+#[derive(Debug, Clone)]
+pub struct QueryRow {
+    pub role: String,
+    pub name: String,
+    pub own_role: String,
+    pub own_name: String,
+    pub kind: ControlKind,
+    pub is_password: bool,
+    pub rect: Rect,
+    pub is_offscreen: bool,
+    pub is_enabled: Option<bool>,
+    pub runtime_id: Vec<i32>,
+    pub depth: u32,
+}
+
+/// Filter predicates applied inside the walk (so `examined` counts real nodes, not a
+/// post-filter subset).
+#[derive(Debug, Clone, Default)]
+pub struct QueryFilters {
+    pub role: Option<String>,
+    pub text: Option<String>,
+    pub rect: Option<Rect>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QueryScopeOutcome {
+    pub rows: Vec<QueryRow>,
+    pub examined: usize,
+    pub complete: bool,
+    pub reason: Option<&'static str>,
+}
+
+#[cfg(test)]
+type UiaQueryHook =
+    fn(isize, Option<(&str, &str)>, usize, u32) -> Result<QueryScopeOutcome, ScopedFailure>;
+
+#[cfg(test)]
+thread_local! {
+    static UIA_QUERY_HOOK: std::cell::Cell<Option<UiaQueryHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_uia_query_hook(hook: Option<UiaQueryHook>) {
+    UIA_QUERY_HOOK.with(|c| c.set(hook));
+}
+
+/// Bounded, read-only control-view walk from `ElementFromHandle(hwnd)` (never
+/// `GetRootElement`). A subtree root is resolved **inside the same worker** by `ridh` hash + own
+/// `fp` (0123 path), because a `sref1:u` locator carries no RuntimeId array. Caps and deadlines
+/// return rows **and** `complete:false`; they are never an error and never a first-match guess.
+#[allow(clippy::result_large_err)]
+pub fn query_scope(
+    hwnd: isize,
+    root: Option<(&str, &str)>,
+    filters: QueryFilters,
+    node_cap: usize,
+    depth_cap: u32,
+    deadline: Duration,
+) -> Result<QueryScopeOutcome, ScopedFailure> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = UIA_QUERY_HOOK.with(|c| c.get()) {
+            return hook(hwnd, root, node_cap, depth_cap);
+        }
+    }
+    let root = root.map(|(ridh, fp)| (ridh.to_string(), fp.to_string()));
+    let Some(slot) = WorkerSlot::acquire() else {
+        return Err(ScopedFailure::unknown("provider_timeout"));
+    };
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("hands-uia-query".into())
+        .spawn(move || {
+            let _slot = slot;
+            let _ = tx.send(sta_query_scope(hwnd, root, filters, node_cap, depth_cap));
+        })
+        .map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(_) => Err(ScopedFailure::unknown("provider_timeout")),
+    }
+}
+
+fn sta_query_scope(
+    hwnd: isize,
+    root: Option<(String, String)>,
+    filters: QueryFilters,
+    node_cap: usize,
+    depth_cap: u32,
+) -> Result<QueryScopeOutcome, ScopedFailure> {
+    let _sta = StaGuard::enter().map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    let automation = create_automation().map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    let window_root = unsafe { automation.ElementFromHandle(crate::foreground::raw_hwnd(hwnd)) }
+        .map_err(|_| ScopedFailure::unknown("window_unreadable"))?;
+    let walker = unsafe { automation.ControlViewWalker() }
+        .map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
+    let (start, root_is_scope) = match &root {
+        Some((ridh, fp)) => (
+            resolve_scoped_com(&automation, &walker, hwnd, ridh, fp)?.0,
+            true,
+        ),
+        None => (window_root, false),
+    };
+    let mut rows = Vec::new();
+    let mut examined = 0usize;
+    let mut reason: Option<&'static str> = None;
+    let mut stack = vec![(start, 0u32)];
+    while let Some((element, depth)) = stack.pop() {
+        examined += 1;
+        if examined > node_cap {
+            examined -= 1;
+            reason = Some("node_truncated");
+            break;
+        }
+        let is_root = root_is_scope && depth == 0;
+        if depth > depth_cap {
+            reason = Some("depth_truncated");
+            continue;
+        }
+        if depth < depth_cap {
+            push_children_with_depth(&walker, &element, depth, &mut stack);
+        } else if has_first_child(&walker, &element) {
+            reason = Some("depth_truncated");
+        }
+        if is_root {
+            continue;
+        }
+        let Some(row) = query_row(&element, depth) else {
+            continue;
+        };
+        if query_row_matches(&row, &filters) {
+            rows.push(row);
+        }
+    }
+    let complete = reason.is_none();
+    Ok(QueryScopeOutcome {
+        rows,
+        examined,
+        complete,
+        reason,
+    })
+}
+
+fn has_first_child(walker: &IUIAutomationTreeWalker, parent: &IUIAutomationElement) -> bool {
+    unsafe { walker.GetFirstChildElement(parent) }.is_ok()
+}
+
+fn push_children_with_depth(
+    walker: &IUIAutomationTreeWalker,
+    parent: &IUIAutomationElement,
+    depth: u32,
+    stack: &mut Vec<(IUIAutomationElement, u32)>,
+) {
+    let Ok(first) = (unsafe { walker.GetFirstChildElement(parent) }) else {
+        return;
+    };
+    let mut current = Some(first);
+    let mut children = Vec::new();
+    while let Some(el) = current {
+        let next = unsafe { walker.GetNextSiblingElement(&el) }.ok();
+        children.push(el);
+        current = next;
+    }
+    for child in children.into_iter().rev() {
+        stack.push((child, depth + 1));
+    }
+}
+
+/// Read-only row builder. Deliberately does **not** call [`value_pattern`]: a list query never
+/// reads `CurrentValue`, and a password element never contributes text.
+fn query_row(element: &IUIAutomationElement, depth: u32) -> Option<QueryRow> {
+    unsafe {
+        let is_control = element.CurrentIsControlElement().ok()?.as_bool();
+        if !is_control {
+            return None;
+        }
+        let is_offscreen = element.CurrentIsOffscreen().ok()?.as_bool();
+        let rect = element
+            .CurrentBoundingRectangle()
+            .ok()
+            .map(rect_from_uia)
+            .unwrap_or(Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            });
+        let control_kind = ControlKind::from_uia_id(element.CurrentControlType().ok()?.0);
+        let is_password = element.CurrentIsPassword().ok()?.as_bool();
+        let name = element.CurrentName().ok()?.to_string();
+        let localized = element
+            .CurrentLocalizedControlType()
+            .ok()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let own_role = fingerprint_role(element);
+        let role = if localized.is_empty() {
+            control_kind.type_name().to_string()
+        } else {
+            localized
+        };
+        let runtime_id = runtime_id(element)?;
+        if runtime_id.is_empty() {
+            return None;
+        }
+        let is_enabled = element.CurrentIsEnabled().ok().map(|v| v.as_bool());
+        Some(QueryRow {
+            role,
+            name: name.clone(),
+            own_role,
+            own_name: if is_password { String::new() } else { name },
+            kind: control_kind,
+            is_password,
+            rect,
+            is_offscreen,
+            is_enabled,
+            runtime_id,
+            depth,
+        })
+    }
+}
+
+pub(crate) fn query_row_matches(row: &QueryRow, filters: &QueryFilters) -> bool {
+    if let Some(role) = filters.role.as_deref() {
+        let want = role.to_ascii_lowercase();
+        let emitted = row.role.to_ascii_lowercase();
+        let canonical = row.kind.type_name().to_ascii_lowercase();
+        if emitted != want && canonical != want {
+            return false;
+        }
+    }
+    if let Some(text) = filters.text.as_deref() {
+        let haystack = if row.is_password {
+            String::new()
+        } else {
+            row.own_name.chars().take(80).collect::<String>()
+        };
+        if !haystack
+            .to_ascii_lowercase()
+            .contains(&text.to_ascii_lowercase())
+        {
+            return false;
+        }
+    }
+    if let Some(want) = filters.rect
+        && !rect_intersect(row.rect, want)
+    {
+        return false;
+    }
+    true
+}
+
+fn rect_intersect(a: Rect, b: Rect) -> bool {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.w).min(b.x + b.w);
+    let bottom = (a.y + a.h).min(b.y + b.h);
+    right > left && bottom > top
+}
+
+/// Resolve the 0123 subtree root on the same STA worker and keep the COM element so the descent
+/// uses the same interface. Mirrors `scoped_matches_outcome` arbitration exactly.
+pub(crate) fn resolve_scoped_com(
+    automation: &IUIAutomation,
+    walker: &IUIAutomationTreeWalker,
+    hwnd: isize,
+    ridh: &str,
+    fp: &str,
+) -> Result<(IUIAutomationElement, ResolvedElement), ScopedFailure> {
+    let root = unsafe { automation.ElementFromHandle(crate::foreground::raw_hwnd(hwnd)) }
+        .map_err(|_| ScopedFailure::unknown("window_unreadable"))?;
+    let mut stack = vec![root];
+    let mut visited = 0usize;
+    let mut pairs: Vec<(IUIAutomationElement, ResolvedElement)> = Vec::new();
+    let mut cap_hit = false;
+    while let Some(element) = stack.pop() {
+        visited += 1;
+        if visited > SCOPED_NODE_CAP {
+            cap_hit = true;
+            break;
+        }
+        if let Some(id) = runtime_id(&element)
+            && runtime_id_hash(&id) == ridh
+            && let Some(candidate) = scoped_candidate(walker, &element)
+        {
+            pairs.push((element.clone(), candidate));
+            if pairs.len() >= SCOPED_MATCH_CAP {
+                break;
+            }
+        }
+        push_children(walker, &element, &mut stack);
+    }
+    // One arbitration, shared with the 0123 scoped resolve: cap/empty/window/duplicate/fp.
+    // The index keeps the returned COM element and the fingerprinted candidate from the same
+    // pair (a duplicate RuntimeId with one out-of-window pair must not cross-join).
+    let idx = scoped_pair_index(&pairs, cap_hit, hwnd, fp)?;
+    pairs
+        .into_iter()
+        .nth(idx)
+        .ok_or_else(|| ScopedFailure::stale("stale_element"))
+}
+
 fn sta_resolve_scoped(hwnd: isize, ridh: &str, fp: &str) -> Result<ResolvedElement, ScopedFailure> {
     let _sta = StaGuard::enter().map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
     let automation = create_automation().map_err(|_| ScopedFailure::unknown("provider_timeout"))?;
@@ -736,13 +1043,15 @@ fn scoped_candidate(
 }
 
 /// Pure candidate arbitration used by the live walk and tests. A cap hit with no resolved
-/// hash is `unknown`, never a partial first match.
-pub(crate) fn scoped_matches_outcome(
-    matches: Vec<ResolvedElement>,
+/// hash is `unknown`, never a partial first match. Returns the **index** of the surviving
+/// candidate so a caller holding a parallel `IUIAutomationElement` can join the element and
+/// fingerprint from the same pair.
+pub(crate) fn scoped_match_index(
+    matches: &[ResolvedElement],
     cap_hit: bool,
     hwnd: isize,
     fp: &str,
-) -> Result<ResolvedElement, ScopedFailure> {
+) -> Result<usize, ScopedFailure> {
     // A cap hit means the walk is incomplete even if a candidate was already collected.
     // Never accept a partial first match (DoD-7).
     if cap_hit {
@@ -752,12 +1061,12 @@ pub(crate) fn scoped_matches_outcome(
         return Err(ScopedFailure::stale("stale_element"));
     }
     let mut within = Vec::new();
-    for candidate in matches {
+    for (idx, candidate) in matches.iter().enumerate() {
         if candidate
             .hwnd
             .is_some_and(|native| crate::foreground::related_to_root(native, hwnd))
         {
-            within.push(candidate);
+            within.push(idx);
         }
     }
     if within.is_empty() {
@@ -766,15 +1075,41 @@ pub(crate) fn scoped_matches_outcome(
     if within.len() > 1 {
         return Err(ScopedFailure::ambiguous("duplicate_runtime_id"));
     }
-    let found = within
-        .into_iter()
-        .next()
-        .ok_or_else(|| ScopedFailure::stale("stale_element"))?;
-    let actual = format!("{:08x}", found.own_fingerprint());
+    let idx = within[0];
+    let actual = format!("{:08x}", matches[idx].own_fingerprint());
     if actual != fp {
         return Err(ScopedFailure::stale("stale_identity"));
     }
-    Ok(found)
+    Ok(idx)
+}
+
+pub(crate) fn scoped_matches_outcome(
+    matches: Vec<ResolvedElement>,
+    cap_hit: bool,
+    hwnd: isize,
+    fp: &str,
+) -> Result<ResolvedElement, ScopedFailure> {
+    let idx = scoped_match_index(&matches, cap_hit, hwnd, fp)?;
+    matches
+        .into_iter()
+        .nth(idx)
+        .ok_or_else(|| ScopedFailure::stale("stale_element"))
+}
+
+/// Pair-aware arbitration for the same-worker subtree resolver. The returned index names the
+/// pair whose candidate was fingerprinted, so the COM element and the fingerprint can never come
+/// from different pairs (a duplicate RuntimeId with one out-of-window pair is the risk).
+pub(crate) fn scoped_pair_index<T>(
+    pairs: &[(T, ResolvedElement)],
+    cap_hit: bool,
+    hwnd: isize,
+    fp: &str,
+) -> Result<usize, ScopedFailure> {
+    let candidates = pairs
+        .iter()
+        .map(|(_, candidate)| candidate.clone())
+        .collect::<Vec<_>>();
+    scoped_match_index(&candidates, cap_hit, hwnd, fp)
 }
 
 fn sta_collect(detail: Detail, cap: usize, hwnd: Option<isize>) -> Result<UiaSnapshot, HandsError> {
@@ -1041,6 +1376,40 @@ impl Drop for StaGuard {
 mod tests {
     use super::*;
     use crate::extract::Detail;
+
+    #[test]
+    fn duplicate_runtime_id_pairs_return_the_in_window_element() {
+        // Two candidates share the same RuntimeId; only one is related to the walk root. The
+        // pair index (not a runtime_id-only re-join) must select the in-window pair so the COM
+        // element and the fingerprint cannot diverge.
+        crate::foreground::set_related_to_root_hook(Some(|hwnd, _root| hwnd == 0x10));
+        let candidate = |name: &str, hwnd: isize| ResolvedElement {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            name: name.into(),
+            role: "Button".into(),
+            hwnd: Some(hwnd),
+            runtime_id: vec![7, 1],
+            own_name: name.into(),
+            own_role: "Button".into(),
+            is_password: false,
+        };
+        let out = candidate("Out", 0x20);
+        let inside = candidate("In", 0x10);
+        let fp = format!("{:08x}", inside.own_fingerprint());
+        let pairs = vec![("out", out), ("in", inside)];
+        assert_eq!(pairs[0].1.runtime_id, pairs[1].1.runtime_id);
+        let idx = scoped_pair_index(&pairs, false, 0x10, &fp).expect("arbitration index");
+        assert_eq!(pairs[idx].0, "in", "the in-window pair must win");
+        let (label, found) = pairs.into_iter().nth(idx).expect("pair");
+        assert_eq!(label, "in");
+        assert_eq!(format!("{:08x}", found.own_fingerprint()), fp);
+        crate::foreground::set_related_to_root_hook(None);
+    }
 
     #[test]
     #[ignore = "live desktop; not a CI gate. Run: cargo test -- --ignored"]

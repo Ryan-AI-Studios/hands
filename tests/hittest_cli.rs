@@ -72,7 +72,7 @@ fn hittest_dispatches_without_input_main_or_lease() {
         "hittest must dispatch like Observe/ElevationStatus, not input_main"
     );
     assert!(
-        src.contains("| Command::Hittest { .. } =>"),
+        src.contains("| Command::Hittest { .. }"),
         "hittest must be unreachable inside input_main"
     );
     let start = src.find("fn hittest_main").expect("hittest_main");

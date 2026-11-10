@@ -2249,21 +2249,34 @@ fn scoped_fixture_hit(
     hit_from_scoped_reply(&reply, r, hwnd, true, assess)
 }
 
+/// Role→verb tables mirrored by `extension/content.js` (`CAP_*` consts). A parity test keeps the
+/// live and fixture vocabularies identical.
+pub(crate) const CAP_INVOKE_ROLES: &[&str] = &[
+    "button",
+    "hyperlink",
+    "tabitem",
+    "menuitem",
+    "listitem",
+    "checkbox",
+    "radiobutton",
+    "treeitem",
+];
+pub(crate) const CAP_TOGGLE_ROLES: &[&str] = &["checkbox", "radiobutton"];
+pub(crate) const CAP_EXPAND_ROLES: &[&str] = &["combobox", "menuitem"];
+pub(crate) const CAP_SELECT_ROLES: &[&str] = &["tabitem", "menuitem", "listitem", "treeitem"];
+pub(crate) const CAP_VALUE_ROLES: &[&str] = &["edit", "combobox"];
+
 /// Fixture-only DOM capability evidence: role markup, no live attributes. The Node harness and
 /// the live extension own the real attribute predicates; this keeps fixture mode honest about
-/// what a role alone can say (never `unavailable`).
+/// what a role alone can say (never `unavailable`) and uses the same role tables/tokens as live.
 fn fixture_capability(role: &str) -> serde_json::Value {
     let role = role.to_ascii_lowercase();
-    let invoke = matches!(
-        role.as_str(),
-        "button" | "hyperlink" | "tabitem" | "menuitem" | "checkbox" | "radiobutton" | "combobox"
-    );
-    let toggle = matches!(role.as_str(), "checkbox" | "radiobutton");
-    let select = matches!(
-        role.as_str(),
-        "tabitem" | "menuitem" | "option" | "listitem"
-    );
-    let set_value = matches!(role.as_str(), "edit" | "combobox");
+    let has = |table: &[&str]| table.contains(&role.as_str());
+    let invoke = has(CAP_INVOKE_ROLES);
+    let toggle = has(CAP_TOGGLE_ROLES);
+    let expand = has(CAP_EXPAND_ROLES);
+    let select = has(CAP_SELECT_ROLES);
+    let set_value = has(CAP_VALUE_ROLES);
     let action = |verb: &str, available: bool, evidence: &str| {
         serde_json::json!({
             "action": verb,
@@ -2271,13 +2284,18 @@ fn fixture_capability(role: &str) -> serde_json::Value {
             "evidence": if available { evidence } else { "no_markup_evidence" },
         })
     };
+    let invoke_evidence = if role == "button" {
+        "role_button"
+    } else {
+        "role_markup"
+    };
     serde_json::json!({
         "source": "dom",
         "actions": [
-            action("invoke", invoke, "role_button"),
+            action("invoke", invoke, invoke_evidence),
             action("toggle", toggle, "role_checkbox"),
-            action("expand", false, "no_markup_evidence"),
-            action("collapse", false, "no_markup_evidence"),
+            action("expand", expand, "role_expand"),
+            action("collapse", expand, "role_expand"),
             action("select", select, "role_selection"),
             action("set_value", set_value, "editable_role"),
         ],

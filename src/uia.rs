@@ -900,7 +900,7 @@ fn query_row(element: &IUIAutomationElement, depth: u32) -> Option<QueryRow> {
     }
 }
 
-fn query_row_matches(row: &QueryRow, filters: &QueryFilters) -> bool {
+pub(crate) fn query_row_matches(row: &QueryRow, filters: &QueryFilters) -> bool {
     if let Some(role) = filters.role.as_deref() {
         let want = role.to_ascii_lowercase();
         let emitted = row.role.to_ascii_lowercase();
@@ -951,7 +951,7 @@ pub(crate) fn resolve_scoped_com(
         .map_err(|_| ScopedFailure::unknown("window_unreadable"))?;
     let mut stack = vec![root];
     let mut visited = 0usize;
-    let mut matches: Vec<(IUIAutomationElement, ResolvedElement)> = Vec::new();
+    let mut pairs: Vec<(IUIAutomationElement, ResolvedElement)> = Vec::new();
     let mut cap_hit = false;
     while let Some(element) = stack.pop() {
         visited += 1;
@@ -963,39 +963,24 @@ pub(crate) fn resolve_scoped_com(
             && runtime_id_hash(&id) == ridh
             && let Some(candidate) = scoped_candidate(walker, &element)
         {
-            matches.push((element.clone(), candidate));
-            if matches.len() >= SCOPED_MATCH_CAP {
+            pairs.push((element.clone(), candidate));
+            if pairs.len() >= SCOPED_MATCH_CAP {
                 break;
             }
         }
         push_children(walker, &element, &mut stack);
     }
-    if cap_hit {
-        return Err(ScopedFailure::unknown("provider_timeout"));
-    }
-    if matches.is_empty() {
-        return Err(ScopedFailure::stale("stale_element"));
-    }
-    let mut within: Vec<(IUIAutomationElement, ResolvedElement)> = matches
+    // One arbitration, shared with the 0123 scoped resolve: cap/empty/window/duplicate/fp.
+    let candidates = pairs
+        .iter()
+        .map(|(_, candidate)| candidate.clone())
+        .collect::<Vec<_>>();
+    let found = scoped_matches_outcome(candidates, cap_hit, hwnd, fp)?;
+    let element = pairs
         .into_iter()
-        .filter(|(_, candidate)| {
-            candidate
-                .hwnd
-                .is_some_and(|native| crate::foreground::related_to_root(native, hwnd))
-        })
-        .collect();
-    if within.is_empty() {
-        return Err(ScopedFailure::stale("window_mismatch"));
-    }
-    if within.len() > 1 {
-        return Err(ScopedFailure::ambiguous("duplicate_runtime_id"));
-    }
-    let (element, found) = within
-        .pop()
+        .find(|(_, candidate)| candidate.runtime_id == found.runtime_id)
+        .map(|(element, _)| element)
         .ok_or_else(|| ScopedFailure::stale("stale_element"))?;
-    if format!("{:08x}", found.own_fingerprint()) != fp {
-        return Err(ScopedFailure::stale("stale_identity"));
-    }
     Ok((element, found))
 }
 

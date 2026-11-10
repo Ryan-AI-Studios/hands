@@ -568,7 +568,8 @@ pub fn runtime_id_hash(ids: &[i32]) -> String {
 
 /// The one UIA `sref1:` formula, shared by `observe` ref stamping and `find` rows so a
 /// query ref is byte-identical to the observe ref for the same element. `role`/`text`/
-/// `unnamed` are the element's **own** attributes; an empty RuntimeId cannot make a ref.
+/// `unnamed` are the element's **own** attributes; an empty RuntimeId or a zero HWND cannot
+/// make a ref (the observe caller only reaches this with a live, positive walk HWND).
 pub fn uia_ref_from_parts(
     hwnd: u64,
     role: &str,

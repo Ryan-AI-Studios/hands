@@ -2510,6 +2510,16 @@ function postcheckTests() {
 }
 
 function queryTests() {
+  // DoD-named cases, each driven through the real `queryScoped`/`forward` predicates:
+  // J1 query_returns_matches_in_preorder_with_idx_role_text_rect
+  // J2 query_does_not_replace_last_snapshot
+  // J3 query_stale_doc_and_snap_are_named (+ the no_snapshot record case)
+  // J4 query_subtree_uses_contains
+  // J5 query_budget_truncates_with_budget_hit
+  // J6 query_never_reads_password_text
+  // J7 query_filter_cases_match_fixture
+  // J8 sw_forwards_query_by_tab_and_frame_with_evidence
+  // J9 query_detached_node_reports_stale_element
   // J1 — pre-order rows with idx/role/text/rect.
   const context = contentContext();
   const a = element({ tag: "BUTTON", attrs: { "aria-label": "Sign in" }, rect: { left: 10, top: 20, width: 100, height: 40 } });

@@ -1568,6 +1568,9 @@ pub const CLOSED_TOKENS: &[&str] = &[
     "protocol_error",
     "window_unreadable",
     "unbound_extension",
+    "window_mismatch",
+    "duplicate_runtime_id",
+    "duplicate_identity",
     "frame_unsupported",
     "frame_link_missing",
     "frame_link_ambiguous",
@@ -1603,8 +1606,13 @@ pub const CLOSED_TOKENS: &[&str] = &[
     "selection_item_pattern",
     "value_pattern",
     "role_button",
+    "role_markup",
     "role_checkbox",
+    "role_expand",
     "role_selection",
+    "aria_checked",
+    "aria_expanded",
+    "aria_selected",
     "editable_role",
 ];
 
@@ -1737,14 +1745,54 @@ mod tests {
         assert!(!qbody.contains("\"path\""));
     }
 
+    fn set_env(key: &str, value: Option<&str>) {
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
     #[test]
     fn frame_zero_output_unchanged() {
-        // Frame 0 is always allowed (the kill switch is a nonzero-frame refusal only), and a
-        // frame-0 match omits the `frame` key, exactly as before this track.
+        let _guard = crate::chrome::EnvGuard::lock();
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/find-cases.json");
+        _guard.set_snapshot(Some(&path));
+        let envelope = run(FindRequest {
+            within: Some("sref1:c.c.0.7a1b.feedface.0".into()),
+            session_id: Some("s-frame0".into()),
+            ..FindRequest::default()
+        })
+        .expect("frame-0 run");
+        assert!(envelope.ok);
+        assert_eq!(envelope.scope.as_ref().and_then(|s| s.frame), Some(0));
+        let json: serde_json::Value =
+            serde_json::from_str(&serialize(&envelope).expect("json")).expect("value");
+        for row in json["matches"].as_array().expect("matches") {
+            assert!(
+                row.get("frame").is_none(),
+                "frame 0 omits the frame key: {row}"
+            );
+        }
+
+        // The kill switch is per-process and refuses only a nonzero frame.
+        set_env("HANDS_FRAMES", Some("0"));
         assert!(frame_allowed(&chrome_ref(12, 0, "9f3a", "a1b2c3d4", 1)));
-        let env = dense_envelope(1);
-        let json = serde_json::to_value(&env).expect("json");
-        assert!(json["matches"][0].get("frame").is_none());
+        let r = chrome_ref(12, 3, "9f3a", "a1b2c3d4", 1);
+        let refused = run(FindRequest {
+            r#ref: Some(r.to_string()),
+            session_id: Some("s-frame0".into()),
+            ..FindRequest::default()
+        })
+        .expect("frame-3 run");
+        set_env("HANDS_FRAMES", None);
+        assert!(!refused.ok);
+        assert_eq!(
+            refused.coverage.reason.as_deref(),
+            Some("frame_unsupported")
+        );
     }
 
     #[test]
@@ -1811,6 +1859,115 @@ mod tests {
             assert!(!token.starts_with('_') && !token.ends_with('_'), "{token}");
         }
         assert_eq!(ActionVerb::SetValue.as_str(), "set_value");
+    }
+
+    fn slice_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+        let from = src.find(start).unwrap_or_else(|| panic!("missing {start}"));
+        let to = src[from..]
+            .find(end)
+            .map(|i| from + i)
+            .unwrap_or_else(|| panic!("missing {end} after {start}"));
+        &src[from..to]
+    }
+
+    /// Every double-quoted snake_case literal in a capability emitter body. Action verbs are the
+    /// only non-token entries allowed; anything else must be in `CLOSED_TOKENS`.
+    fn emitter_tokens(body: &str) -> Vec<String> {
+        let bytes = body.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b'"' {
+                end += 1;
+            }
+            if end >= bytes.len() {
+                break;
+            }
+            let token = &body[start..end];
+            if token.contains('_')
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            {
+                out.push(token.to_string());
+            }
+            i = end + 1;
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn js_role_table(js: &str, name: &str) -> Vec<String> {
+        let start_marker = format!("const {name} = [");
+        let block = slice_between(js, &start_marker, "];");
+        let mut out = Vec::new();
+        for piece in block[start_marker.len()..].split(',') {
+            let piece = piece.trim();
+            if let Some(value) = piece.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
+                out.push(value.to_string());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn capability_evidence_tokens_are_closed_and_unified() {
+        let js = include_str!("../extension/content.js");
+        let rust = include_str!("chrome.rs");
+        let js_body = slice_between(
+            js,
+            "function domCapability(",
+            "function isPostcheckRendered(",
+        );
+        let rust_body = slice_between(
+            rust,
+            "fn fixture_capability(",
+            "/// Frame pre-dispatch probe evidence",
+        );
+
+        let allowed_non_tokens = ["set_value"];
+        for (label, body) in [("content.js", js_body), ("chrome.rs", rust_body)] {
+            for token in emitter_tokens(body) {
+                if allowed_non_tokens.contains(&token.as_str()) {
+                    continue;
+                }
+                assert!(
+                    CLOSED_TOKENS.contains(&token.as_str()),
+                    "{label} emits capability token '{token}' that is absent from CLOSED_TOKENS"
+                );
+            }
+        }
+
+        // Fixture evidence is a role-only subset of live evidence (live adds aria-* evidence).
+        let live = emitter_tokens(js_body);
+        for token in emitter_tokens(rust_body) {
+            assert!(
+                live.contains(&token),
+                "fixture emits '{token}' but the live DOM predicate never does"
+            );
+        }
+        assert!(!live.contains(&"editable_surface".to_string()));
+        assert!(live.contains(&"editable_role".to_string()));
+
+        // One role→verb table shared by live and fixture.
+        for (name, want) in [
+            ("CAP_INVOKE_ROLES", crate::chrome::CAP_INVOKE_ROLES),
+            ("CAP_TOGGLE_ROLES", crate::chrome::CAP_TOGGLE_ROLES),
+            ("CAP_EXPAND_ROLES", crate::chrome::CAP_EXPAND_ROLES),
+            ("CAP_SELECT_ROLES", crate::chrome::CAP_SELECT_ROLES),
+            ("CAP_VALUE_ROLES", crate::chrome::CAP_VALUE_ROLES),
+        ] {
+            let got = js_role_table(js, name);
+            let want = want.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            assert_eq!(got, want, "{name} drift between content.js and chrome.rs");
+        }
     }
 
     #[test]
@@ -2066,6 +2223,41 @@ mod tests {
     }
 
     #[test]
+    fn dense_fixture_bytes_stay_pinned() {
+        let _guard = crate::chrome::EnvGuard::lock();
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/find-dense.json");
+        _guard.set_snapshot(Some(&path));
+        let envelope = run(FindRequest {
+            within: Some("sref1:c.c.0.7a1b.feedface.0".into()),
+            role: Some("button".into()),
+            limit: Some(20),
+            session_id: Some("s-dense".into()),
+            ..FindRequest::default()
+        })
+        .expect("dense fixture run");
+        assert!(envelope.ok);
+        assert_eq!(
+            envelope.coverage.examined, 60,
+            "the stored walk is 60 nodes"
+        );
+        assert_eq!(envelope.coverage.scope_total, Some(60));
+        assert!(envelope.coverage.scope_complete);
+        assert_eq!(envelope.matches_total, Some(20));
+        assert!(
+            envelope.matches_returned >= FIND_MIN_RETURNED_MATCHES,
+            "returned {}",
+            envelope.matches_returned
+        );
+        let len = serialize(&envelope).expect("json").len();
+        assert!(
+            len <= crate::observe::DEFAULT_ENVELOPE_MAX_BYTES,
+            "{len} bytes"
+        );
+        assert!(envelope.matches_truncated);
+    }
+
+    #[test]
     fn dense_match_floor_fits_4kib() {
         let env = finalize(dense_envelope(60)).expect("finalize");
         let json = serialize(&env).expect("json");
@@ -2284,7 +2476,12 @@ mod tests {
             .unwrap_or(src.len());
         let body = &src[start..end];
         assert!(body.contains("runtime_id_hash"));
-        assert!(body.contains("own_fingerprint"));
+        assert!(
+            body.contains("scoped_matches_outcome"),
+            "the subtree resolver must reuse the 0123 arbitration"
+        );
+        assert!(!body.contains("duplicate_runtime_id"));
+        assert!(!body.contains("window_mismatch"));
         assert!(!body.contains("resolve_on("));
     }
 
@@ -2325,15 +2522,34 @@ mod tests {
             runtime_id: vec![1, 2],
             depth: 1,
         };
-        let filters = crate::uia::QueryFilters {
+        let button = crate::uia::QueryFilters {
             role: Some("button".to_string()),
             ..Default::default()
         };
-        // The predicate lives in uia.rs; a localized emitted role still matches canonical English.
-        let src = include_str!("uia.rs");
-        assert!(src.contains("let canonical = row.kind.type_name()"));
-        assert_eq!(row.kind.type_name(), "Button");
-        let _ = filters;
+        assert!(
+            crate::uia::query_row_matches(&row, &button),
+            "canonical English must match a localized emitted role"
+        );
+        let edit = crate::uia::QueryFilters {
+            role: Some("edit".to_string()),
+            ..Default::default()
+        };
+        assert!(!crate::uia::query_row_matches(&row, &edit));
+        let text = crate::uia::QueryFilters {
+            text: Some("send".to_string()),
+            ..Default::default()
+        };
+        assert!(crate::uia::query_row_matches(&row, &text));
+        let rect = crate::uia::QueryFilters {
+            rect: Some(Rect {
+                x: 5,
+                y: 5,
+                w: 10,
+                h: 10,
+            }),
+            ..Default::default()
+        };
+        assert!(crate::uia::query_row_matches(&row, &rect));
     }
 
     #[test]

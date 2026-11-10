@@ -1155,6 +1155,23 @@ function rectsIntersect(a, b) {
 }
 
 // Read-only DOM capability evidence. Attributes only: never `value`, never focus/click.
+// Role→verb tables are mirrored by `src/chrome.rs` (`fixture_capability`); a parity test keeps
+// the live and fixture vocabularies identical.
+const CAP_INVOKE_ROLES = [
+  "button",
+  "hyperlink",
+  "tabitem",
+  "menuitem",
+  "listitem",
+  "checkbox",
+  "radiobutton",
+  "treeitem",
+];
+const CAP_TOGGLE_ROLES = ["checkbox", "radiobutton"];
+const CAP_EXPAND_ROLES = ["combobox", "menuitem"];
+const CAP_SELECT_ROLES = ["tabitem", "menuitem", "listitem", "treeitem"];
+const CAP_VALUE_ROLES = ["edit", "combobox"];
+
 function domCapability(el, payload) {
   const role = String((payload && payload.role) || "").toLowerCase();
   const tag = String(el.tagName || "").toUpperCase();
@@ -1162,38 +1179,15 @@ function domCapability(el, payload) {
   const attr = (name) => String(el.getAttribute(name) || "").toLowerCase();
   const editable = isEditableSurface(el) || el.isContentEditable === true;
   const password = isPassword(el);
-  const invokeRoles = [
-    "button",
-    "link",
-    "tab",
-    "menuitem",
-    "option",
-    "checkbox",
-    "radio",
-    "menuitemcheckbox",
-    "menuitemradio",
-    "treeitem",
-    "switch",
-  ];
-  const invoke =
-    tag === "BUTTON" ||
-    tag === "A" ||
-    tag === "SUMMARY" ||
-    invokeRoles.indexOf(role) >= 0;
+  const invoke = CAP_INVOKE_ROLES.indexOf(role) >= 0;
   const toggle =
     has("aria-checked") ||
     (tag === "INPUT" && (el.type === "checkbox" || el.type === "radio")) ||
-    role === "checkbox" ||
-    role === "radio" ||
-    role === "switch";
-  const expand = has("aria-expanded") || role === "combobox" || role === "menuitem";
-  const select =
-    has("aria-selected") ||
-    role === "option" ||
-    role === "tab" ||
-    role === "treeitem" ||
-    role === "menuitem";
-  const setValue = editable && !password;
+    CAP_TOGGLE_ROLES.indexOf(role) >= 0;
+  const expand = has("aria-expanded") || CAP_EXPAND_ROLES.indexOf(role) >= 0;
+  const select = has("aria-selected") || CAP_SELECT_ROLES.indexOf(role) >= 0;
+  const setValue =
+    editable && !password && CAP_VALUE_ROLES.indexOf(role) >= 0;
   const action = (verb, available, evidence) => {
     const row = {
       action: verb,
@@ -1216,7 +1210,7 @@ function domCapability(el, payload) {
       select,
       has("aria-selected") ? "aria_selected" : "role_selection"
     ),
-    action("set_value", setValue, "editable_surface"),
+    action("set_value", setValue, "editable_role"),
   ];
   const disabled =
     el.disabled === true ||

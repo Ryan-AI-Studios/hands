@@ -156,7 +156,9 @@ function contentContext(options) {
           return port;
         },
       },
-      dom: {},
+      dom: {
+        openOrClosedShadowRoot: opts.openOrClosedShadowRoot || undefined,
+      },
     },
     crypto: {
       getRandomValues(array) {
@@ -1112,14 +1114,87 @@ function frameOptOutTests() {
     const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
     const childRows = reply.frames.filter((row) => row.frame === 3);
     assert.equal(childRows.length, 1, "one row for the registered child");
-    assert.ok(
-      childRows[0].status === "ok" || childRows[0].reason === "frame_link_missing",
-      "the registered row is the only honest row"
-    );
+    // P6-7: the parent disappeared, so the child's old link is cleared and the row is stale
+    // rather than an `ok` link the click could not use.
+    assert.equal(childRows[0].reason, "frame_geometry_unavailable");
+    assert.equal(childRows[0].link, undefined);
     assert.ok(
       !reply.frames.some((row) => row.reason === "no_content_script"),
       "no false no_content_script while the top port is down"
     );
+  }
+
+  // P6-1/P6-3: top port down, a never-linked registered child and a distinct same-origin
+  // sibling both keep a row (count-based skip, not an origin set).
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 3, origin: "https://kid.test" });
+    child.__parentCtx = top;
+    const registeredIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://kid.test/a" },
+      rect: { left: 5, top: 5, width: 300, height: 200 },
+    });
+    registeredIframe.contentWindow = child.window;
+    const siblingIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://kid.test/lazy" },
+      rect: { left: 5, top: 250, width: 300, height: 200 },
+    });
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, registeredIframe);
+    attach(rootEl, siblingIframe);
+    top.document.documentElement = rootEl;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "Kid" });
+    top.__port.__silenceDisconnect();
+    top.__port.disconnect();
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(reply.frames.length, 2, "one registered child + one sibling row");
+    assert.equal(reply.frames.find((row) => row.frame === 3).reason, "frame_link_missing");
+    assert.ok(
+      reply.frames.some(
+        (row) => row.reason === "no_content_script" && row.origin === "https://kid.test"
+      ),
+      "the distinct same-origin sibling is not silently dropped"
+    );
+    assert.equal(reply.frames_total, 3, "top + two children");
+  }
+
+  // P6-2: a restricted iframe nested inside an injected child is rowed by that child.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const mid = h.addFrame({ frameId: 3, origin: "https://mid.test" });
+    mid.__parentCtx = top;
+    const midIframe = element({
+      tag: "IFRAME",
+      rect: { left: 5, top: 5, width: 300, height: 200 },
+    });
+    midIframe.contentWindow = mid.window;
+    const topRoot = element({ tag: "DIV" });
+    attach(topRoot, midIframe);
+    top.document.documentElement = topRoot;
+    top.__elementAt = () => midIframe;
+    const sandbox = element({
+      tag: "IFRAME",
+      attrs: { sandbox: "allow-forms", src: "https://nested.test/" },
+      rect: { left: 7, top: 9, width: 200, height: 100 },
+    });
+    const midRoot = element({ tag: "DIV" });
+    attach(midRoot, sandbox);
+    mid.document.documentElement = midRoot;
+    mid.__elementAt = () => sandbox;
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.equal(reply.frames.length, 2, "mid + nested sandbox row");
+    assert.ok(reply.frames.some((row) => row.frame === 3 && row.status === "ok"));
+    assert.ok(
+      reply.frames.some(
+        (row) => row.reason === "sandboxed_no_scripts" && row.parent === 3
+      ),
+      "the nested sandbox iframe is named by its parent"
+    );
+    assert.equal(reply.frames_total, 3, "top + mid + nested");
   }
 
   // M-3: if the top walk already consumed the client budget, fan-out is skipped honestly.
@@ -1837,6 +1912,27 @@ function frameContentTests() {
   assert.equal(withFrames.frame_elements.length, 1);
   const withoutFrames = listenerResolve(top, { op: "snapshot", frames: false, store: false });
   assert.equal(withoutFrames.frame_elements, undefined);
+
+  // P6-5: a frame inside a closed shadow root is enumerated via chrome.dom.
+  const closedIframe = element({
+    tag: "IFRAME",
+    attrs: { src: "https://closed.test/" },
+  });
+  const host = element({ tag: "DIV" });
+  host.__closedRoot = { children: [closedIframe], elementFromPoint: () => null };
+  const closedRootEl = element({ tag: "DIV" });
+  attach(closedRootEl, host);
+  const closedTop = contentContext({
+    documentElement: closedRootEl,
+    openOrClosedShadowRoot: (el) => el.__closedRoot || null,
+  });
+  const closedReply = listenerResolve(closedTop, {
+    op: "snapshot",
+    frames: true,
+    store: false,
+  });
+  assert.equal(closedReply.frame_elements.length, 1);
+  assert.equal(closedReply.frame_elements[0].reason, "no_content_script");
 }
 
 function frameSourceLocksTests() {

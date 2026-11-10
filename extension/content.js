@@ -812,10 +812,11 @@ function buildSnapshot(msg) {
     }
   }
   if (
-    selfFrame === 0 &&
     msg &&
-    msg.frames === true &&
-    (msg.frame == null || Number(msg.frame) === 0)
+    (msg.frame_elements === true ||
+      (selfFrame === 0 &&
+        msg.frames === true &&
+        (msg.frame == null || Number(msg.frame) === 0)))
   ) {
     out.frame_elements = frameElementsReply();
   }

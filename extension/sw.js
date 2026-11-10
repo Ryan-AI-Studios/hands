@@ -262,7 +262,12 @@ function registerFramePort(port) {
       ) {
         const origin = normalizeOrigin(msg.origin);
         const expected = normalizeOrigin(target.origin);
-        if (origin && expected && origin === expected) {
+        if (
+          origin &&
+          expected &&
+          origin === expected &&
+          (target.slotParent == null || target.slotParent === entry.frameId)
+        ) {
           target.slot = msg.slot;
           // A slot is an index in the reporting parent's iframe list; record the owner.
           target.slotParent = entry.frameId;
@@ -276,6 +281,15 @@ function registerFramePort(port) {
   });
   port.onDisconnect.addListener(() => {
     if (frames.get(frameId) === entry) {
+      // Children whose only chain level was this frame can no longer compose; mark them
+      // stale so an observe does not keep advertising an `ok` link the click cannot use.
+      for (const child of frames.values()) {
+        if (child.link && child.link.parent === frameId) {
+          child.link = null;
+          child.linkState = "stale";
+          child.linkReason = "frame_geometry_unavailable";
+        }
+      }
       frames.delete(frameId);
       revokeEntry(entry);
       if (!frames.size) {
@@ -514,25 +528,20 @@ function clampOrigin(value) {
   return origin;
 }
 
-function collectFrameRows(tabId, frameElements) {
+function collectFrameRows(tabId, frameElements, childReplies) {
   const frames = frameRegistry.get(tabId) || new Map();
   const rows = [];
-  const linkedSlots = new Set();
+  // Slot identity is scoped by its owning parent frame: `${parent}:${slot}`.
+  const knownSlots = new Set();
   for (const entry of frames.values()) {
     if (entry.frameId === 0) {
       continue;
     }
-    // A slot is an index in its owning parent's iframe list. Only top-level (parent 0)
-    // identities can dedupe the top document's `frame_elements` array.
-    if (Number.isInteger(entry.slot) && entry.slotParent === 0) {
-      linkedSlots.add(entry.slot);
+    if (Number.isInteger(entry.slot) && Number.isInteger(entry.slotParent)) {
+      knownSlots.add(entry.slotParent + ":" + entry.slot);
     }
-    if (
-      entry.link &&
-      entry.link.parent === 0 &&
-      Number.isInteger(entry.link.slot)
-    ) {
-      linkedSlots.add(entry.link.slot);
+    if (entry.link && Number.isInteger(entry.link.parent) && Number.isInteger(entry.link.slot)) {
+      knownSlots.add(entry.link.parent + ":" + entry.link.slot);
     }
     const origin = clampOrigin(entry.origin);
     if (entry.budget) {
@@ -544,13 +553,6 @@ function collectFrameRows(tabId, frameElements) {
       if (origin) row.origin = origin;
       if (entry.link) row.link = entry.link;
       rows.push(row);
-      if (
-        entry.link &&
-        entry.link.parent === 0 &&
-        Number.isInteger(entry.link.slot)
-      ) {
-        linkedSlots.add(entry.link.slot);
-      }
     } else if (entry.link && entry.linkState === "ok") {
       const row = { frame: entry.frameId, status: "ok" };
       if (entry.link.visible !== true) {
@@ -567,9 +569,14 @@ function collectFrameRows(tabId, frameElements) {
       if (origin) row.origin = origin;
       row.link = entry.link;
       rows.push(row);
-      if (entry.link.parent === 0 && Number.isInteger(entry.link.slot)) {
-        linkedSlots.add(entry.link.slot);
-      }
+    } else if (entry.linkState === "stale") {
+      const row = {
+        frame: entry.frameId,
+        status: "unavailable",
+        reason: "frame_geometry_unavailable",
+      };
+      if (origin) row.origin = origin;
+      rows.push(row);
     } else if (entry.linkState === "ambiguous") {
       const row = {
         frame: entry.frameId,
@@ -604,34 +611,52 @@ function collectFrameRows(tabId, frameElements) {
       row.url = entry.url;
     }
   }
-  // Dedupe by iframe identity/slot. A distinct same-origin un-injected iframe is never
-  // suppressed just because another frame shares its origin.
+  // Every injected frame enumerates its own iframes. The top reply is owner 0; each child
+  // snapshot carries its own `frame_elements` list, owner = that child frame id.
   const topRegistered = [...frames.values()].some((entry) => entry.frameId === 0);
-  const registeredUnlinkedOrigins = new Set();
+  const unlinkedByOrigin = new Map();
   for (const entry of frames.values()) {
     if (entry.frameId === 0 || (entry.link && entry.linkState === "ok")) {
       continue;
     }
     const origin = clampOrigin(entry.origin);
-    if (origin) registeredUnlinkedOrigins.add(origin);
+    if (origin) {
+      unlinkedByOrigin.set(origin, (unlinkedByOrigin.get(origin) || 0) + 1);
+    }
   }
-  const seen = Array.isArray(frameElements) ? frameElements : [];
-  for (const item of seen) {
-    if (!item || typeof item.reason !== "string") {
-      continue;
+  const ownerLists = [{ owner: 0, items: Array.isArray(frameElements) ? frameElements : [] }];
+  if (childReplies) {
+    for (const [frameId, reply] of childReplies) {
+      if (reply && Array.isArray(reply.frame_elements)) {
+        ownerLists.push({ owner: frameId, items: reply.frame_elements });
+      }
     }
-    const origin = clampOrigin(item.origin);
-    if (Number.isInteger(item.slot) && linkedSlots.has(item.slot)) {
-      continue;
+  }
+  for (const { owner, items } of ownerLists) {
+    for (const item of items) {
+      if (!item || typeof item.reason !== "string") {
+        continue;
+      }
+      const origin = clampOrigin(item.origin);
+      if (Number.isInteger(item.slot) && knownSlots.has(owner + ":" + item.slot)) {
+        continue;
+      }
+      if (
+        owner === 0 &&
+        !topRegistered &&
+        origin &&
+        (unlinkedByOrigin.get(origin) || 0) > 0
+      ) {
+        // Top port down: drop at most one item per registered-unlinked child of that origin,
+        // leaving a distinct same-origin un-injected sibling with its own row.
+        unlinkedByOrigin.set(origin, unlinkedByOrigin.get(origin) - 1);
+        continue;
+      }
+      const row = { status: "unavailable", reason: item.reason };
+      if (origin) row.origin = origin;
+      if (owner !== 0) row.parent = owner;
+      rows.push(row);
     }
-    if (!topRegistered && origin && registeredUnlinkedOrigins.has(origin)) {
-      // The top port is down, so its slot report cannot arrive. The registry row already
-      // names this iframe; do not add a false `no_content_script` for it.
-      continue;
-    }
-    const row = { status: "unavailable", reason: item.reason };
-    if (origin) row.origin = origin;
-    rows.push(row);
   }
   const rejected = rejectedPorts.get(tabId) || 0;
   if (rejected > 0) {
@@ -725,9 +750,9 @@ function frameBySlot(tabId, slot) {
       (entry.link && entry.link.parent === 0) || entry.slotParent === 0;
     if (
       entry.frameId !== 0 &&
+      entry.linkState === "ok" &&
       ownsTopSlot &&
-      ((entry.link && entry.linkState === "ok" && entry.link.slot === slot) ||
-        entry.slot === slot)
+      ((entry.link && entry.link.slot === slot) || entry.slot === slot)
     ) {
       return entry;
     }
@@ -749,6 +774,7 @@ function childSnapshot(entry, stored, detail, maxNodes, commitBy, callback) {
       light: true,
       max_nodes: maxNodes,
       frames: false,
+      frame_elements: true,
       frame: entry.frameId,
     },
     (reply) => {
@@ -919,7 +945,7 @@ function mergeFrameSnapshot(out, tab, msg, replies, frameElements) {
       out.elements.push(el);
     }
   }
-  const rows = collectFrameRows(tab.id, frameElements);
+  const rows = collectFrameRows(tab.id, frameElements, replies);
   for (const row of rows.frames) {
     const child = replies.get(row.frame);
     if (!child) {
@@ -937,6 +963,11 @@ function mergeFrameSnapshot(out, tab, msg, replies, frameElements) {
     delete out.frames;
     delete out.frames_total;
     delete out.frames_truncated;
+  }
+  for (const child of replies.values()) {
+    if (child && typeof child === "object") {
+      delete child.frame_elements;
+    }
   }
 }
 

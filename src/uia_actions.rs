@@ -179,7 +179,7 @@ impl SemanticResult {
 
 fn identity_for_code(code: &'static str) -> Option<(IdentityState, &'static str)> {
     match code {
-        "stale_identity" => Some((IdentityState::Stale, "identity_mismatch")),
+        "stale_identity" => Some((IdentityState::Stale, "stale_identity")),
         "stale_target" | "stale_element" => Some((IdentityState::Stale, "stale_element")),
         "duplicate_runtime_id" => Some((IdentityState::Ambiguous, "duplicate_runtime_id")),
         "provider_timeout" | "window_unreadable" => Some((IdentityState::Unknown, code)),
@@ -2203,7 +2203,7 @@ mod tests {
         assert!(!out.ok);
         let identity = out.identity.as_ref().expect("worker identity");
         assert_eq!(identity.state, crate::identity::IdentityState::Stale);
-        assert_eq!(identity.reason.as_deref(), Some("identity_mismatch"));
+        assert_eq!(identity.reason.as_deref(), Some("stale_identity"));
         assert_eq!(
             out.semantic.as_ref().map(|s| s.delivery),
             Some(Delivery::Undelivered)

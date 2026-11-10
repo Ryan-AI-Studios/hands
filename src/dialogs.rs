@@ -161,6 +161,8 @@ mod tests {
 
     fn el(id: &str, role: &str, text: &str) -> Element {
         Element {
+            frame: None,
+            challenge_vendor: true,
             unnamed: None,
             id: id.into(),
             role: role.into(),

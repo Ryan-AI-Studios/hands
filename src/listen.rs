@@ -1025,6 +1025,8 @@ fn write_sidecar(path: &Path, kind: &str, present: bool) {
             "Challenge".to_string(),
             Some("https://www.google.com/recaptcha/api2/anchor".to_string()),
             vec![Element {
+                frame: None,
+                challenge_vendor: true,
                 id: "chr:0".into(),
                 role: "iframe".into(),
                 text: Some("recaptcha".into()),

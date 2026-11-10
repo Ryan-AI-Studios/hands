@@ -5,6 +5,8 @@ const FRAME_ROW_CAP = 12;
 const ANNOUNCE_STEP_MS = 60;
 const LINK_SETTLE_MS = 60;
 const MEASURE_TIMEOUT_MS = 100;
+const CHILD_SNAPSHOT_TIMEOUT_MS = 80;
+const FRAME_ELEMENT_CAP = 8;
 
 let hostPort = null;
 let reconnectTimer = null;
@@ -70,11 +72,15 @@ function copyReply(reply) {
 
 // Every content-script message carries an explicit frame id. A bare broadcast is never sent.
 function frameIdFor(msg) {
-  const frame = msg && msg.frame;
+  const frame = Number(msg && msg.frame);
   if (Number.isInteger(frame) && frame > 0) {
     return frame;
   }
   return 0;
+}
+
+function b36(n) {
+  return (Number(n) >>> 0).toString(36);
 }
 
 function sendToFrame(tabId, frameId, msg, callback) {
@@ -106,8 +112,21 @@ function withTabEvidence(port, tab, fallback, msg, enrich) {
       const out = copyReply(reply);
       Object.assign(out, evidence);
       if (enrich) {
-        enrich(out, tab, port);
+        enrich(out, tab, port, msg);
         return;
+      }
+      const frame = frameIdFor(msg);
+      if ((msg.op === "resolve" || msg.op === "assess") && frame > 0) {
+        enrichFrameReply(tab, frame, out, port);
+        return;
+      }
+      if (msg.op === "assess" && frame === 0 && Number.isInteger(reply.iframe_slot)) {
+        // A top point-assess hit an iframe. Name the owning frame so Rust can issue the
+        // explicit `{tab, frameId}` assess instead of leaving `cross_frame` forever.
+        const entry = frameBySlot(tab.id, reply.iframe_slot);
+        if (entry) {
+          out.iframe_frame = entry.frameId;
+        }
       }
       post(port, out);
     });
@@ -511,6 +530,14 @@ function collectFrameRows(tabId, frameElements) {
       rows.push(row);
     }
   }
+  // Full frame URL is internal only (Rust vendor classification); never serialized as an
+  // origin and never merged into page text.
+  for (const row of rows) {
+    const entry = frames.get(row.frame);
+    if (entry && entry.url) {
+      row.url = entry.url;
+    }
+  }
   const seen = Array.isArray(frameElements) ? frameElements : [];
   for (const item of seen) {
     if (!item || typeof item.reason !== "string") {
@@ -576,15 +603,153 @@ function announceAndMeasure(tabId, callback) {
   });
 }
 
-function finishFrameSnapshot(out, tab, port) {
+function frameBySlot(tabId, slot) {
+  const frames = frameRegistry.get(tabId);
+  if (!frames) {
+    return null;
+  }
+  for (const entry of frames.values()) {
+    if (
+      entry.frameId !== 0 &&
+      entry.link &&
+      entry.linkState === "ok" &&
+      entry.link.slot === slot
+    ) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+function childSnapshot(entry, stored, detail, callback) {
+  sendToFrame(
+    entry.tab,
+    entry.frameId,
+    {
+      op: "snapshot",
+      detail: detail || "default",
+      store: stored,
+      light: true,
+      max_nodes: 1000,
+      frames: false,
+      frame: entry.frameId,
+    },
+    (reply) => {
+      if (chrome.runtime.lastError || !reply || reply.error) {
+        callback(null);
+        return;
+      }
+      callback(reply);
+    }
+  );
+}
+
+function collectChildSnapshots(tabId, entries, stored, detail, callback) {
+  const replies = new Map();
+  if (!entries.length) {
+    callback(replies);
+    return;
+  }
+  let pending = entries.length;
+  let finished = false;
+  const finish = () => {
+    if (finished) {
+      return;
+    }
+    finished = true;
+    callback(replies);
+  };
+  const done = () => {
+    if (finished) {
+      return;
+    }
+    pending -= 1;
+    if (pending <= 0) {
+      finish();
+    }
+  };
+  // Discarded late replies use `store:false`? No: the caller decides `stored`; a reply that
+  // arrives after this deadline is simply not merged and did not retire anything new.
+  setTimeout(finish, CHILD_SNAPSHOT_TIMEOUT_MS);
+  for (const entry of entries) {
+    childSnapshot(entry, stored, detail, (reply) => {
+      if (reply) {
+        replies.set(entry.frameId, reply);
+      }
+      done();
+    });
+  }
+}
+
+function mergeFrameSnapshot(out, tab, msg, replies, frameElements) {
+  const stored = out.stored !== false;
+  for (const [frameId, child] of replies) {
+    const doc = typeof child.doc === "string" ? child.doc : null;
+    const snap = typeof child.snap === "string" ? child.snap : null;
+    const valid = stored && doc && snap && /^[0-9a-f]{4}$/.test(doc) && /^[0-9a-f]{8}$/.test(snap);
+    const elements = Array.isArray(child.elements) ? child.elements : [];
+    for (const el of elements) {
+      if (!el || typeof el !== "object") {
+        continue;
+      }
+      el.frame = frameId;
+      const idx = Number.isInteger(el.idx) ? el.idx : 0;
+      if (valid) {
+        const token =
+          "sref1:c." +
+          b36(tab.id) +
+          "." +
+          b36(frameId) +
+          "." +
+          doc +
+          "." +
+          snap +
+          "." +
+          b36(idx);
+        el.id = token;
+        el.ref = token;
+      } else {
+        // `chr:` is top-frame-only. Internal (store:false) reads still carry frame elements
+        // for detection but cannot mint a resolvable ref without a stored doc/snap pair.
+        el.id = "frame:" + frameId + ":" + idx;
+        delete el.ref;
+      }
+      out.elements.push(el);
+    }
+  }
+  const rows = collectFrameRows(tab.id, frameElements);
+  for (const row of rows.frames) {
+    const child = replies.get(row.frame);
+    if (!child) {
+      continue;
+    }
+    if (typeof child.doc === "string") row.doc = child.doc;
+    if (typeof child.snap === "string") row.snap = child.snap;
+    if (Number.isInteger(child.retained)) row.retained = child.retained;
+  }
+  out.frames = rows.frames;
+  out.frames_total = rows.frames_total;
+  out.frames_truncated = rows.frames_truncated;
+}
+
+function finishFrameSnapshot(out, tab, port, msg) {
   const frameElements = Array.isArray(out.frame_elements) ? out.frame_elements : [];
   delete out.frame_elements;
   announceAndMeasure(tab.id, () => {
-    const rows = collectFrameRows(tab.id, frameElements);
-    out.frames = rows.frames;
-    out.frames_total = rows.frames_total;
-    out.frames_truncated = rows.frames_truncated;
-    post(port, out);
+    const frames = frameRegistry.get(tab.id) || new Map();
+    const entries = [...frames.values()]
+      .filter((entry) => entry.frameId !== 0 && entry.linkState === "ok")
+      .slice(0, FRAME_ROW_CAP);
+    collectChildSnapshots(
+      tab.id,
+      entries,
+      out.stored !== false,
+      msg && msg.detail,
+      (replies) => {
+        mergeFrameSnapshot(out, tab, msg, replies, frameElements);
+        post(port, out);
+      }
+    );
   });
 }
 
@@ -650,6 +815,27 @@ function refreshChain(tabId, frameId, callback) {
     post(parent.port, { op: "frame_measure", tokens: [token] });
   };
   next();
+}
+
+function enrichFrameReply(tab, frame, out, port) {
+  // Fresh top metrics (no walk/store) + fresh chain, in the same exchange as the child reply.
+  sendToFrame(tab.id, 0, { op: "frame_top", frame: 0 }, (top) => {
+    if (chrome.runtime.lastError || !top || top.error || top.frame !== 0) {
+      out.error = "frame_geometry_unavailable";
+      post(port, out);
+      return;
+    }
+    refreshChain(tab.id, frame, (chain) => {
+      if (!chain) {
+        out.error = "frame_geometry_unavailable";
+        post(port, out);
+        return;
+      }
+      out.top = { frame: 0, metrics: top.metrics, url: top.url, title: top.title };
+      out.chain = chain;
+      post(port, out);
+    });
+  });
 }
 
 function frameBindingRequest(port, tab, msg) {

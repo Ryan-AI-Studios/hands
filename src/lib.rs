@@ -20,6 +20,7 @@ pub mod error;
 pub mod extract;
 pub mod fence;
 pub mod foreground;
+pub mod frames;
 pub mod hid;
 pub mod hittest;
 pub mod host_doctor;

@@ -133,6 +133,9 @@ pub struct AtPoint {
     pub confidence: AssessmentConfidence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<f64>,
+    /// Chrome frame id when the point was composed through a linked iframe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -504,6 +507,7 @@ pub fn point_after_snapshot(
         Ok(v) => v,
         Err(reason) => return Ok(point_unknown(&reason)),
     };
+    let tab = map.tab.unwrap_or(0);
     let reply = match chrome::assess_at(css, samples) {
         Ok(reply) => reply,
         Err(chrome::AssessError::HostDown(err)) => {
@@ -516,12 +520,129 @@ pub fn point_after_snapshot(
             return Ok(point_unknown("assessment_unavailable"));
         }
     };
+    if reply.at_point.reason.as_deref() == Some("cross_frame") {
+        return point_from_frame(contract, css, identity.as_ref(), tab, reply, samples);
+    }
     Ok(point_envelope_from_reply(
         contract,
         css,
         identity.as_ref(),
         reply,
     ))
+}
+
+fn frame_chain_rows(
+    frame: u32,
+    chain: &[crate::frames::FrameLink],
+) -> Vec<crate::frames::RawFrameLink> {
+    let mut rows = Vec::new();
+    let mut current = frame;
+    for link in chain {
+        rows.push(crate::frames::RawFrameLink {
+            frame: Some(current),
+            status: Some("ok".into()),
+            link: Some(link.clone()),
+            ..crate::frames::RawFrameLink::default()
+        });
+        let Some(parent) = link.parent else {
+            return Vec::new();
+        };
+        current = parent;
+        if current == 0 {
+            break;
+        }
+    }
+    rows
+}
+
+/// Enter a linked iframe from a top `cross_frame` point reply: explicit `{tab, frameId}` assess,
+/// compose the child's local point/rect through the fresh chain, and require the same one-point
+/// equality as 0128. Any missing/ambiguous geometry is unknown, never a fallback.
+fn point_from_frame(
+    contract: PointContract,
+    top_css: CssPoint,
+    before: Option<&chrome::PageIdentity>,
+    tab: u32,
+    top_reply: chrome::AssessReply,
+    samples: u32,
+) -> Result<HittestEnvelope, HandsError> {
+    if let Some(before) = before
+        && !identity_matches(before, &top_reply.identity)
+    {
+        let reason = if before.url != top_reply.identity.url {
+            "tab_changed"
+        } else {
+            "stale_page"
+        };
+        return Ok(point_reply_envelope(contract, unknown_at_point(reason)));
+    }
+    let Some(echo) = top_reply.css else {
+        return Ok(point_reply_envelope(
+            contract,
+            unknown_at_point("point_mismatch"),
+        ));
+    };
+    if !points_match(top_css, echo) {
+        return Ok(point_reply_envelope(
+            contract,
+            unknown_at_point("point_mismatch"),
+        ));
+    }
+    let (Some(frame), Some(local)) = (top_reply.iframe_frame, top_reply.local_css) else {
+        return Ok(point_reply_envelope(
+            contract,
+            unknown_at_point("frame_geometry_unavailable"),
+        ));
+    };
+    if tab == 0 {
+        return Ok(point_reply_envelope(
+            contract,
+            unknown_at_point("frame_geometry_unavailable"),
+        ));
+    }
+    let child = match chrome::assess_at_frame(tab, frame, local, samples) {
+        Ok(reply) => reply,
+        Err(chrome::AssessError::HostDown(err)) => {
+            return Err(HandsError::Chrome(format!(
+                "Chrome host is not connected; frame point mode needs a live host: {err}"
+            )));
+        }
+        Err(chrome::AssessError::Timeout(_)) => return Ok(point_unknown("assessment_timeout")),
+        Err(chrome::AssessError::Unavailable(_)) => {
+            return Ok(point_unknown("assessment_unavailable"));
+        }
+    };
+    if child.frame != Some(frame) || child.top_metrics.is_none() {
+        return Ok(point_reply_envelope(
+            contract,
+            unknown_at_point("frame_geometry_unavailable"),
+        ));
+    }
+    let rows = frame_chain_rows(frame, &child.frame_chain);
+    let composed = match crate::frames::compose_point(&rows, frame, local) {
+        Ok(point) => point,
+        Err(err) => {
+            return Ok(point_reply_envelope(
+                contract,
+                unknown_at_point(err.token()),
+            ));
+        }
+    };
+    if (composed.x - top_css.x).abs() > 1.0 || (composed.y - top_css.y).abs() > 1.0 {
+        return Ok(point_reply_envelope(
+            contract,
+            unknown_at_point("frame_geometry_unavailable"),
+        ));
+    }
+    let mut at_point = child.at_point;
+    bound_at_point(&mut at_point);
+    at_point.frame = Some(frame);
+    if let Some(element) = at_point.element.as_mut()
+        && let Some(rect) = element.rect_css
+    {
+        element.rect_css = crate::frames::compose_rect(&rows, frame, rect).ok();
+    }
+    Ok(point_reply_envelope(contract, at_point))
 }
 
 /// Validate one point-mode reply. A missing/incorrect CSS echo fails closed; an unchanged
@@ -588,6 +709,7 @@ fn unknown_at_point(reason: &str) -> AtPoint {
         notes: Vec::new(),
         confidence: AssessmentConfidence::None,
         elapsed_ms: None,
+        frame: None,
     }
 }
 
@@ -1764,6 +1886,11 @@ mod tests {
         let reply = chrome::AssessReply {
             at_point: at_point("point-topmost.json"),
             css: None,
+            iframe_frame: None,
+            local_css: None,
+            frame: None,
+            top_metrics: None,
+            frame_chain: Vec::new(),
             identity: chrome::PageIdentity::default(),
         };
         let envelope = point_envelope_from_reply(contract, css, None, reply);
@@ -2455,6 +2582,7 @@ mod tests {
         identity: Option<chrome::PageIdentity>,
     ) -> chrome::ChromeMap {
         chrome::ChromeMap {
+            tab: None,
             url: Some("https://example.test/".into()),
             title: "Example".into(),
             main_text: String::new(),

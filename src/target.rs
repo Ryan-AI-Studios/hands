@@ -209,7 +209,7 @@ impl Target {
             }
             Self::Scoped(r) => match r {
                 SnapshotRef::Chrome { frame, .. } => {
-                    if *frame != 0 {
+                    if *frame != 0 && !crate::frames::enabled() {
                         return Ok(TargetOutcome::Identity {
                             target: self.clone(),
                             report: IdentityReport::chrome_failure(
@@ -566,6 +566,19 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finish_chr_has_no_frame_arithmetic() {
+        let src = include_str!("target.rs");
+        let start = src.find("fn finish_chr(").expect("finish_chr");
+        let end = src.find("fn invalid_from(").expect("invalid_from");
+        let body = &src[start..end];
+        assert!(!body.contains("content_left"), "{body}");
+        assert!(!body.contains("content_top"), "{body}");
+        assert!(!body.contains("crate::frames"), "{body}");
+        assert!(!body.contains("compose_"), "{body}");
+        assert!(body.contains("contract_for"), "finish_chr maps once");
+    }
 
     #[test]
     fn parse_accepts_each_kind() {

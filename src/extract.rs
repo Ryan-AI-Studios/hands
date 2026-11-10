@@ -181,6 +181,8 @@ impl RawNode {
     pub fn to_element(&self) -> Option<Element> {
         let (text, unnamed) = name_fields(&self.name, self.is_password);
         Some(Element {
+            frame: None,
+            challenge_vendor: true,
             id: self.element_id()?,
             role: self.role.clone(),
             text,
@@ -237,6 +239,12 @@ pub struct Element {
     /// Canonical snapshot-bound ref (`sref1:`); `id` stays the legacy handle.
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub sref: Option<String>,
+    /// Chrome frame id for a nonzero-frame element; omitted for the top frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<u32>,
+    /// Detection/target eligibility: top frame or a vendor-classified frame. Never serialized.
+    #[serde(skip)]
+    pub challenge_vendor: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

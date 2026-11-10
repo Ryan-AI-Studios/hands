@@ -77,6 +77,7 @@ function nextSnap() {
 // A child never walks or posts until the SW asks it to; frame content is data only.
 
 const FRAME_LINK_CAP = 12;
+const FRAME_ELEMENT_CAP = 8;
 const FRAME_MEASURE_DEPTH = 16;
 let SELF_FRAME = null;
 let FRAME_TOKEN = null;
@@ -372,6 +373,30 @@ function deepElementFromPoint(x, y) {
   return el;
 }
 
+function frameContentBox(el) {
+  const rect = el.getBoundingClientRect();
+  const style = window.getComputedStyle(el);
+  const bl = style ? parseFloat(style.borderLeftWidth) || 0 : 0;
+  const bt = style ? parseFloat(style.borderTopWidth) || 0 : 0;
+  const br = style ? parseFloat(style.borderRightWidth) || 0 : 0;
+  const bb = style ? parseFloat(style.borderBottomWidth) || 0 : 0;
+  const pl = style ? parseFloat(style.paddingLeft) || 0 : 0;
+  const pt = style ? parseFloat(style.paddingTop) || 0 : 0;
+  const pr = style ? parseFloat(style.paddingRight) || 0 : 0;
+  const pb = style ? parseFloat(style.paddingBottom) || 0 : 0;
+  return {
+    left: rect.left + bl + pl,
+    top: rect.top + bt + pt,
+    width: Math.max(0, rect.width - bl - br - pl - pr),
+    height: Math.max(0, rect.height - bt - bb - pt - pb),
+  };
+}
+
+function frameSlotOf(el) {
+  const els = iframeElements();
+  return els.indexOf(el);
+}
+
 function measureFrameElement(el, slot) {
   const rect = el.getBoundingClientRect();
   if (!rect) {
@@ -538,8 +563,9 @@ function frameTargetAllowed(msg) {
     return selfFrame == null || selfFrame === 0;
   }
   if (frame == null) {
-    // A top op with no frame field must not be answered by a child document.
-    return selfFrame == null || selfFrame === 0;
+    // SW `{frameId}` routing is the primary defence. A missing frame field is accepted here
+    // (a direct child snapshot must still answer); a *present* mismatch is rejected below.
+    return true;
   }
   if (Number(frame) === 0) {
     // Never reject frame:0 while SELF_FRAME is unset (a top op right after load).
@@ -591,8 +617,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 function buildSnapshot(msg) {
   const detail = msg && msg.detail;
   const store = msg && msg.store;
+  // A child snapshot is lightweight: elements + metrics + identity only. The top frame keeps
+  // main_text/cards/listing.
+  const light = msg && msg.light === true;
+  const nodeCap = Number.isInteger(msg && msg.max_nodes)
+    ? Math.max(1, Math.min(SNAPSHOT_NODE_CAP, Number(msg.max_nodes)))
+    : SNAPSHOT_NODE_CAP;
   const metrics = windowMetrics();
-  const nodes = walk(detail).slice(0, SNAPSHOT_NODE_CAP);
+  const nodes = walk(detail).slice(0, nodeCap);
   const elements = [];
   const keys = [];
   for (let i = 0; i < nodes.length; i += 1) {
@@ -601,6 +633,7 @@ function buildSnapshot(msg) {
     const rect = cssRect(nodes[i]);
     if (rect) {
       payload.rectCss = rect;
+      payload.idx = i;
       elements.push(payload);
       keys.push(key);
     } else {
@@ -624,17 +657,22 @@ function buildSnapshot(msg) {
   } else {
     retained = 0;
   }
-  const collected = collectCards();
+  const collected = light ? { cards: [], cards_walked: 0 } : collectCards();
   const out = {
     url: location.href || "",
     title: document.title || "",
-    main_text: mainText(),
     elements: elements,
     cards: collected.cards,
     metrics: metrics,
     assess_v: 1,
     stored: stored,
   };
+  if (!light) {
+    out.main_text = mainText();
+  }
+  if (light) {
+    out.elements = rankFrameElements(elements, metrics).slice(0, FRAME_ELEMENT_CAP);
+  }
   if (stored) {
     out.doc = doc;
     out.snap = snap;
@@ -643,6 +681,10 @@ function buildSnapshot(msg) {
   const selfFrame = SELF_FRAME == null ? 0 : SELF_FRAME;
   if (selfFrame !== 0) {
     out.frame = selfFrame;
+    // Identity is useful even when the caller asked for no stored snapshot (solver/hittest).
+    if (!stored) {
+      out.doc = DOC_NONCE;
+    }
   }
   if (
     selfFrame === 0 &&
@@ -655,13 +697,33 @@ function buildSnapshot(msg) {
   if (collected.cards_walked > 0) {
     out.cards_walked = collected.cards_walked;
   }
-  const listing = collectListingMeta();
-  if (listing.result_count) out.result_count = listing.result_count;
-  if (listing.local_matches) out.local_matches = listing.local_matches;
-  if (listing.empty_state) out.empty_state = listing.empty_state;
-  if (listing.zip) out.zip = listing.zip;
-  if (listing.radius) out.radius = listing.radius;
+  if (!light) {
+    const listing = collectListingMeta();
+    if (listing.result_count) out.result_count = listing.result_count;
+    if (listing.local_matches) out.local_matches = listing.local_matches;
+    if (listing.empty_state) out.empty_state = listing.empty_state;
+    if (listing.zip) out.zip = listing.zip;
+    if (listing.radius) out.radius = listing.radius;
+  }
   return out;
+}
+
+function rankFrameElements(elements, metrics) {
+  const vw = Number(metrics && metrics.innerWidth) || 0;
+  const vh = Number(metrics && metrics.innerHeight) || 0;
+  const interactive = /^(Button|Hyperlink|Edit|ComboBox|CheckBox|RadioButton|TabItem|MenuItem)$/;
+  const rank = (el) => {
+    const r = el.rectCss;
+    const inViewport =
+      r && r.left < vw && r.top < vh && r.left + r.width > 0 && r.top + r.height > 0;
+    const reserved = interactive.test(String(el.role || "")) ? 0 : 1;
+    return (inViewport ? 0 : 2) + reserved;
+  };
+  return elements.slice().sort((a, b) => {
+    const diff = rank(a) - rank(b);
+    if (diff !== 0) return diff;
+    return Number(a.idx || 0) - Number(b.idx || 0);
+  });
 }
 
 function buildResolve(id, detail, assess, samples) {
@@ -2386,6 +2448,9 @@ function buildAssess(msg) {
     title: document.title || "",
     metrics: metrics,
   };
+  if (SELF_FRAME != null && SELF_FRAME !== 0) {
+    base.frame = SELF_FRAME;
+  }
   if (!css || !Number.isFinite(css.x) || !Number.isFinite(css.y)) {
     base.css = null;
     base.at_point = unknownAtPoint("point_mismatch");
@@ -2404,6 +2469,11 @@ function buildAssess(msg) {
   }
   if (hit.iframe) {
     base.at_point = unknownAtPoint("cross_frame", hit);
+    base.iframe_slot = frameSlotOf(hit.el);
+    const box = frameContentBox(hit.el);
+    if (box && box.width > 0 && box.height > 0) {
+      base.local_css = { x: css.x - box.left, y: css.y - box.top };
+    }
     return base;
   }
   if (!hit.el) {

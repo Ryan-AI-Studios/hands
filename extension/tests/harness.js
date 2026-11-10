@@ -799,6 +799,8 @@ function frameRoutingTests() {
   attach(rootEl, iframe);
   top.document.documentElement = rootEl;
   top.__elementAt = () => iframe;
+  const childButton = element({ tag: "BUTTON", innerText: "Target" });
+  child.document.documentElement = childButton;
 
   // E1: two frames register distinct ids and receive frame_id.
   const registry = h.sw.registry(12);
@@ -811,13 +813,15 @@ function frameRoutingTests() {
 
   // E8/E9: explicit frame routing, never a bare broadcast.
   h.sw.forward({ op: "resolve", v: 1, tab: 12, frame: 0, doc: "x", snap: "y", idx: 0 });
-  assert.deepEqual(h.sw.calls.routes[h.sw.calls.routes.length - 1], {
+  let resolves = h.sw.calls.routes.filter((route) => route.op === "resolve");
+  assert.deepEqual(resolves[resolves.length - 1], {
     tab: 12,
     frameId: 0,
     op: "resolve",
   });
   h.sw.forward({ op: "resolve", v: 1, tab: 12, frame: 3, doc: "x", snap: "y", idx: 0 });
-  assert.deepEqual(h.sw.calls.routes[h.sw.calls.routes.length - 1], {
+  resolves = h.sw.calls.routes.filter((route) => route.op === "resolve");
+  assert.deepEqual(resolves[resolves.length - 1], {
     tab: 12,
     frameId: 3,
     op: "resolve",
@@ -847,6 +851,12 @@ function frameRoutingTests() {
   assert.equal(row.link.content_height, 250);
   assert.equal(row.link.parent, 0, "parent frame id comes from the reporting port");
   assert.equal(h.sw.registry(12).get(3).doc, vm.runInContext("DOC_NONCE", child));
+  const frameEl = reply.elements.find((el) => el.frame === 3);
+  assert.ok(frameEl, "child elements merge with frame provenance");
+  assert.ok(frameEl.id.startsWith("sref1:c.c.3."), "tab/frame base36 ref: " + frameEl.id);
+  assert.equal(frameEl.id, frameEl.ref, "id == ref for a frame element");
+  assert.ok(!frameEl.id.startsWith("chr:"), "chr: is top-frame-only");
+  assert.ok(row.doc && row.snap, "linked row carries the child doc/snap");
 }
 
 function frameOptOutTests() {
@@ -869,6 +879,22 @@ function frameOptOutTests() {
 
   reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
   assert.ok(Array.isArray(reply.frames), "frames:true opts in");
+
+  // A non-storing internal observe still carries frame elements for detection, but never
+  // mints a resolvable ref or a colliding chr: id.
+  const childButton = element({ tag: "BUTTON", innerText: "Target" });
+  child.document.documentElement = childButton;
+  top.document.documentElement = element({ tag: "DIV" });
+  const topIframe = element({ tag: "IFRAME", rect: { left: 1, top: 2, width: 300, height: 200 } });
+  topIframe.contentWindow = child.window;
+  attach(top.document.documentElement, topIframe);
+  top.__elementAt = () => topIframe;
+  reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true, store: false });
+  assert.equal(reply.stored, false);
+  const internal = reply.elements.find((el) => el.frame === 3);
+  assert.ok(internal, "internal frame elements are still observed");
+  assert.ok(internal.id.startsWith("frame:3:"), internal.id);
+  assert.equal(internal.ref, undefined, "no resolvable ref without a stored pair");
 }
 
 function frameRestrictedTests() {
@@ -1360,10 +1386,25 @@ function frameContentTests() {
   // A child snapshot is frame-tagged; the top reply is not.
   const child = contentContext({ nonce: 0x7777 });
   vm.runInContext("SELF_FRAME = 3;", child);
+  const childButton = element({ tag: "BUTTON", innerText: "Target" });
+  child.document.documentElement = childButton;
   child.__msg = { op: "snapshot", detail: "default", store: false, frames: true };
   const childReply = vm.runInContext("buildSnapshot(__msg)", child);
   assert.equal(childReply.frame, 3);
   assert.equal(childReply.frame_elements, undefined);
+  assert.equal(childReply.stored, false);
+  assert.equal(childReply.doc, vm.runInContext("DOC_NONCE", child), "identity survives store:false");
+  assert.equal(childReply.snap, undefined, "no stored snapshot means no snap");
+  assert.equal(childReply.elements.length, 1, "the child page's button is observed");
+  assert.ok(childReply.metrics && childReply.metrics.innerWidth > 0);
+
+  // B4 finding: a direct child snapshot with no `frame` field is accepted (SW routing is the
+  // primary defence); a *present* mismatched frame is still protocol_error.
+  const direct = listenerResolve(child, { op: "snapshot", detail: "default", store: false });
+  assert.equal(direct.error, undefined);
+  assert.equal(direct.elements.length, 1);
+  const mismatched = listenerResolve(child, { op: "snapshot", frame: 4, store: false });
+  assert.equal(mismatched.error, "protocol_error");
 
   // frame_binding on an unregistered child is frame_unavailable; a mismatched frame is refused.
   assert.equal(listenerResolve(child, { op: "frame_binding", frame: 3 }).connected, true);

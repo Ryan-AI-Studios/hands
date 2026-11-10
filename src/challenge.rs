@@ -479,7 +479,17 @@ impl ChallengeMachine {
     }
 
     pub fn observe(&mut self, hit: &DetectHit) -> bool {
+        self.observe_frames(hit, false)
+    }
+
+    /// `frames_transient` holds an existing challenge/yield counter across a frame fan-out that
+    /// did not complete (frame_late / budget / missing / geometry). A complete observe with a
+    /// definitive `present:false` still clears.
+    pub fn observe_frames(&mut self, hit: &DetectHit, frames_transient: bool) -> bool {
         if !hit.present {
+            if frames_transient && (self.present || self.yielded) {
+                return false;
+            }
             *self = Self::new();
             return false;
         }
@@ -564,8 +574,16 @@ pub fn reset_for_test() {
 }
 
 pub fn apply_observe(session_id: &str, hit: DetectHit) -> ChallengeInfo {
+    apply_observe_with_frames(session_id, hit, false)
+}
+
+pub fn apply_observe_with_frames(
+    session_id: &str,
+    hit: DetectHit,
+    frames_transient: bool,
+) -> ChallengeInfo {
     let mut g = lock();
-    let just_yielded = g.observe(&hit);
+    let just_yielded = g.observe_frames(&hit, frames_transient);
     if just_yielded && crate::attach::current_identity() == crate::attach::Identity::Research {
         g.suppress_yield_keep_attempts();
         lease::set_challenge_hold(g.hold());
@@ -604,8 +622,11 @@ pub fn detect_from_extract(
     main_text: &str,
     elements: &[Element],
 ) -> DetectHit {
+    // Only the top frame or a vendor-classified frame may arm detection. Non-vendor frame
+    // text (ads/marketing copy) is observed data, never a challenge surface.
     let pairs: Vec<(&str, &str)> = elements
         .iter()
+        .filter(|e| e.frame.is_none() || e.challenge_vendor)
         .map(|e| (e.role.as_str(), e.text.as_deref().unwrap_or("")))
         .collect();
     detect(&DetectInput {
@@ -614,6 +635,16 @@ pub fn detect_from_extract(
         main_text,
         elements: &pairs,
     })
+}
+
+/// Path-aware vendor classification for one frame URL (0131). The URL is internal only:
+/// callers must never serialize it. Origin-only matching is insufficient because
+/// `www.google.com/recaptcha/api2/anchor` and `www.google.com/search` share an origin.
+pub fn vendor_url(url: &str) -> Option<ChallengeKind> {
+    let (host, path) = host_and_path(url);
+    host.as_deref()
+        .and_then(|host| match_host(host, &path))
+        .map(|(kind, _)| kind)
 }
 
 pub fn watch_timeout_ms() -> u64 {
@@ -1426,6 +1457,65 @@ mod tests {
         assert_eq!(m.info().attempts, 0);
         assert!(!m.yielded());
         assert!(m.hold());
+    }
+
+    #[test]
+    fn transient_frame_fan_out_holds_attempts_then_clears() {
+        let mut m = ChallengeMachine::new();
+        assert!(!m.observe(&present_hit()));
+        m.note_actuation();
+        assert!(!m.observe(&present_hit()));
+        assert_eq!(m.info().attempts, 1);
+        // A transient frame miss is unknown, not a definitive `present:false`: hold.
+        assert!(!m.observe_frames(&DetectHit::clear(), true));
+        assert_eq!(m.info().attempts, 1);
+        assert!(m.hold());
+        // A complete observe with a definitive clear still resets.
+        assert!(!m.observe_frames(&DetectHit::clear(), false));
+        assert_eq!(m.info().attempts, 0);
+        assert!(!m.hold());
+    }
+
+    #[test]
+    fn vendor_url_is_path_aware_and_lookalike_safe() {
+        assert!(vendor_url("https://www.google.com/recaptcha/api2/anchor").is_some());
+        assert!(vendor_url("https://www.google.com/search?q=captcha").is_none());
+        assert!(vendor_url("https://recaptcha.evil.example/").is_none());
+        assert!(vendor_url("https://google.com.evil.example/recaptcha").is_none());
+        assert!(vendor_url("https://challenges.cloudflare.com/turnstile").is_some());
+        assert!(vendor_url("https://hcaptcha.com/").is_some());
+        assert!(vendor_url("https://arkoselabs.com/").is_some());
+    }
+
+    #[test]
+    fn non_vendor_frame_copy_does_not_arm_detection() {
+        let mut el = Element {
+            frame: Some(3),
+            challenge_vendor: false,
+            id: "sref1:c.c.3.9f3a.a1b2c3d4.0".into(),
+            role: "Button".into(),
+            text: Some("I'm not a robot".into()),
+            rect: crate::space::Rect {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 20,
+            },
+            grid: None,
+            unnamed: None,
+            sref: None,
+        };
+        let hit = detect_from_extract("Top", Some("https://top.test/"), "", &[el.clone()]);
+        assert!(
+            !hit.present,
+            "ad-frame marketing copy must not arm detection"
+        );
+        el.challenge_vendor = true;
+        let hit = detect_from_extract("Top", Some("https://top.test/"), "", &[el]);
+        assert!(
+            hit.present,
+            "a vendor-classified frame is a detection input"
+        );
     }
 
     #[test]

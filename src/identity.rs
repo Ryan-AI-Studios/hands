@@ -229,6 +229,42 @@ pub struct SnapshotBinding {
     pub fallback: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Per-frame status/identity rows. Empty on a top-frame-only page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<FrameBinding>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub frames_total: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub frames_truncated: bool,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One frame row on `snapshot.frames[]`. `frame` is absent when the frame was never injected
+/// (Chrome exposes no frame id without `webNavigation`); it is never fabricated.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FrameBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<u32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub doc: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub snap: String,
+    #[serde(default)]
+    pub retained: usize,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Bounded scheme+host+port; untrusted hostname text, never a path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 impl SnapshotBinding {
@@ -237,6 +273,16 @@ impl SnapshotBinding {
             && self.tab.is_some_and(|t| t > 0)
             && self.doc.len() == 4
             && self.snap.len() == 8
+    }
+
+    /// A frame row that carries a usable document/snapshot pair.
+    pub fn frame_binding(&self, frame: u32) -> Option<&FrameBinding> {
+        self.frames.iter().find(|row| {
+            row.frame == Some(frame)
+                && row.status == "ok"
+                && row.doc.len() == 4
+                && row.snap.len() == 8
+        })
     }
 }
 
@@ -520,6 +566,67 @@ pub fn runtime_id_hash(ids: &[i32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonzero_frame_ref_round_trips_and_fits_64_chars() {
+        let r = SnapshotRef::Chrome {
+            tab: u32::MAX,
+            frame: u32::MAX,
+            doc: "ffff".into(),
+            snap: "ffffffff".into(),
+            idx: 1_679_615,
+        };
+        let text = r.to_string();
+        assert!(text.len() <= MAX_REF_CHARS, "{} chars: {text}", text.len());
+        assert_eq!(SnapshotRef::parse(&text).expect("parse"), r);
+        assert_eq!(r.frame(), u32::MAX);
+    }
+
+    #[test]
+    fn frame_bindings_serialize_additively_and_drop_urls() {
+        let top = SnapshotBinding {
+            tab: Some(12),
+            window: Some(45),
+            frame: 0,
+            hwnd: None,
+            doc: "9f3a".into(),
+            snap: "a1b2c3d4".into(),
+            retained: 1,
+            source: "live".into(),
+            fallback: false,
+            reason: None,
+            frames: Vec::new(),
+            frames_total: 0,
+            frames_truncated: false,
+        };
+        let json = serde_json::to_string(&top).expect("json");
+        assert!(
+            !json.contains("frames"),
+            "top-only envelope stays 0123-shaped: {json}"
+        );
+        let mut with_frames = top;
+        with_frames.frames.push(FrameBinding {
+            frame: Some(3),
+            doc: "cafe".into(),
+            snap: "00112233".into(),
+            retained: 4,
+            status: "ok".into(),
+            reason: None,
+            origin: Some("https://widget.test".into()),
+        });
+        with_frames.frames_total = 13;
+        with_frames.frames_truncated = true;
+        let json = serde_json::to_string(&with_frames).expect("json");
+        assert!(json.contains("\"frames\":[{"), "{json}");
+        assert!(
+            json.contains("\"origin\":\"https://widget.test\""),
+            "{json}"
+        );
+        assert!(
+            !json.contains("http://localhost:8132/index.html"),
+            "no frame URL: {json}"
+        );
+    }
 
     #[test]
     fn sref_grammar_accept_table() {

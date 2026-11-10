@@ -226,7 +226,7 @@ pub fn detect(input: &DetectInput<'_>) -> DetectHit {
 
     let mut host_classified = false;
     if let Some(host) = host.as_deref()
-        && let Some((kind, reason)) = match_host(host, &path)
+        && let Some((kind, reason)) = match_host(host, &path, HostScope::TopPage)
     {
         push_cand(&mut cands, kind, reason, 0);
         host_classified = true;
@@ -273,9 +273,12 @@ pub fn detect(input: &DetectInput<'_>) -> DetectHit {
     let host_hit = host_classified;
     let vendor_on_token_surface = vendor_token_hit(&token_surfaces);
     let recaptcha_chrome = vendor_on_token_surface == Some(ChallengeKind::Recaptcha)
-        || host
-            .as_deref()
-            .is_some_and(|h| matches!(match_host(h, &path), Some((ChallengeKind::Recaptcha, _))));
+        || host.as_deref().is_some_and(|h| {
+            matches!(
+                match_host(h, &path, HostScope::TopPage),
+                Some((ChallengeKind::Recaptcha, _))
+            )
+        });
     let cf_on_any = surfaces_have_token(&all_surfaces, "cloudflare");
     let turnstile_on_any = surfaces_have_token(&all_surfaces, "turnstile");
 
@@ -366,7 +369,16 @@ fn host_is_cloudflare(host: Option<&str>) -> bool {
     host.is_some_and(|h| h == "cloudflare.com" || h.ends_with(".cloudflare.com"))
 }
 
-fn match_host(host: &str, path: &str) -> Option<(ChallengeKind, String)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostScope {
+    /// The top document: includes the Cloudflare interstitial and funcaptcha host rules.
+    TopPage,
+    /// A frame: only the vendor hosts in spec §3.8. The any-host Cloudflare interstitial and
+    /// `funcaptcha.com` are deliberately excluded.
+    Frame,
+}
+
+fn match_host(host: &str, path: &str, scope: HostScope) -> Option<(ChallengeKind, String)> {
     let host = normalize_host(host);
     if host == "recaptcha.net" || host.ends_with(".recaptcha.net") || host == "recaptcha.google.com"
     {
@@ -381,22 +393,24 @@ fn match_host(host: &str, path: &str) -> Option<(ChallengeKind, String)> {
     if host == "challenges.cloudflare.com" {
         return Some((ChallengeKind::Turnstile, host));
     }
-    if (host == "cloudflare.com" || host.ends_with(".cloudflare.com"))
-        && path.contains("/cdn-cgi/challenge-platform")
-    {
-        return Some((
-            ChallengeKind::Turnstile,
-            "/cdn-cgi/challenge-platform".into(),
-        ));
-    }
-    if path.contains("/cdn-cgi/challenge-platform") {
-        return Some((
-            ChallengeKind::Interstitial,
-            "/cdn-cgi/challenge-platform".into(),
-        ));
-    }
-    if host == "funcaptcha.com" || host.ends_with(".funcaptcha.com") {
-        return Some((ChallengeKind::Funcaptcha, host));
+    if scope == HostScope::TopPage {
+        if (host == "cloudflare.com" || host.ends_with(".cloudflare.com"))
+            && path.contains("/cdn-cgi/challenge-platform")
+        {
+            return Some((
+                ChallengeKind::Turnstile,
+                "/cdn-cgi/challenge-platform".into(),
+            ));
+        }
+        if path.contains("/cdn-cgi/challenge-platform") {
+            return Some((
+                ChallengeKind::Interstitial,
+                "/cdn-cgi/challenge-platform".into(),
+            ));
+        }
+        if host == "funcaptcha.com" || host.ends_with(".funcaptcha.com") {
+            return Some((ChallengeKind::Funcaptcha, host));
+        }
     }
     if host == "arkoselabs.com"
         || host.ends_with(".arkoselabs.com")
@@ -418,37 +432,31 @@ fn host_and_path(raw: &str) -> (Option<String>, String) {
     } else {
         trimmed
     };
-    let after_user = if let Some(at) = after_scheme.find('@') {
-        &after_scheme[at + 1..]
+    // Authority ends at the first `/`, `?` or `#`; an `@` after that is path/query data and
+    // must never change the host.
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    // Strip userinfo only inside the authority. rfind is conservative for malformed input.
+    let host_port = if let Some(at) = authority.rfind('@') {
+        &authority[at + 1..]
     } else {
-        after_scheme
+        authority
     };
-    let host_end = after_user
-        .find(|c: char| c == '/' || c == '?' || c == '#' || c == ':' || c.is_whitespace())
-        .unwrap_or(after_user.len());
-    let host_raw = after_user[..host_end].trim();
+    let host_end = host_port
+        .find(|c: char| c == ':' || c.is_whitespace())
+        .unwrap_or(host_port.len());
+    let host_raw = host_port[..host_end].trim();
     if host_raw.is_empty() || !host_raw.contains('.') {
         return (None, String::new());
     }
-    // Host stops at `:`; skip `:` + ASCII digits (port) then take `/` path.
-    let after_host = if host_end < after_user.len() {
-        &after_user[host_end..]
-    } else {
-        ""
-    };
-    let after_port = if let Some(rest) = after_host.strip_prefix(':') {
-        let digit_len = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        &rest[digit_len..]
-    } else {
-        after_host
-    };
-    let path = if after_port.starts_with('/') {
-        let path_end = after_port
+    let remainder = &after_scheme[authority_end..];
+    let path = if remainder.starts_with('/') {
+        let path_end = remainder
             .find(|c: char| c == '?' || c == '#' || c.is_whitespace())
-            .unwrap_or(after_port.len());
-        after_port[..path_end].to_ascii_lowercase()
+            .unwrap_or(remainder.len());
+        remainder[..path_end].to_ascii_lowercase()
     } else {
         String::new()
     };
@@ -642,30 +650,10 @@ pub fn detect_from_extract(
 /// `www.google.com/recaptcha/api2/anchor` and `www.google.com/search` share an origin.
 pub fn vendor_url(url: &str) -> Option<ChallengeKind> {
     let (host, path) = host_and_path(url);
-    let host = normalize_host(host?.as_str());
-    // Frame vendor classification is host/pattern based, per spec §3.8. The top-page
-    // any-host `/cdn-cgi/challenge-platform` interstitial rule is deliberately excluded:
-    // `https://evil.example/cdn-cgi/challenge-platform/x` is not a vendor frame.
-    if host == "recaptcha.net" || host.ends_with(".recaptcha.net") || host == "recaptcha.google.com"
-    {
-        return Some(ChallengeKind::Recaptcha);
-    }
-    if host == "google.com" && path.contains("/recaptcha") {
-        return Some(ChallengeKind::Recaptcha);
-    }
-    if host == "hcaptcha.com" || host.ends_with(".hcaptcha.com") {
-        return Some(ChallengeKind::Hcaptcha);
-    }
-    if host == "challenges.cloudflare.com" {
-        return Some(ChallengeKind::Turnstile);
-    }
-    if host == "arkoselabs.com"
-        || host.ends_with(".arkoselabs.com")
-        || host == "client-api.arkoselabs.com"
-    {
-        return Some(ChallengeKind::Funcaptcha);
-    }
-    None
+    // Single classifier: the same `match_host` table as the top page, scoped to the §3.8
+    // frame vendor list. The any-host Cloudflare interstitial and `funcaptcha.com` are
+    // deliberately out of frame scope.
+    match_host(host?.as_str(), &path, HostScope::Frame).map(|(kind, _)| kind)
 }
 
 pub fn watch_timeout_ms() -> u64 {
@@ -1511,6 +1499,23 @@ mod tests {
             "an arbitrary host with the Cloudflare path is not a frame vendor"
         );
         assert!(vendor_url("https://google.com.evil.example/recaptcha").is_none());
+        // P3-1: an `@` outside the authority is path/query data, never userinfo.
+        assert!(vendor_url("https://evil.example/x@google.com/recaptcha").is_none());
+        assert!(vendor_url("https://evil.example?q=@google.com/recaptcha").is_none());
+        assert!(vendor_url("https://evil.example/x@@google.com/recaptcha").is_none());
+        assert!(vendor_url("https://evil.example/x%40google.com/recaptcha").is_none());
+        assert!(vendor_url("https://user:pass@google.com/recaptcha").is_some());
+        // P3-3: frame scope excludes the top-page-only funcaptcha/cdn-cgi rules.
+        assert!(vendor_url("https://funcaptcha.com/").is_none());
+        assert!(vendor_url("https://cloudflare.com/cdn-cgi/challenge-platform/x").is_none());
+        assert!(
+            match_host("funcaptcha.com", "", HostScope::TopPage).is_some(),
+            "the top-page rule still exists"
+        );
+        assert_eq!(
+            vendor_url("https://www.google.com/recaptcha/api2/anchor"),
+            match_host("google.com", "/recaptcha", HostScope::Frame).map(|(kind, _)| kind)
+        );
     }
 
     #[test]

@@ -562,11 +562,16 @@ function collectFrameRows(tabId, frameElements) {
       row.url = entry.url;
     }
   }
-  const registeredOrigins = new Set();
+  // Suppress at most one parent iframe row per registered-but-unlinked child of that origin.
+  // A distinct same-origin un-injected iframe must still get its own row.
+  const unlinkedByOrigin = new Map();
   for (const entry of frames.values()) {
-    if (entry.frameId !== 0) {
-      const origin = clampOrigin(entry.origin);
-      if (origin) registeredOrigins.add(origin);
+    if (entry.frameId === 0 || (entry.link && entry.linkState === "ok")) {
+      continue;
+    }
+    const origin = clampOrigin(entry.origin);
+    if (origin) {
+      unlinkedByOrigin.set(origin, (unlinkedByOrigin.get(origin) || 0) + 1);
     }
   }
   const seen = Array.isArray(frameElements) ? frameElements : [];
@@ -578,9 +583,8 @@ function collectFrameRows(tabId, frameElements) {
       continue;
     }
     const origin = clampOrigin(item.origin);
-    // A registered but unlinked child already has a registry row; do not add a second
-    // `no_content_script` row for the same origin/slot.
-    if (origin && registeredOrigins.has(origin)) {
+    if (origin && (unlinkedByOrigin.get(origin) || 0) > 0) {
+      unlinkedByOrigin.set(origin, unlinkedByOrigin.get(origin) - 1);
       continue;
     }
     const row = { status: "unavailable", reason: item.reason };
@@ -934,6 +938,12 @@ function finishFrameSnapshot(out, tab, port, msg) {
   const budget = Math.min(FANOUT_BUDGET_MS, remaining);
   const commitBy = Date.now() + budget;
   setTimeout(finalize, budget);
+  const known = frameRegistry.get(tab.id);
+  if (!known || known.size <= 1) {
+    // A top-only page needs no announce/measure settle.
+    finalize();
+    return;
+  }
   announceAndMeasure(tab.id, () => {
     const frames = frameRegistry.get(tab.id) || new Map();
     const entries = [...frames.values()].filter(

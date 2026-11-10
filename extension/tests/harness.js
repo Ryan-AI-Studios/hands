@@ -922,6 +922,64 @@ function frameOptOutTests() {
     );
   }
 
+  // P3-2: a distinct same-origin un-injected iframe still gets a row even when a sibling is
+  // registered/linked.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 4, origin: "https://same.test" });
+    child.__parentCtx = top;
+    const linkedIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://same.test/" },
+      rect: { left: 5, top: 5, width: 300, height: 200 },
+    });
+    linkedIframe.contentWindow = child.window;
+    const unlinkedIframe = element({
+      tag: "IFRAME",
+      attrs: { src: "https://same.test/other" },
+      rect: { left: 5, top: 250, width: 300, height: 200 },
+    });
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, linkedIframe);
+    attach(rootEl, unlinkedIframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = () => linkedIframe;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "Same" });
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    assert.ok(
+      reply.frames.some((row) => row.reason === "no_content_script"),
+      "the distinct same-origin un-injected iframe is not silently dropped"
+    );
+  }
+
+  // L-2/m-8: a stored observe whose child commit fails must not expose a ref-less frame id.
+  {
+    const h = frameHarness();
+    const top = h.addFrame({ frameId: 0 });
+    const child = h.addFrame({ frameId: 8, origin: "https://nocommit.test" });
+    child.__parentCtx = top;
+    const iframe = element({ tag: "IFRAME", rect: { left: 5, top: 5, width: 300, height: 200 } });
+    iframe.contentWindow = child.window;
+    const rootEl = element({ tag: "DIV" });
+    attach(rootEl, iframe);
+    top.document.documentElement = rootEl;
+    top.__elementAt = () => iframe;
+    child.document.documentElement = element({ tag: "BUTTON", innerText: "Target" });
+    h.sw.setContent(12, 8, (msg, cb) => {
+      if (msg.op === "frame_commit") {
+        cb({ error: "stale_snapshot" });
+        return;
+      }
+      child.__listener(msg, null, (reply) => cb(reply));
+    });
+    const reply = fanOutSnapshot(h, { op: "snapshot", tab: 12, frames: true });
+    const leaked = reply.elements.find(
+      (el) => el.frame === 8 || String(el.id || "").startsWith("frame:")
+    );
+    assert.equal(leaked, undefined, "a stored observe drops a failed-commit frame element");
+  }
+
   // M-3: if the top walk already consumed the client budget, fan-out is skipped honestly.
   {
     const h = frameHarness();

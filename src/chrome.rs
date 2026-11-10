@@ -4174,6 +4174,73 @@ mod tests {
     }
 
     #[test]
+    fn fully_clipped_child_elements_name_the_frame_not_visible() {
+        let raw = RawSnapshot {
+            tab: Some(12),
+            window: Some(45),
+            frame: Some(0),
+            doc: Some("9f3a".into()),
+            snap: Some("a1b2c3d4".into()),
+            retained: Some(10),
+            stored: Some(true),
+            metrics: serde_json::from_value(top_metrics_json()).expect("metrics"),
+            elements: vec![RawNode {
+                frame: Some(3),
+                idx: Some(0),
+                id: Some(frame_ref().to_string()),
+                role: Some("Button".into()),
+                text: Some("Outside".into()),
+                rect_css: CssRect {
+                    left: 400.0,
+                    top: 10.0,
+                    width: 50.0,
+                    height: 20.0,
+                },
+                _href: None,
+            }],
+            frames: vec![crate::frames::RawFrameLink {
+                frame: Some(3),
+                status: Some("ok".into()),
+                doc: Some("cafe".into()),
+                snap: Some("00112233".into()),
+                link: Some(crate::frames::FrameLink {
+                    parent: Some(0),
+                    content_left: 40.0,
+                    content_top: 60.0,
+                    content_width: 300.0,
+                    content_height: 250.0,
+                    clip: vec![crate::frames::ClipRect {
+                        left: 40.0,
+                        top: 60.0,
+                        width: 300.0,
+                        height: 250.0,
+                    }],
+                    transform_ok: true,
+                    visible: true,
+                    hit_ok: true,
+                    onscreen: true,
+                    viewport_w: 1920.0,
+                    viewport_h: 1080.0,
+                    ..crate::frames::FrameLink::default()
+                }),
+                ..crate::frames::RawFrameLink::default()
+            }],
+            ..RawSnapshot::default()
+        };
+        let map = map_from_raw(raw, Some(0x1234), true, "obs".into());
+        assert!(
+            map.elements.is_empty(),
+            "the fully clipped element is not clickable"
+        );
+        let binding = map.snapshot.expect("binding");
+        assert_eq!(binding.frames[0].status, "unavailable");
+        assert_eq!(
+            binding.frames[0].reason.as_deref(),
+            Some("frame_not_visible")
+        );
+    }
+
+    #[test]
     fn evil_cloudflare_path_is_not_a_frame_vendor() {
         let rows = vec![crate::frames::RawFrameLink {
             frame: Some(3),
@@ -4183,6 +4250,15 @@ mod tests {
         assert!(
             !frame_is_vendor(&rows, 3),
             "an arbitrary host with the Cloudflare path is not a frame vendor"
+        );
+        let rows = vec![crate::frames::RawFrameLink {
+            frame: Some(3),
+            url: Some("https://evil.example/x@google.com/recaptcha".into()),
+            ..crate::frames::RawFrameLink::default()
+        }];
+        assert!(
+            !frame_is_vendor(&rows, 3),
+            "an @ in the path cannot change the vendor host"
         );
         let rows = vec![crate::frames::RawFrameLink {
             frame: Some(3),

@@ -4135,14 +4135,18 @@ mod tests {
     }
 
     #[test]
-    fn all_frames_still_false_and_no_dwm() {
+    fn all_frames_policy_and_envelope_caps() {
         let manifest = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/extension/manifest.json"
         ));
         assert!(
-            manifest.contains("\"all_frames\": false"),
-            "all_frames must stay false"
+            manifest.contains("\"all_frames\": true"),
+            "ADR 0002 turns frame observation on"
+        );
+        assert!(
+            manifest.contains("\"match_about_blank\": true"),
+            "about:blank frames inherit the parent origin"
         );
         assert_eq!(crate::extract::DEFAULT_ELEMENT_CAP, 250);
         assert_eq!(VIEWPORT_ENVELOPE_ELEMENT_CAP, 20);

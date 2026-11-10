@@ -2313,10 +2313,17 @@ mod tests {
             serde_json::json!(["<all_urls>"])
         );
         let scripts = manifest["content_scripts"].as_array().expect("scripts");
-        assert_eq!(scripts[0]["all_frames"], serde_json::json!(false));
+        assert_eq!(scripts[0]["all_frames"], serde_json::json!(true));
+        assert_eq!(scripts[0]["match_about_blank"], serde_json::json!(true));
         assert_eq!(scripts[0]["world"], serde_json::json!("ISOLATED"));
         assert_eq!(manifest["manifest_version"], serde_json::json!(3));
-        for missing in ["scripting", "tabs", "debugger", "webRequest"] {
+        for missing in [
+            "scripting",
+            "tabs",
+            "debugger",
+            "webRequest",
+            "webNavigation",
+        ] {
             assert!(
                 !manifest["permissions"]
                     .as_array()

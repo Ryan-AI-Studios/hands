@@ -1766,11 +1766,43 @@ mod tests {
             "challenge.rs must not import the pick module"
         );
 
-        let manifest = include_str!("../extension/manifest.json");
-        assert!(
-            manifest.contains("\"all_frames\": false"),
-            "all_frames must stay false"
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../extension/manifest.json")).expect("manifest");
+        assert_eq!(manifest["manifest_version"], serde_json::json!(3));
+        assert_eq!(manifest["version"], serde_json::json!("0.3.0"));
+        assert_eq!(
+            manifest["permissions"],
+            serde_json::json!(["nativeMessaging"])
         );
+        assert_eq!(
+            manifest["host_permissions"],
+            serde_json::json!(["<all_urls>"])
+        );
+        let scripts = manifest["content_scripts"].as_array().expect("scripts");
+        assert_eq!(scripts[0]["all_frames"], serde_json::json!(true));
+        assert_eq!(scripts[0]["match_about_blank"], serde_json::json!(true));
+        assert_eq!(scripts[0]["world"], serde_json::json!("ISOLATED"));
+        assert_eq!(scripts[0]["run_at"], serde_json::json!("document_idle"));
+        assert!(
+            scripts[0].get("match_origin_as_fallback").is_none(),
+            "data:/blob: frames are out of scope for ADR 0002 v1"
+        );
+        for missing in [
+            "webNavigation",
+            "scripting",
+            "tabs",
+            "debugger",
+            "webRequest",
+        ] {
+            assert!(
+                !manifest["permissions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == missing),
+                "manifest must not add {missing}"
+            );
+        }
     }
 
     #[test]

@@ -72,16 +72,506 @@ function nextSnap() {
   return hex32(snapCounter);
 }
 
+// ---------------------------------------------------------------- frame registry
+// Every injected content script (top and child) self-registers over a private port.
+// A child never walks or posts until the SW asks it to; frame content is data only.
+
+const FRAME_LINK_CAP = 12;
+const FRAME_MEASURE_DEPTH = 16;
+let SELF_FRAME = null;
+let FRAME_TOKEN = null;
+let framePort = null;
+let frameReconnectMs = 250;
+const knownFrameTokens = new Map();
+
+function connectFramePort() {
+  if (!chrome.runtime || typeof chrome.runtime.connect !== "function") {
+    return;
+  }
+  let port = null;
+  try {
+    port = chrome.runtime.connect({ name: "hands-frame" });
+  } catch (_err) {
+    scheduleFrameReconnect();
+    return;
+  }
+  if (!port || !port.onMessage || !port.onDisconnect) {
+    return;
+  }
+  framePort = port;
+  port.onMessage.addListener((msg) => {
+    const op = msg && msg.op;
+    if (op === "frame_id") {
+      SELF_FRAME = Number.isInteger(msg.frame) ? msg.frame : null;
+      FRAME_TOKEN = typeof msg.token === "string" ? msg.token : null;
+      frameReconnectMs = 250;
+      try {
+        port.postMessage({ op: "frame_hello", doc: DOC_NONCE });
+      } catch (_err) {}
+      return;
+    }
+    if (op === "frame_announce") {
+      announceToParent();
+      return;
+    }
+    if (op === "frame_measure") {
+      measureTokens(msg.tokens);
+    }
+  });
+  port.onDisconnect.addListener(() => {
+    if (framePort === port) {
+      framePort = null;
+    }
+    SELF_FRAME = null;
+    FRAME_TOKEN = null;
+    scheduleFrameReconnect();
+  });
+}
+
+function scheduleFrameReconnect() {
+  if (frameReconnectMs > 8000) {
+    frameReconnectMs = 8000;
+  }
+  const delay = frameReconnectMs + Math.floor(Math.random() * 250);
+  frameReconnectMs = Math.min(frameReconnectMs * 2, 8000);
+  setTimeout(connectFramePort, delay);
+}
+
+function announceToParent() {
+  if (SELF_FRAME == null || SELF_FRAME === 0 || !FRAME_TOKEN) {
+    return;
+  }
+  try {
+    window.parent.postMessage({ handsFrameToken: FRAME_TOKEN }, "*");
+  } catch (_err) {}
+  // Ack only after the postMessage call returned: the SW may then wait for the parent.
+  try {
+    framePort.postMessage({ op: "frame_announce_ack", announced: true });
+  } catch (_err) {}
+}
+
+function collectFrameCandidates(node, out) {
+  if (!node || node.nodeType !== 1) {
+    return;
+  }
+  const tag = String(node.tagName || "").toUpperCase();
+  if (tag === "IFRAME" || tag === "FRAME" || tag === "OBJECT" || tag === "FENCEDFRAME") {
+    out.push(node);
+  }
+  const shadow = node.shadowRoot;
+  if (shadow && shadow.children) {
+    for (let i = 0; i < shadow.children.length; i += 1) {
+      collectFrameCandidates(shadow.children[i], out);
+    }
+  }
+  const kids = node.children;
+  if (kids) {
+    for (let i = 0; i < kids.length; i += 1) {
+      collectFrameCandidates(kids[i], out);
+    }
+  }
+}
+
+function iframeElements() {
+  const out = [];
+  const root = document.documentElement;
+  if (root) {
+    collectFrameCandidates(root, out);
+  }
+  return out;
+}
+
+function frameScheme(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  const colon = value.indexOf(":");
+  if (colon <= 0) {
+    return "";
+  }
+  return value.slice(0, colon);
+}
+
+function sourceOrigin(raw) {
+  if (!raw || typeof URL !== "function") {
+    return null;
+  }
+  try {
+    const url = new URL(raw, location.href);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return null;
+    }
+    return url.origin.toLowerCase();
+  } catch (_err) {
+    return null;
+  }
+}
+
+function classifyFrameElement(el) {
+  const tag = String(el.tagName || "").toUpperCase();
+  if (tag === "FENCEDFRAME") {
+    return { reason: "fenced_frame", origin: null };
+  }
+  const sandbox = el.getAttribute("sandbox");
+  if (sandbox != null) {
+    const tokens = String(sandbox).toLowerCase().split(/\s+/);
+    if (tokens.indexOf("allow-scripts") === -1) {
+      return { reason: "sandboxed_no_scripts", origin: null };
+    }
+  }
+  const raw = String(el.getAttribute("src") || "").trim();
+  if (raw) {
+    const scheme = frameScheme(raw);
+    if (scheme === "about") {
+      const lower = raw.toLowerCase();
+      if (lower === "about:blank" || lower.indexOf("about:srcdoc") === 0) {
+        // Chrome may not inject without match_origin_as_fallback; never claim a scheme refusal.
+        return { reason: "no_content_script", origin: null };
+      }
+      return { reason: "restricted_scheme", origin: null };
+    }
+    if (
+      scheme === "data" ||
+      scheme === "blob" ||
+      scheme === "filesystem" ||
+      scheme === "chrome" ||
+      scheme === "chrome-extension" ||
+      scheme === "devtools" ||
+      scheme === "view-source"
+    ) {
+      return { reason: "restricted_scheme", origin: null };
+    }
+  }
+  return { reason: "no_content_script", origin: sourceOrigin(raw) };
+}
+
+function frameElementsReply() {
+  const els = iframeElements();
+  const out = [];
+  for (let i = 0; i < els.length && i < FRAME_LINK_CAP; i += 1) {
+    const verdict = classifyFrameElement(els[i]);
+    const row = { slot: i, reason: verdict.reason };
+    if (verdict.origin) {
+      row.origin = verdict.origin;
+    }
+    out.push(row);
+  }
+  return out;
+}
+
+function findFrameElementBySource(source) {
+  if (!source) {
+    return null;
+  }
+  const els = iframeElements();
+  for (let i = 0; i < els.length; i += 1) {
+    let win = null;
+    try {
+      win = els[i].contentWindow;
+    } catch (_err) {
+      win = null;
+    }
+    if (win && win === source) {
+      return { el: els[i], slot: i };
+    }
+  }
+  return null;
+}
+
+function styleIsTransforming(style) {
+  if (!style) {
+    return false;
+  }
+  if (style.transform && style.transform !== "none") return true;
+  if (style.scale && style.scale !== "none" && style.scale !== "1") return true;
+  if (style.zoom && style.zoom !== "1" && style.zoom !== "normal") return true;
+  if (style.filter && style.filter !== "none") return true;
+  if (style.perspective && style.perspective !== "none") return true;
+  if (style.willChange && /transform|perspective|filter/.test(String(style.willChange))) {
+    return true;
+  }
+  return false;
+}
+
+function linkTransformOk(el) {
+  let node = el;
+  let depth = 0;
+  while (node && depth < FRAME_MEASURE_DEPTH) {
+    if (styleIsTransforming(window.getComputedStyle(node))) {
+      return false;
+    }
+    node = parentOf(node);
+    depth += 1;
+  }
+  return true;
+}
+
+function linkVisible(el) {
+  let node = el;
+  let depth = 0;
+  while (node && depth < FRAME_MEASURE_DEPTH) {
+    const style = window.getComputedStyle(node);
+    if (style) {
+      if (style.display === "none") return false;
+      if (style.visibility === "hidden" || style.visibility === "collapse") return false;
+      if (style.pointerEvents === "none") return false;
+      if (style.opacity !== "" && parseFloat(style.opacity) === 0) return false;
+    }
+    if (node.hasAttribute) {
+      if (node.hasAttribute("inert")) return false;
+      if (node.getAttribute("aria-hidden") === "true") return false;
+    }
+    node = parentOf(node);
+    depth += 1;
+  }
+  return true;
+}
+
+function linkClip(el, contentBox) {
+  const out = [
+    {
+      left: contentBox.left,
+      top: contentBox.top,
+      width: contentBox.width,
+      height: contentBox.height,
+    },
+  ];
+  let node = parentOf(el);
+  let depth = 0;
+  while (node && depth < FRAME_MEASURE_DEPTH && out.length < 8) {
+    if (clipsOverflow(node)) {
+      const box = paddingBox(node);
+      if (box) {
+        out.push(box);
+      }
+    }
+    node = parentOf(node);
+    depth += 1;
+  }
+  return out;
+}
+
+function deepElementFromPoint(x, y) {
+  let el = document.elementFromPoint(x, y);
+  let depth = 0;
+  while (el && depth < ASSESS_SHADOW_PATH) {
+    const root = el.shadowRoot;
+    if (!root || typeof root.elementFromPoint !== "function") {
+      return el;
+    }
+    let inner = null;
+    try {
+      inner = root.elementFromPoint(x, y);
+    } catch (_err) {
+      inner = null;
+    }
+    if (!inner || inner === el) {
+      return el;
+    }
+    el = inner;
+    depth += 1;
+  }
+  return el;
+}
+
+function measureFrameElement(el, slot) {
+  const rect = el.getBoundingClientRect();
+  if (!rect) {
+    return null;
+  }
+  const style = window.getComputedStyle(el);
+  const bl = style ? parseFloat(style.borderLeftWidth) || 0 : 0;
+  const bt = style ? parseFloat(style.borderTopWidth) || 0 : 0;
+  const br = style ? parseFloat(style.borderRightWidth) || 0 : 0;
+  const bb = style ? parseFloat(style.borderBottomWidth) || 0 : 0;
+  const pl = style ? parseFloat(style.paddingLeft) || 0 : 0;
+  const pt = style ? parseFloat(style.paddingTop) || 0 : 0;
+  const pr = style ? parseFloat(style.paddingRight) || 0 : 0;
+  const pb = style ? parseFloat(style.paddingBottom) || 0 : 0;
+  const contentBox = {
+    left: rect.left + bl + pl,
+    top: rect.top + bt + pt,
+    width: Math.max(0, rect.width - bl - br - pl - pr),
+    height: Math.max(0, rect.height - bt - bb - pt - pb),
+  };
+  let childW = null;
+  let childH = null;
+  try {
+    if (el.contentWindow) {
+      childW = Number(el.contentWindow.innerWidth);
+      childH = Number(el.contentWindow.innerHeight);
+    }
+  } catch (_err) {
+    childW = null;
+    childH = null;
+  }
+  const onscreen =
+    contentBox.left < Number(window.innerWidth) &&
+    contentBox.top < Number(window.innerHeight) &&
+    contentBox.left + contentBox.width > 0 &&
+    contentBox.top + contentBox.height > 0;
+  let hitOk = false;
+  if (contentBox.width > 0 && contentBox.height > 0) {
+    const cx = contentBox.left + contentBox.width / 2;
+    const cy = contentBox.top + contentBox.height / 2;
+    let hit = null;
+    try {
+      hit = deepElementFromPoint(cx, cy);
+    } catch (_err) {
+      hit = null;
+    }
+    hitOk = !!hit && composedContains(el, hit);
+  }
+  return {
+    content_left: contentBox.left,
+    content_top: contentBox.top,
+    content_width: contentBox.width,
+    content_height: contentBox.height,
+    clip: linkClip(el, contentBox),
+    transform_ok: linkTransformOk(el),
+    visible: linkVisible(el),
+    hit_ok: hitOk,
+    viewport_w: Number(window.innerWidth),
+    viewport_h: Number(window.innerHeight),
+    onscreen: onscreen,
+    child_viewport_w: Number.isFinite(childW) ? childW : null,
+    child_viewport_h: Number.isFinite(childH) ? childH : null,
+    slot: slot,
+  };
+}
+
+function reportFrameLink(token, origin) {
+  const known = knownFrameTokens.get(token);
+  if (!known || !framePort) {
+    return;
+  }
+  const link = measureFrameElement(known.el, known.slot);
+  if (!link) {
+    return;
+  }
+  try {
+    framePort.postMessage({
+      op: "frame_link",
+      token: token,
+      origin: typeof origin === "string" ? origin : "",
+      link: link,
+    });
+  } catch (_err) {}
+}
+
+function onFrameMessage(event) {
+  const data = event && event.data;
+  if (!data || typeof data !== "object") {
+    return;
+  }
+  const token = data.handsFrameToken;
+  if (typeof token !== "string" || token.length < 8 || token.length > 128) {
+    return;
+  }
+  const match = findFrameElementBySource(event.source);
+  if (!match) {
+    return;
+  }
+  if (knownFrameTokens.size >= 64 && !knownFrameTokens.has(token)) {
+    const oldest = knownFrameTokens.keys().next();
+    if (!oldest.done) {
+      knownFrameTokens.delete(oldest.value);
+    }
+  }
+  knownFrameTokens.set(token, {
+    el: match.el,
+    slot: match.slot,
+    origin: typeof event.origin === "string" ? event.origin : "",
+  });
+  reportFrameLink(token, event.origin);
+}
+
+function measureTokens(tokens) {
+  if (!Array.isArray(tokens)) {
+    return;
+  }
+  for (let i = 0; i < tokens.length && i < 32; i += 1) {
+    const token = tokens[i];
+    const known = typeof token === "string" ? knownFrameTokens.get(token) : null;
+    if (!known) {
+      try {
+        framePort.postMessage({ op: "frame_link_missing", token: token });
+      } catch (_err) {}
+      continue;
+    }
+    reportFrameLink(token, known.origin);
+  }
+}
+
+function frameTopReply() {
+  return {
+    frame: 0,
+    metrics: windowMetrics(),
+    url: location.href || "",
+    title: document.title || "",
+    visibilityState: document.visibilityState,
+  };
+}
+
+function frameBindingReply(msg) {
+  const frame = Number(msg.frame);
+  if (!Number.isInteger(frame) || frame <= 0) {
+    return { error: "protocol_error" };
+  }
+  if (SELF_FRAME == null || SELF_FRAME !== frame) {
+    return { error: "frame_unavailable" };
+  }
+  const record = lastSnapshot;
+  return {
+    frame: frame,
+    doc: DOC_NONCE,
+    snap: record ? record.snap : null,
+    connected: true,
+  };
+}
+
+function frameTargetAllowed(msg) {
+  const selfFrame = SELF_FRAME == null ? null : SELF_FRAME;
+  const frame = msg && msg.frame;
+  if (msg && msg.op === "frame_binding") {
+    return Number.isInteger(Number(frame)) && Number(frame) > 0;
+  }
+  if (msg && msg.op === "frame_top") {
+    return selfFrame == null || selfFrame === 0;
+  }
+  if (frame == null) {
+    // A top op with no frame field must not be answered by a child document.
+    return selfFrame == null || selfFrame === 0;
+  }
+  if (Number(frame) === 0) {
+    // Never reject frame:0 while SELF_FRAME is unset (a top op right after load).
+    return selfFrame == null || selfFrame === 0;
+  }
+  return selfFrame != null && Number(frame) === selfFrame;
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const op = msg && msg.op;
-  if (op !== "snapshot" && op !== "resolve" && op !== "assess") {
+  if (
+    op !== "snapshot" &&
+    op !== "resolve" &&
+    op !== "assess" &&
+    op !== "frame_top" &&
+    op !== "frame_binding"
+  ) {
+    return false;
+  }
+  if (!frameTargetAllowed(msg)) {
+    sendResponse({ error: "protocol_error" });
     return false;
   }
   try {
     if (op === "snapshot") {
-      sendResponse(buildSnapshot(msg.detail, msg.store));
+      sendResponse(buildSnapshot(msg));
     } else if (op === "assess") {
       sendResponse(buildAssess(msg));
+    } else if (op === "frame_top") {
+      sendResponse(frameTopReply());
+    } else if (op === "frame_binding") {
+      sendResponse(frameBindingReply(msg));
     } else if (
       msg.v === 1 &&
       msg.doc &&
@@ -98,7 +588,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return false;
 });
 
-function buildSnapshot(detail, store) {
+function buildSnapshot(msg) {
+  const detail = msg && msg.detail;
+  const store = msg && msg.store;
   const metrics = windowMetrics();
   const nodes = walk(detail).slice(0, SNAPSHOT_NODE_CAP);
   const elements = [];
@@ -148,6 +640,18 @@ function buildSnapshot(detail, store) {
     out.snap = snap;
     out.retained = retained;
   }
+  const selfFrame = SELF_FRAME == null ? 0 : SELF_FRAME;
+  if (selfFrame !== 0) {
+    out.frame = selfFrame;
+  }
+  if (
+    selfFrame === 0 &&
+    msg &&
+    msg.frames === true &&
+    (msg.frame == null || Number(msg.frame) === 0)
+  ) {
+    out.frame_elements = frameElementsReply();
+  }
   if (collected.cards_walked > 0) {
     out.cards_walked = collected.cards_walked;
   }
@@ -191,7 +695,8 @@ function buildResolve(id, detail, assess, samples) {
 }
 
 function resolveScoped(msg) {
-  if (Number(msg.frame) !== 0) {
+  const selfFrame = SELF_FRAME == null ? 0 : SELF_FRAME;
+  if (Number(msg.frame) !== selfFrame) {
     return { error: "frame_unsupported" };
   }
   const record = lastSnapshot;
@@ -238,7 +743,7 @@ function resolveScoped(msg) {
     doc: record.doc,
     snap: record.snap,
     idx: idx,
-    frame: 0,
+    frame: selfFrame,
   };
   if (payload.href) {
     reply.href = payload.href;
@@ -1939,3 +2444,9 @@ function cap(s, n) {
   }
   return t.slice(0, n);
 }
+
+// A page can flood `message`; every event is shape/source checked and page data is never logged.
+if (window.addEventListener) {
+  window.addEventListener("message", onFrameMessage);
+}
+connectFramePort();

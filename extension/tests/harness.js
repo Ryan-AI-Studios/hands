@@ -2420,11 +2420,15 @@ function postcheckTests() {
     "satisfied"
   );
 
-  // Positive-only kinds report unavailable, never unsatisfied.
+  // Positive-only kinds report unavailable with the documented `not_observed`, never
+  // unsatisfied and never a free-form token.
   assert.equal(check({ kind: "dialog_present" }).state, "unavailable");
+  assert.equal(check({ kind: "dialog_present" }).reason, "not_observed");
   assert.equal(check({ kind: "focus_editable" }).state, "unavailable");
+  assert.equal(check({ kind: "focus_editable" }).reason, "not_observed");
   assert.equal(check({ kind: "count_at_least", role: "button", n: 51 }).reason, "invalid_condition");
   assert.equal(check({ kind: "count_at_least", role: "Button", n: 2 }).reason, "invalid_condition");
+  assert.equal(check({ kind: "count_at_least", role: "button", n: 2 }).reason, "not_observed");
 
   // Booleans/states only: never text, URL, title or a value.
   reply = check({ kind: "url_equals", value: "https://example.test/a" });

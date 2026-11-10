@@ -2284,16 +2284,31 @@ pub fn postcheck(
         }
     })?;
     if let Some(token) = error_token(&reply) {
-        let (_, reason) = classify_ref_error(&token);
-        let reason = if token == "empty" || token == "unsupported-op" {
-            "unsupported".to_string()
-        } else {
-            reason
-        };
-        return Err(PostcheckError::Unavailable(reason));
+        // Postcondition reasons are a distinct closed vocabulary (§3.5.1); a 0123 identity
+        // transport token degrades instead of leaking into the postcondition reason set.
+        return Err(PostcheckError::Unavailable(postcheck_error_reason(&token)));
     }
     serde_json::from_value::<PostcheckReply>(reply)
         .map_err(|_| PostcheckError::Unavailable("protocol_error".into()))
+}
+
+/// Map a raw host/extension error token onto the documented closed postcondition reasons.
+fn postcheck_error_reason(token: &str) -> String {
+    match token {
+        "empty" | "unsupported-op" | "unsupported" => "unsupported",
+        "host_down" => "host_down",
+        "window_unreadable" => "window_unreadable",
+        "tab_not_active" => "tab_not_active",
+        "window_not_focused" => "window_not_focused",
+        "tab_hidden" => "tab_hidden",
+        "stale_document" => "stale_document",
+        "stale_snapshot" => "stale_snapshot",
+        "stale_element" => "stale_element",
+        "baseline_mismatch" => "baseline_mismatch",
+        "fixture_snapshot" => "fixture_snapshot",
+        _ => "protocol_error",
+    }
+    .to_string()
 }
 
 fn pipe_snapshot(

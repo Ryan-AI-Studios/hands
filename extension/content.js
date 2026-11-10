@@ -1095,7 +1095,10 @@ function buildPostcheck(msg) {
   }
   if (kind === "focus_editable") {
     return Object.assign(reply, {
-      state: isEditableActive(document.activeElement) ? "satisfied" : "unavailable",
+      state: isEditableActive(document.activeElement)
+        ? "satisfied"
+        : "unavailable",
+      reason: isEditableActive(document.activeElement) ? undefined : "not_observed",
     });
   }
   if (kind === "dialog_present") {
@@ -1114,6 +1117,7 @@ function buildPostcheck(msg) {
     } catch (_err) {}
     return Object.assign(reply, {
       state: found ? "satisfied" : "unavailable",
+      reason: found ? undefined : "not_observed",
     });
   }
   if (kind === "count_at_least") {
@@ -1148,6 +1152,7 @@ function buildPostcheck(msg) {
     }
     return Object.assign(reply, {
       state: count >= n ? "satisfied" : "unavailable",
+      reason: count >= n ? undefined : "not_observed",
     });
   }
   return unavailable("unsupported");

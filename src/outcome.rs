@@ -749,6 +749,35 @@ fn finish(delivery: Delivery, effect: Effect, retry: RetryInfo) -> Classificatio
     }
 }
 
+/// Closed postcondition-reason vocabulary (spec §3.5.1). Any reason outside this set degrades
+/// to `protocol_error` in the Rust mapper and is never echoed from page/extension text.
+pub const POSTCONDITION_REASONS: &[&str] = &[
+    "not_dispatched",
+    "requires_scoped_chrome_ref",
+    "dom_only",
+    "frame_postcondition_out_of_scope",
+    "invalid_condition",
+    "stale_document",
+    "stale_snapshot",
+    "stale_element",
+    "baseline_mismatch",
+    "tab_not_active",
+    "window_not_focused",
+    "tab_hidden",
+    "window_unreadable",
+    "host_down",
+    "protocol_error",
+    "fixture_snapshot",
+    "unsupported",
+    "count_capped",
+    "not_observed",
+    "postcondition_not_met_yet",
+    "postcondition_failed",
+    "postcondition_unavailable",
+    "postcondition_timeout",
+    "evaluation_failed",
+];
+
 /// Closed retry-reason vocabulary (§3.3.4). Every emitted reason must be here.
 pub const RETRY_REASONS: &[&str] = &[
     "effect_confirmed",
@@ -771,7 +800,6 @@ pub const RETRY_REASONS: &[&str] = &[
     "interactable_blocked",
     "interactable_unknown",
     "assessment_unavailable",
-    "interactable_unavailable",
     "blind_guard",
     "invalid_request",
     "scoped_ref_no_auto_retry",

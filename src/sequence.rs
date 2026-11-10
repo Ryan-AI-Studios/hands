@@ -27,8 +27,11 @@ pub enum StopReason {
     UnknownKey,
     BadSteps,
     Cooldown,
-    /// A click step declared a postcondition that was not satisfied.
+    /// A click step declared a postcondition whose effect was `failed` (exact, after deadline).
     PostconditionFailed,
+    /// A click step declared a postcondition that was unavailable/timeout/not-yet-met; the step
+    /// still aborts, but evidence is not `failed`.
+    PostconditionNotMet,
 }
 
 impl StopReason {
@@ -44,6 +47,7 @@ impl StopReason {
             Self::BadSteps => "bad_steps",
             Self::Cooldown => "cooldown",
             Self::PostconditionFailed => "postcondition_failed",
+            Self::PostconditionNotMet => "postcondition_not_met",
         }
     }
 }
@@ -754,9 +758,14 @@ fn classify_failure(step: &SequenceStep, outcome: &StepOutcome) -> Option<StopRe
                 && outcome.postcondition_state
                     != Some(crate::outcome::PostconditionState::Satisfied)
             {
-                // A declared condition that did not hold is the only new stop rule; a step
-                // with no postcondition keeps `no_change`/`reobserve` informational.
-                Some(StopReason::PostconditionFailed)
+                // The abort is the contract; the name must match the actual effect. Only an
+                // exact, post-deadline `failed` is `postcondition_failed`; unavailable / timeout
+                // / one-read unsatisfied is `postcondition_not_met`.
+                if outcome.effect == Some(crate::outcome::Effect::Failed) {
+                    Some(StopReason::PostconditionFailed)
+                } else {
+                    Some(StopReason::PostconditionNotMet)
+                }
             } else {
                 None
             }
@@ -1811,15 +1820,15 @@ mod tests {
                 postcondition_requested: true,
                 postcondition_state: Some(crate::outcome::PostconditionState::Unsatisfied),
                 delivery: Some(crate::outcome::Delivery::Delivered),
-                effect: Some(crate::outcome::Effect::Unconfirmed),
-                verdict: Some(crate::outcome::Verdict::Unconfirmed),
+                effect: Some(crate::outcome::Effect::Failed),
+                verdict: Some(crate::outcome::Verdict::Failed),
                 ..StepOutcome::default()
             })
         };
         let env = run_hooks(
             "seq-0124-postcondition",
             json!([
-                {"tool":"click","element_id":"chr:0","postcondition":{"kind":"dialog_present"}},
+                {"tool":"click","element_id":"chr:0","postcondition":{"kind":"dialog_present","wait_ms":300}},
                 {"tool":"click","element_id":"chr:1"}
             ]),
             hooks,
@@ -1827,6 +1836,52 @@ mod tests {
         assert_eq!(env.stop_reason, StopReason::PostconditionFailed);
         assert_eq!(env.failed_step_index, Some(0));
         assert_eq!(tools(&env), vec!["click"]);
+    }
+
+    #[test]
+    fn postcondition_unavailable_aborts_as_not_met() {
+        let mut hooks = test_hooks();
+        hooks.click = |_, _| {
+            Ok(StepOutcome {
+                ok: true,
+                foregrounded: Some(true),
+                postcondition_requested: true,
+                postcondition_state: Some(crate::outcome::PostconditionState::Unavailable),
+                delivery: Some(crate::outcome::Delivery::Delivered),
+                effect: Some(crate::outcome::Effect::Unconfirmed),
+                verdict: Some(crate::outcome::Verdict::Unconfirmed),
+                ..StepOutcome::default()
+            })
+        };
+        let env = run_hooks(
+            "seq-0124-postcondition-unavailable",
+            json!([{"tool":"click","element_id":"chr:0","postcondition":{"kind":"dialog_present"}}]),
+            hooks,
+        );
+        assert_eq!(env.stop_reason, StopReason::PostconditionNotMet);
+    }
+
+    #[test]
+    fn postcondition_one_read_unsatisfied_is_not_met() {
+        let mut hooks = test_hooks();
+        hooks.click = |_, _| {
+            Ok(StepOutcome {
+                ok: true,
+                foregrounded: Some(true),
+                postcondition_requested: true,
+                postcondition_state: Some(crate::outcome::PostconditionState::Unsatisfied),
+                delivery: Some(crate::outcome::Delivery::Delivered),
+                effect: Some(crate::outcome::Effect::Unconfirmed),
+                verdict: Some(crate::outcome::Verdict::Unconfirmed),
+                ..StepOutcome::default()
+            })
+        };
+        let env = run_hooks(
+            "seq-0124-postcondition-not-met",
+            json!([{"tool":"click","element_id":"chr:0","postcondition":{"kind":"dialog_present"}}]),
+            hooks,
+        );
+        assert_eq!(env.stop_reason, StopReason::PostconditionNotMet);
     }
 
     #[test]

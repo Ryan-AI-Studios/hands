@@ -971,17 +971,13 @@ pub(crate) fn resolve_scoped_com(
         push_children(walker, &element, &mut stack);
     }
     // One arbitration, shared with the 0123 scoped resolve: cap/empty/window/duplicate/fp.
-    let candidates = pairs
-        .iter()
-        .map(|(_, candidate)| candidate.clone())
-        .collect::<Vec<_>>();
-    let found = scoped_matches_outcome(candidates, cap_hit, hwnd, fp)?;
-    let element = pairs
+    // The index keeps the returned COM element and the fingerprinted candidate from the same
+    // pair (a duplicate RuntimeId with one out-of-window pair must not cross-join).
+    let idx = scoped_pair_index(&pairs, cap_hit, hwnd, fp)?;
+    pairs
         .into_iter()
-        .find(|(_, candidate)| candidate.runtime_id == found.runtime_id)
-        .map(|(element, _)| element)
-        .ok_or_else(|| ScopedFailure::stale("stale_element"))?;
-    Ok((element, found))
+        .nth(idx)
+        .ok_or_else(|| ScopedFailure::stale("stale_element"))
 }
 
 fn sta_resolve_scoped(hwnd: isize, ridh: &str, fp: &str) -> Result<ResolvedElement, ScopedFailure> {
@@ -1047,13 +1043,15 @@ fn scoped_candidate(
 }
 
 /// Pure candidate arbitration used by the live walk and tests. A cap hit with no resolved
-/// hash is `unknown`, never a partial first match.
-pub(crate) fn scoped_matches_outcome(
-    matches: Vec<ResolvedElement>,
+/// hash is `unknown`, never a partial first match. Returns the **index** of the surviving
+/// candidate so a caller holding a parallel `IUIAutomationElement` can join the element and
+/// fingerprint from the same pair.
+pub(crate) fn scoped_match_index(
+    matches: &[ResolvedElement],
     cap_hit: bool,
     hwnd: isize,
     fp: &str,
-) -> Result<ResolvedElement, ScopedFailure> {
+) -> Result<usize, ScopedFailure> {
     // A cap hit means the walk is incomplete even if a candidate was already collected.
     // Never accept a partial first match (DoD-7).
     if cap_hit {
@@ -1063,12 +1061,12 @@ pub(crate) fn scoped_matches_outcome(
         return Err(ScopedFailure::stale("stale_element"));
     }
     let mut within = Vec::new();
-    for candidate in matches {
+    for (idx, candidate) in matches.iter().enumerate() {
         if candidate
             .hwnd
             .is_some_and(|native| crate::foreground::related_to_root(native, hwnd))
         {
-            within.push(candidate);
+            within.push(idx);
         }
     }
     if within.is_empty() {
@@ -1077,15 +1075,41 @@ pub(crate) fn scoped_matches_outcome(
     if within.len() > 1 {
         return Err(ScopedFailure::ambiguous("duplicate_runtime_id"));
     }
-    let found = within
-        .into_iter()
-        .next()
-        .ok_or_else(|| ScopedFailure::stale("stale_element"))?;
-    let actual = format!("{:08x}", found.own_fingerprint());
+    let idx = within[0];
+    let actual = format!("{:08x}", matches[idx].own_fingerprint());
     if actual != fp {
         return Err(ScopedFailure::stale("stale_identity"));
     }
-    Ok(found)
+    Ok(idx)
+}
+
+pub(crate) fn scoped_matches_outcome(
+    matches: Vec<ResolvedElement>,
+    cap_hit: bool,
+    hwnd: isize,
+    fp: &str,
+) -> Result<ResolvedElement, ScopedFailure> {
+    let idx = scoped_match_index(&matches, cap_hit, hwnd, fp)?;
+    matches
+        .into_iter()
+        .nth(idx)
+        .ok_or_else(|| ScopedFailure::stale("stale_element"))
+}
+
+/// Pair-aware arbitration for the same-worker subtree resolver. The returned index names the
+/// pair whose candidate was fingerprinted, so the COM element and the fingerprint can never come
+/// from different pairs (a duplicate RuntimeId with one out-of-window pair is the risk).
+pub(crate) fn scoped_pair_index<T>(
+    pairs: &[(T, ResolvedElement)],
+    cap_hit: bool,
+    hwnd: isize,
+    fp: &str,
+) -> Result<usize, ScopedFailure> {
+    let candidates = pairs
+        .iter()
+        .map(|(_, candidate)| candidate.clone())
+        .collect::<Vec<_>>();
+    scoped_match_index(&candidates, cap_hit, hwnd, fp)
 }
 
 fn sta_collect(detail: Detail, cap: usize, hwnd: Option<isize>) -> Result<UiaSnapshot, HandsError> {
@@ -1352,6 +1376,40 @@ impl Drop for StaGuard {
 mod tests {
     use super::*;
     use crate::extract::Detail;
+
+    #[test]
+    fn duplicate_runtime_id_pairs_return_the_in_window_element() {
+        // Two candidates share the same RuntimeId; only one is related to the walk root. The
+        // pair index (not a runtime_id-only re-join) must select the in-window pair so the COM
+        // element and the fingerprint cannot diverge.
+        crate::foreground::set_related_to_root_hook(Some(|hwnd, _root| hwnd == 0x10));
+        let candidate = |name: &str, hwnd: isize| ResolvedElement {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            name: name.into(),
+            role: "Button".into(),
+            hwnd: Some(hwnd),
+            runtime_id: vec![7, 1],
+            own_name: name.into(),
+            own_role: "Button".into(),
+            is_password: false,
+        };
+        let out = candidate("Out", 0x20);
+        let inside = candidate("In", 0x10);
+        let fp = format!("{:08x}", inside.own_fingerprint());
+        let pairs = vec![("out", out), ("in", inside)];
+        assert_eq!(pairs[0].1.runtime_id, pairs[1].1.runtime_id);
+        let idx = scoped_pair_index(&pairs, false, 0x10, &fp).expect("arbitration index");
+        assert_eq!(pairs[idx].0, "in", "the in-window pair must win");
+        let (label, found) = pairs.into_iter().nth(idx).expect("pair");
+        assert_eq!(label, "in");
+        assert_eq!(format!("{:08x}", found.own_fingerprint()), fp);
+        crate::foreground::set_related_to_root_hook(None);
+    }
 
     #[test]
     #[ignore = "live desktop; not a CI gate. Run: cargo test -- --ignored"]

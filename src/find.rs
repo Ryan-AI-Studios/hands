@@ -2224,37 +2224,43 @@ mod tests {
 
     #[test]
     fn dense_fixture_bytes_stay_pinned() {
+        // 36-char session id, as used for the recorded DoD-7 numbers.
+        const SESSION: &str = "s-0125-dense-bytes-pinned-0123456789";
         let _guard = crate::chrome::EnvGuard::lock();
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/find-dense.json");
         _guard.set_snapshot(Some(&path));
-        let envelope = run(FindRequest {
-            within: Some("sref1:c.c.0.7a1b.feedface.0".into()),
-            role: Some("button".into()),
-            limit: Some(20),
-            session_id: Some("s-dense".into()),
-            ..FindRequest::default()
-        })
-        .expect("dense fixture run");
-        assert!(envelope.ok);
-        assert_eq!(
-            envelope.coverage.examined, 60,
-            "the stored walk is 60 nodes"
-        );
-        assert_eq!(envelope.coverage.scope_total, Some(60));
-        assert!(envelope.coverage.scope_complete);
-        assert_eq!(envelope.matches_total, Some(20));
-        assert!(
-            envelope.matches_returned >= FIND_MIN_RETURNED_MATCHES,
-            "returned {}",
-            envelope.matches_returned
-        );
-        let len = serialize(&envelope).expect("json").len();
-        assert!(
-            len <= crate::observe::DEFAULT_ENVELOPE_MAX_BYTES,
-            "{len} bytes"
-        );
-        assert!(envelope.matches_truncated);
+        for (limit, want_bytes, want_returned) in [
+            (1usize, 645usize, 1usize),
+            (12, 3114, 12),
+            (13, 3340, 13),
+            (20, 4018, 16),
+        ] {
+            let envelope = run(FindRequest {
+                within: Some("sref1:c.c.0.7a1b.feedface.0".into()),
+                role: Some("button".into()),
+                limit: Some(limit),
+                session_id: Some(SESSION.into()),
+                ..FindRequest::default()
+            })
+            .expect("dense fixture run");
+            assert!(envelope.ok);
+            assert_eq!(
+                envelope.coverage.examined, 60,
+                "the stored walk is 60 nodes"
+            );
+            assert_eq!(envelope.coverage.scope_total, Some(60));
+            assert!(envelope.coverage.scope_complete);
+            assert_eq!(envelope.matches_total, Some(20));
+            assert_eq!(
+                envelope.matches_returned, want_returned,
+                "limit {limit} returned"
+            );
+            let len = serialize(&envelope).expect("json").len();
+            assert_eq!(len, want_bytes, "limit {limit} byte envelope");
+            assert!(len <= crate::observe::DEFAULT_ENVELOPE_MAX_BYTES);
+            assert!(envelope.matches_truncated);
+        }
     }
 
     #[test]
@@ -2477,11 +2483,15 @@ mod tests {
         let body = &src[start..end];
         assert!(body.contains("runtime_id_hash"));
         assert!(
-            body.contains("scoped_matches_outcome"),
-            "the subtree resolver must reuse the 0123 arbitration"
+            body.contains("scoped_pair_index"),
+            "the subtree resolver must reuse the 0123 arbitration by pair index"
         );
         assert!(!body.contains("duplicate_runtime_id"));
         assert!(!body.contains("window_mismatch"));
+        assert!(
+            !body.contains("candidate.runtime_id =="),
+            "the element must join by pair index, not runtime_id alone"
+        );
         assert!(!body.contains("resolve_on("));
     }
 
@@ -2553,7 +2563,10 @@ mod tests {
     }
 
     #[test]
-    fn frame_scope_routes_and_honours_kill_switch() {
+    fn frame_scope_source_lock_and_kill_switch() {
+        // Source lock only: the `{frameId}` routing half is behavioural in the Node harness
+        // (`sw_forwards_query_by_tab_and_frame_with_evidence`) and the kill switch is behavioural
+        // in `frame_zero_output_unchanged`.
         let src = include_str!("find.rs");
         assert!(src.contains("crate::frames::enabled()"));
         assert!(src.contains("frame_unsupported"));

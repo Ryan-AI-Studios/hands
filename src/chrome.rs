@@ -2256,14 +2256,13 @@ pub(crate) const CAP_INVOKE_ROLES: &[&str] = &[
     "hyperlink",
     "tabitem",
     "menuitem",
-    "listitem",
     "checkbox",
     "radiobutton",
     "treeitem",
 ];
 pub(crate) const CAP_TOGGLE_ROLES: &[&str] = &["checkbox", "radiobutton"];
-pub(crate) const CAP_EXPAND_ROLES: &[&str] = &["combobox", "menuitem"];
-pub(crate) const CAP_SELECT_ROLES: &[&str] = &["tabitem", "menuitem", "listitem", "treeitem"];
+pub(crate) const CAP_EXPAND_ROLES: &[&str] = &["combobox"];
+pub(crate) const CAP_SELECT_ROLES: &[&str] = &["tabitem", "menuitem", "treeitem"];
 pub(crate) const CAP_VALUE_ROLES: &[&str] = &["edit", "combobox"];
 
 /// Fixture-only DOM capability evidence: role markup, no live attributes. The Node harness and

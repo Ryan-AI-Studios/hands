@@ -286,6 +286,32 @@ function installSnapshotNodes(context, nodes, doc, snap) {
   );
 }
 
+function capability(context, node) {
+  context.__capNode = node;
+  return vm.runInContext(
+    "domCapability(__capNode, keyPayload(__capNode, 0))",
+    context
+  );
+}
+
+function actionSupport(cap, verb) {
+  for (const row of cap.actions) {
+    if (row.action === verb) {
+      return row.support;
+    }
+  }
+  return null;
+}
+
+function actionEvidence(cap, verb) {
+  for (const row of cap.actions) {
+    if (row.action === verb) {
+      return row.evidence;
+    }
+  }
+  return null;
+}
+
 function listenerResolve(context, message) {
   let response = null;
   context.__listener(message, null, (value) => {
@@ -2688,6 +2714,45 @@ function queryTests() {
   assert.ok(!domBody.includes("el.value"), "capability probe never reads a value");
 }
 
+function capabilityTests() {
+  const ctx = contentContext();
+  // A bare list item is not a verb-bearing control: no invoke and no select over-claim.
+  const bareLi = element({ tag: "LI", attrs: { "aria-label": "Item" } });
+  let cap = capability(ctx, bareLi);
+  assert.equal(actionSupport(cap, "invoke"), "unknown", "bare <li> invoke");
+  assert.equal(actionSupport(cap, "select"), "unknown", "bare <li> select");
+
+  // An explicit role=option is a selection item.
+  const option = element({ tag: "LI", attrs: { role: "option", "aria-label": "Choice" } });
+  cap = capability(ctx, option);
+  assert.equal(actionSupport(cap, "select"), "available");
+  assert.equal(actionEvidence(cap, "select"), "role_selection");
+
+  // menuitem alone does not advertise expand/collapse; aria-expanded does.
+  const menuItem = element({ tag: "DIV", attrs: { role: "menuitem", "aria-label": "Open" } });
+  cap = capability(ctx, menuItem);
+  assert.equal(actionSupport(cap, "expand"), "unknown", "menuitem without aria-expanded");
+  const expandedItem = element({
+    tag: "DIV",
+    attrs: { role: "menuitem", "aria-label": "Open", "aria-expanded": "true" },
+  });
+  cap = capability(ctx, expandedItem);
+  assert.equal(actionSupport(cap, "expand"), "available");
+  assert.equal(actionEvidence(cap, "expand"), "aria_expanded");
+
+  // Button / checkbox / edit / password evidence stays as declared.
+  cap = capability(ctx, element({ tag: "BUTTON", attrs: { "aria-label": "Go" } }));
+  assert.equal(actionEvidence(cap, "invoke"), "role_button");
+  cap = capability(ctx, element({ tag: "INPUT", type: "checkbox", attrs: { type: "checkbox" } }));
+  assert.equal(actionEvidence(cap, "toggle"), "role_checkbox");
+  cap = capability(ctx, element({ tag: "INPUT", type: "text", attrs: { type: "text", "aria-label": "Name" } }));
+  assert.equal(actionEvidence(cap, "set_value"), "editable_role");
+  const password = element({ tag: "INPUT", type: "password", attrs: { type: "password" } });
+  password.value = "hunter2-secret";
+  cap = capability(ctx, password);
+  assert.equal(actionSupport(cap, "set_value"), "unknown", "password never set_value");
+}
+
 function main() {
   contentTests();
   swTests();
@@ -2702,6 +2767,7 @@ function main() {
   frameContentTests();
   postcheckTests();
   queryTests();
+  capabilityTests();
   frameSourceLocksTests();
   process.stdout.write("extension harness: ok\n");
 }

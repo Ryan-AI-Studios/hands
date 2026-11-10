@@ -1162,14 +1162,13 @@ const CAP_INVOKE_ROLES = [
   "hyperlink",
   "tabitem",
   "menuitem",
-  "listitem",
   "checkbox",
   "radiobutton",
   "treeitem",
 ];
 const CAP_TOGGLE_ROLES = ["checkbox", "radiobutton"];
-const CAP_EXPAND_ROLES = ["combobox", "menuitem"];
-const CAP_SELECT_ROLES = ["tabitem", "menuitem", "listitem", "treeitem"];
+const CAP_EXPAND_ROLES = ["combobox"];
+const CAP_SELECT_ROLES = ["tabitem", "menuitem", "treeitem"];
 const CAP_VALUE_ROLES = ["edit", "combobox"];
 
 function domCapability(el, payload) {
@@ -1185,7 +1184,10 @@ function domCapability(el, payload) {
     (tag === "INPUT" && (el.type === "checkbox" || el.type === "radio")) ||
     CAP_TOGGLE_ROLES.indexOf(role) >= 0;
   const expand = has("aria-expanded") || CAP_EXPAND_ROLES.indexOf(role) >= 0;
-  const select = has("aria-selected") || CAP_SELECT_ROLES.indexOf(role) >= 0;
+  const select =
+    has("aria-selected") ||
+    CAP_SELECT_ROLES.indexOf(role) >= 0 ||
+    attr("role") === "option";
   const setValue =
     editable && !password && CAP_VALUE_ROLES.indexOf(role) >= 0;
   const action = (verb, available, evidence) => {
